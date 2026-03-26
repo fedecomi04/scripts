@@ -1,0 +1,970 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+from collections import OrderedDict
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import cv2
+import numpy as np
+import pyrender
+import ros_numpy
+import rospy
+import tf2_ros
+import trimesh
+from message_filters import ApproximateTimeSynchronizer, Subscriber
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+from urdfpy import URDF
+
+DATASET_ROOT = Path(
+    "/home/mrc-cuhk/Documents/dynamic_gaussian_splat/data_teleoperation/"
+    "datasets/dynaarm_gs_depth_mask_01"
+)
+URDF_PATH = Path(
+    "/home/mrc-cuhk/dev/teleop/catkin_ws/src/active_camera_arm_control/"
+    "active_camera_arm_examples/dynaarm_description/urdf/dynamic_gaussian_splat/"
+    "dynaarm_with_gripper_for_gazebo_only_no_wrist_collision.urdf"
+)
+STL_DIR = Path("/home/mrc-cuhk/Documents/dynamic_gaussian_splat/stl")
+WORLD_FILE = Path(
+    "/home/mrc-cuhk/dev/teleop/catkin_ws/src/active_camera_arm_control/"
+    "active_camera_arm_gazebo/worlds/dynamic_gaussian_splat/empty_world.world"
+)
+PACKAGE_MAP = {
+    "dynaarm_description": (
+        "/home/mrc-cuhk/dev/teleop/catkin_ws/src/active_camera_arm_control/"
+        "active_camera_arm_examples/dynaarm_description"
+    ),
+    "robotiq_2f_85_gripper_visualization": (
+        "/home/mrc-cuhk/dev/teleop/catkin_ws/src/active_camera_arm_control/"
+        "active_camera_arm_examples/robotiq/robotiq_2f_85_gripper_visualization"
+    ),
+}
+
+IMAGE_TOPIC = "/dynaarm_arm/dynaarm_arm/camera1/image_raw"
+INFO_TOPIC = "/dynaarm_arm/dynaarm_arm/camera1/camera_info"
+POINTCLOUD_TOPIC = "/dynaarm_arm/dynaarm_arm/camera1/depth/points"
+BASE_FRAME = "dynaarm_arm_tf/world"
+DEFAULT_CAMERA_FRAME = "dynaarm_arm_tf/camera_link"
+LINK_FRAME_PREFIX = "dynaarm_arm_tf"
+CAMERA_NAME = "arm"
+
+INIT_CLOUD_NAME = "depth_camera_init_points.ply"
+READY_SENTINEL_NAME = ".robot_mask_saver_ready"
+CAPTURE_COMPLETE_SENTINEL_NAME = ".capture_complete.json"
+
+TF_TIMEOUT = 0.1
+QUEUE_SIZE = 200
+POINTCLOUD_SYNC_SLOP = 0.1
+POINTS_PER_FRAME = 200000
+BACKGROUND_COLOR_THRESHOLD = 10.0
+COMPLETE_DRAIN_SEC = 1.0
+LOOP_RATE_HZ = 30.0
+
+RUN_DIR_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d{2})?$")
+
+
+@dataclass
+class CameraIntrinsics:
+    width: int
+    height: int
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+
+
+def read_json_with_retry(path: Path, retries: int = 5, delay_sec: float = 0.05) -> dict:
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return json.loads(path.read_text())
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay_sec)
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"Failed to read JSON from {path}")
+
+
+def write_json_atomic(path: Path, payload: dict, indent: int = 2) -> None:
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=indent), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+@contextmanager
+def locked_file(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def write_ascii_ply(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
+    if xyz.shape[0] != rgb.shape[0]:
+        raise ValueError("xyz and rgb must have the same number of rows")
+
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("ply\n")
+        handle.write("format ascii 1.0\n")
+        handle.write(f"element vertex {xyz.shape[0]}\n")
+        handle.write("property float x\n")
+        handle.write("property float y\n")
+        handle.write("property float z\n")
+        handle.write("property uchar red\n")
+        handle.write("property uchar green\n")
+        handle.write("property uchar blue\n")
+        handle.write("end_header\n")
+        for point, color in zip(xyz, rgb):
+            handle.write(
+                f"{point[0]:.8f} {point[1]:.8f} {point[2]:.8f} "
+                f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+            )
+
+
+def pointcloud_struct_to_xyz(cloud_struct: np.ndarray) -> np.ndarray:
+    if not all(name in cloud_struct.dtype.names for name in ("x", "y", "z")):
+        raise ValueError(f"PointCloud2 missing x/y/z fields: {cloud_struct.dtype.names}")
+    return np.stack(
+        [
+            np.asarray(cloud_struct["x"], dtype=np.float32),
+            np.asarray(cloud_struct["y"], dtype=np.float32),
+            np.asarray(cloud_struct["z"], dtype=np.float32),
+        ],
+        axis=-1,
+    )
+
+
+def pointcloud_rgb_from_struct(cloud_struct: np.ndarray) -> Optional[np.ndarray]:
+    names = set(cloud_struct.dtype.names or [])
+    if {"r", "g", "b"}.issubset(names):
+        return np.stack(
+            [
+                np.asarray(cloud_struct["r"], dtype=np.uint8),
+                np.asarray(cloud_struct["g"], dtype=np.uint8),
+                np.asarray(cloud_struct["b"], dtype=np.uint8),
+            ],
+            axis=-1,
+        )
+
+    if "rgb" in names:
+        split = ros_numpy.point_cloud2.split_rgb_field(cloud_struct.copy())
+        return np.stack(
+            [
+                np.asarray(split["r"], dtype=np.uint8),
+                np.asarray(split["g"], dtype=np.uint8),
+                np.asarray(split["b"], dtype=np.uint8),
+            ],
+            axis=-1,
+        )
+
+    return None
+
+
+class RobotMaskSaver:
+    def __init__(self) -> None:
+        self.dataset_root = DATASET_ROOT.expanduser().resolve()
+        self.ready_sentinel_path = self.dataset_root / READY_SENTINEL_NAME
+        self.known_run_names = {run.name for run in self._list_run_dirs(self.dataset_root)}
+
+        self.dataset_dir: Optional[Path] = None
+        self.rgb_dir: Optional[Path] = None
+        self.masks_dir: Optional[Path] = None
+        self.transforms_path: Optional[Path] = None
+        self.transforms_lock_path: Optional[Path] = None
+        self.init_cloud_path: Optional[Path] = None
+        self.capture_complete_path: Optional[Path] = None
+
+        self.intrinsics: Optional[CameraIntrinsics] = None
+        self.renderer: Optional[pyrender.OffscreenRenderer] = None
+        self.scene: Optional[pyrender.Scene] = None
+        self.camera_node = None
+        self.robot_nodes: list[Tuple[str, object, object]] = []
+        self.mesh_cache: Dict[str, trimesh.Trimesh] = {}
+
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+
+        self.stamps_by_seq: "OrderedDict[int, rospy.Time]" = OrderedDict()
+        self.pending_points_by_seq: "OrderedDict[int, dict]" = OrderedDict()
+        self.processed_seqs: set[int] = set()
+        self.rgb_name_by_seq: Dict[int, str] = {}
+        self.init_cloud_target_seq: Optional[int] = None
+        self.init_cloud_saved = False
+        self.completion_detected_at: Optional[float] = None
+        self.finalized = False
+
+        self.background_rgb_colors = self._load_background_rgb_colors()
+
+        rospy.loginfo("Loading URDF from %s", URDF_PATH)
+        patched_urdf = self._make_temp_resolved_urdf(URDF_PATH, PACKAGE_MAP, STL_DIR)
+        self.robot = URDF.load(patched_urdf)
+
+        self.camera_info_sub = rospy.Subscriber(INFO_TOPIC, CameraInfo, self._camera_info_cb, queue_size=1)
+        self.image_sub = rospy.Subscriber(IMAGE_TOPIC, Image, self._image_cb, queue_size=20)
+        self.sync_image_sub = Subscriber(IMAGE_TOPIC, Image)
+        self.pointcloud_sub = Subscriber(POINTCLOUD_TOPIC, PointCloud2)
+        self.point_sync = ApproximateTimeSynchronizer(
+            [self.sync_image_sub, self.pointcloud_sub],
+            queue_size=QUEUE_SIZE,
+            slop=POINTCLOUD_SYNC_SLOP,
+        )
+        self.point_sync.registerCallback(self._pointcloud_sync_cb)
+
+    def write_ready_sentinel(self) -> None:
+        payload = {"pid": os.getpid(), "ready_time": time.time()}
+        write_json_atomic(self.ready_sentinel_path, payload, indent=2)
+
+    def _list_run_dirs(self, dataset_dir: Path) -> list[Path]:
+        if not dataset_dir.exists() or not dataset_dir.is_dir():
+            return []
+        return [path for path in dataset_dir.iterdir() if path.is_dir() and RUN_DIR_PATTERN.match(path.name)]
+
+    def _refresh_dataset_dir(self) -> None:
+        if self.dataset_dir is not None:
+            return
+
+        new_runs = [run for run in self._list_run_dirs(self.dataset_root) if run.name not in self.known_run_names]
+        if not new_runs:
+            return
+
+        dataset_dir = max(new_runs, key=lambda path: path.stat().st_mtime).resolve()
+        self.known_run_names.add(dataset_dir.name)
+        self.dataset_dir = dataset_dir
+        self.rgb_dir = dataset_dir / "rgb"
+        self.masks_dir = dataset_dir / "masks"
+        self.transforms_path = dataset_dir / "transforms.json"
+        self.transforms_lock_path = dataset_dir / "transforms.json.lock"
+        self.init_cloud_path = dataset_dir / INIT_CLOUD_NAME
+        self.capture_complete_path = dataset_dir / CAPTURE_COMPLETE_SENTINEL_NAME
+        self.masks_dir.mkdir(parents=True, exist_ok=True)
+        self._initialize_processed_seqs()
+        rospy.loginfo("Detected new dataset run: %s", dataset_dir)
+
+    def _camera_info_cb(self, msg: CameraInfo) -> None:
+        if self.intrinsics is not None:
+            return
+
+        self.intrinsics = CameraIntrinsics(
+            width=int(msg.width),
+            height=int(msg.height),
+            fx=float(msg.K[0]),
+            fy=float(msg.K[4]),
+            cx=float(msg.K[2]),
+            cy=float(msg.K[5]),
+        )
+        rospy.loginfo(
+            "Camera intrinsics: %dx%d fx=%.3f fy=%.3f cx=%.3f cy=%.3f",
+            self.intrinsics.width,
+            self.intrinsics.height,
+            self.intrinsics.fx,
+            self.intrinsics.fy,
+            self.intrinsics.cx,
+            self.intrinsics.cy,
+        )
+
+    def _image_cb(self, msg: Image) -> None:
+        seq = int(msg.header.seq)
+        if seq in self.stamps_by_seq:
+            del self.stamps_by_seq[seq]
+        self.stamps_by_seq[seq] = msg.header.stamp
+        while len(self.stamps_by_seq) > QUEUE_SIZE:
+            self.stamps_by_seq.popitem(last=False)
+
+    def _image_msg_to_rgb(self, msg: Image) -> np.ndarray:
+        image = ros_numpy.numpify(msg)
+        if image.ndim == 2:
+            image = np.stack([image, image, image], axis=-1)
+        elif image.ndim == 3 and image.shape[2] >= 3:
+            image = image[:, :, :3]
+        else:
+            raise ValueError(f"Unsupported image shape {image.shape}")
+        return image[:, :, ::-1].copy()
+
+    def _pointcloud_sync_cb(self, image_msg: Image, points_msg: PointCloud2) -> None:
+        if self.init_cloud_saved:
+            return
+
+        seq = int(image_msg.header.seq)
+        if self.init_cloud_target_seq is not None and seq != self.init_cloud_target_seq:
+            return
+
+        try:
+            rgb = self._image_msg_to_rgb(image_msg)
+            cloud_struct = ros_numpy.numpify(points_msg)
+            xyz_cam = pointcloud_struct_to_xyz(cloud_struct)
+        except Exception as exc:
+            rospy.logwarn_throttle(2.0, "Failed to decode synced point cloud: %s", exc)
+            return
+
+        valid = np.isfinite(xyz_cam[..., 0]) & np.isfinite(xyz_cam[..., 1]) & np.isfinite(xyz_cam[..., 2])
+        valid &= xyz_cam[..., 2] > 0.0
+        if not np.any(valid):
+            return
+
+        if xyz_cam.ndim == 3 and rgb.shape[:2] == xyz_cam.shape[:2]:
+            colors = rgb
+        else:
+            colors = pointcloud_rgb_from_struct(cloud_struct)
+            if colors is None:
+                flat_n = int(np.prod(xyz_cam.shape[:-1]))
+                colors = np.full((flat_n, 3), 255, dtype=np.uint8)
+
+        uv_valid = None
+        if xyz_cam.ndim == 3:
+            ys, xs = np.where(valid)
+            xyz_valid = xyz_cam[ys, xs].reshape(-1, 3).astype(np.float32)
+            rgb_valid = colors[ys, xs].reshape(-1, 3).astype(np.uint8)
+            uv_valid = np.stack([ys, xs], axis=1).astype(np.int32)
+        else:
+            xyz_valid = xyz_cam[valid].reshape(-1, 3).astype(np.float32)
+            rgb_valid = colors[valid].reshape(-1, 3).astype(np.uint8)
+
+        if xyz_valid.shape[0] > POINTS_PER_FRAME:
+            choice = np.random.default_rng(seq).choice(xyz_valid.shape[0], size=POINTS_PER_FRAME, replace=False)
+            xyz_valid = xyz_valid[choice]
+            rgb_valid = rgb_valid[choice]
+            if uv_valid is not None:
+                uv_valid = uv_valid[choice]
+
+        if seq in self.pending_points_by_seq:
+            del self.pending_points_by_seq[seq]
+        self.pending_points_by_seq[seq] = {
+            "xyz_cam_ros": xyz_valid,
+            "rgb": rgb_valid,
+            "uv": uv_valid,
+        }
+        while len(self.pending_points_by_seq) > QUEUE_SIZE:
+            self.pending_points_by_seq.popitem(last=False)
+
+    def _make_temp_resolved_urdf(self, urdf_path: Path, package_map: Dict[str, str], stl_dir: Path) -> str:
+        text = urdf_path.read_text()
+
+        def repl(match):
+            pkg = match.group(1)
+            rest = match.group(2)
+
+            basename = Path(rest).stem + ".stl"
+            stl_path = stl_dir / basename
+            if stl_path.exists():
+                return str(stl_path)
+            if pkg not in package_map:
+                raise RuntimeError(f"Missing package root for '{pkg}'")
+            return str(Path(package_map[pkg]) / rest)
+
+        text = re.sub(r"package://([^/]+)/([^\"'<> ]+)", repl, text)
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".urdf", delete=False)
+        tmp.write(text)
+        tmp.flush()
+        tmp.close()
+        return tmp.name
+
+    def _ensure_renderer(self) -> None:
+        if self.renderer is not None or self.intrinsics is None:
+            return
+
+        self.renderer = pyrender.OffscreenRenderer(
+            viewport_width=self.intrinsics.width,
+            viewport_height=self.intrinsics.height,
+        )
+        self.scene = pyrender.Scene(
+            bg_color=np.array([0.0, 0.0, 0.0, 1.0]),
+            ambient_light=np.array([0.8, 0.8, 0.8]),
+        )
+        camera = pyrender.IntrinsicsCamera(
+            fx=self.intrinsics.fx,
+            fy=self.intrinsics.fy,
+            cx=self.intrinsics.cx,
+            cy=self.intrinsics.cy,
+            znear=0.001,
+            zfar=100.0,
+        )
+        self.camera_node = self.scene.add(camera, pose=np.eye(4, dtype=np.float32))
+        self.scene.add(pyrender.DirectionalLight(color=np.ones(3), intensity=5.0), pose=np.eye(4, dtype=np.float32))
+        light2_pose = np.eye(4, dtype=np.float32)
+        light2_pose[:3, 3] = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        self.scene.add(pyrender.PointLight(color=np.ones(3), intensity=20.0), pose=light2_pose)
+        self._build_scene()
+        rospy.loginfo("Renderer initialized")
+
+    def _build_scene(self) -> None:
+        assert self.scene is not None
+        for link in self.robot.links:
+            for visual in link.visuals:
+                tri = self._geometry_to_trimesh(visual.geometry)
+                if tri is None:
+                    rospy.logwarn("Skipping unsupported visual geometry on link '%s'", link.name)
+                    continue
+                pose = np.eye(4, dtype=np.float32)
+                if visual.origin is not None:
+                    pose = visual.origin.astype(np.float32)
+                node = self.scene.add(self._make_render_mesh(tri), pose=pose)
+                self.robot_nodes.append((link.name, visual, node))
+
+    def _geometry_to_trimesh(self, geom) -> Optional[trimesh.Trimesh]:
+        inner = None
+        if hasattr(geom, "mesh") and geom.mesh is not None:
+            inner = geom.mesh
+        elif hasattr(geom, "box") and geom.box is not None:
+            inner = geom.box
+        elif hasattr(geom, "cylinder") and geom.cylinder is not None:
+            inner = geom.cylinder
+        elif hasattr(geom, "sphere") and geom.sphere is not None:
+            inner = geom.sphere
+        else:
+            return None
+
+        if hasattr(inner, "filename") and inner.filename is not None:
+            scale = np.array(inner.scale, dtype=np.float32) if getattr(inner, "scale", None) is not None else None
+            return self._load_trimesh(inner.filename, scale)
+
+        if hasattr(inner, "size") and inner.size is not None:
+            return trimesh.creation.box(extents=np.array(inner.size, dtype=np.float32))
+
+        if hasattr(inner, "radius") and hasattr(inner, "length"):
+            radius = getattr(inner, "radius", None)
+            length = getattr(inner, "length", None)
+            if radius is not None and length is not None:
+                return trimesh.creation.cylinder(radius=float(radius), height=float(length), sections=32)
+
+        if hasattr(inner, "radius") and not hasattr(inner, "length"):
+            radius = getattr(inner, "radius", None)
+            if radius is not None:
+                return trimesh.creation.icosphere(radius=float(radius), subdivisions=2)
+
+        return None
+
+    def _load_trimesh(self, path: str, scale: Optional[np.ndarray]) -> trimesh.Trimesh:
+        key = f"{path}|{None if scale is None else tuple(scale.tolist())}"
+        if key in self.mesh_cache:
+            return self.mesh_cache[key].copy()
+
+        loaded = trimesh.load(path, force="scene")
+        if isinstance(loaded, trimesh.Scene):
+            meshes = [geometry.copy() for geometry in loaded.geometry.values()]
+            if not meshes:
+                raise RuntimeError(f"No geometry found in mesh file: {path}")
+            mesh = trimesh.util.concatenate(meshes)
+        else:
+            mesh = loaded.copy()
+
+        if scale is not None:
+            mesh.apply_scale(scale)
+
+        self.mesh_cache[key] = mesh.copy()
+        return mesh
+
+    def _make_render_mesh(self, mesh: trimesh.Trimesh) -> pyrender.Mesh:
+        material = pyrender.MetallicRoughnessMaterial(
+            baseColorFactor=(0.9, 0.2, 0.2, 1.0),
+            metallicFactor=0.0,
+            roughnessFactor=1.0,
+            alphaMode="OPAQUE",
+        )
+        return pyrender.Mesh.from_trimesh(mesh, smooth=False, material=material)
+
+    @staticmethod
+    def _transform_to_matrix(transform_msg) -> np.ndarray:
+        t = transform_msg.transform.translation
+        q = transform_msg.transform.rotation
+
+        x, y, z, w = q.x, q.y, q.z, q.w
+        xx, yy, zz = x * x, y * y, z * z
+        xy, xz, yz = x * y, x * z, y * z
+        wx, wy, wz = w * x, w * y, w * z
+
+        rot = np.array(
+            [
+                [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+                [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+                [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+            ],
+            dtype=np.float32,
+        )
+
+        mat = np.eye(4, dtype=np.float32)
+        mat[:3, :3] = rot
+        mat[:3, 3] = np.array([t.x, t.y, t.z], dtype=np.float32)
+        return mat
+
+    def _lookup_camera_pose(self, stamp: rospy.Time, camera_frame: Optional[str]) -> np.ndarray:
+        resolved_camera_frame = (camera_frame or "").strip().lstrip("/") or DEFAULT_CAMERA_FRAME
+        tf_msg = self.tf_buffer.lookup_transform(
+            BASE_FRAME,
+            resolved_camera_frame,
+            stamp,
+            timeout=rospy.Duration(TF_TIMEOUT),
+        )
+        return self._transform_to_matrix(tf_msg)
+
+    def _tf_link_frame(self, link_name: str) -> str:
+        return f"{LINK_FRAME_PREFIX}/{link_name}" if LINK_FRAME_PREFIX else link_name
+
+    def _update_robot_poses(self, stamp: rospy.Time) -> None:
+        assert self.scene is not None
+        for link_name, visual, node in self.robot_nodes:
+            link_frame = self._tf_link_frame(link_name)
+            if not self.tf_buffer.can_transform(
+                BASE_FRAME,
+                link_frame,
+                stamp,
+                timeout=rospy.Duration(TF_TIMEOUT),
+            ):
+                rospy.logwarn_throttle(2.0, "Skipping link without TF connection: %s", link_frame)
+                continue
+
+            tf_msg = self.tf_buffer.lookup_transform(
+                BASE_FRAME,
+                link_frame,
+                stamp,
+                timeout=rospy.Duration(TF_TIMEOUT),
+            )
+            base_T_link = self._transform_to_matrix(tf_msg)
+            link_T_visual = np.eye(4, dtype=np.float32)
+            if visual.origin is not None:
+                link_T_visual = visual.origin.astype(np.float32)
+            self.scene.set_pose(node, pose=base_T_link @ link_T_visual)
+
+    def _build_render_camera_pose(self, ros_pose: np.ndarray) -> np.ndarray:
+        T_optical_to_opengl = np.eye(4, dtype=np.float32)
+        T_optical_to_opengl[:3, :3] = np.array(
+            [
+                [1, 0, 0],
+                [0, -1, 0],
+                [0, 0, -1],
+            ],
+            dtype=np.float32,
+        )
+        T_rot_y_m90 = np.eye(4, dtype=np.float32)
+        T_rot_y_m90[:3, :3] = np.array(
+            [
+                [0, 0, -1],
+                [0, 1, 0],
+                [1, 0, 0],
+            ],
+            dtype=np.float32,
+        )
+        T_rot_z_90 = np.eye(4, dtype=np.float32)
+        T_rot_z_90[:3, :3] = np.array(
+            [
+                [0, 1, 0],
+                [-1, 0, 0],
+                [0, 0, 1],
+            ],
+            dtype=np.float32,
+        )
+        return ros_pose @ T_optical_to_opengl @ T_rot_y_m90 @ T_rot_z_90
+
+    def _render_robot_black_mask(self, stamp: rospy.Time, camera_frame: str) -> np.ndarray:
+        cam_pose = self._lookup_camera_pose(stamp, camera_frame)
+        self._update_robot_poses(stamp)
+        render_cam_pose = self._build_render_camera_pose(cam_pose)
+        self.scene.set_pose(self.camera_node, pose=render_cam_pose)
+        _, depth = self.renderer.render(self.scene)
+        robot_black_mask = (depth == 0).astype(np.uint8) * 255
+        return cv2.flip(robot_black_mask, 0)
+
+    def _rgb_name_for_seq(self, seq: int) -> str:
+        return self.rgb_name_by_seq.get(seq, f"{CAMERA_NAME}_{seq:05d}.png")
+
+    def _mask_path_for_seq(self, seq: int) -> Path:
+        assert self.masks_dir is not None
+        return self.masks_dir / self._rgb_name_for_seq(seq)
+
+    def _rgb_path_for_seq(self, seq: int) -> Path:
+        assert self.rgb_dir is not None
+        return self.rgb_dir / self._rgb_name_for_seq(seq)
+
+    def _seq_from_camera_filename(self, path: Path) -> Optional[int]:
+        match = re.fullmatch(rf"{re.escape(CAMERA_NAME)}_(\d+)\.png", path.name)
+        if match is not None:
+            return int(match.group(1))
+        stem = path.stem
+        return int(stem) if stem.isdigit() else None
+
+    def _initialize_processed_seqs(self) -> None:
+        self.processed_seqs = set()
+        if self.masks_dir is None or not self.masks_dir.exists():
+            return
+
+        for mask_path in self.masks_dir.glob("*.png"):
+            seq = self._seq_from_camera_filename(mask_path)
+            if seq is None:
+                continue
+            self.rgb_name_by_seq[seq] = mask_path.name
+            self.processed_seqs.add(seq)
+
+    def _load_frame_pose(self, seq: int) -> Optional[np.ndarray]:
+        if self.transforms_path is None or not self.transforms_path.exists():
+            return None
+
+        try:
+            data = read_json_with_retry(self.transforms_path)
+        except Exception as exc:
+            rospy.logwarn_throttle(2.0, "Failed to read transforms.json for seq %d: %s", seq, exc)
+            return None
+
+        rgb_name = self._rgb_name_for_seq(seq)
+        for frame in data.get("frames", []):
+            if Path(frame.get("file_path", "")).name != rgb_name:
+                continue
+            matrix = np.array(frame.get("transform_matrix"), dtype=np.float32)
+            if matrix.shape != (4, 4):
+                rospy.logwarn("Invalid transform_matrix shape for seq %d: %s", seq, matrix.shape)
+                return None
+            return matrix
+        return None
+
+    def _save_init_cloud(self, seq: int, mask: Optional[np.ndarray] = None) -> bool:
+        if self.init_cloud_saved or self.init_cloud_target_seq != seq:
+            return False
+
+        record = self.pending_points_by_seq.get(seq)
+        if record is None:
+            return False
+
+        if mask is None:
+            mask_path = self._mask_path_for_seq(seq)
+            if not mask_path.exists():
+                return False
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+            if mask is None:
+                rospy.logwarn("Failed to read mask for seq %d from %s", seq, mask_path)
+                return False
+            if mask.ndim == 3:
+                mask = mask[..., 0]
+
+        xyz_cam_ros = record["xyz_cam_ros"]
+        rgb = record["rgb"]
+        uv = record["uv"]
+        if uv is not None:
+            keep = mask[uv[:, 0], uv[:, 1]] > 0
+            xyz_cam_ros = xyz_cam_ros[keep]
+            rgb = rgb[keep]
+
+        if xyz_cam_ros.shape[0] == 0:
+            rospy.logwarn("No scene points remained after masking for seq %d", seq)
+            return False
+
+        c2w = self._load_frame_pose(seq)
+        if c2w is None:
+            return False
+
+        xyz_cam_ns = np.stack(
+            [
+                xyz_cam_ros[:, 0],
+                -xyz_cam_ros[:, 1],
+                -xyz_cam_ros[:, 2],
+            ],
+            axis=1,
+        ).astype(np.float32)
+        hom = np.concatenate([xyz_cam_ns, np.ones((xyz_cam_ns.shape[0], 1), dtype=np.float32)], axis=1)
+        xyz_world = (c2w @ hom.T).T[:, :3]
+
+        assert self.init_cloud_path is not None
+        write_ascii_ply(self.init_cloud_path, xyz_world.astype(np.float32), rgb)
+        self.init_cloud_saved = True
+        self.pending_points_by_seq.clear()
+        self._patch_transforms()
+        rospy.loginfo("Saved init cloud for seq %d to %s", seq, self.init_cloud_path)
+        return True
+
+    def _patch_transforms(self) -> None:
+        if self.transforms_path is None or self.transforms_lock_path is None or not self.transforms_path.exists():
+            return
+
+        with locked_file(self.transforms_lock_path):
+            data = read_json_with_retry(self.transforms_path)
+            updated = False
+
+            for frame in data.get("frames", []):
+                rgb_name = Path(frame.get("file_path", "")).name
+                if not rgb_name or self.masks_dir is None:
+                    continue
+                mask_file = self.masks_dir / rgb_name
+                if not mask_file.exists():
+                    continue
+                mask_rel = f"./masks/{rgb_name}"
+                if frame.get("mask_path") != mask_rel:
+                    frame["mask_path"] = mask_rel
+                    updated = True
+
+            if self.init_cloud_path is not None and self.init_cloud_path.exists():
+                if data.get("ply_file_path") != self.init_cloud_path.name:
+                    data["ply_file_path"] = self.init_cloud_path.name
+                    updated = True
+
+            if updated:
+                write_json_atomic(self.transforms_path, data, indent=2)
+
+    def _compute_background_black_mask(self, seq: int) -> Optional[np.ndarray]:
+        rgb_path = self._rgb_path_for_seq(seq)
+        rgb_bgr = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
+        if rgb_bgr is None:
+            rospy.logwarn("Failed to read RGB image for seq %d from %s", seq, rgb_path)
+            return None
+
+        if not self.background_rgb_colors:
+            rospy.logwarn_throttle(
+                2.0,
+                "No background colors were loaded from %s; keeping full scene mask",
+                WORLD_FILE,
+            )
+            return None
+
+        rgb = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+        background_like = np.zeros(rgb.shape[:2], dtype=bool)
+        for color_rgb in self.background_rgb_colors:
+            diff = rgb - color_rgb[None, None, :]
+            color_dist = np.linalg.norm(diff, axis=2)
+            background_like |= color_dist <= BACKGROUND_COLOR_THRESHOLD
+        return (~background_like).astype(np.uint8) * 255
+
+    def _parse_rgba_text_to_rgb255(self, text: Optional[str]) -> Optional[np.ndarray]:
+        if text is None:
+            return None
+        parts = [part for part in text.strip().split() if part]
+        if len(parts) < 3:
+            return None
+        try:
+            rgb = np.array([float(parts[0]), float(parts[1]), float(parts[2])], dtype=np.float32)
+        except ValueError:
+            return None
+        if np.any(rgb > 1.0):
+            return np.clip(rgb, 0.0, 255.0).astype(np.float32)
+        return np.clip(rgb * 255.0, 0.0, 255.0).astype(np.float32)
+
+    def _load_background_rgb_colors(self) -> list[np.ndarray]:
+        colors: list[np.ndarray] = []
+        if not WORLD_FILE.exists():
+            rospy.logwarn("World file not found for background masking: %s", WORLD_FILE)
+            return colors
+
+        try:
+            root = ET.parse(WORLD_FILE).getroot()
+        except Exception as exc:
+            rospy.logwarn("Failed to parse world file %s: %s", WORLD_FILE, exc)
+            return colors
+
+        for scene in root.findall(".//scene"):
+            color = self._parse_rgba_text_to_rgb255(scene.findtext("background"))
+            if color is not None:
+                colors.append(color)
+
+        for model in root.findall(".//model"):
+            name = (model.get("name") or "").lower()
+            if not any(token in name for token in ("wall", "floor", "background")):
+                continue
+            for material in model.findall(".//material"):
+                color = self._parse_rgba_text_to_rgb255(material.findtext("emissive"))
+                if color is not None:
+                    colors.append(color)
+
+        deduped: list[np.ndarray] = []
+        seen = set()
+        for color in colors:
+            key = tuple(int(round(value)) for value in color.tolist())
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(np.array(key, dtype=np.float32))
+        return deduped
+
+    def _process_seq(self, seq: int, stamp: rospy.Time, camera_frame: Optional[str]) -> bool:
+        self._ensure_renderer()
+        if self.renderer is None or self.scene is None:
+            return False
+
+        selected_camera_frame = (camera_frame or "").strip().lstrip("/") or DEFAULT_CAMERA_FRAME
+        try:
+            robot_black_mask = self._render_robot_black_mask(stamp, selected_camera_frame)
+        except Exception as exc:
+            rospy.logwarn_throttle(2.0, "TF/render pose update failed for camera frame %s: %s", selected_camera_frame, exc)
+            return False
+
+        robot_pixels = int(np.count_nonzero(robot_black_mask == 0))
+        if robot_pixels <= 0:
+            rospy.logwarn_throttle(
+                2.0,
+                "Rendered robot mask is empty for seq %d with camera frame %s",
+                seq,
+                selected_camera_frame,
+            )
+        else:
+            rospy.loginfo(
+                "Using camera frame %s for seq %d gripper mask (%d robot pixels)",
+                selected_camera_frame,
+                seq,
+                robot_pixels,
+            )
+
+        background_black_mask = self._compute_background_black_mask(seq)
+        if background_black_mask is None:
+            background_black_mask = np.full(robot_black_mask.shape, 255, dtype=np.uint8)
+            mask = robot_black_mask
+        else:
+            mask = cv2.bitwise_and(robot_black_mask, background_black_mask)
+
+        mask_path = self._mask_path_for_seq(seq)
+        if not cv2.imwrite(str(mask_path), mask):
+            rospy.logerr("Failed to save mask to %s", mask_path)
+            return False
+
+        self.processed_seqs.add(seq)
+        if self.init_cloud_target_seq is None:
+            self.init_cloud_target_seq = seq
+        self._save_init_cloud(seq, mask=mask)
+        self._patch_transforms()
+        rospy.loginfo("Saved mask for seq %d", seq)
+        return True
+
+    def _prune_frames_missing_masks(self) -> None:
+        if self.transforms_path is None or self.transforms_lock_path is None or not self.transforms_path.exists():
+            return
+
+        with locked_file(self.transforms_lock_path):
+            data = read_json_with_retry(self.transforms_path)
+            frames = data.get("frames", [])
+            kept_frames = []
+            removed_frames = []
+
+            for frame in frames:
+                rgb_name = Path(frame.get("file_path", "")).name
+                if not rgb_name or self.masks_dir is None:
+                    kept_frames.append(frame)
+                    continue
+                mask_path = (self.masks_dir / rgb_name).resolve()
+                if mask_path.exists():
+                    kept_frames.append(frame)
+                    continue
+                removed_frames.append(frame)
+
+            if not removed_frames:
+                return
+
+            for frame in removed_frames:
+                for key in ("file_path", "depth_file_path", "mask_path"):
+                    rel = frame.get(key)
+                    if not rel or self.dataset_dir is None:
+                        continue
+                    path = (self.dataset_dir / rel).resolve() if not Path(rel).is_absolute() else Path(rel)
+                    try:
+                        if path.exists():
+                            path.unlink()
+                    except Exception as exc:
+                        rospy.logwarn("Failed to delete %s while pruning missing-mask frame: %s", path, exc)
+
+            data["frames"] = kept_frames
+            write_json_atomic(self.transforms_path, data, indent=2)
+            rospy.loginfo("Pruned %d frames without masks from dataset %s", len(removed_frames), self.dataset_dir)
+
+    def _cleanup_renderer(self) -> None:
+        if self.renderer is None:
+            return
+        try:
+            self.renderer.delete()
+        except Exception as exc:
+            rospy.logwarn("Renderer cleanup failed: %s", exc)
+        finally:
+            self.renderer = None
+            self.scene = None
+            self.camera_node = None
+            self.robot_nodes = []
+
+    def _cleanup_sentinels(self) -> None:
+        for path in (self.ready_sentinel_path, self.capture_complete_path):
+            if path is None:
+                continue
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
+
+    def finalize(self) -> None:
+        if self.finalized:
+            return
+        self.finalized = True
+        try:
+            if self.init_cloud_target_seq is not None:
+                self._save_init_cloud(self.init_cloud_target_seq)
+            self._patch_transforms()
+            self._prune_frames_missing_masks()
+        finally:
+            self._cleanup_renderer()
+            self._cleanup_sentinels()
+
+    def process_once(self) -> None:
+        self._refresh_dataset_dir()
+        if self.rgb_dir is None or not self.rgb_dir.exists():
+            return
+
+        for rgb_path in sorted(self.rgb_dir.glob("*.png")):
+            seq = self._seq_from_camera_filename(rgb_path)
+            if seq is None:
+                continue
+            self.rgb_name_by_seq[seq] = rgb_path.name
+
+            if seq in self.processed_seqs:
+                continue
+
+            mask_path = self._mask_path_for_seq(seq)
+            if mask_path.exists():
+                self.processed_seqs.add(seq)
+                if self.init_cloud_target_seq is None:
+                    self.init_cloud_target_seq = seq
+                continue
+
+            stamp = self.stamps_by_seq.get(seq)
+            if stamp is None:
+                continue
+            self._process_seq(seq, stamp, DEFAULT_CAMERA_FRAME)
+
+        if self.init_cloud_target_seq is not None:
+            self._save_init_cloud(self.init_cloud_target_seq)
+
+        if self.capture_complete_path is None or not self.capture_complete_path.exists():
+            return
+
+        if self.completion_detected_at is None:
+            self.completion_detected_at = time.time()
+            rospy.loginfo("Capture complete sentinel detected for %s", self.dataset_dir)
+
+        self._patch_transforms()
+        if time.time() - self.completion_detected_at >= COMPLETE_DRAIN_SEC:
+            self.finalize()
+            rospy.signal_shutdown("Mask generation finished")
+
+    def spin(self) -> None:
+        rate = rospy.Rate(LOOP_RATE_HZ)
+        while not rospy.is_shutdown():
+            self.process_once()
+            rate.sleep()
+
+
+def main() -> None:
+    rospy.init_node("robot_mask_saver_stl", anonymous=False)
+    saver = RobotMaskSaver()
+    rospy.on_shutdown(saver.finalize)
+    saver.write_ready_sentinel()
+    rospy.loginfo("robot_mask_saver_stl is waiting for a new dataset run under %s", DATASET_ROOT)
+    saver.spin()
+
+
+if __name__ == "__main__":
+    main()
