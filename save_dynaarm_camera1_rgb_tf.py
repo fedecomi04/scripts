@@ -46,13 +46,8 @@ MASK_SAVER_EXIT_TIMEOUT_SEC = 180.0
 # This fixed-axis composition is equivalent to +90 deg about Y followed by
 # +90 deg about the rotated Z axis.
 ROS_OPTICAL_TO_NERFSTUDIO = np.diag([1.0, -1.0, -1.0])
-EXTRA_FIXED_ROTATION = np.array([
-    [ 0.0, -1.0,  0.0],
-    [ 0.0,  0.0,  1.0],
-    [-1.0,  0.0,  0.0],
-], dtype=np.float64)
 
-ROS_CAMERA_TO_OUTPUT_FRAME = ROS_OPTICAL_TO_NERFSTUDIO @ EXTRA_FIXED_ROTATION
+ROS_CAMERA_TO_OUTPUT_FRAME = ROS_OPTICAL_TO_NERFSTUDIO 
 
 tf_buffer = None
 tf_listener = None
