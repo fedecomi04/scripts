@@ -43,7 +43,7 @@ MASK_SAVER_EXIT_TIMEOUT_SEC = 180.0
 SYNC_QUEUE_SIZE = 20
 SYNC_SLOP_SEC = 0.1
 INIT_CLOUD_NAME = "depth_camera_init_points.ply"
-MAX_INIT_CLOUD_POINTS = 200000
+MAX_INIT_CLOUD_POINTS = 400000
 TF_TOPIC = "/tf"
 TF_STATIC_TOPIC = "/tf_static"
 GAZEBO_LINK_STATES_TOPIC = "/gazebo/link_states"
@@ -82,7 +82,6 @@ meta = None
 meta_tf = None
 frame_index = 0
 last_saved_stamp = None
-first_frame_bundle = None
 pose_debug_path = None
 gazebo_transforms_path = None
 gazebo_pose_diff_path = None
@@ -202,6 +201,54 @@ def write_ascii_ply(path, xyz, rgb):
                 f"{point[0]:.8f} {point[1]:.8f} {point[2]:.8f} "
                 f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
             )
+
+
+def resolve_relpath(base_dir, rel_path):
+    return (base_dir / rel_path).resolve()
+
+
+def resolve_frame_mask_path(dataset_dir, frame):
+    mask_rel = frame.get("mask_path")
+    if mask_rel:
+        mask_path = resolve_relpath(dataset_dir, mask_rel)
+        if mask_path.exists():
+            return mask_path
+
+    rgb_rel = frame.get("file_path")
+    if not rgb_rel:
+        return None
+
+    fallback_mask_path = (dataset_dir / "masks" / Path(rgb_rel).name).resolve()
+    if fallback_mask_path.exists():
+        return fallback_mask_path
+    return None
+
+
+def load_saved_mask(mask_path, expected_hw):
+    if mask_path is None or not mask_path.exists():
+        raise RuntimeError(f"Missing mask at {mask_path}")
+
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+    if mask is None:
+        raise RuntimeError(f"Failed to read mask from {mask_path}")
+    if mask.ndim == 3:
+        mask = mask[..., 0]
+    if mask.shape != expected_hw:
+        raise RuntimeError(
+            f"Mask shape mismatch for {mask_path}: got {mask.shape}, expected {expected_hw}"
+        )
+    return mask > 0
+
+
+def load_saved_rgb(rgb_path, expected_hw):
+    image_bgr = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise RuntimeError(f"Failed to read RGB image from {rgb_path}")
+    if image_bgr.shape[:2] != expected_hw:
+        raise RuntimeError(
+            f"RGB shape mismatch for {rgb_path}: got {image_bgr.shape[:2]}, expected {expected_hw}"
+        )
+    return image_bgr
 
 
 def gazebo_link_name_to_tf_frame(link_name):
@@ -994,60 +1041,86 @@ def write_gazebo_pose_reports():
     write_json_atomic(gazebo_pose_diff_path, difference_payload)
 
 
-def write_init_cloud_from_first_frame():
-    if first_frame_bundle is None or run_dir is None or masks_dir is None:
+def write_init_cloud_from_saved_frames():
+    if run_dir is None or transforms_path is None or not transforms_path.exists():
         return
 
-    mask_path = masks_dir / first_frame_bundle["image_file_name"]
     ply_path = run_dir / INIT_CLOUD_NAME
+    current_transforms = read_json_with_retry(transforms_path)
+    frames = current_transforms.get("frames", [])
+    if not frames:
+        return
 
-    if not mask_path.exists():
-        if ply_path.exists():
-            meta["ply_file_path"] = INIT_CLOUD_NAME
-            if meta_tf is not None:
-                meta_tf["ply_file_path"] = INIT_CLOUD_NAME
-            patch_ply_file_path_on_outputs()
-            return
-        raise RuntimeError(f"Missing first-frame mask at {mask_path}")
+    dataset_dir = run_dir.resolve()
+    samples_per_frame = max(1, (MAX_INIT_CLOUD_POINTS + len(frames) - 1) // len(frames))
+    rng = np.random.default_rng(0)
+    all_xyz = []
+    all_rgb = []
 
-    mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
-    if mask is None:
-        raise RuntimeError(f"Failed to read first-frame mask from {mask_path}")
-    if mask.ndim == 3:
-        mask = mask[..., 0]
+    for frame in frames:
+        depth_rel = frame.get("depth_file_path")
+        rgb_rel = frame.get("file_path")
+        if not depth_rel or not rgb_rel:
+            continue
 
-    depth_mm = first_frame_bundle["depth_mm"]
-    if mask.shape != depth_mm.shape:
-        raise RuntimeError(
-            f"First-frame mask shape {mask.shape} does not match depth shape {depth_mm.shape}"
-        )
+        depth_path = resolve_relpath(dataset_dir, depth_rel)
+        rgb_path = resolve_relpath(dataset_dir, rgb_rel)
+        mask_path = resolve_frame_mask_path(dataset_dir, frame)
 
-    valid = (mask > 0) & (depth_mm > 0)
-    ys, xs = np.where(valid)
-    if ys.size == 0:
-        raise RuntimeError("No valid first-frame depth pixels remained after masking")
+        depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            raise RuntimeError(f"Failed to read depth image from {depth_path}")
+        if depth.ndim != 2:
+            raise RuntimeError(f"Depth image must be HxW, got {depth.shape} for {depth_path}")
 
-    if ys.size > MAX_INIT_CLOUD_POINTS:
-        choice = np.random.default_rng(first_frame_bundle["seq"]).choice(
-            ys.size,
-            size=MAX_INIT_CLOUD_POINTS,
-            replace=False,
-        )
+        if np.issubdtype(depth.dtype, np.floating):
+            depth_mm = depth.astype(np.float32) * 1000.0
+        elif depth.dtype == np.uint16:
+            depth_mm = depth.astype(np.float32)
+        else:
+            raise RuntimeError(f"Unsupported depth dtype {depth.dtype} for {depth_path}")
+
+        expected_hw = depth_mm.shape
+        valid_mask = load_saved_mask(mask_path, expected_hw)
+        rgb_bgr = load_saved_rgb(rgb_path, expected_hw)
+
+        valid = valid_mask & (depth_mm > 0.0)
+        ys, xs = np.where(valid)
+        if ys.size == 0:
+            continue
+
+        n_sample = min(samples_per_frame, ys.size)
+        choice = rng.choice(ys.size, size=n_sample, replace=False)
         ys = ys[choice]
         xs = xs[choice]
 
-    depth_m = depth_mm[ys, xs].astype(np.float32) / 1000.0
-    x = (xs.astype(np.float32) - float(meta["cx"])) * depth_m / float(meta["fl_x"])
-    y = -(ys.astype(np.float32) - float(meta["cy"])) * depth_m / float(meta["fl_y"])
-    xyz_cam = np.stack([x, y, -depth_m], axis=1)
-    hom = np.concatenate(
-        [xyz_cam, np.ones((xyz_cam.shape[0], 1), dtype=np.float32)],
-        axis=1,
-    )
-    xyz_world = (first_frame_bundle["transform_matrix"] @ hom.T).T[:, :3]
-    rgb = first_frame_bundle["image_bgr"][ys, xs][:, ::-1].astype(np.uint8)
+        depth_m = depth_mm[ys, xs] / 1000.0
+        x = (xs.astype(np.float32) - float(current_transforms["cx"])) * depth_m / float(current_transforms["fl_x"])
+        y = -(ys.astype(np.float32) - float(current_transforms["cy"])) * depth_m / float(current_transforms["fl_y"])
+        xyz_cam = np.stack([x, y, -depth_m], axis=1)
+        hom = np.concatenate(
+            [xyz_cam, np.ones((xyz_cam.shape[0], 1), dtype=np.float32)],
+            axis=1,
+        )
+        transform_matrix = np.asarray(frame["transform_matrix"], dtype=np.float32)
+        xyz_world = (transform_matrix @ hom.T).T[:, :3]
+        rgb = rgb_bgr[ys, xs][:, ::-1].astype(np.uint8)
 
-    write_ascii_ply(ply_path, xyz_world.astype(np.float32), rgb)
+        all_xyz.append(xyz_world.astype(np.float32))
+        all_rgb.append(rgb)
+
+    if not all_xyz:
+        raise RuntimeError("No valid depth points remained after applying masks across saved frames")
+
+    xyz = np.concatenate(all_xyz, axis=0)
+    rgb = np.concatenate(all_rgb, axis=0)
+
+    if xyz.shape[0] > MAX_INIT_CLOUD_POINTS:
+        keep = rng.choice(xyz.shape[0], size=MAX_INIT_CLOUD_POINTS, replace=False)
+        xyz = xyz[keep]
+        rgb = rgb[keep]
+
+    write_ascii_ply(ply_path, xyz.astype(np.float32), rgb)
     meta["ply_file_path"] = INIT_CLOUD_NAME
     if meta_tf is not None:
         meta_tf["ply_file_path"] = INIT_CLOUD_NAME
@@ -1113,7 +1186,6 @@ def wait_for_mask_saver(process):
 def image_callback(image_msg, depth_msg):
     global frame_index
     global last_saved_stamp
-    global first_frame_bundle
     global gazebo_alignment_transform
     global gazebo_alignment_metadata
 
@@ -1202,15 +1274,6 @@ def image_callback(image_msg, depth_msg):
     cv2.imwrite(str(rgb_dir / image_file_name), image)
     cv2.imwrite(str(depth_dir / depth_file_name), depth_mm)
 
-    if first_frame_bundle is None:
-        first_frame_bundle = {
-            "seq": ros_seq,
-            "image_file_name": image_file_name,
-            "image_bgr": image.copy(),
-            "depth_mm": depth_mm.copy(),
-            "transform_matrix": T_primary_output.astype(np.float32).copy(),
-        }
-
     meta["frames"].append(
         {
             "file_path": file_path,
@@ -1266,7 +1329,6 @@ def main():
     global capture_complete_path
     global meta
     global meta_tf
-    global first_frame_bundle
     global tf_edge_samples
     global tf_parent_by_child
     global pose_debug_records
@@ -1295,7 +1357,6 @@ def main():
         transforms_tf_path = run_dir / TF_TRANSFORMS_NAME
         transforms_tf_lock_path = run_dir / f"{TF_TRANSFORMS_NAME}.lock"
         capture_complete_path = run_dir / CAPTURE_COMPLETE_SENTINEL_NAME
-        first_frame_bundle = None
         tf_edge_samples = {}
         tf_parent_by_child = {}
         pose_debug_records = []
@@ -1358,7 +1419,7 @@ def main():
         write_capture_complete_sentinel()
         wait_for_mask_saver(mask_process)
         write_transforms()
-        write_init_cloud_from_first_frame()
+        write_init_cloud_from_saved_frames()
         write_gazebo_pose_reports()
         run_completed = True
     finally:
