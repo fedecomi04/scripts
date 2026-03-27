@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import shutil
 import subprocess
 import tempfile
@@ -13,7 +14,8 @@ from typing import Dict, List, Tuple
 
 import matplotlib
 
-matplotlib.use("Agg")
+if os.environ.get("DGS_MATPLOTLIB_INTERACTIVE") != "1":
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 

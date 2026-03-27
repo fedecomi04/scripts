@@ -17,12 +17,10 @@ from typing import Dict, Optional, Tuple
 import cv2
 import numpy as np
 import pyrender
-import ros_numpy
 import rospy
 import tf2_ros
 import trimesh
-from message_filters import ApproximateTimeSynchronizer, Subscriber
-from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+from sensor_msgs.msg import CameraInfo, Image
 from urdfpy import URDF
 
 DATASET_ROOT = Path(
@@ -52,7 +50,6 @@ PACKAGE_MAP = {
 
 IMAGE_TOPIC = "/dynaarm_arm/dynaarm_arm/camera1/image_raw"
 INFO_TOPIC = "/dynaarm_arm/dynaarm_arm/camera1/camera_info"
-POINTCLOUD_TOPIC = "/dynaarm_arm/dynaarm_arm/camera1/depth/points"
 BASE_FRAME = "dynaarm_arm_tf/world"
 DEFAULT_CAMERA_FRAME = "dynaarm_arm_tf/camera_link"
 LINK_FRAME_PREFIX = "dynaarm_arm_tf"
@@ -64,7 +61,6 @@ CAPTURE_COMPLETE_SENTINEL_NAME = ".capture_complete.json"
 
 TF_TIMEOUT = 0.1
 QUEUE_SIZE = 200
-POINTCLOUD_SYNC_SLOP = 0.1
 POINTS_PER_FRAME = 200000
 BACKGROUND_COLOR_THRESHOLD = 10.0
 COMPLETE_DRAIN_SEC = 1.0
@@ -137,45 +133,6 @@ def write_ascii_ply(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
             )
 
 
-def pointcloud_struct_to_xyz(cloud_struct: np.ndarray) -> np.ndarray:
-    if not all(name in cloud_struct.dtype.names for name in ("x", "y", "z")):
-        raise ValueError(f"PointCloud2 missing x/y/z fields: {cloud_struct.dtype.names}")
-    return np.stack(
-        [
-            np.asarray(cloud_struct["x"], dtype=np.float32),
-            np.asarray(cloud_struct["y"], dtype=np.float32),
-            np.asarray(cloud_struct["z"], dtype=np.float32),
-        ],
-        axis=-1,
-    )
-
-
-def pointcloud_rgb_from_struct(cloud_struct: np.ndarray) -> Optional[np.ndarray]:
-    names = set(cloud_struct.dtype.names or [])
-    if {"r", "g", "b"}.issubset(names):
-        return np.stack(
-            [
-                np.asarray(cloud_struct["r"], dtype=np.uint8),
-                np.asarray(cloud_struct["g"], dtype=np.uint8),
-                np.asarray(cloud_struct["b"], dtype=np.uint8),
-            ],
-            axis=-1,
-        )
-
-    if "rgb" in names:
-        split = ros_numpy.point_cloud2.split_rgb_field(cloud_struct.copy())
-        return np.stack(
-            [
-                np.asarray(split["r"], dtype=np.uint8),
-                np.asarray(split["g"], dtype=np.uint8),
-                np.asarray(split["b"], dtype=np.uint8),
-            ],
-            axis=-1,
-        )
-
-    return None
-
-
 class RobotMaskSaver:
     def __init__(self) -> None:
         self.dataset_root = DATASET_ROOT.expanduser().resolve()
@@ -201,7 +158,6 @@ class RobotMaskSaver:
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
         self.stamps_by_seq: "OrderedDict[int, rospy.Time]" = OrderedDict()
-        self.pending_points_by_seq: "OrderedDict[int, dict]" = OrderedDict()
         self.processed_seqs: set[int] = set()
         self.rgb_name_by_seq: Dict[int, str] = {}
         self.init_cloud_target_seq: Optional[int] = None
@@ -217,14 +173,6 @@ class RobotMaskSaver:
 
         self.camera_info_sub = rospy.Subscriber(INFO_TOPIC, CameraInfo, self._camera_info_cb, queue_size=1)
         self.image_sub = rospy.Subscriber(IMAGE_TOPIC, Image, self._image_cb, queue_size=20)
-        self.sync_image_sub = Subscriber(IMAGE_TOPIC, Image)
-        self.pointcloud_sub = Subscriber(POINTCLOUD_TOPIC, PointCloud2)
-        self.point_sync = ApproximateTimeSynchronizer(
-            [self.sync_image_sub, self.pointcloud_sub],
-            queue_size=QUEUE_SIZE,
-            slop=POINTCLOUD_SYNC_SLOP,
-        )
-        self.point_sync.registerCallback(self._pointcloud_sync_cb)
 
     def write_ready_sentinel(self) -> None:
         payload = {"pid": os.getpid(), "ready_time": time.time()}
@@ -285,72 +233,6 @@ class RobotMaskSaver:
         self.stamps_by_seq[seq] = msg.header.stamp
         while len(self.stamps_by_seq) > QUEUE_SIZE:
             self.stamps_by_seq.popitem(last=False)
-
-    def _image_msg_to_rgb(self, msg: Image) -> np.ndarray:
-        image = ros_numpy.numpify(msg)
-        if image.ndim == 2:
-            image = np.stack([image, image, image], axis=-1)
-        elif image.ndim == 3 and image.shape[2] >= 3:
-            image = image[:, :, :3]
-        else:
-            raise ValueError(f"Unsupported image shape {image.shape}")
-        return image[:, :, ::-1].copy()
-
-    def _pointcloud_sync_cb(self, image_msg: Image, points_msg: PointCloud2) -> None:
-        if self.init_cloud_saved:
-            return
-
-        seq = int(image_msg.header.seq)
-        if self.init_cloud_target_seq is not None and seq != self.init_cloud_target_seq:
-            return
-
-        try:
-            rgb = self._image_msg_to_rgb(image_msg)
-            cloud_struct = ros_numpy.numpify(points_msg)
-            xyz_cam = pointcloud_struct_to_xyz(cloud_struct)
-        except Exception as exc:
-            rospy.logwarn_throttle(2.0, "Failed to decode synced point cloud: %s", exc)
-            return
-
-        valid = np.isfinite(xyz_cam[..., 0]) & np.isfinite(xyz_cam[..., 1]) & np.isfinite(xyz_cam[..., 2])
-        valid &= xyz_cam[..., 2] > 0.0
-        if not np.any(valid):
-            return
-
-        if xyz_cam.ndim == 3 and rgb.shape[:2] == xyz_cam.shape[:2]:
-            colors = rgb
-        else:
-            colors = pointcloud_rgb_from_struct(cloud_struct)
-            if colors is None:
-                flat_n = int(np.prod(xyz_cam.shape[:-1]))
-                colors = np.full((flat_n, 3), 255, dtype=np.uint8)
-
-        uv_valid = None
-        if xyz_cam.ndim == 3:
-            ys, xs = np.where(valid)
-            xyz_valid = xyz_cam[ys, xs].reshape(-1, 3).astype(np.float32)
-            rgb_valid = colors[ys, xs].reshape(-1, 3).astype(np.uint8)
-            uv_valid = np.stack([ys, xs], axis=1).astype(np.int32)
-        else:
-            xyz_valid = xyz_cam[valid].reshape(-1, 3).astype(np.float32)
-            rgb_valid = colors[valid].reshape(-1, 3).astype(np.uint8)
-
-        if xyz_valid.shape[0] > POINTS_PER_FRAME:
-            choice = np.random.default_rng(seq).choice(xyz_valid.shape[0], size=POINTS_PER_FRAME, replace=False)
-            xyz_valid = xyz_valid[choice]
-            rgb_valid = rgb_valid[choice]
-            if uv_valid is not None:
-                uv_valid = uv_valid[choice]
-
-        if seq in self.pending_points_by_seq:
-            del self.pending_points_by_seq[seq]
-        self.pending_points_by_seq[seq] = {
-            "xyz_cam_ros": xyz_valid,
-            "rgb": rgb_valid,
-            "uv": uv_valid,
-        }
-        while len(self.pending_points_by_seq) > QUEUE_SIZE:
-            self.pending_points_by_seq.popitem(last=False)
 
     def _make_temp_resolved_urdf(self, urdf_path: Path, package_map: Dict[str, str], stl_dir: Path) -> str:
         text = urdf_path.read_text()
@@ -609,7 +491,7 @@ class RobotMaskSaver:
             self.rgb_name_by_seq[seq] = mask_path.name
             self.processed_seqs.add(seq)
 
-    def _load_frame_pose(self, seq: int) -> Optional[np.ndarray]:
+    def _load_frame_record(self, seq: int) -> Optional[dict]:
         if self.transforms_path is None or not self.transforms_path.exists():
             return None
 
@@ -623,19 +505,78 @@ class RobotMaskSaver:
         for frame in data.get("frames", []):
             if Path(frame.get("file_path", "")).name != rgb_name:
                 continue
-            matrix = np.array(frame.get("transform_matrix"), dtype=np.float32)
-            if matrix.shape != (4, 4):
-                rospy.logwarn("Invalid transform_matrix shape for seq %d: %s", seq, matrix.shape)
-                return None
-            return matrix
+            return frame
         return None
 
-    def _save_init_cloud(self, seq: int, mask: Optional[np.ndarray] = None) -> bool:
-        if self.init_cloud_saved or self.init_cloud_target_seq != seq:
-            return False
+    def _resolve_dataset_path(self, rel_or_abs: str) -> Optional[Path]:
+        if not rel_or_abs or self.dataset_dir is None:
+            return None
+        path = Path(rel_or_abs)
+        if path.is_absolute():
+            return path
+        return (self.dataset_dir / path).resolve()
 
-        record = self.pending_points_by_seq.get(seq)
-        if record is None:
+    def _load_frame_pose(self, seq: int) -> Optional[np.ndarray]:
+        frame = self._load_frame_record(seq)
+        if frame is None:
+            return None
+
+        matrix = np.array(frame.get("transform_matrix"), dtype=np.float32)
+        if matrix.shape != (4, 4):
+            rospy.logwarn("Invalid transform_matrix shape for seq %d: %s", seq, matrix.shape)
+            return None
+        return matrix
+
+    def _load_depth_mm(self, frame: dict, seq: int, expected_hw: tuple[int, int]) -> Optional[np.ndarray]:
+        depth_path = self._resolve_dataset_path(frame.get("depth_file_path", ""))
+        if depth_path is None or not depth_path.exists():
+            return None
+
+        depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            rospy.logwarn("Failed to read depth image for seq %d from %s", seq, depth_path)
+            return None
+
+        if depth.ndim == 3:
+            depth = depth[..., 0]
+        if depth.shape != expected_hw:
+            rospy.logwarn(
+                "Depth shape mismatch for seq %d: got %s expected %s",
+                seq,
+                depth.shape,
+                expected_hw,
+            )
+            return None
+
+        if np.issubdtype(depth.dtype, np.floating):
+            invalid = ~np.isfinite(depth) | (depth <= 0.0)
+            depth_mm = np.round(depth * 1000.0)
+            depth_mm[invalid] = 0.0
+            return np.clip(depth_mm, 0.0, 65535.0).astype(np.uint16)
+
+        return depth.astype(np.uint16)
+
+    def _load_rgb(self, frame: dict, seq: int, expected_hw: tuple[int, int]) -> Optional[np.ndarray]:
+        rgb_path = self._resolve_dataset_path(frame.get("file_path", ""))
+        if rgb_path is None or not rgb_path.exists():
+            return None
+
+        rgb_bgr = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
+        if rgb_bgr is None:
+            rospy.logwarn("Failed to read RGB image for seq %d from %s", seq, rgb_path)
+            return None
+        if rgb_bgr.shape[:2] != expected_hw:
+            rospy.logwarn(
+                "RGB shape mismatch for seq %d: got %s expected %s",
+                seq,
+                rgb_bgr.shape[:2],
+                expected_hw,
+            )
+            return None
+        return cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
+
+    def _save_init_cloud(self, seq: int, mask: Optional[np.ndarray] = None) -> bool:
+        if self.init_cloud_saved or self.init_cloud_target_seq != seq or self.intrinsics is None:
             return False
 
         if mask is None:
@@ -649,37 +590,45 @@ class RobotMaskSaver:
             if mask.ndim == 3:
                 mask = mask[..., 0]
 
-        xyz_cam_ros = record["xyz_cam_ros"]
-        rgb = record["rgb"]
-        uv = record["uv"]
-        if uv is not None:
-            keep = mask[uv[:, 0], uv[:, 1]] > 0
-            xyz_cam_ros = xyz_cam_ros[keep]
-            rgb = rgb[keep]
+        frame = self._load_frame_record(seq)
+        if frame is None:
+            return False
 
-        if xyz_cam_ros.shape[0] == 0:
-            rospy.logwarn("No scene points remained after masking for seq %d", seq)
+        depth_mm = self._load_depth_mm(frame, seq, mask.shape)
+        if depth_mm is None:
             return False
 
         c2w = self._load_frame_pose(seq)
         if c2w is None:
             return False
 
-        xyz_cam_ns = np.stack(
-            [
-                xyz_cam_ros[:, 0],
-                -xyz_cam_ros[:, 1],
-                -xyz_cam_ros[:, 2],
-            ],
-            axis=1,
-        ).astype(np.float32)
+        rgb = self._load_rgb(frame, seq, mask.shape)
+        if rgb is None:
+            return False
+
+        valid = (mask > 0) & (depth_mm > 0)
+        ys, xs = np.where(valid)
+        if ys.size == 0:
+            rospy.logwarn("No scene points remained after masking for seq %d", seq)
+            return False
+
+        if ys.size > POINTS_PER_FRAME:
+            choice = np.random.default_rng(seq).choice(ys.size, size=POINTS_PER_FRAME, replace=False)
+            ys = ys[choice]
+            xs = xs[choice]
+
+        depth_m = depth_mm[ys, xs].astype(np.float32) / 1000.0
+        x = (xs.astype(np.float32) - self.intrinsics.cx) * depth_m / self.intrinsics.fx
+        y = -(ys.astype(np.float32) - self.intrinsics.cy) * depth_m / self.intrinsics.fy
+        xyz_cam_ns = np.stack([x, y, -depth_m], axis=1)
+        rgb = rgb[ys, xs].reshape(-1, 3).astype(np.uint8)
+
         hom = np.concatenate([xyz_cam_ns, np.ones((xyz_cam_ns.shape[0], 1), dtype=np.float32)], axis=1)
         xyz_world = (c2w @ hom.T).T[:, :3]
 
         assert self.init_cloud_path is not None
         write_ascii_ply(self.init_cloud_path, xyz_world.astype(np.float32), rgb)
         self.init_cloud_saved = True
-        self.pending_points_by_seq.clear()
         self._patch_transforms()
         rospy.loginfo("Saved init cloud for seq %d to %s", seq, self.init_cloud_path)
         return True
