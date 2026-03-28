@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from bisect import bisect_left
 import fcntl
 import json
 import os
@@ -18,9 +17,12 @@ from typing import Dict, Optional, Tuple
 import cv2
 import numpy as np
 import pyrender
+import ros_numpy
 import rospy
+import tf2_ros
 import trimesh
-from sensor_msgs.msg import CameraInfo, Image, JointState
+from message_filters import ApproximateTimeSynchronizer, Subscriber
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from urdfpy import URDF
 
 DATASET_ROOT = Path(
@@ -50,25 +52,23 @@ PACKAGE_MAP = {
 
 IMAGE_TOPIC = "/dynaarm_arm/dynaarm_arm/camera1/image_raw"
 INFO_TOPIC = "/dynaarm_arm/dynaarm_arm/camera1/camera_info"
+POINTCLOUD_TOPIC = "/dynaarm_arm/dynaarm_arm/camera1/depth/points"
 BASE_FRAME = "dynaarm_arm_tf/world"
-DEFAULT_CAMERA_FRAME = "dynaarm_arm_tf/camera_pose_link"
-GAZEBO_JOINT_STATES_TOPIC = "/dynaarm_arm/joint_states_full"
+DEFAULT_CAMERA_FRAME = "dynaarm_arm_tf/camera_link"
+LINK_FRAME_PREFIX = "dynaarm_arm_tf"
 CAMERA_NAME = "arm"
 
 INIT_CLOUD_NAME = "depth_camera_init_points.ply"
 READY_SENTINEL_NAME = ".robot_mask_saver_ready"
 CAPTURE_COMPLETE_SENTINEL_NAME = ".capture_complete.json"
-TRANSFORMS_METADATA_NAMES = ("transforms.json", "transforms_tf.json", "transform_gazebo.json")
 
+TF_TIMEOUT = 0.1
 QUEUE_SIZE = 200
+POINTCLOUD_SYNC_SLOP = 0.1
 POINTS_PER_FRAME = 200000
 BACKGROUND_COLOR_THRESHOLD = 10.0
 COMPLETE_DRAIN_SEC = 1.0
 LOOP_RATE_HZ = 30.0
-HISTORY_TIMEOUT_SEC = 10.0
-TIME_EPS_SEC = 1e-6
-MASK_KEEP_ERODE_RADIUS_PX = 4
-MASK_MIN_KEEP_COMPONENT_AREA_PX = 64
 
 RUN_DIR_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d{2})?$")
 
@@ -137,6 +137,45 @@ def write_ascii_ply(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
             )
 
 
+def pointcloud_struct_to_xyz(cloud_struct: np.ndarray) -> np.ndarray:
+    if not all(name in cloud_struct.dtype.names for name in ("x", "y", "z")):
+        raise ValueError(f"PointCloud2 missing x/y/z fields: {cloud_struct.dtype.names}")
+    return np.stack(
+        [
+            np.asarray(cloud_struct["x"], dtype=np.float32),
+            np.asarray(cloud_struct["y"], dtype=np.float32),
+            np.asarray(cloud_struct["z"], dtype=np.float32),
+        ],
+        axis=-1,
+    )
+
+
+def pointcloud_rgb_from_struct(cloud_struct: np.ndarray) -> Optional[np.ndarray]:
+    names = set(cloud_struct.dtype.names or [])
+    if {"r", "g", "b"}.issubset(names):
+        return np.stack(
+            [
+                np.asarray(cloud_struct["r"], dtype=np.uint8),
+                np.asarray(cloud_struct["g"], dtype=np.uint8),
+                np.asarray(cloud_struct["b"], dtype=np.uint8),
+            ],
+            axis=-1,
+        )
+
+    if "rgb" in names:
+        split = ros_numpy.point_cloud2.split_rgb_field(cloud_struct.copy())
+        return np.stack(
+            [
+                np.asarray(split["r"], dtype=np.uint8),
+                np.asarray(split["g"], dtype=np.uint8),
+                np.asarray(split["b"], dtype=np.uint8),
+            ],
+            axis=-1,
+        )
+
+    return None
+
+
 class RobotMaskSaver:
     def __init__(self) -> None:
         self.dataset_root = DATASET_ROOT.expanduser().resolve()
@@ -157,10 +196,12 @@ class RobotMaskSaver:
         self.camera_node = None
         self.robot_nodes: list[Tuple[str, object, object]] = []
         self.mesh_cache: Dict[str, trimesh.Trimesh] = {}
-        self.joint_state_times_sec: list[float] = []
-        self.joint_state_positions: list[Dict[str, float]] = []
+
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
         self.stamps_by_seq: "OrderedDict[int, rospy.Time]" = OrderedDict()
+        self.pending_points_by_seq: "OrderedDict[int, dict]" = OrderedDict()
         self.processed_seqs: set[int] = set()
         self.rgb_name_by_seq: Dict[int, str] = {}
         self.init_cloud_target_seq: Optional[int] = None
@@ -173,18 +214,17 @@ class RobotMaskSaver:
         rospy.loginfo("Loading URDF from %s", URDF_PATH)
         patched_urdf = self._make_temp_resolved_urdf(URDF_PATH, PACKAGE_MAP, STL_DIR)
         self.robot = URDF.load(patched_urdf)
-        self.zero_link_fk_by_name = self.robot.link_fk(use_names=True)
-        self.actuated_joint_names = set(self.robot.actuated_joint_names)
-        self.frame_prefix = f"{self._normalize_frame_id(BASE_FRAME).rsplit('/', 1)[0]}/"
 
         self.camera_info_sub = rospy.Subscriber(INFO_TOPIC, CameraInfo, self._camera_info_cb, queue_size=1)
         self.image_sub = rospy.Subscriber(IMAGE_TOPIC, Image, self._image_cb, queue_size=20)
-        self.joint_states_sub = rospy.Subscriber(
-            GAZEBO_JOINT_STATES_TOPIC,
-            JointState,
-            self._joint_states_cb,
-            queue_size=200,
+        self.sync_image_sub = Subscriber(IMAGE_TOPIC, Image)
+        self.pointcloud_sub = Subscriber(POINTCLOUD_TOPIC, PointCloud2)
+        self.point_sync = ApproximateTimeSynchronizer(
+            [self.sync_image_sub, self.pointcloud_sub],
+            queue_size=QUEUE_SIZE,
+            slop=POINTCLOUD_SYNC_SLOP,
         )
+        self.point_sync.registerCallback(self._pointcloud_sync_cb)
 
     def write_ready_sentinel(self) -> None:
         payload = {"pid": os.getpid(), "ready_time": time.time()}
@@ -245,6 +285,72 @@ class RobotMaskSaver:
         self.stamps_by_seq[seq] = msg.header.stamp
         while len(self.stamps_by_seq) > QUEUE_SIZE:
             self.stamps_by_seq.popitem(last=False)
+
+    def _image_msg_to_rgb(self, msg: Image) -> np.ndarray:
+        image = ros_numpy.numpify(msg)
+        if image.ndim == 2:
+            image = np.stack([image, image, image], axis=-1)
+        elif image.ndim == 3 and image.shape[2] >= 3:
+            image = image[:, :, :3]
+        else:
+            raise ValueError(f"Unsupported image shape {image.shape}")
+        return image[:, :, ::-1].copy()
+
+    def _pointcloud_sync_cb(self, image_msg: Image, points_msg: PointCloud2) -> None:
+        if self.init_cloud_saved:
+            return
+
+        seq = int(image_msg.header.seq)
+        if self.init_cloud_target_seq is not None and seq != self.init_cloud_target_seq:
+            return
+
+        try:
+            rgb = self._image_msg_to_rgb(image_msg)
+            cloud_struct = ros_numpy.numpify(points_msg)
+            xyz_cam = pointcloud_struct_to_xyz(cloud_struct)
+        except Exception as exc:
+            rospy.logwarn_throttle(2.0, "Failed to decode synced point cloud: %s", exc)
+            return
+
+        valid = np.isfinite(xyz_cam[..., 0]) & np.isfinite(xyz_cam[..., 1]) & np.isfinite(xyz_cam[..., 2])
+        valid &= xyz_cam[..., 2] > 0.0
+        if not np.any(valid):
+            return
+
+        if xyz_cam.ndim == 3 and rgb.shape[:2] == xyz_cam.shape[:2]:
+            colors = rgb
+        else:
+            colors = pointcloud_rgb_from_struct(cloud_struct)
+            if colors is None:
+                flat_n = int(np.prod(xyz_cam.shape[:-1]))
+                colors = np.full((flat_n, 3), 255, dtype=np.uint8)
+
+        uv_valid = None
+        if xyz_cam.ndim == 3:
+            ys, xs = np.where(valid)
+            xyz_valid = xyz_cam[ys, xs].reshape(-1, 3).astype(np.float32)
+            rgb_valid = colors[ys, xs].reshape(-1, 3).astype(np.uint8)
+            uv_valid = np.stack([ys, xs], axis=1).astype(np.int32)
+        else:
+            xyz_valid = xyz_cam[valid].reshape(-1, 3).astype(np.float32)
+            rgb_valid = colors[valid].reshape(-1, 3).astype(np.uint8)
+
+        if xyz_valid.shape[0] > POINTS_PER_FRAME:
+            choice = np.random.default_rng(seq).choice(xyz_valid.shape[0], size=POINTS_PER_FRAME, replace=False)
+            xyz_valid = xyz_valid[choice]
+            rgb_valid = rgb_valid[choice]
+            if uv_valid is not None:
+                uv_valid = uv_valid[choice]
+
+        if seq in self.pending_points_by_seq:
+            del self.pending_points_by_seq[seq]
+        self.pending_points_by_seq[seq] = {
+            "xyz_cam_ros": xyz_valid,
+            "rgb": rgb_valid,
+            "uv": uv_valid,
+        }
+        while len(self.pending_points_by_seq) > QUEUE_SIZE:
+            self.pending_points_by_seq.popitem(last=False)
 
     def _make_temp_resolved_urdf(self, urdf_path: Path, package_map: Dict[str, str], stl_dir: Path) -> str:
         text = urdf_path.read_text()
@@ -373,134 +479,66 @@ class RobotMaskSaver:
         return pyrender.Mesh.from_trimesh(mesh, smooth=False, material=material)
 
     @staticmethod
-    def _normalize_frame_id(frame_id: Optional[str]) -> str:
-        return (frame_id or "").strip().lstrip("/")
+    def _transform_to_matrix(transform_msg) -> np.ndarray:
+        t = transform_msg.transform.translation
+        q = transform_msg.transform.rotation
 
-    @staticmethod
-    def _invert_rigid_transform(transform: np.ndarray) -> np.ndarray:
-        transform_inv = np.eye(4, dtype=np.float32)
-        rotation = transform[:3, :3]
-        translation = transform[:3, 3]
-        transform_inv[:3, :3] = rotation.T
-        transform_inv[:3, 3] = -rotation.T @ translation
-        return transform_inv
+        x, y, z, w = q.x, q.y, q.z, q.w
+        xx, yy, zz = x * x, y * y, z * z
+        xy, xz, yz = x * y, x * z, y * z
+        wx, wy, wz = w * x, w * y, w * z
 
-    def _trim_history(self, times_sec: list[float], payloads: list, newest_time_sec: float) -> None:
-        while len(times_sec) > 1 and newest_time_sec - times_sec[0] > HISTORY_TIMEOUT_SEC:
-            times_sec.pop(0)
-            payloads.pop(0)
+        rot = np.array(
+            [
+                [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+                [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+                [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+            ],
+            dtype=np.float32,
+        )
 
-    def _joint_states_cb(self, msg: JointState) -> None:
-        stamp_sec = float(msg.header.stamp.to_sec())
-        if stamp_sec <= 0.0 or not msg.name or not msg.position:
-            return
+        mat = np.eye(4, dtype=np.float32)
+        mat[:3, :3] = rot
+        mat[:3, 3] = np.array([t.x, t.y, t.z], dtype=np.float32)
+        return mat
 
-        positions = {
-            name: float(position)
-            for name, position in zip(msg.name, msg.position)
-            if name in self.actuated_joint_names
-        }
-        if not positions:
-            return
+    def _lookup_camera_pose(self, stamp: rospy.Time, camera_frame: Optional[str]) -> np.ndarray:
+        resolved_camera_frame = (camera_frame or "").strip().lstrip("/") or DEFAULT_CAMERA_FRAME
+        tf_msg = self.tf_buffer.lookup_transform(
+            BASE_FRAME,
+            resolved_camera_frame,
+            stamp,
+            timeout=rospy.Duration(TF_TIMEOUT),
+        )
+        return self._transform_to_matrix(tf_msg)
 
-        insert_at = bisect_left(self.joint_state_times_sec, stamp_sec)
-        if insert_at < len(self.joint_state_times_sec) and abs(self.joint_state_times_sec[insert_at] - stamp_sec) <= TIME_EPS_SEC:
-            self.joint_state_positions[insert_at] = positions
-        else:
-            self.joint_state_times_sec.insert(insert_at, stamp_sec)
-            self.joint_state_positions.insert(insert_at, positions)
-        self._trim_history(self.joint_state_times_sec, self.joint_state_positions, stamp_sec)
+    def _tf_link_frame(self, link_name: str) -> str:
+        return f"{LINK_FRAME_PREFIX}/{link_name}" if LINK_FRAME_PREFIX else link_name
 
-    def _frame_to_link_name(self, frame_id: Optional[str]) -> Optional[str]:
-        normalized = self._normalize_frame_id(frame_id)
-        if not normalized.startswith(self.frame_prefix):
-            return None
-        return normalized[len(self.frame_prefix):]
-
-    def _static_link_offset(self, source_frame: str, target_frame: str) -> np.ndarray:
-        source_link = self._frame_to_link_name(source_frame)
-        target_link = self._frame_to_link_name(target_frame)
-        if source_link is None or target_link is None:
-            raise RuntimeError(
-                f"Unable to resolve link names from frames '{source_frame}' -> '{target_frame}'"
-            )
-
-        source_pose = self.zero_link_fk_by_name.get(source_link)
-        target_pose = self.zero_link_fk_by_name.get(target_link)
-        if source_pose is None or target_pose is None:
-            raise RuntimeError(
-                f"URDF FK is missing required link pose for '{source_link}' or '{target_link}'"
-            )
-        return self._invert_rigid_transform(source_pose.astype(np.float32)) @ target_pose.astype(np.float32)
-
-    def _sample_joint_positions(self, stamp: rospy.Time) -> Dict[str, float]:
-        if not self.joint_state_times_sec:
-            raise RuntimeError("No Gazebo joint state samples have been received yet")
-
-        query_time_sec = float(stamp.to_sec())
-        insert_at = bisect_left(self.joint_state_times_sec, query_time_sec)
-
-        if insert_at < len(self.joint_state_times_sec) and abs(self.joint_state_times_sec[insert_at] - query_time_sec) <= TIME_EPS_SEC:
-            return dict(self.joint_state_positions[insert_at])
-        if insert_at > 0 and abs(self.joint_state_times_sec[insert_at - 1] - query_time_sec) <= TIME_EPS_SEC:
-            return dict(self.joint_state_positions[insert_at - 1])
-
-        prev_idx = insert_at - 1 if insert_at > 0 else None
-        next_idx = insert_at if insert_at < len(self.joint_state_times_sec) else None
-
-        if prev_idx is not None and next_idx is not None:
-            prev_time_sec = self.joint_state_times_sec[prev_idx]
-            next_time_sec = self.joint_state_times_sec[next_idx]
-            alpha = (query_time_sec - prev_time_sec) / (next_time_sec - prev_time_sec)
-            prev_positions = self.joint_state_positions[prev_idx]
-            next_positions = self.joint_state_positions[next_idx]
-            joint_names = set(prev_positions.keys()) | set(next_positions.keys())
-            interpolated_positions: Dict[str, float] = {}
-            for joint_name in joint_names:
-                prev_value = prev_positions.get(joint_name)
-                next_value = next_positions.get(joint_name)
-                if prev_value is None:
-                    interpolated_positions[joint_name] = float(next_value)
-                    continue
-                if next_value is None:
-                    interpolated_positions[joint_name] = float(prev_value)
-                    continue
-                interpolated_positions[joint_name] = float(prev_value * (1.0 - alpha) + next_value * alpha)
-            return interpolated_positions
-
-        sample_idx = prev_idx if prev_idx is not None else next_idx
-        if sample_idx is None:
-            raise RuntimeError("No Gazebo joint state samples are available for interpolation")
-        return dict(self.joint_state_positions[sample_idx])
-
-    def _camera_pose_from_link_fk(
-        self,
-        link_fk: Dict[str, np.ndarray],
-        camera_frame: Optional[str],
-    ) -> np.ndarray:
-        resolved_camera_frame = self._normalize_frame_id(camera_frame) or DEFAULT_CAMERA_FRAME
-        link_name = self._frame_to_link_name(resolved_camera_frame)
-        if link_name is not None and link_name in link_fk:
-            return link_fk[link_name].astype(np.float32)
-
-        default_link_name = self._frame_to_link_name(DEFAULT_CAMERA_FRAME)
-        if default_link_name is None or default_link_name not in link_fk:
-            raise RuntimeError(f"Camera link '{DEFAULT_CAMERA_FRAME}' is missing from FK results")
-
-        default_pose = link_fk[default_link_name].astype(np.float32)
-        return default_pose @ self._static_link_offset(DEFAULT_CAMERA_FRAME, resolved_camera_frame)
-
-    def _update_robot_poses(self, link_fk: Dict[str, np.ndarray]) -> None:
+    def _update_robot_poses(self, stamp: rospy.Time) -> None:
         assert self.scene is not None
         for link_name, visual, node in self.robot_nodes:
-            base_T_link = link_fk.get(link_name)
-            if base_T_link is None:
-                rospy.logwarn_throttle(2.0, "Skipping link without FK pose: %s", link_name)
+            link_frame = self._tf_link_frame(link_name)
+            if not self.tf_buffer.can_transform(
+                BASE_FRAME,
+                link_frame,
+                stamp,
+                timeout=rospy.Duration(TF_TIMEOUT),
+            ):
+                rospy.logwarn_throttle(2.0, "Skipping link without TF connection: %s", link_frame)
                 continue
+
+            tf_msg = self.tf_buffer.lookup_transform(
+                BASE_FRAME,
+                link_frame,
+                stamp,
+                timeout=rospy.Duration(TF_TIMEOUT),
+            )
+            base_T_link = self._transform_to_matrix(tf_msg)
             link_T_visual = np.eye(4, dtype=np.float32)
             if visual.origin is not None:
                 link_T_visual = visual.origin.astype(np.float32)
-            self.scene.set_pose(node, pose=base_T_link.astype(np.float32) @ link_T_visual)
+            self.scene.set_pose(node, pose=base_T_link @ link_T_visual)
 
     def _build_render_camera_pose(self, ros_pose: np.ndarray) -> np.ndarray:
         T_optical_to_opengl = np.eye(4, dtype=np.float32)
@@ -533,10 +571,8 @@ class RobotMaskSaver:
         return ros_pose @ T_optical_to_opengl @ T_rot_y_m90 @ T_rot_z_90
 
     def _render_robot_black_mask(self, stamp: rospy.Time, camera_frame: str) -> np.ndarray:
-        sampled_joint_positions = self._sample_joint_positions(stamp)
-        link_fk = self.robot.link_fk(cfg=sampled_joint_positions, use_names=True)
-        cam_pose = self._camera_pose_from_link_fk(link_fk, camera_frame)
-        self._update_robot_poses(link_fk)
+        cam_pose = self._lookup_camera_pose(stamp, camera_frame)
+        self._update_robot_poses(stamp)
         render_cam_pose = self._build_render_camera_pose(cam_pose)
         self.scene.set_pose(self.camera_node, pose=render_cam_pose)
         _, depth = self.renderer.render(self.scene)
@@ -573,7 +609,7 @@ class RobotMaskSaver:
             self.rgb_name_by_seq[seq] = mask_path.name
             self.processed_seqs.add(seq)
 
-    def _load_frame_record(self, seq: int) -> Optional[dict]:
+    def _load_frame_pose(self, seq: int) -> Optional[np.ndarray]:
         if self.transforms_path is None or not self.transforms_path.exists():
             return None
 
@@ -587,78 +623,19 @@ class RobotMaskSaver:
         for frame in data.get("frames", []):
             if Path(frame.get("file_path", "")).name != rgb_name:
                 continue
-            return frame
+            matrix = np.array(frame.get("transform_matrix"), dtype=np.float32)
+            if matrix.shape != (4, 4):
+                rospy.logwarn("Invalid transform_matrix shape for seq %d: %s", seq, matrix.shape)
+                return None
+            return matrix
         return None
 
-    def _resolve_dataset_path(self, rel_or_abs: str) -> Optional[Path]:
-        if not rel_or_abs or self.dataset_dir is None:
-            return None
-        path = Path(rel_or_abs)
-        if path.is_absolute():
-            return path
-        return (self.dataset_dir / path).resolve()
-
-    def _load_frame_pose(self, seq: int) -> Optional[np.ndarray]:
-        frame = self._load_frame_record(seq)
-        if frame is None:
-            return None
-
-        matrix = np.array(frame.get("transform_matrix"), dtype=np.float32)
-        if matrix.shape != (4, 4):
-            rospy.logwarn("Invalid transform_matrix shape for seq %d: %s", seq, matrix.shape)
-            return None
-        return matrix
-
-    def _load_depth_mm(self, frame: dict, seq: int, expected_hw: tuple[int, int]) -> Optional[np.ndarray]:
-        depth_path = self._resolve_dataset_path(frame.get("depth_file_path", ""))
-        if depth_path is None or not depth_path.exists():
-            return None
-
-        depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-        if depth is None:
-            rospy.logwarn("Failed to read depth image for seq %d from %s", seq, depth_path)
-            return None
-
-        if depth.ndim == 3:
-            depth = depth[..., 0]
-        if depth.shape != expected_hw:
-            rospy.logwarn(
-                "Depth shape mismatch for seq %d: got %s expected %s",
-                seq,
-                depth.shape,
-                expected_hw,
-            )
-            return None
-
-        if np.issubdtype(depth.dtype, np.floating):
-            invalid = ~np.isfinite(depth) | (depth <= 0.0)
-            depth_mm = np.round(depth * 1000.0)
-            depth_mm[invalid] = 0.0
-            return np.clip(depth_mm, 0.0, 65535.0).astype(np.uint16)
-
-        return depth.astype(np.uint16)
-
-    def _load_rgb(self, frame: dict, seq: int, expected_hw: tuple[int, int]) -> Optional[np.ndarray]:
-        rgb_path = self._resolve_dataset_path(frame.get("file_path", ""))
-        if rgb_path is None or not rgb_path.exists():
-            return None
-
-        rgb_bgr = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
-        if rgb_bgr is None:
-            rospy.logwarn("Failed to read RGB image for seq %d from %s", seq, rgb_path)
-            return None
-        if rgb_bgr.shape[:2] != expected_hw:
-            rospy.logwarn(
-                "RGB shape mismatch for seq %d: got %s expected %s",
-                seq,
-                rgb_bgr.shape[:2],
-                expected_hw,
-            )
-            return None
-        return cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
-
     def _save_init_cloud(self, seq: int, mask: Optional[np.ndarray] = None) -> bool:
-        if self.init_cloud_saved or self.init_cloud_target_seq != seq or self.intrinsics is None:
+        if self.init_cloud_saved or self.init_cloud_target_seq != seq:
+            return False
+
+        record = self.pending_points_by_seq.get(seq)
+        if record is None:
             return False
 
         if mask is None:
@@ -672,45 +649,37 @@ class RobotMaskSaver:
             if mask.ndim == 3:
                 mask = mask[..., 0]
 
-        frame = self._load_frame_record(seq)
-        if frame is None:
-            return False
+        xyz_cam_ros = record["xyz_cam_ros"]
+        rgb = record["rgb"]
+        uv = record["uv"]
+        if uv is not None:
+            keep = mask[uv[:, 0], uv[:, 1]] > 0
+            xyz_cam_ros = xyz_cam_ros[keep]
+            rgb = rgb[keep]
 
-        depth_mm = self._load_depth_mm(frame, seq, mask.shape)
-        if depth_mm is None:
+        if xyz_cam_ros.shape[0] == 0:
+            rospy.logwarn("No scene points remained after masking for seq %d", seq)
             return False
 
         c2w = self._load_frame_pose(seq)
         if c2w is None:
             return False
 
-        rgb = self._load_rgb(frame, seq, mask.shape)
-        if rgb is None:
-            return False
-
-        valid = (mask > 0) & (depth_mm > 0)
-        ys, xs = np.where(valid)
-        if ys.size == 0:
-            rospy.logwarn("No scene points remained after masking for seq %d", seq)
-            return False
-
-        if ys.size > POINTS_PER_FRAME:
-            choice = np.random.default_rng(seq).choice(ys.size, size=POINTS_PER_FRAME, replace=False)
-            ys = ys[choice]
-            xs = xs[choice]
-
-        depth_m = depth_mm[ys, xs].astype(np.float32) / 1000.0
-        x = (xs.astype(np.float32) - self.intrinsics.cx) * depth_m / self.intrinsics.fx
-        y = -(ys.astype(np.float32) - self.intrinsics.cy) * depth_m / self.intrinsics.fy
-        xyz_cam_ns = np.stack([x, y, -depth_m], axis=1)
-        rgb = rgb[ys, xs].reshape(-1, 3).astype(np.uint8)
-
+        xyz_cam_ns = np.stack(
+            [
+                xyz_cam_ros[:, 0],
+                -xyz_cam_ros[:, 1],
+                -xyz_cam_ros[:, 2],
+            ],
+            axis=1,
+        ).astype(np.float32)
         hom = np.concatenate([xyz_cam_ns, np.ones((xyz_cam_ns.shape[0], 1), dtype=np.float32)], axis=1)
         xyz_world = (c2w @ hom.T).T[:, :3]
 
         assert self.init_cloud_path is not None
         write_ascii_ply(self.init_cloud_path, xyz_world.astype(np.float32), rgb)
         self.init_cloud_saved = True
+        self.pending_points_by_seq.clear()
         self._patch_transforms()
         rospy.loginfo("Saved init cloud for seq %d to %s", seq, self.init_cloud_path)
         return True
@@ -720,29 +689,28 @@ class RobotMaskSaver:
             return
 
         with locked_file(self.transforms_lock_path):
-            for transforms_path in self._existing_transforms_paths():
-                data = read_json_with_retry(transforms_path)
-                updated = False
+            data = read_json_with_retry(self.transforms_path)
+            updated = False
 
-                for frame in data.get("frames", []):
-                    rgb_name = Path(frame.get("file_path", "")).name
-                    if not rgb_name or self.masks_dir is None:
-                        continue
-                    mask_file = self.masks_dir / rgb_name
-                    if not mask_file.exists():
-                        continue
-                    mask_rel = f"./masks/{rgb_name}"
-                    if frame.get("mask_path") != mask_rel:
-                        frame["mask_path"] = mask_rel
-                        updated = True
+            for frame in data.get("frames", []):
+                rgb_name = Path(frame.get("file_path", "")).name
+                if not rgb_name or self.masks_dir is None:
+                    continue
+                mask_file = self.masks_dir / rgb_name
+                if not mask_file.exists():
+                    continue
+                mask_rel = f"./masks/{rgb_name}"
+                if frame.get("mask_path") != mask_rel:
+                    frame["mask_path"] = mask_rel
+                    updated = True
 
-                if self.init_cloud_path is not None and self.init_cloud_path.exists():
-                    if data.get("ply_file_path") != self.init_cloud_path.name:
-                        data["ply_file_path"] = self.init_cloud_path.name
-                        updated = True
+            if self.init_cloud_path is not None and self.init_cloud_path.exists():
+                if data.get("ply_file_path") != self.init_cloud_path.name:
+                    data["ply_file_path"] = self.init_cloud_path.name
+                    updated = True
 
-                if updated:
-                    write_json_atomic(transforms_path, data, indent=2)
+            if updated:
+                write_json_atomic(self.transforms_path, data, indent=2)
 
     def _compute_background_black_mask(self, seq: int) -> Optional[np.ndarray]:
         rgb_path = self._rgb_path_for_seq(seq)
@@ -817,30 +785,6 @@ class RobotMaskSaver:
             deduped.append(np.array(key, dtype=np.float32))
         return deduped
 
-    def _refine_keep_mask(self, mask: np.ndarray) -> np.ndarray:
-        refined = mask.copy()
-
-        if MASK_KEEP_ERODE_RADIUS_PX > 0:
-            kernel_size = MASK_KEEP_ERODE_RADIUS_PX * 2 + 1
-            kernel = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE,
-                (kernel_size, kernel_size),
-            )
-            refined = cv2.erode(refined, kernel, iterations=1)
-
-        if MASK_MIN_KEEP_COMPONENT_AREA_PX > 0:
-            keep_binary = (refined > 0).astype(np.uint8)
-            component_count, labels, stats, _ = cv2.connectedComponentsWithStats(keep_binary, connectivity=8)
-            cleaned = np.zeros_like(refined)
-            for component_idx in range(1, component_count):
-                area = stats[component_idx, cv2.CC_STAT_AREA]
-                if area < MASK_MIN_KEEP_COMPONENT_AREA_PX:
-                    continue
-                cleaned[labels == component_idx] = 255
-            refined = cleaned
-
-        return refined
-
     def _process_seq(self, seq: int, stamp: rospy.Time, camera_frame: Optional[str]) -> bool:
         self._ensure_renderer()
         if self.renderer is None or self.scene is None:
@@ -850,12 +794,7 @@ class RobotMaskSaver:
         try:
             robot_black_mask = self._render_robot_black_mask(stamp, selected_camera_frame)
         except Exception as exc:
-            rospy.logwarn_throttle(
-                2.0,
-                "Gazebo/render pose update failed for camera frame %s: %s",
-                selected_camera_frame,
-                exc,
-            )
+            rospy.logwarn_throttle(2.0, "TF/render pose update failed for camera frame %s: %s", selected_camera_frame, exc)
             return False
 
         robot_pixels = int(np.count_nonzero(robot_black_mask == 0))
@@ -880,7 +819,6 @@ class RobotMaskSaver:
             mask = robot_black_mask
         else:
             mask = cv2.bitwise_and(robot_black_mask, background_black_mask)
-        mask = self._refine_keep_mask(mask)
 
         mask_path = self._mask_path_for_seq(seq)
         if not cv2.imwrite(str(mask_path), mask):
@@ -900,8 +838,8 @@ class RobotMaskSaver:
             return
 
         with locked_file(self.transforms_lock_path):
-            primary_data = read_json_with_retry(self.transforms_path)
-            frames = primary_data.get("frames", [])
+            data = read_json_with_retry(self.transforms_path)
+            frames = data.get("frames", [])
             kept_frames = []
             removed_frames = []
 
@@ -919,11 +857,6 @@ class RobotMaskSaver:
             if not removed_frames:
                 return
 
-            removed_rgb_names = {
-                Path(frame.get("file_path", "")).name
-                for frame in removed_frames
-                if frame.get("file_path")
-            }
             for frame in removed_frames:
                 for key in ("file_path", "depth_file_path", "mask_path"):
                     rel = frame.get(key)
@@ -936,35 +869,9 @@ class RobotMaskSaver:
                     except Exception as exc:
                         rospy.logwarn("Failed to delete %s while pruning missing-mask frame: %s", path, exc)
 
-            primary_data["frames"] = kept_frames
-            write_json_atomic(self.transforms_path, primary_data, indent=2)
-            for transforms_path in self._existing_transforms_paths():
-                if transforms_path == self.transforms_path:
-                    continue
-                data = read_json_with_retry(transforms_path)
-                data["frames"] = [
-                    frame
-                    for frame in data.get("frames", [])
-                    if Path(frame.get("file_path", "")).name not in removed_rgb_names
-                ]
-                write_json_atomic(transforms_path, data, indent=2)
+            data["frames"] = kept_frames
+            write_json_atomic(self.transforms_path, data, indent=2)
             rospy.loginfo("Pruned %d frames without masks from dataset %s", len(removed_frames), self.dataset_dir)
-
-    def _existing_transforms_paths(self) -> list[Path]:
-        if self.dataset_dir is None:
-            return []
-
-        paths: list[Path] = []
-        seen = set()
-        for name in TRANSFORMS_METADATA_NAMES:
-            path = (self.dataset_dir / name).resolve()
-            if not path.exists():
-                continue
-            if path in seen:
-                continue
-            seen.add(path)
-            paths.append(path)
-        return paths
 
     def _cleanup_renderer(self) -> None:
         if self.renderer is None:
