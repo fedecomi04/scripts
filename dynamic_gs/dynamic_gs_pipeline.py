@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal, Optional, Type
 
 from PIL import Image
+from nerfstudio.engine.callbacks import TrainingCallbackAttributes
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline, VanillaPipelineConfig
 from nerfstudio.utils import profiler
 from nerfstudio.utils.rich_utils import CONSOLE
@@ -20,8 +21,8 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     datamanager: DynamicGSDataManagerConfig = field(default_factory=DynamicGSDataManagerConfig)
     model: DynamicGSModelConfig = field(default_factory=DynamicGSModelConfig)
 
-    static_num_steps: int = 2500
-    dynamic_num_steps: int = 500
+    static_num_steps: int = 4000
+    dynamic_steps_per_frame: int = 200
 
 
 class DynamicGSPipeline(VanillaPipeline):
@@ -29,7 +30,10 @@ class DynamicGSPipeline(VanillaPipeline):
 
     def __init__(self, config, device, test_mode="val", world_size=1, local_rank=0, grad_scaler=None):
         self.current_phase = None  # type: Optional[Literal["static", "dynamic"]]
-        self._dynamic_prepared = False
+        self.current_dynamic_frame_idx = None  # type: Optional[int]
+        self.dynamic_steps_on_current_frame = 0
+        self.total_dynamic_frames = 0
+        self.total_dynamic_steps = 0
         super().__init__(
             config=config,
             device=device,
@@ -38,58 +42,95 @@ class DynamicGSPipeline(VanillaPipeline):
             local_rank=local_rank,
             grad_scaler=grad_scaler,
         )
+        self.total_dynamic_frames = self.datamanager.get_num_dynamic_frames()
+        self.total_dynamic_steps = self.total_dynamic_frames * self.config.dynamic_steps_per_frame
         self._sync_phase(0)
 
     @staticmethod
-    def _save_debug_image(image, path):
+    def _save_image(image, path):
         path = Path(path)
-        image_uint8 = image.detach().clamp(0.0, 1.0).mul(255).byte().cpu().numpy()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tensor = image.detach().float().clamp(0.0, 1.0)
+        if tensor.ndim == 2:
+            tensor = tensor[..., None]
+        if tensor.shape[-1] == 1:
+            tensor = tensor.repeat(1, 1, 3)
+        image_uint8 = tensor.mul(255).byte().cpu().numpy()
         Image.fromarray(image_uint8).save(path)
 
-    def _phase_for_step(self, step):
-        dynamic_start = self.config.static_num_steps
-        dynamic_end = dynamic_start + self.config.dynamic_num_steps
-        if step < dynamic_start:
+    def _total_train_steps(self) -> int:
+        return self.config.static_num_steps + self.total_dynamic_steps
+
+    def _phase_for_step(self, step: int) -> Literal["static", "dynamic"]:
+        if self.total_dynamic_frames == 0 or step < self.config.static_num_steps:
             return "static"
-        if step < dynamic_end:
-            return "dynamic"
         return "dynamic"
 
-    def _sync_phase(self, step):
+    def _dynamic_frame_for_step(self, step: int) -> int:
+        dynamic_step = max(step - self.config.static_num_steps, 0)
+        return min(dynamic_step // self.config.dynamic_steps_per_frame, self.total_dynamic_frames - 1)
+
+    def _prepare_dynamic_frame(self) -> None:
+        assert self.current_dynamic_frame_idx is not None
+        self.datamanager.set_dynamic_frame_idx(self.current_dynamic_frame_idx)
+        self.model.reset_dynamic_state()
+        camera, batch = self.datamanager.get_current_dynamic_train_batch()
+        stats = self.model.prepare_dynamic_update(camera, batch)
+
+        # Debug tool: keep per-frame rendered reference and computed mask for inspection.
+        frame_name = self.datamanager.get_current_dynamic_frame_name()
+        debug_dir = self.datamanager.get_dynamic_debug_dir()
+        self._save_image(stats["rendered_rgb"], debug_dir / f"{frame_name}_render.png")
+        self._save_image(stats["change_mask"], debug_dir / f"{frame_name}_change_mask.png")
+
+        CONSOLE.log(
+            "[dynamic-gs] frame "
+            f"{self.current_dynamic_frame_idx + 1}/{self.total_dynamic_frames} -> {frame_name}, "
+            f"mask pixels={stats['change_mask_pixels']}, flagged gaussians={stats['flagged_gaussians']}"
+        )
+
+    def _sync_phase(self, step: int) -> None:
         phase = self._phase_for_step(step)
-        if phase == self.current_phase:
+        phase_changed = phase != self.current_phase
+
+        if phase_changed:
+            self.current_phase = phase
+            self.datamanager.set_phase(phase)
+            self.model.set_phase(phase, reset_means_optimizer=phase == "dynamic")
+            CONSOLE.log(f"[dynamic-gs] phase -> {phase} at step {step}")
+
+        if phase == "static":
+            self.current_dynamic_frame_idx = None
+            self.dynamic_steps_on_current_frame = 0
             return
 
-        if phase == "dynamic" and not self._dynamic_prepared:
-            camera, batch = self.datamanager.get_dynamic_train_batch()
-            stats = self.model.prepare_dynamic_update(camera, batch)
-            debug_path = Path(self.datamanager.config.data) / "change_mask_debug.png"
-            self._save_debug_image(stats["debug_image"], debug_path)
-            self._dynamic_prepared = True
-            CONSOLE.log(
-                "[dynamic-gs] generated change mask with "
-                f"{stats['change_mask_pixels']} pixels and "
-                f"{stats['flagged_gaussians']} flagged gaussians"
-            )
-            CONSOLE.log(f"[dynamic-gs] saved change-mask debug image to {debug_path}")
+        frame_idx = self._dynamic_frame_for_step(step)
+        frame_changed = frame_idx != self.current_dynamic_frame_idx
+        self.current_dynamic_frame_idx = frame_idx
+        self.dynamic_steps_on_current_frame = (step - self.config.static_num_steps) % self.config.dynamic_steps_per_frame
 
-        self.current_phase = phase
-        self.datamanager.set_phase(phase)
-        self.model.set_phase(phase, reset_means_optimizer=phase == "dynamic")
-        CONSOLE.log(f"[dynamic-gs] phase -> {phase} at step {step}")
+        if phase_changed or frame_changed:
+            self._prepare_dynamic_frame()
+
+    def get_training_callbacks(self, training_callback_attributes: TrainingCallbackAttributes):
+        callbacks = super().get_training_callbacks(training_callback_attributes)
+        trainer = training_callback_attributes.trainer
+        if trainer is not None:
+            trainer.config.max_num_iterations = self._total_train_steps()
+        return callbacks
 
     @profiler.time_function
-    def get_train_loss_dict(self, step):
+    def get_train_loss_dict(self, step: int):
         self._sync_phase(step)
         return super().get_train_loss_dict(step)
 
     @profiler.time_function
-    def get_eval_loss_dict(self, step):
+    def get_eval_loss_dict(self, step: int):
         self._sync_phase(step)
         return super().get_eval_loss_dict(step)
 
     @profiler.time_function
-    def get_eval_image_metrics_and_images(self, step):
+    def get_eval_image_metrics_and_images(self, step: int):
         self._sync_phase(step)
         return super().get_eval_image_metrics_and_images(step)
 

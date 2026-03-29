@@ -3,7 +3,6 @@ from __future__ import annotations
 from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
 from nerfstudio.configs.base_config import ViewerConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
-from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.plugins.types import MethodSpecification
 
@@ -12,8 +11,8 @@ from .dynamic_gs_model import DynamicGSModelConfig
 from .dynamic_gs_pipeline import DynamicGSPipelineConfig
 
 STATIC_NUM_STEPS = 4000
-DYNAMIC_NUM_STEPS = 200
-TOTAL_NUM_STEPS = STATIC_NUM_STEPS + DYNAMIC_NUM_STEPS
+DYNAMIC_STEPS_PER_FRAME = 200
+DEFAULT_MAX_NUM_STEPS = STATIC_NUM_STEPS + DYNAMIC_STEPS_PER_FRAME
 
 
 DynamicGS = MethodSpecification(
@@ -23,11 +22,11 @@ DynamicGS = MethodSpecification(
         steps_per_eval_batch=0,
         steps_per_eval_all_images=500,
         steps_per_save=500,
-        max_num_iterations=TOTAL_NUM_STEPS,
+        max_num_iterations=DEFAULT_MAX_NUM_STEPS,
         mixed_precision=False,
         pipeline=DynamicGSPipelineConfig(
             static_num_steps=STATIC_NUM_STEPS,
-            dynamic_num_steps=DYNAMIC_NUM_STEPS,
+            dynamic_steps_per_frame=DYNAMIC_STEPS_PER_FRAME,
             datamanager=DynamicGSDataManagerConfig(),
             model=DynamicGSModelConfig(
                 camera_optimizer=CameraOptimizerConfig(mode="off"),
@@ -38,10 +37,7 @@ DynamicGS = MethodSpecification(
         optimizers={
             "means": {
                 "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=1.6e-6,
-                    max_steps=DYNAMIC_NUM_STEPS,
-                ),
+                "scheduler": None,
             },
             "features_dc": {
                 "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),

@@ -15,7 +15,7 @@ from nerfstudio.data.utils.data_utils import get_depth_image_from_path
 
 
 class DynamicFrameDataset(InputDataset):
-    """Minimal dataset for the single dynamic frame with real depth."""
+    """Full-image dataset with dedicated depth loading for dynamic frames."""
 
     exclude_batch_keys_from_device = InputDataset.exclude_batch_keys_from_device + ["depth_image"]
 
@@ -27,7 +27,7 @@ class DynamicFrameDataset(InputDataset):
         )
         depth_filenames = dataparser_outputs.metadata.get("depth_filenames")
         if depth_filenames is None:
-            raise ValueError("dynamic_scene must provide depth_file_path for its frame.")
+            raise ValueError("dynamic_scene must provide depth_file_path for every frame.")
         self.depth_filenames = depth_filenames
         self.depth_unit_scale_factor = dataparser_outputs.metadata.get("depth_unit_scale_factor", 1.0)
 
@@ -47,7 +47,7 @@ class DynamicFrameDataset(InputDataset):
 
 
 class DynamicFrameFullImageDatamanager(FullImageDatamanager[DynamicFrameDataset]):
-    """Typed full-image datamanager for the dynamic frame dataset."""
+    """Typed full-image datamanager for dynamic frames with depth."""
 
 
 @dataclass
@@ -74,7 +74,7 @@ class DynamicGSDataManagerConfig(DataManagerConfig):
 
 
 class DynamicGSDataManager(DataManager):
-    """Wrap two FullImageDatamanagers and switch between them by phase."""
+    """Wrap two FullImageDatamanagers and pin one dynamic frame at a time."""
 
     config: DynamicGSDataManagerConfig
 
@@ -107,10 +107,10 @@ class DynamicGSDataManager(DataManager):
 
         self.static_manager = self._build_manager(static_root, use_depth_dataset=False)
         self.dynamic_manager = self._build_manager(dynamic_root, use_depth_dataset=True)
+        self.current_dynamic_frame_idx = 0
 
-        if test_mode != "inference":
-            if len(self.dynamic_manager.train_dataset) != 1:
-                raise ValueError("dynamic_scene must contain exactly one training frame.")
+        if test_mode != "inference" and len(self.dynamic_manager.train_dataset) == 0:
+            raise ValueError("dynamic_scene must contain at least one training frame.")
 
         self.phase = "static"
         self.active_manager = self.static_manager
@@ -142,8 +142,52 @@ class DynamicGSDataManager(DataManager):
         self.train_dataparser_outputs = self.active_manager.train_dataparser_outputs
         self.includes_time = self.active_manager.includes_time
 
+    def set_dynamic_frame_idx(self, frame_idx: int) -> None:
+        num_frames = self.get_num_dynamic_frames()
+        if not 0 <= frame_idx < num_frames:
+            raise IndexError(f"dynamic frame index {frame_idx} is out of range for {num_frames} frames")
+        self.current_dynamic_frame_idx = int(frame_idx)
+
+    def get_num_dynamic_frames(self) -> int:
+        return len(self.dynamic_manager.train_dataset)
+
+    def get_current_dynamic_frame_name(self) -> str:
+        image_path = self.dynamic_manager.train_dataset.image_filenames[self.current_dynamic_frame_idx]
+        return image_path.stem
+
+    def get_dynamic_debug_dir(self) -> Path:
+        return Path(self.config.data) / self.config.dynamic_subdir / "render_and_masks"
+
+    def _get_dynamic_batch(self, frame_idx: int, split: Literal["train", "eval"]):
+        if split == "train":
+            dataset = self.dynamic_manager.train_dataset
+            cached = self.dynamic_manager.cached_train
+        else:
+            dataset = self.dynamic_manager.eval_dataset
+            cached = self.dynamic_manager.cached_eval
+
+        data = cached[frame_idx].copy()
+        data["image"] = data["image"].to(self.device)
+        if "mask" in data:
+            data["mask"] = data["mask"].to(self.device)
+
+        assert len(dataset.cameras.shape) == 1, "Assumes single batch dimension"
+        camera = dataset.cameras[frame_idx : frame_idx + 1].to(self.device)
+        if camera.metadata is None:
+            camera.metadata = {}
+        camera.metadata["cam_idx"] = frame_idx
+        return camera, data
+
+    def get_current_dynamic_train_batch(self):
+        return self._get_dynamic_batch(self.current_dynamic_frame_idx, split="train")
+
+    def get_current_dynamic_eval_batch(self):
+        return self._get_dynamic_batch(self.current_dynamic_frame_idx, split="eval")
+
     @property
     def fixed_indices_eval_dataloader(self):
+        if self.phase == "dynamic":
+            return [self.get_current_dynamic_eval_batch()]
         return self.active_manager.fixed_indices_eval_dataloader
 
     def setup_train(self):
@@ -156,19 +200,33 @@ class DynamicGSDataManager(DataManager):
         raise NotImplementedError
 
     def next_train(self, step):
+        if self.phase == "dynamic":
+            self.train_count += 1
+            return self.get_current_dynamic_train_batch()
         return self.active_manager.next_train(step)
 
     def next_eval(self, step):
+        if self.phase == "dynamic":
+            self.eval_count += 1
+            return self.get_current_dynamic_eval_batch()
         return self.active_manager.next_eval(step)
 
     def next_eval_image(self, step):
+        if self.phase == "dynamic":
+            return self.get_current_dynamic_eval_batch()
         return self.active_manager.next_eval_image(step)
 
     def get_train_rays_per_batch(self):
+        if self.phase == "dynamic":
+            camera = self.dynamic_manager.train_dataset.cameras[self.current_dynamic_frame_idx].reshape(())
+            return int(camera.width[0].item() * camera.height[0].item())
         camera = self.train_dataset.cameras[0].reshape(())
         return int(camera.width[0].item() * camera.height[0].item())
 
     def get_eval_rays_per_batch(self):
+        if self.phase == "dynamic":
+            camera = self.dynamic_manager.eval_dataset.cameras[self.current_dynamic_frame_idx].reshape(())
+            return int(camera.width[0].item() * camera.height[0].item())
         dataset = self.eval_dataset if self.eval_dataset is not None and len(self.eval_dataset) > 0 else self.train_dataset
         camera = dataset.cameras[0].reshape(())
         return int(camera.width[0].item() * camera.height[0].item())
@@ -181,17 +239,3 @@ class DynamicGSDataManager(DataManager):
 
     def get_training_callbacks(self, training_callback_attributes):
         return self.active_manager.get_training_callbacks(training_callback_attributes)
-
-    def get_dynamic_train_batch(self):
-        """Return the single dynamic frame without switching the active datamanager."""
-
-        data = self.dynamic_manager.cached_train[0].copy()
-        data["image"] = data["image"].to(self.device)
-        if "mask" in data:
-            data["mask"] = data["mask"].to(self.device)
-
-        camera = self.dynamic_manager.train_cameras[0:1].to(self.device)
-        if camera.metadata is None:
-            camera.metadata = {}
-        camera.metadata["cam_idx"] = 0
-        return camera, data

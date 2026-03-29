@@ -31,7 +31,7 @@ except ImportError as exc:  # pragma: no cover - import-time dependency guard
 class DynamicGSModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: DynamicGSModel)
 
-    depth_lambda: float = 0.2
+    depth_lambda: float = 0.4
     active_mask_dilate_radius: int = 0
     output_depth_during_training: bool = True
 
@@ -131,6 +131,8 @@ class DynamicGSModel(SplatfactoModel):
         self.phase = phase
         self._apply_phase_trainability()
         self._apply_phase_optimizers(reset_means_optimizer=reset_means_optimizer)
+        if phase == "static":
+            self.reset_dynamic_state()
 
     def _apply_phase_trainability(self):
         static_phase = self.phase == "static"
@@ -184,6 +186,12 @@ class DynamicGSModel(SplatfactoModel):
             return None
         return self._downscale_if_required(self.change_mask_image).to(self.device)
 
+    def reset_dynamic_state(self):
+        self.current_active_mask.zero_()
+        self.object_flags.zero_()
+        self.change_mask_image.zero_()
+        self._dynamic_ready = False
+
     def _get_gt_depth(self, batch):
         depth = batch["depth_image"]
         if depth.ndim == 2:
@@ -225,26 +233,9 @@ class DynamicGSModel(SplatfactoModel):
         denom = (mask.sum() * pred.shape[-1]).clamp_min(1.0)
         return torch.abs((pred - gt) * mask).sum() / denom
 
-    @staticmethod
-    def _to_rgb_image(image):
-        if image.ndim == 2:
-            image = image[..., None]
-        if image.shape[-1] == 1:
-            image = image.repeat(1, 1, 3)
-        return torch.clamp(image.float(), 0.0, 1.0)
-
-    def _build_change_mask_debug_image(self, change_mask, rendered_rgb, target_rgb):
-        mask_vis = self._to_rgb_image(change_mask)
-        rendered_rgb = self._to_rgb_image(rendered_rgb)
-        target_rgb = self._to_rgb_image(target_rgb)
-
-        top_row = torch.cat([mask_vis, mask_vis], dim=1)
-        bottom_row = torch.cat([rendered_rgb, target_rgb], dim=1)
-        return torch.cat([top_row, bottom_row], dim=0)
-
     @torch.no_grad()
     def prepare_dynamic_update(self, camera, batch):
-        """Generate the change mask and flag dynamic Gaussians once at phase switch."""
+        """Generate the change mask and active Gaussian subset for one dynamic frame."""
 
         if "depth_image" not in batch:
             raise ValueError("dynamic_scene must provide depth_image for dynamic-gs phase 2.")
@@ -292,7 +283,8 @@ class DynamicGSModel(SplatfactoModel):
             return {
                 "change_mask_pixels": int((change_mask[..., 0] > 0.5).sum().item()),
                 "flagged_gaussians": int(active.sum().item()),
-                "debug_image": self._build_change_mask_debug_image(change_mask, outputs["rgb"], gt_rgb),
+                "rendered_rgb": outputs["rgb"],
+                "change_mask": change_mask,
             }
         finally:
             if was_training:
