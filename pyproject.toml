@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dynamic_gs"
+version = "0.1.0"
+description = "Two-phase static + dynamic Gaussian Splatting for Nerfstudio"
+requires-python = ">=3.8"
+dependencies = [
+    "nerfstudio",
+    "gsplat>=1.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["dynamic_gs*"]
+
+[project.entry-points."nerfstudio.method_configs"]
+dynamic-gs = "dynamic_gs.dynamic_gs_config:DynamicGS"
