@@ -34,6 +34,12 @@ class DynamicGSPipeline(VanillaPipeline):
         self.dynamic_steps_on_current_frame = 0
         self.total_dynamic_frames = 0
         self.total_dynamic_steps = 0
+        self._render_sam2_seeded = False
+        self._live_sam2_seeded = False
+        self._previous_rendered_rgb = None
+        self._previous_render_object_mask = None
+        self._previous_live_rgb = None
+        self._previous_live_object_mask = None
         super().__init__(
             config=config,
             device=device,
@@ -45,6 +51,14 @@ class DynamicGSPipeline(VanillaPipeline):
         self.total_dynamic_frames = self.datamanager.get_num_dynamic_frames()
         self.total_dynamic_steps = self.total_dynamic_frames * self.config.dynamic_steps_per_frame
         self._sync_phase(0)
+
+    def _reset_dynamic_segmentation_state(self) -> None:
+        self._render_sam2_seeded = False
+        self._live_sam2_seeded = False
+        self._previous_rendered_rgb = None
+        self._previous_render_object_mask = None
+        self._previous_live_rgb = None
+        self._previous_live_object_mask = None
 
     @staticmethod
     def _save_image(image, path):
@@ -75,18 +89,48 @@ class DynamicGSPipeline(VanillaPipeline):
         self.datamanager.set_dynamic_frame_idx(self.current_dynamic_frame_idx)
         self.model.reset_dynamic_state()
         camera, batch = self.datamanager.get_current_dynamic_train_batch()
-        stats = self.model.prepare_dynamic_update(camera, batch)
+        stats = self.model.prepare_dynamic_update(
+            camera,
+            batch,
+            previous_rendered_rgb=self._previous_rendered_rgb,
+            previous_render_object_mask=self._previous_render_object_mask,
+            previous_live_rgb=self._previous_live_rgb,
+            previous_live_object_mask=self._previous_live_object_mask,
+            use_render_sam2=self._render_sam2_seeded,
+            use_live_sam2=self._live_sam2_seeded,
+        )
 
         # Debug tool: keep per-frame rendered reference and computed mask for inspection.
         frame_name = self.datamanager.get_current_dynamic_frame_name()
         debug_dir = self.datamanager.get_dynamic_debug_dir()
         self._save_image(stats["rendered_rgb"], debug_dir / f"{frame_name}_render.png")
         self._save_image(stats["change_mask"], debug_dir / f"{frame_name}_change_mask.png")
+        self._save_image(stats["render_object_mask"], debug_dir / f"{frame_name}_render_object_mask.png")
+        self._save_image(stats["live_object_mask"], debug_dir / f"{frame_name}_live_object_mask.png")
+        self._save_image(stats["optim_mask"], debug_dir / f"{frame_name}_combined_optim_mask.png")
+
+        if stats["render_object_mask_pixels"] > 0:
+            if stats["render_object_mask_source"] == "esam":
+                self._render_sam2_seeded = True
+            if self._render_sam2_seeded:
+                self._previous_rendered_rgb = stats["rendered_rgb"].detach().clone()
+                self._previous_render_object_mask = stats["render_propagation_mask"].detach().clone()
+
+        if stats["live_object_mask_pixels"] > 0:
+            if stats["live_object_mask_source"] == "esam":
+                self._live_sam2_seeded = True
+            if self._live_sam2_seeded:
+                self._previous_live_rgb = stats["live_rgb"].detach().clone()
+                self._previous_live_object_mask = stats["live_propagation_mask"].detach().clone()
 
         CONSOLE.log(
             "[dynamic-gs] frame "
             f"{self.current_dynamic_frame_idx + 1}/{self.total_dynamic_frames} -> {frame_name}, "
-            f"mask pixels={stats['change_mask_pixels']}, flagged gaussians={stats['flagged_gaussians']}"
+            f"change pixels={stats['change_mask_pixels']}, "
+            f"render {stats['render_object_mask_source']} pixels={stats['render_object_mask_pixels']}, "
+            f"live {stats['live_object_mask_source']} pixels={stats['live_object_mask_pixels']}, "
+            f"optim pixels={stats['optim_mask_pixels']}, "
+            f"flagged gaussians={stats['flagged_gaussians']}"
         )
 
     def _sync_phase(self, step: int) -> None:
@@ -97,11 +141,14 @@ class DynamicGSPipeline(VanillaPipeline):
             self.current_phase = phase
             self.datamanager.set_phase(phase)
             self.model.set_phase(phase, reset_means_optimizer=phase == "dynamic")
+            if phase == "dynamic":
+                self._reset_dynamic_segmentation_state()
             CONSOLE.log(f"[dynamic-gs] phase -> {phase} at step {step}")
 
         if phase == "static":
             self.current_dynamic_frame_idx = None
             self.dynamic_steps_on_current_frame = 0
+            self._reset_dynamic_segmentation_state()
             return
 
         frame_idx = self._dynamic_frame_for_step(step)

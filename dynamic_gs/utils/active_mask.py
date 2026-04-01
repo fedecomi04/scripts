@@ -92,6 +92,20 @@ def remove_small_components(mask, min_area):
     return keep.to(mask.device).float()[..., None]
 
 
+def combine_object_masks(render_mask, live_mask, valid_mask=None):
+    """Build the optimization mask from rendered and live object masks."""
+
+    raw_union = ((_to_hw1(render_mask) > 0.5) | (_to_hw1(live_mask) > 0.5)).float()
+    combined = close_binary_mask(raw_union, OFFICIAL_FILTER_OPEN_RADIUS)
+    combined = open_binary_mask(combined, 1)
+    combined = remove_small_components(combined, OFFICIAL_FILTER_MIN_AREA)
+    if not torch.any(combined > 0.5):
+        combined = raw_union
+    if valid_mask is not None:
+        combined = combined * _to_hw1(valid_mask)
+    return combined
+
+
 def _gaussian_blur_image(image, kernel_size, sigma, valid_mask=None):
     """Apply a light Gaussian blur while respecting an optional valid mask."""
 

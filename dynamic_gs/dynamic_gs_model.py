@@ -13,12 +13,19 @@ from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig,
 from nerfstudio.utils.rich_utils import CONSOLE
 
 from .utils import (
+    ESAM_NUM_PROMPT_POINTS,
     NoRefineStrategy,
     build_active_mask,
     build_change_mask,
+    build_esam_ti,
+    build_sam2_tiny_video_predictor,
+    combine_object_masks,
     dilate_binary_mask,
     extract_projected_centers_and_radii,
     masked_l1_depth_loss,
+    query_esam_mask,
+    query_sam2_propagated_mask,
+    rigid_or_static_loss,
 )
 
 try:
@@ -42,6 +49,8 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     change_mask_blur_sigma: float = 1.0
     change_mask_filter_radius: int = 1
     change_mask_min_component_size: int = 64
+    rigid_static_lambda: float = 0.1
+    rigid_inlier_threshold: float = 1e-4
 
 
 class DynamicGSModel(SplatfactoModel):
@@ -52,6 +61,10 @@ class DynamicGSModel(SplatfactoModel):
         self._base_lrs = {}  # type: Dict[str, float]
         self._initial_scheduler_states = {}  # type: Dict[str, Dict]
         self._dynamic_ready = False
+        self._esam_model = None
+        self._sam2_video_predictor = None
+        self._reference_flagged_indices = None
+        self._reference_flagged_means = None
         super().__init__(config=config, metadata=metadata, **kwargs)
 
     def load_state_dict(self, state_dict, **kwargs):  # type: ignore[override]
@@ -172,7 +185,7 @@ class DynamicGSModel(SplatfactoModel):
         mask = self.current_active_mask.to(device=grad.device, dtype=grad.dtype).unsqueeze(-1)
         return grad * mask
 
-    def _set_change_mask(self, mask):
+    def _set_optim_mask(self, mask):
         mask = mask.detach().float()
         if mask.ndim == 2:
             mask = mask[..., None]
@@ -181,7 +194,7 @@ class DynamicGSModel(SplatfactoModel):
         else:
             self.change_mask_image.copy_(mask)
 
-    def _get_change_mask(self):
+    def _get_optim_mask(self):
         if not self._dynamic_ready:
             return None
         return self._downscale_if_required(self.change_mask_image).to(self.device)
@@ -191,6 +204,8 @@ class DynamicGSModel(SplatfactoModel):
         self.object_flags.zero_()
         self.change_mask_image.zero_()
         self._dynamic_ready = False
+        self._reference_flagged_indices = None
+        self._reference_flagged_means = None
 
     def _get_gt_depth(self, batch):
         depth = batch["depth_image"]
@@ -233,8 +248,28 @@ class DynamicGSModel(SplatfactoModel):
         denom = (mask.sum() * pred.shape[-1]).clamp_min(1.0)
         return torch.abs((pred - gt) * mask).sum() / denom
 
+    def _get_esam_model(self):
+        if self._esam_model is None:
+            self._esam_model = build_esam_ti(torch.device(self.device))
+        return self._esam_model
+
+    def _get_sam2_video_predictor(self):
+        if self._sam2_video_predictor is None:
+            self._sam2_video_predictor = build_sam2_tiny_video_predictor(torch.device(self.device))
+        return self._sam2_video_predictor
+
     @torch.no_grad()
-    def prepare_dynamic_update(self, camera, batch):
+    def prepare_dynamic_update(
+        self,
+        camera,
+        batch,
+        previous_rendered_rgb=None,
+        previous_render_object_mask=None,
+        previous_live_rgb=None,
+        previous_live_object_mask=None,
+        use_render_sam2=False,
+        use_live_sam2=False,
+    ):
         """Generate the change mask and active Gaussian subset for one dynamic frame."""
 
         if "depth_image" not in batch:
@@ -250,6 +285,7 @@ class DynamicGSModel(SplatfactoModel):
             gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
             gt_depth = self._get_gt_depth(batch)
             valid_mask = self._get_batch_mask(batch)
+            live_rgb = gt_rgb
             change_mask = build_change_mask(
                 outputs["depth"],
                 gt_depth,
@@ -267,22 +303,107 @@ class DynamicGSModel(SplatfactoModel):
             if self.config.active_mask_dilate_radius > 0:
                 change_mask = dilate_binary_mask(change_mask, self.config.active_mask_dilate_radius)
 
+            render_prompt_points = torch.zeros((0, 2), dtype=torch.long, device=outputs["rgb"].device)
+            if use_render_sam2 and previous_rendered_rgb is not None and previous_render_object_mask is not None:
+                render_object_mask = query_sam2_propagated_mask(
+                    self._get_sam2_video_predictor(),
+                    previous_rendered_rgb,
+                    outputs["rgb"],
+                    previous_render_object_mask,
+                )
+                render_object_mask_source = "sam2"
+            else:
+                render_object_mask, _, render_prompt_points = query_esam_mask(
+                    self._get_esam_model(),
+                    outputs["rgb"],
+                    change_mask,
+                    num_points=ESAM_NUM_PROMPT_POINTS,
+                )
+                render_object_mask_source = "esam"
+
+            live_prompt_points = torch.zeros((0, 2), dtype=torch.long, device=outputs["rgb"].device)
+            if use_live_sam2 and previous_live_rgb is not None and previous_live_object_mask is not None:
+                live_object_mask = query_sam2_propagated_mask(
+                    self._get_sam2_video_predictor(),
+                    previous_live_rgb,
+                    live_rgb,
+                    previous_live_object_mask,
+                )
+                live_object_mask_source = "sam2"
+            else:
+                live_object_mask, _, live_prompt_points = query_esam_mask(
+                    self._get_esam_model(),
+                    live_rgb,
+                    change_mask,
+                    num_points=ESAM_NUM_PROMPT_POINTS,
+                )
+                live_object_mask_source = "esam"
+
+            render_object_mask = (
+                render_object_mask[..., None].float()
+                if render_object_mask.ndim == 2
+                else render_object_mask.float()
+            )
+            live_object_mask = (
+                live_object_mask[..., None].float()
+                if live_object_mask.ndim == 2
+                else live_object_mask.float()
+            )
+
+            flag_mask = render_object_mask
+            if not torch.any(flag_mask > 0.5):
+                CONSOLE.log(
+                    f"[dynamic-gs] {render_object_mask_source.upper()} returned an empty rendered object mask; "
+                    "falling back to the change mask for flagging."
+                )
+                flag_mask = change_mask
+
+            optim_mask = combine_object_masks(
+                render_object_mask if torch.any(render_object_mask > 0.5) else flag_mask,
+                live_object_mask if torch.any(live_object_mask > 0.5) else change_mask,
+                valid_mask=valid_mask,
+            )
+            if not torch.any(optim_mask > 0.5):
+                CONSOLE.log("[dynamic-gs] combined optimization mask is empty; falling back to the change mask.")
+                optim_mask = change_mask
+
             centers_2d, radii = extract_projected_centers_and_radii(self.info, self.num_points)
-            active = build_active_mask(change_mask, centers_2d, radii)
+            active = build_active_mask(flag_mask, centers_2d, radii)
             if not torch.any(active):
                 CONSOLE.log(
-                    "[dynamic-gs] generated change mask flagged no Gaussians; falling back to visible Gaussians."
+                    "[dynamic-gs] object-mask-based flagging selected no Gaussians; "
+                    "falling back to visible Gaussians."
                 )
                 active = torch.isfinite(radii) & (radii > 0)
 
             self.current_active_mask.copy_(active)
             self.object_flags.copy_(active.float()[:, None])
-            self._set_change_mask(change_mask.to(self.device))
+            flagged_indices = torch.nonzero(active, as_tuple=False).squeeze(-1)
+            if flagged_indices.numel() >= 3:
+                self._reference_flagged_indices = flagged_indices.detach().clone()
+                self._reference_flagged_means = self.means[flagged_indices].detach().clone()
+            else:
+                self._reference_flagged_indices = None
+                self._reference_flagged_means = None
+            self._set_optim_mask(optim_mask.to(self.device))
             self._dynamic_ready = True
 
             return {
                 "change_mask_pixels": int((change_mask[..., 0] > 0.5).sum().item()),
                 "flagged_gaussians": int(active.sum().item()),
+                "render_object_mask_pixels": int((render_object_mask[..., 0] > 0.5).sum().item()),
+                "live_object_mask_pixels": int((live_object_mask[..., 0] > 0.5).sum().item()),
+                "optim_mask_pixels": int((optim_mask[..., 0] > 0.5).sum().item()),
+                "render_object_mask_source": render_object_mask_source,
+                "live_object_mask_source": live_object_mask_source,
+                "render_prompt_point_count": int(render_prompt_points.shape[0]),
+                "live_prompt_point_count": int(live_prompt_points.shape[0]),
+                "render_object_mask": render_object_mask,
+                "live_object_mask": live_object_mask,
+                "optim_mask": optim_mask,
+                "render_propagation_mask": render_object_mask if torch.any(render_object_mask > 0.5) else flag_mask,
+                "live_rgb": live_rgb,
+                "live_propagation_mask": live_object_mask if torch.any(live_object_mask > 0.5) else optim_mask,
                 "rendered_rgb": outputs["rgb"],
                 "change_mask": change_mask,
             }
@@ -395,16 +516,16 @@ class DynamicGSModel(SplatfactoModel):
         metrics["active_gaussian_count"] = int(self.current_active_mask.sum().item())
         metrics["object_flag_count"] = int((self.object_flags.squeeze(-1) > 0.5).sum().item())
         if self._dynamic_ready:
-            metrics["change_mask_pixels"] = int((self.change_mask_image[..., 0] > 0.5).sum().item())
+            metrics["optim_mask_pixels"] = int((self.change_mask_image[..., 0] > 0.5).sum().item())
         return metrics
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         if self.phase == "static":
             return super().get_loss_dict(outputs, batch, metrics_dict)
 
-        mask = self._get_change_mask()
+        mask = self._get_optim_mask()
         if mask is None:
-            raise RuntimeError("Dynamic phase started before change-mask generation.")
+            raise RuntimeError("Dynamic phase started before optimization-mask generation.")
 
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         rgb_loss = self._masked_rgb_l1(outputs["rgb"], gt_img, mask)
@@ -413,9 +534,22 @@ class DynamicGSModel(SplatfactoModel):
         if outputs["depth"] is not None and "depth_image" in batch:
             depth_loss = masked_l1_depth_loss(outputs["depth"], self._get_gt_depth(batch), mask)
 
+        rigid_static_reg = outputs["rgb"].new_tensor(0.0)
+        if (
+            self.config.rigid_static_lambda > 0
+            and self._reference_flagged_indices is not None
+            and self._reference_flagged_means is not None
+        ):
+            rigid_static_reg = rigid_or_static_loss(
+                self._reference_flagged_means,
+                self.means[self._reference_flagged_indices],
+                rigid_inlier_threshold=self.config.rigid_inlier_threshold,
+            )
+
         loss_dict = {
             "main_loss": rgb_loss,
             "depth_loss": self.config.depth_lambda * depth_loss,
+            "rigid_static_loss": self.config.rigid_static_lambda * rigid_static_reg,
         }
         if self.training:
             self.camera_optimizer.get_loss_dict(loss_dict)

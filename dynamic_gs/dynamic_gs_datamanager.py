@@ -156,7 +156,7 @@ class DynamicGSDataManager(DataManager):
         return image_path.stem
 
     def get_dynamic_debug_dir(self) -> Path:
-        return Path(self.config.data) / self.config.dynamic_subdir / "render_and_masks"
+        return Path(self.config.data) / self.config.dynamic_subdir / "render_masks_esam"
 
     def _get_dynamic_batch(self, frame_idx: int, split: Literal["train", "eval"]):
         if split == "train":
