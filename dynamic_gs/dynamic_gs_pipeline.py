@@ -21,8 +21,8 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     datamanager: DynamicGSDataManagerConfig = field(default_factory=DynamicGSDataManagerConfig)
     model: DynamicGSModelConfig = field(default_factory=DynamicGSModelConfig)
 
-    static_num_steps: int = 4000
-    dynamic_steps_per_frame: int = 200
+    static_num_steps: int = 100
+    dynamic_steps_per_frame: int = 10
 
 
 class DynamicGSPipeline(VanillaPipeline):
@@ -40,6 +40,7 @@ class DynamicGSPipeline(VanillaPipeline):
         self._previous_render_object_mask = None
         self._previous_live_rgb = None
         self._previous_live_object_mask = None
+        self._sam3d_inserted = False
         super().__init__(
             config=config,
             device=device,
@@ -59,6 +60,7 @@ class DynamicGSPipeline(VanillaPipeline):
         self._previous_render_object_mask = None
         self._previous_live_rgb = None
         self._previous_live_object_mask = None
+        self._sam3d_inserted = False
 
     @staticmethod
     def _save_image(image, path):
@@ -108,6 +110,31 @@ class DynamicGSPipeline(VanillaPipeline):
         self._save_image(stats["render_object_mask"], debug_dir / f"{frame_name}_render_object_mask.png")
         self._save_image(stats["live_object_mask"], debug_dir / f"{frame_name}_live_object_mask.png")
         self._save_image(stats["optim_mask"], debug_dir / f"{frame_name}_combined_optim_mask.png")
+
+        if self.current_dynamic_frame_idx == 0 and not self._sam3d_inserted and self.model.config.use_sam3d_object_init:
+            sam3d_stats = self.model.initialize_object_from_sam3d(
+                render_image_path=debug_dir / f"{frame_name}_render.png",
+                object_mask_path=debug_dir / f"{frame_name}_live_object_mask.png",
+                render_object_mask=stats["render_object_mask"],
+                rendered_depth=stats["rendered_depth"],
+                camera=camera,
+                debug_dir=debug_dir,
+                frame_name=frame_name,
+            )
+            if sam3d_stats:
+                self._sam3d_inserted = True
+                stats["flagged_gaussians"] = self.model.refresh_dynamic_state_after_insertion(
+                    camera,
+                    stats["render_object_mask"],
+                    stats["optim_mask"],
+                )
+                CONSOLE.log(
+                    "[dynamic-gs] SAM3D object init -> "
+                    f"existing={sam3d_stats['existing_object_gaussians']}, "
+                    f"scale={sam3d_stats['chosen_scale']:.4f}, "
+                    f"generated={sam3d_stats['sam3d_generated_points']}, "
+                    f"kept={sam3d_stats['kept_points_after_dedup']}"
+                )
 
         if stats["render_object_mask_pixels"] > 0:
             if stats["render_object_mask_source"] == "esam":

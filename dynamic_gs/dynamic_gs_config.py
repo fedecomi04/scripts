@@ -10,8 +10,8 @@ from .dynamic_gs_datamanager import DynamicGSDataManagerConfig
 from .dynamic_gs_model import DynamicGSModelConfig
 from .dynamic_gs_pipeline import DynamicGSPipelineConfig
 
-STATIC_NUM_STEPS = 4000
-DYNAMIC_STEPS_PER_FRAME = 500
+STATIC_NUM_STEPS = 1000
+DYNAMIC_STEPS_PER_FRAME = 100
 DEFAULT_MAX_NUM_STEPS = STATIC_NUM_STEPS + DYNAMIC_STEPS_PER_FRAME
 
 
