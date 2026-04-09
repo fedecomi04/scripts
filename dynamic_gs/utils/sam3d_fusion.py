@@ -1,17 +1,20 @@
 from __future__ import annotations
 """Geometry-only SAM3D object fusion for dynamic-gs.
 
-The pipeline is:
-1. load the SAM3D point cloud
+The active fusion path is:
+1. load the raw SAM3D point cloud and the current visible object subset from the splat
 2. estimate an isotropic scale from source/target extents
-3. translate the scaled source to the target centroid
-4. run Fast Global Registration on full downsampled geometry
-5. keep only the post-FGR source points that are visible in the rendered object mask
-6. refine the pose with a truncated nearest-neighbor rigid step, then point-to-point ICP
-7. append only non-overlapping SAM3D points back into the Gaussian scene
+3. translate the scaled SAM3D source to the target centroid
+4. voxel-downsample both clouds and run Fast Global Registration for coarse pose
+5. keep the post-FGR source points that remain visible in the rendered object mask
+6. refine that coarse pose with the existing truncated nearest-neighbor rigid step
+7. run an explicit Open3D point-to-point refinement with scaling from fresh nearest-neighbor correspondences
+8. run a short rigid ICP cleanup
+9. append only non-overlapping SAM3D points back into the Gaussian scene
 
-This file intentionally uses only geometry. No RGB matching, colored ICP, or
-object-specific axis heuristics are used here.
+The final insertion still uses append-with-dedup only. Existing scene/object
+Gaussians are kept. This file intentionally uses only geometry; there is no RGB
+matching, colored ICP, or object-specific axis heuristic in the registration.
 """
 
 from dataclasses import dataclass
@@ -53,6 +56,11 @@ class Sam3DInsertionResult:
     robust_transform: np.ndarray
     robust_inlier_count: int
     robust_truncation_distance: float
+    similarity_transform: np.ndarray
+    similarity_correspondence_count: int
+    similarity_scale: float
+    correspondence_threshold: float
+    correspondence_plot_path: str
 
 
 def _require_open3d():
@@ -103,6 +111,136 @@ def save_point_cloud(path: Path, points: np.ndarray, colors: np.ndarray | None =
         )
         return
     _require_open3d().io.write_point_cloud(str(path), _to_pcd(points, colors))
+
+
+def _sample_rows_for_plot(points: np.ndarray, max_points: int) -> np.ndarray:
+    if len(points) <= max_points:
+        return points
+    keep_positions = np.linspace(0, len(points) - 1, num=max_points)
+    keep_indices = np.unique(np.round(keep_positions).astype(np.int64))
+    return points[keep_indices]
+
+
+def _set_equal_axes(ax, points: np.ndarray) -> None:
+    mins = points.min(axis=0)
+    maxs = points.max(axis=0)
+    center = 0.5 * (mins + maxs)
+    radius = 0.5 * float(np.max(maxs - mins))
+    radius = max(radius, 1e-3)
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+
+
+def _save_correspondence_plot(
+    debug_dir: Path,
+    output_stem: str,
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+    correspondences,
+    threshold: float,
+) -> Path:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection
+
+    plot_source = _sample_rows_for_plot(source_points, max_points=5000)
+    plot_target = _sample_rows_for_plot(target_points, max_points=5000)
+    correspondence_array = np.asarray(correspondences, dtype=np.int32)
+
+    fig = plt.figure(figsize=(16, 8))
+    ax = fig.add_subplot(121, projection="3d")
+    ax.scatter(
+        plot_target[:, 0],
+        plot_target[:, 1],
+        plot_target[:, 2],
+        s=2.0,
+        c="royalblue",
+        alpha=0.70,
+        label=f"target splat object ({len(target_points)})",
+    )
+    ax.scatter(
+        plot_source[:, 0],
+        plot_source[:, 1],
+        plot_source[:, 2],
+        s=1.0,
+        c="crimson",
+        alpha=0.45,
+        label=f"aligned SAM3D source ({len(source_points)})",
+    )
+
+    if len(correspondence_array) > 0:
+        segments = np.stack(
+            [
+                source_points[correspondence_array[:, 0]],
+                target_points[correspondence_array[:, 1]],
+            ],
+            axis=1,
+        )
+        if len(segments) > 400:
+            keep_positions = np.linspace(0, len(segments) - 1, num=400)
+            keep_indices = np.unique(np.round(keep_positions).astype(np.int64))
+            segments = segments[keep_indices]
+        ax.add_collection3d(Line3DCollection(segments, colors="black", linewidths=0.8, alpha=0.45))
+
+    all_points = np.concatenate([plot_source, plot_target], axis=0)
+    _set_equal_axes(ax, all_points)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    ax.legend(loc="upper right")
+    ax.set_title(
+        f"{output_stem} full context\n"
+        f"source points={len(source_points)}, target points={len(target_points)}, "
+        f"pairs={len(correspondence_array)}, tau={threshold:.6f}"
+    )
+
+    ax_pairs = fig.add_subplot(122, projection="3d")
+    if len(correspondence_array) > 0:
+        pair_points_source = source_points[correspondence_array[:, 0]]
+        pair_points_target = target_points[correspondence_array[:, 1]]
+        if len(correspondence_array) > 600:
+            keep_positions = np.linspace(0, len(correspondence_array) - 1, num=600)
+            keep_indices = np.unique(np.round(keep_positions).astype(np.int64))
+            pair_points_source = pair_points_source[keep_indices]
+            pair_points_target = pair_points_target[keep_indices]
+        ax_pairs.scatter(
+            pair_points_target[:, 0],
+            pair_points_target[:, 1],
+            pair_points_target[:, 2],
+            s=8.0,
+            c="royalblue",
+            alpha=0.90,
+            label=f"matched target ({len(pair_points_target)})",
+        )
+        ax_pairs.scatter(
+            pair_points_source[:, 0],
+            pair_points_source[:, 1],
+            pair_points_source[:, 2],
+            s=8.0,
+            c="crimson",
+            alpha=0.90,
+            label=f"matched source ({len(pair_points_source)})",
+        )
+        pair_segments = np.stack([pair_points_source, pair_points_target], axis=1)
+        ax_pairs.add_collection3d(Line3DCollection(pair_segments, colors="darkgreen", linewidths=1.0, alpha=0.55))
+        _set_equal_axes(ax_pairs, np.concatenate([pair_points_source, pair_points_target], axis=0))
+        ax_pairs.legend(loc="upper right")
+    else:
+        ax_pairs.text2D(0.1, 0.5, "No correspondences", transform=ax_pairs.transAxes)
+        _set_equal_axes(ax_pairs, all_points)
+    ax_pairs.set_xlabel("x")
+    ax_pairs.set_ylabel("y")
+    ax_pairs.set_zlabel("z")
+    ax_pairs.set_title("Matched pairs only")
+
+    out_path = Path(debug_dir) / f"{output_stem}_correspondence_plot.png"
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+    return out_path
 
 
 def _centroid(points: np.ndarray) -> np.ndarray:
@@ -263,6 +401,74 @@ def _run_icp(source_points: np.ndarray, source_colors: np.ndarray, target_points
     return result, threshold
 
 
+def _extract_isotropic_scale(transform: np.ndarray) -> float:
+    linear = np.asarray(transform[:3, :3], dtype=np.float32)
+    norms = np.linalg.norm(linear, axis=0)
+    finite = norms[np.isfinite(norms)]
+    if len(finite) == 0:
+        return 1.0
+    return float(np.mean(finite).clip(min=1e-6))
+
+
+def _build_explicit_correspondences(
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+    max_distance: float,
+):
+    o3d_mod = _require_open3d()
+    if len(source_points) == 0 or len(target_points) == 0:
+        return o3d_mod.utility.Vector2iVector(np.zeros((0, 2), dtype=np.int32)), 0
+
+    target_pcd = _to_pcd(target_points)
+    target_kdtree = o3d_mod.geometry.KDTreeFlann(target_pcd)
+    max_distance_sq = float(max_distance) * float(max_distance)
+    pairs = []
+    for source_idx, point in enumerate(source_points.astype(np.float64)):
+        count, indices, sq_dists = target_kdtree.search_knn_vector_3d(point, 1)
+        if count <= 0 or len(indices) == 0 or len(sq_dists) == 0:
+            continue
+        if not np.isfinite(sq_dists[0]) or sq_dists[0] > max_distance_sq:
+            continue
+        pairs.append([source_idx, int(indices[0])])
+
+    if len(pairs) == 0:
+        pair_array = np.zeros((0, 2), dtype=np.int32)
+    else:
+        pair_array = np.asarray(pairs, dtype=np.int32)
+    return o3d_mod.utility.Vector2iVector(pair_array), int(len(pair_array))
+
+
+def _run_similarity_correspondence_refinement(
+    source_points: np.ndarray,
+    source_colors: np.ndarray,
+    target_points: np.ndarray,
+    target_colors: np.ndarray,
+    init_transform: np.ndarray,
+    correspondence_distance: float,
+) -> tuple[np.ndarray, int]:
+    o3d_mod = _require_open3d()
+    if len(source_points) < 3 or len(target_points) < 3:
+        return init_transform.astype(np.float32), 0
+
+    transformed_source = _transform_points(source_points, init_transform)
+    correspondences, correspondence_count = _build_explicit_correspondences(
+        transformed_source,
+        target_points,
+        max_distance=correspondence_distance,
+    )
+    if correspondence_count < 3:
+        return init_transform.astype(np.float32), correspondence_count
+
+    estimator = o3d_mod.pipelines.registration.TransformationEstimationPointToPoint(with_scaling=True)
+    delta_transform = estimator.compute_transformation(
+        _to_pcd(transformed_source, source_colors),
+        _to_pcd(target_points, target_colors),
+        correspondences,
+    )
+    refined_transform = np.asarray(delta_transform, dtype=np.float32) @ init_transform.astype(np.float32)
+    return refined_transform.astype(np.float32), correspondence_count
+
+
 def _estimate_rigid_transform(source_points: np.ndarray, target_points: np.ndarray) -> np.ndarray:
     if len(source_points) < 3 or len(target_points) < 3:
         return np.eye(4, dtype=np.float32)
@@ -344,6 +550,8 @@ def register_and_fuse_sam3d_object(
     intrinsics: np.ndarray,
     width: int,
     height: int,
+    debug_dir: Path | None = None,
+    output_stem: str | None = None,
 ) -> Sam3DInsertionResult:
     if len(source_points) == 0:
         raise ValueError("SAM3D source point cloud is empty.")
@@ -404,18 +612,37 @@ def register_and_fuse_sam3d_object(
         truncation_distance=robust_truncation_distance,
     )
 
+    similarity_transform = robust_transform.astype(np.float32)
+    similarity_correspondence_threshold = max(2.0 * _median_nn_distance(target_down_points), 1e-3)
+    similarity_transform, similarity_correspondence_count = _run_similarity_correspondence_refinement(
+        icp_source_points,
+        icp_source_colors,
+        target_down_points,
+        target_down_colors,
+        similarity_transform,
+        correspondence_distance=similarity_correspondence_threshold,
+    )
+    similarity_scale = float(chosen_scale * _extract_isotropic_scale(similarity_transform))
+    source_visible_for_plot = _transform_points(icp_source_points, similarity_transform)
+    similarity_correspondences, _ = _build_explicit_correspondences(
+        source_visible_for_plot,
+        target_down_points,
+        max_distance=similarity_correspondence_threshold,
+    )
+
     icp_result, _ = _run_icp(
         icp_source_points,
         icp_source_colors,
         target_down_points,
         target_down_colors,
-        robust_transform,
+        similarity_transform,
         voxel_size,
     )
     icp_transform = np.asarray(icp_result.transformation, dtype=np.float32)
 
     aligned_points = _transform_points(scaled_source, icp_transform)
     aligned_colors = scaled_source_colors.astype(np.float32)
+    final_scale = float(chosen_scale * _extract_isotropic_scale(icp_transform))
 
     dedup_threshold = 1.5 * target_spacing
     target_pcd = _to_pcd(target_points, target_colors)
@@ -424,12 +651,29 @@ def register_and_fuse_sam3d_object(
     kept_points = aligned_points[keep_mask].astype(np.float32)
     kept_colors = aligned_colors[keep_mask].astype(np.float32)
 
+    correspondence_plot_path = ""
+    if debug_dir is not None and output_stem is not None:
+        debug_dir = Path(debug_dir)
+        save_point_cloud(debug_dir / f"{output_stem}_source_reg_ref.ply", icp_source_points, icp_source_colors)
+        save_point_cloud(debug_dir / f"{output_stem}_target_reg_ref.ply", target_down_points, target_down_colors)
+        save_point_cloud(debug_dir / f"{output_stem}_source_visible_work_iter_00.ply", source_visible_for_plot, icp_source_colors)
+        correspondence_plot_path = str(
+            _save_correspondence_plot(
+                debug_dir,
+                output_stem,
+                source_visible_for_plot,
+                target_down_points,
+                similarity_correspondences,
+                similarity_correspondence_threshold,
+            )
+        )
+
     return Sam3DInsertionResult(
         aligned_points=aligned_points,
         aligned_colors=aligned_colors,
         kept_points=kept_points,
         kept_colors=kept_colors,
-        chosen_scale=float(chosen_scale),
+        chosen_scale=float(final_scale),
         dedup_threshold=float(dedup_threshold),
         voxel_size=float(voxel_size),
         source_point_count=source_point_count,
@@ -444,4 +688,9 @@ def register_and_fuse_sam3d_object(
         robust_transform=robust_transform,
         robust_inlier_count=int(robust_inlier_count),
         robust_truncation_distance=float(robust_truncation_distance),
+        similarity_transform=similarity_transform,
+        similarity_correspondence_count=int(similarity_correspondence_count),
+        similarity_scale=float(similarity_scale),
+        correspondence_threshold=float(similarity_correspondence_threshold),
+        correspondence_plot_path=correspondence_plot_path,
     )

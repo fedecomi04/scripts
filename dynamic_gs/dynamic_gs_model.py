@@ -621,6 +621,8 @@ class DynamicGSModel(SplatfactoModel):
             intrinsics=intrinsics,
             width=width,
             height=height,
+            debug_dir=debug_dir,
+            output_stem=output_stem,
         )
         aligned_path = debug_dir / f"{output_stem}_aligned_output.ply"
         save_point_cloud(aligned_path, insertion_result.aligned_points, insertion_result.aligned_colors)
@@ -665,6 +667,10 @@ class DynamicGSModel(SplatfactoModel):
             f"robust_transform: {insertion_result.robust_transform.tolist()}",
             f"robust_inlier_count: {insertion_result.robust_inlier_count}",
             f"robust_truncation_distance: {insertion_result.robust_truncation_distance}",
+            f"similarity_transform: {insertion_result.similarity_transform.tolist()}",
+            f"similarity_correspondence_count: {insertion_result.similarity_correspondence_count}",
+            f"similarity_scale: {insertion_result.similarity_scale}",
+            f"correspondence_threshold: {insertion_result.correspondence_threshold}",
             f"icp_transformation: {insertion_result.icp_transformation.tolist()}",
             f"icp_fitness: {insertion_result.icp_fitness}",
             f"icp_rmse: {insertion_result.icp_rmse}",
@@ -679,6 +685,9 @@ class DynamicGSModel(SplatfactoModel):
             f"raw_sam3d_output_ply: {sam3d_outputs['ply_path']}",
             f"aligned_sam3d_output_ply: {aligned_path}",
             f"fused_object_only_ply: {fused_path}",
+            f"source_reg_ref_ply: {debug_dir / f'{output_stem}_source_reg_ref.ply'}",
+            f"target_reg_ref_ply: {debug_dir / f'{output_stem}_target_reg_ref.ply'}",
+            f"correspondence_plot_path: {insertion_result.correspondence_plot_path}",
         ]
         log_path.write_text("\n".join(log_lines) + "\n")
 
