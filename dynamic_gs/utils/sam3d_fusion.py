@@ -2,18 +2,16 @@ from __future__ import annotations
 """Geometry-only SAM3D object fusion for dynamic-gs.
 
 The active fusion path is:
-1. load the raw SAM3D point cloud and the current visible object subset from the splat
+1. load the raw SAM3D point cloud
 2. estimate an isotropic scale from source/target extents
 3. translate the scaled SAM3D source to the target centroid
-4. voxel-downsample both clouds and run Fast Global Registration for coarse pose
-5. keep the post-FGR source points that remain visible in the rendered object mask
-6. refine the coarse pose with probreg CPD similarity (scale + rigid)
-7. run a short color-aware ICP cleanup
-8. append only non-overlapping SAM3D points back into the Gaussian scene
+4. voxel-downsample both clouds
+5. refine the pose with probreg CPD similarity (scale + rigid)
+6. append only non-overlapping SAM3D points back into the Gaussian scene
 
 The final insertion still uses append-with-dedup only. Existing scene/object
 Gaussians are kept. This file intentionally uses geometry-first registration with
-RGB used only in the final colored ICP cleanup.
+RGB used only for the CPD refinement and the final Gaussian insertion.
 """
 
 from dataclasses import dataclass
@@ -305,150 +303,6 @@ def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return (homog @ transform.T)[:, :3].astype(np.float32)
 
 
-def _project_points(
-    points: np.ndarray,
-    viewmat: np.ndarray,
-    intrinsics: np.ndarray,
-    width: int,
-    height: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    camera_points = points @ viewmat[:3, :3].T + viewmat[:3, 3]
-    depths = camera_points[:, 2]
-    valid = np.isfinite(depths) & (depths > 1e-6)
-    pixels = np.full((len(points), 2), -1, dtype=np.int32)
-    if not np.any(valid):
-        return pixels, depths, valid
-
-    xy = camera_points[valid, :2] / depths[valid, None]
-    u = intrinsics[0, 0] * xy[:, 0] + intrinsics[0, 2]
-    v = intrinsics[1, 1] * xy[:, 1] + intrinsics[1, 2]
-    valid_indices = np.flatnonzero(valid)
-    pixels[valid_indices, 0] = np.rint(u).astype(np.int32)
-    pixels[valid_indices, 1] = np.rint(v).astype(np.int32)
-    in_frame = (
-        (pixels[:, 0] >= 0)
-        & (pixels[:, 0] < width)
-        & (pixels[:, 1] >= 0)
-        & (pixels[:, 1] < height)
-    )
-    return pixels, depths, valid & in_frame
-
-
-def _visible_source_indices(
-    points: np.ndarray,
-    render_object_mask: np.ndarray,
-    viewmat: np.ndarray,
-    intrinsics: np.ndarray,
-    width: int,
-    height: int,
-) -> np.ndarray:
-    pixels, depths, valid = _project_points(points, viewmat, intrinsics, width, height)
-    valid_indices = np.flatnonzero(valid)
-    if len(valid_indices) == 0:
-        return np.zeros((0,), dtype=np.int64)
-
-    inside_mask = render_object_mask[pixels[valid_indices, 1], pixels[valid_indices, 0]] > 0
-    valid_indices = valid_indices[inside_mask]
-    if len(valid_indices) == 0:
-        return np.zeros((0,), dtype=np.int64)
-
-    pixel_ids = pixels[valid_indices, 1] * width + pixels[valid_indices, 0]
-    order = np.lexsort((depths[valid_indices], pixel_ids))
-    sorted_indices = valid_indices[order]
-    sorted_pixel_ids = pixel_ids[order]
-    keep = np.ones(len(sorted_indices), dtype=bool)
-    keep[1:] = sorted_pixel_ids[1:] != sorted_pixel_ids[:-1]
-    return sorted_indices[keep].astype(np.int64)
-
-
-def _estimate_normals_and_fpfh(point_cloud, voxel_size: float):
-    o3d_mod = _require_open3d()
-    if len(point_cloud.points) == 0:
-        raise ValueError("Cannot estimate normals on an empty point cloud.")
-    normal_radius = max(voxel_size * 2.0, 1e-3)
-    feature_radius = max(voxel_size * 5.0, normal_radius)
-    point_cloud.estimate_normals(
-        o3d_mod.geometry.KDTreeSearchParamHybrid(radius=float(normal_radius), max_nn=30)
-    )
-    features = o3d_mod.pipelines.registration.compute_fpfh_feature(
-        point_cloud,
-        o3d_mod.geometry.KDTreeSearchParamHybrid(radius=float(feature_radius), max_nn=100),
-    )
-    return point_cloud, features
-
-
-def _run_fgr(source_points: np.ndarray, source_colors: np.ndarray, target_points: np.ndarray, target_colors: np.ndarray, voxel_size: float):
-    o3d_mod = _require_open3d()
-    source_pcd = _to_pcd(source_points, source_colors)
-    target_pcd = _to_pcd(target_points, target_colors)
-    source_pcd, source_fpfh = _estimate_normals_and_fpfh(source_pcd, voxel_size)
-    target_pcd, target_fpfh = _estimate_normals_and_fpfh(target_pcd, voxel_size)
-    threshold = max(voxel_size * 1.5, 1e-3)
-    registration_mod = o3d_mod.pipelines.registration
-    fgr_fn = getattr(
-        registration_mod,
-        "registration_fgr_based_on_feature_matching",
-        getattr(registration_mod, "registration_fast_based_on_feature_matching"),
-    )
-    result = fgr_fn(
-        source_pcd,
-        target_pcd,
-        source_fpfh,
-        target_fpfh,
-        registration_mod.FastGlobalRegistrationOption(
-            maximum_correspondence_distance=float(threshold),
-            iteration_number=64,
-        ),
-    )
-    return result, threshold
-
-
-def _run_icp(source_points: np.ndarray, source_colors: np.ndarray, target_points: np.ndarray, target_colors: np.ndarray, init_transform: np.ndarray, voxel_size: float):
-    o3d_mod = _require_open3d()
-    source_pcd = _to_pcd(source_points, source_colors)
-    target_pcd = _to_pcd(target_points, target_colors)
-    threshold = max(voxel_size * 1.0, 1e-3)
-    registration_mod = o3d_mod.pipelines.registration
-    use_colored_icp = (
-        hasattr(registration_mod, "registration_colored_icp")
-        and source_pcd.has_colors()
-        and target_pcd.has_colors()
-    )
-    if use_colored_icp:
-        normal_radius = max(voxel_size * 2.0, 1e-3)
-        normal_param = o3d_mod.geometry.KDTreeSearchParamHybrid(radius=float(normal_radius), max_nn=30)
-        source_pcd.estimate_normals(normal_param)
-        target_pcd.estimate_normals(normal_param)
-        try:
-            result = registration_mod.registration_colored_icp(
-                source_pcd,
-                target_pcd,
-                max_correspondence_distance=float(threshold),
-                init=init_transform.astype(np.float64),
-                estimation_method=registration_mod.TransformationEstimationForColoredICP(lambda_geometric=0.968),
-                criteria=registration_mod.ICPConvergenceCriteria(max_iteration=20),
-            )
-        except RuntimeError:
-            result = registration_mod.registration_icp(
-                source_pcd,
-                target_pcd,
-                max_correspondence_distance=float(threshold),
-                init=init_transform.astype(np.float64),
-                estimation_method=registration_mod.TransformationEstimationPointToPoint(),
-                criteria=registration_mod.ICPConvergenceCriteria(max_iteration=20),
-            )
-    else:
-        result = registration_mod.registration_icp(
-            source_pcd,
-            target_pcd,
-            max_correspondence_distance=float(threshold),
-            init=init_transform.astype(np.float64),
-            estimation_method=registration_mod.TransformationEstimationPointToPoint(),
-            criteria=registration_mod.ICPConvergenceCriteria(max_iteration=20),
-        )
-    return result, threshold
-
-
 def _extract_isotropic_scale(transform: np.ndarray) -> float:
     linear = np.asarray(transform[:3, :3], dtype=np.float32)
     norms = np.linalg.norm(linear, axis=0)
@@ -491,37 +345,6 @@ def _build_explicit_correspondences(
     else:
         pair_array = np.asarray(pairs, dtype=np.int32)
     return o3d_mod.utility.Vector2iVector(pair_array), int(len(pair_array))
-
-
-def _run_similarity_correspondence_refinement(
-    source_points: np.ndarray,
-    source_colors: np.ndarray,
-    target_points: np.ndarray,
-    target_colors: np.ndarray,
-    init_transform: np.ndarray,
-    correspondence_distance: float,
-) -> tuple[np.ndarray, int]:
-    o3d_mod = _require_open3d()
-    if len(source_points) < 3 or len(target_points) < 3:
-        return init_transform.astype(np.float32), 0
-
-    transformed_source = _transform_points(source_points, init_transform)
-    correspondences, correspondence_count = _build_explicit_correspondences(
-        transformed_source,
-        target_points,
-        max_distance=correspondence_distance,
-    )
-    if correspondence_count < 3:
-        return init_transform.astype(np.float32), correspondence_count
-
-    estimator = o3d_mod.pipelines.registration.TransformationEstimationPointToPoint(with_scaling=True)
-    delta_transform = estimator.compute_transformation(
-        _to_pcd(transformed_source, source_colors),
-        _to_pcd(target_points, target_colors),
-        correspondences,
-    )
-    refined_transform = np.asarray(delta_transform, dtype=np.float32) @ init_transform.astype(np.float32)
-    return refined_transform.astype(np.float32), correspondence_count
 
 
 def _run_probreg_similarity_refinement(
@@ -603,61 +426,11 @@ def _estimate_rigid_transform(source_points: np.ndarray, target_points: np.ndarr
     return transform
 
 
-def _run_truncated_rigid_refinement(
-    source_points: np.ndarray,
-    target_points: np.ndarray,
-    init_transform: np.ndarray,
-    truncation_distance: float,
-    trim_keep_ratio: float = 0.8,
-    max_iterations: int = 10,
-) -> tuple[np.ndarray, int]:
-    if len(source_points) < 3 or len(target_points) < 3:
-        return init_transform.astype(np.float32), 0
-
-    from sklearn.neighbors import NearestNeighbors
-
-    transform = init_transform.astype(np.float32).copy()
-    best_inlier_count = 0
-    for _ in range(max_iterations):
-        transformed_source = _transform_points(source_points, transform)
-        nn_model = NearestNeighbors(n_neighbors=1, algorithm="auto", metric="euclidean").fit(transformed_source)
-        distances, indices = nn_model.kneighbors(target_points)
-        distances = distances[:, 0].astype(np.float32)
-        indices = indices[:, 0].astype(np.int64)
-
-        valid = np.isfinite(distances) & (distances <= truncation_distance)
-        if int(valid.sum()) < 3:
-            break
-
-        valid_indices = np.flatnonzero(valid)
-        valid_distances = distances[valid]
-        keep_count = max(3, int(np.ceil(trim_keep_ratio * len(valid_indices))))
-        keep_order = np.argsort(valid_distances)[:keep_count]
-        target_keep = valid_indices[keep_order]
-        source_keep = indices[target_keep]
-
-        delta = _estimate_rigid_transform(transformed_source[source_keep], target_points[target_keep])
-        transform = (delta @ transform).astype(np.float32)
-        best_inlier_count = max(best_inlier_count, keep_count)
-
-        delta_translation = float(np.linalg.norm(delta[:3, 3]))
-        delta_rotation = float(np.linalg.norm(delta[:3, :3] - np.eye(3, dtype=np.float32)))
-        if delta_translation < 1e-5 and delta_rotation < 1e-4:
-            break
-
-    return transform, best_inlier_count
-
-
 def register_and_fuse_sam3d_object(
     source_points: np.ndarray,
     source_colors: np.ndarray,
     target_points: np.ndarray,
     target_colors: np.ndarray,
-    render_object_mask: np.ndarray,
-    viewmat: np.ndarray,
-    intrinsics: np.ndarray,
-    width: int,
-    height: int,
     debug_dir: Path | None = None,
     output_stem: str | None = None,
 ) -> Sam3DInsertionResult:
@@ -666,7 +439,6 @@ def register_and_fuse_sam3d_object(
     if len(target_points) < 3:
         raise ValueError("Need at least 3 existing object Gaussians for SAM3D registration.")
 
-    render_object_mask = render_object_mask.astype(bool)
     source_points = source_points.astype(np.float32)
     target_points = target_points.astype(np.float32)
     source_colors = _ensure_rgb_colors(source_colors, len(source_points))
@@ -689,8 +461,6 @@ def register_and_fuse_sam3d_object(
     voxel_size = max(3.0 * max(target_spacing, source_spacing), 1e-3)
     source_down_points, source_down_colors = _voxel_downsample(scaled_source, scaled_source_colors, voxel_size)
     target_down_points, target_down_colors = _voxel_downsample(target_points, target_colors, voxel_size)
-    # Initialization-only experiment path: disable FGR/CPD/ICP and keep only
-    # the initial scale + centroid alignment.
     fgr_transform = np.eye(4, dtype=np.float32)
     fgr_aligned_points = source_down_points.astype(np.float32)
 
@@ -720,15 +490,6 @@ def register_and_fuse_sam3d_object(
         max_distance=similarity_correspondence_threshold,
     )
 
-    # icp_result, _ = _run_icp(
-    #     icp_source_points,
-    #     icp_source_colors,
-    #     target_down_points,
-    #     target_down_colors,
-    #     similarity_transform,
-    #     voxel_size,
-    # )
-    # icp_transform = np.asarray(icp_result.transformation, dtype=np.float32)
     icp_transform = similarity_transform.astype(np.float32)
     icp_fitness = 0.0
     icp_rmse = 0.0

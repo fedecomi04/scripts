@@ -9,6 +9,7 @@ from nerfstudio.plugins.types import MethodSpecification
 from .dynamic_gs_datamanager import DynamicGSDataManagerConfig
 from .dynamic_gs_model import DynamicGSModelConfig
 from .dynamic_gs_pipeline import DynamicGSPipelineConfig
+from .dynamic_gs_trainer import NoSaveTrainer
 
 STATIC_NUM_STEPS = 1000
 DYNAMIC_STEPS_PER_FRAME = 50   # optimization epochs per dynamic frame
@@ -17,6 +18,7 @@ DEFAULT_MAX_NUM_STEPS = STATIC_NUM_STEPS + DYNAMIC_STEPS_PER_FRAME  # updated at
 
 DynamicGS = MethodSpecification(
     config=TrainerConfig(
+        _target=NoSaveTrainer,
         method_name="dynamic-gs",
         steps_per_eval_image=100,
         steps_per_eval_batch=0,
@@ -32,7 +34,7 @@ DynamicGS = MethodSpecification(
                 camera_optimizer=CameraOptimizerConfig(mode="off"),
                 output_depth_during_training=True,
                 stop_split_at=0,
-                reuse_sam3d_generated_ply=False,
+                reuse_sam3d_generated_ply=True,
             ),
         ),
         optimizers={

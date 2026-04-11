@@ -33,8 +33,6 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
 
     static_num_steps: int = 100
     dynamic_steps_per_frame: int = 300
-
-
 class DynamicGSPipeline(VanillaPipeline):
     config: DynamicGSPipelineConfig
 

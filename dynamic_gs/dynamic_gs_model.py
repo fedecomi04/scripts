@@ -763,20 +763,14 @@ class DynamicGSModel(SplatfactoModel):
                     torch.cuda.empty_cache()
         sam3d_generation_time = time.time() - t_sam3d_gen
 
-        # --- TIMING: SAM3D insertion (FGR + PROBREG + ICP registration, dedup, Gaussian insertion) ---
+        # --- TIMING: SAM3D insertion (CPD registration, dedup, Gaussian insertion) ---
         t_sam3d_ins = time.time()
         source_points, source_colors = load_sam3d_gaussian_ply(sam3d_outputs["ply_path"])
-        viewmat, intrinsics, width, height = self._get_render_projection_params(camera.to(self.device))
         insertion_result: Sam3DInsertionResult = register_and_fuse_sam3d_object(
             source_points=source_points,
             source_colors=source_colors,
             target_points=existing_means_np,
             target_colors=existing_colors_np,
-            render_object_mask=(render_object_mask[..., 0] > 0.5).detach().cpu().numpy(),
-            viewmat=viewmat,
-            intrinsics=intrinsics,
-            width=width,
-            height=height,
             debug_dir=debug_dir,
             output_stem=output_stem,
         )
