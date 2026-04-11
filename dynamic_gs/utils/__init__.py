@@ -5,6 +5,7 @@ from .active_mask import (
     dilate_binary_mask,
     extract_projected_centers_and_radii,
 )
+from .cotracker_motion import CoTrackerMotionEstimate, CoTrackerMotionEstimator
 from .depth_loss import masked_l1_depth_loss
 from .esam import ESAM_NUM_PROMPT_POINTS, build_esam_ti, query_esam_mask
 from .no_refine_strategy import NoRefineStrategy
@@ -41,4 +42,6 @@ __all__ = [
     "load_sam3d_gaussian_ply",
     "register_and_fuse_sam3d_object",
     "save_point_cloud",
+    "CoTrackerMotionEstimate",
+    "CoTrackerMotionEstimator",
 ]

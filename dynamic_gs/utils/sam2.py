@@ -96,6 +96,9 @@ def query_sam2_propagated_mask(
     current_rendered_rgb: torch.Tensor,
     previous_mask: torch.Tensor,
 ) -> torch.Tensor:
+    # SAM2 only produces object_score_logits in eval mode
+    if hasattr(predictor, "eval"):
+        predictor.eval()
     with tempfile.TemporaryDirectory(prefix="dynamic_gs_sam2_") as tmp_dir:
         frame_dir = Path(tmp_dir)
         _save_jpg_frame(previous_rendered_rgb, frame_dir / "0.jpg")

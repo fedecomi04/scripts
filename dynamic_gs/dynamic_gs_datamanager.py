@@ -151,9 +151,11 @@ class DynamicGSDataManager(DataManager):
     def get_num_dynamic_frames(self) -> int:
         return len(self.dynamic_manager.train_dataset)
 
+    def get_dynamic_frame_name(self, frame_idx: int) -> str:
+        return self.dynamic_manager.train_dataset.image_filenames[frame_idx].stem
+
     def get_current_dynamic_frame_name(self) -> str:
-        image_path = self.dynamic_manager.train_dataset.image_filenames[self.current_dynamic_frame_idx]
-        return image_path.stem
+        return self.get_dynamic_frame_name(self.current_dynamic_frame_idx)
 
     def get_dynamic_debug_dir(self) -> Path:
         return Path(self.config.data) / self.config.dynamic_subdir / "render_masks_esam"

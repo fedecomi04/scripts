@@ -11,8 +11,8 @@ from .dynamic_gs_model import DynamicGSModelConfig
 from .dynamic_gs_pipeline import DynamicGSPipelineConfig
 
 STATIC_NUM_STEPS = 1000
-DYNAMIC_STEPS_PER_FRAME = 100
-DEFAULT_MAX_NUM_STEPS = STATIC_NUM_STEPS + DYNAMIC_STEPS_PER_FRAME
+DYNAMIC_STEPS_PER_FRAME = 50   # optimization epochs per dynamic frame
+DEFAULT_MAX_NUM_STEPS = STATIC_NUM_STEPS + DYNAMIC_STEPS_PER_FRAME  # updated at runtime
 
 
 DynamicGS = MethodSpecification(
@@ -32,6 +32,7 @@ DynamicGS = MethodSpecification(
                 camera_optimizer=CameraOptimizerConfig(mode="off"),
                 output_depth_during_training=True,
                 stop_split_at=0,
+                reuse_sam3d_generated_ply=False,
             ),
         ),
         optimizers={
