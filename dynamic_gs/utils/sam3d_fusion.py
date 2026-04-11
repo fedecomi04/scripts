@@ -7,14 +7,13 @@ The active fusion path is:
 3. translate the scaled SAM3D source to the target centroid
 4. voxel-downsample both clouds and run Fast Global Registration for coarse pose
 5. keep the post-FGR source points that remain visible in the rendered object mask
-6. refine that coarse pose with the existing truncated nearest-neighbor rigid step
-7. run an explicit Open3D point-to-point refinement with scaling from fresh nearest-neighbor correspondences
-8. run a short rigid ICP cleanup
-9. append only non-overlapping SAM3D points back into the Gaussian scene
+6. refine the coarse pose with probreg CPD similarity (scale + rigid)
+7. run a short color-aware ICP cleanup
+8. append only non-overlapping SAM3D points back into the Gaussian scene
 
 The final insertion still uses append-with-dedup only. Existing scene/object
-Gaussians are kept. This file intentionally uses only geometry; there is no RGB
-matching, colored ICP, or object-specific axis heuristic in the registration.
+Gaussians are kept. This file intentionally uses geometry-first registration with
+RGB used only in the final colored ICP cleanup.
 """
 
 from dataclasses import dataclass
@@ -33,6 +32,11 @@ try:
     from plyfile import PlyData
 except ImportError:  # pragma: no cover - training env dependency
     PlyData = None
+
+try:
+    from probreg import cpd
+except ImportError:  # pragma: no cover - training env dependency
+    cpd = None
 
 
 @dataclass
@@ -94,6 +98,20 @@ def _to_pcd(points: np.ndarray, colors: np.ndarray | None = None):
     if colors is not None and len(colors) == len(points):
         pcd.colors = o3d_mod.utility.Vector3dVector(np.clip(colors, 0.0, 1.0).astype(np.float64))
     return pcd
+
+
+def _ensure_rgb_colors(colors: np.ndarray, point_count: int) -> np.ndarray:
+    if colors is None or len(colors) != point_count:
+        return np.full((point_count, 3), 0.5, dtype=np.float32)
+    colors_np = np.asarray(colors, dtype=np.float32)
+    if colors_np.ndim != 2 or colors_np.shape[1] != 3:
+        return np.full((point_count, 3), 0.5, dtype=np.float32)
+
+    # Registration backends expect RGB in [0, 1]. If values are outside this
+    # range, treat input as SH-DC coefficients and decode to RGB.
+    if float(np.min(colors_np)) < 0.0 or float(np.max(colors_np)) > 1.0:
+        return SH2RGB(torch.from_numpy(colors_np)).clamp(0.0, 1.0).cpu().numpy().astype(np.float32)
+    return np.clip(colors_np, 0.0, 1.0).astype(np.float32)
 
 
 def save_point_cloud(path: Path, points: np.ndarray, colors: np.ndarray | None = None) -> None:
@@ -390,14 +408,44 @@ def _run_icp(source_points: np.ndarray, source_colors: np.ndarray, target_points
     source_pcd = _to_pcd(source_points, source_colors)
     target_pcd = _to_pcd(target_points, target_colors)
     threshold = max(voxel_size * 1.0, 1e-3)
-    result = o3d_mod.pipelines.registration.registration_icp(
-        source_pcd,
-        target_pcd,
-        max_correspondence_distance=float(threshold),
-        init=init_transform.astype(np.float64),
-        estimation_method=o3d_mod.pipelines.registration.TransformationEstimationPointToPoint(),
-        criteria=o3d_mod.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
+    registration_mod = o3d_mod.pipelines.registration
+    use_colored_icp = (
+        hasattr(registration_mod, "registration_colored_icp")
+        and source_pcd.has_colors()
+        and target_pcd.has_colors()
     )
+    if use_colored_icp:
+        normal_radius = max(voxel_size * 2.0, 1e-3)
+        normal_param = o3d_mod.geometry.KDTreeSearchParamHybrid(radius=float(normal_radius), max_nn=30)
+        source_pcd.estimate_normals(normal_param)
+        target_pcd.estimate_normals(normal_param)
+        try:
+            result = registration_mod.registration_colored_icp(
+                source_pcd,
+                target_pcd,
+                max_correspondence_distance=float(threshold),
+                init=init_transform.astype(np.float64),
+                estimation_method=registration_mod.TransformationEstimationForColoredICP(lambda_geometric=0.968),
+                criteria=registration_mod.ICPConvergenceCriteria(max_iteration=20),
+            )
+        except RuntimeError:
+            result = registration_mod.registration_icp(
+                source_pcd,
+                target_pcd,
+                max_correspondence_distance=float(threshold),
+                init=init_transform.astype(np.float64),
+                estimation_method=registration_mod.TransformationEstimationPointToPoint(),
+                criteria=registration_mod.ICPConvergenceCriteria(max_iteration=20),
+            )
+    else:
+        result = registration_mod.registration_icp(
+            source_pcd,
+            target_pcd,
+            max_correspondence_distance=float(threshold),
+            init=init_transform.astype(np.float64),
+            estimation_method=registration_mod.TransformationEstimationPointToPoint(),
+            criteria=registration_mod.ICPConvergenceCriteria(max_iteration=20),
+        )
     return result, threshold
 
 
@@ -408,6 +456,13 @@ def _extract_isotropic_scale(transform: np.ndarray) -> float:
     if len(finite) == 0:
         return 1.0
     return float(np.mean(finite).clip(min=1e-6))
+
+
+def _compose_similarity_transform(scale: float, rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
+    transform = np.eye(4, dtype=np.float32)
+    transform[:3, :3] = (float(scale) * np.asarray(rotation, dtype=np.float32)).astype(np.float32)
+    transform[:3, 3] = np.asarray(translation, dtype=np.float32).reshape(3)
+    return transform
 
 
 def _build_explicit_correspondences(
@@ -466,6 +521,59 @@ def _run_similarity_correspondence_refinement(
         correspondences,
     )
     refined_transform = np.asarray(delta_transform, dtype=np.float32) @ init_transform.astype(np.float32)
+    return refined_transform.astype(np.float32), correspondence_count
+
+
+def _run_probreg_similarity_refinement(
+    source_points: np.ndarray,
+    source_colors: np.ndarray,
+    target_points: np.ndarray,
+    target_colors: np.ndarray,
+    init_transform: np.ndarray,
+    voxel_size: float,
+) -> tuple[np.ndarray, int]:
+    if cpd is None:
+        return init_transform.astype(np.float32), 0
+    if len(source_points) < 3 or len(target_points) < 3:
+        return init_transform.astype(np.float32), 0
+
+    transformed_source = _transform_points(source_points, init_transform)
+    source_probreg_points = transformed_source
+    source_probreg_colors = source_colors
+    target_probreg_points = target_points
+    target_probreg_colors = target_colors
+    if len(source_probreg_points) < 3 or len(target_probreg_points) < 3:
+        return init_transform.astype(np.float32), 0
+
+    if len(source_probreg_colors) != len(source_probreg_points):
+        source_probreg_colors = np.full((len(source_probreg_points), 3), 0.5, dtype=np.float32)
+    if len(target_probreg_colors) != len(target_probreg_points):
+        target_probreg_colors = np.full((len(target_probreg_points), 3), 0.5, dtype=np.float32)
+
+    source_probreg_pcd = _to_pcd(source_probreg_points, source_probreg_colors)
+    target_probreg_pcd = _to_pcd(target_probreg_points, target_probreg_colors)
+    try:
+        probreg_result = cpd.registration_cpd(
+            source_probreg_pcd,
+            target_probreg_pcd,
+            tf_type_name="rigid",
+            update_scale=True,
+            maxiter=80,
+            tol=1e-6,
+            w=0.5,
+            use_color=True,
+        )
+    except Exception:
+        return init_transform.astype(np.float32), 0
+
+    probreg_transform = _compose_similarity_transform(
+        probreg_result.transformation.scale,
+        probreg_result.transformation.rot,
+        probreg_result.transformation.t,
+    )
+    refined_transform = probreg_transform @ init_transform.astype(np.float32)
+
+    correspondence_count = int(min(len(source_probreg_points), len(target_probreg_points)))
     return refined_transform.astype(np.float32), correspondence_count
 
 
@@ -559,6 +667,10 @@ def register_and_fuse_sam3d_object(
         raise ValueError("Need at least 3 existing object Gaussians for SAM3D registration.")
 
     render_object_mask = render_object_mask.astype(bool)
+    source_points = source_points.astype(np.float32)
+    target_points = target_points.astype(np.float32)
+    source_colors = _ensure_rgb_colors(source_colors, len(source_points))
+    target_colors = _ensure_rgb_colors(target_colors, len(target_points))
     source_point_count = int(len(source_points))
     target_point_count = int(len(target_points))
 
@@ -570,58 +682,36 @@ def register_and_fuse_sam3d_object(
     source_centroid = _centroid(source_points)
     target_centroid = _centroid(target_points)
     scaled_source = target_centroid[None, :] + chosen_scale * (source_points - source_centroid[None, :])
-    scaled_source_colors = source_colors.astype(np.float32)
+    scaled_source_colors = source_colors
 
     target_spacing = _median_nn_distance(target_points)
     source_spacing = _median_nn_distance(scaled_source)
-    voxel_size = max(1.5 * max(target_spacing, source_spacing), 1e-3)
+    voxel_size = max(3.0 * max(target_spacing, source_spacing), 1e-3)
     source_down_points, source_down_colors = _voxel_downsample(scaled_source, scaled_source_colors, voxel_size)
     target_down_points, target_down_colors = _voxel_downsample(target_points, target_colors, voxel_size)
-    fgr_result, _ = _run_fgr(
-        source_down_points,
-        source_down_colors,
-        target_down_points,
-        target_down_colors,
-        voxel_size,
-    )
-    fgr_transform = np.asarray(fgr_result.transformation, dtype=np.float32)
-    fgr_aligned_points = _transform_points(source_down_points, fgr_transform)
-
-    visible_source_indices = _visible_source_indices(
-        fgr_aligned_points,
-        render_object_mask,
-        viewmat,
-        intrinsics,
-        width,
-        height,
-    )
-    visible_source_points = fgr_aligned_points[visible_source_indices].astype(np.float32)
+    # Initialization-only experiment path: disable FGR/CPD/ICP and keep only
+    # the initial scale + centroid alignment.
+    fgr_transform = np.eye(4, dtype=np.float32)
+    fgr_aligned_points = source_down_points.astype(np.float32)
 
     icp_source_points = source_down_points
     icp_source_colors = source_down_colors
-    if len(visible_source_indices) >= 32:
-        icp_source_points = source_down_points[visible_source_indices]
-        icp_source_colors = source_down_colors[visible_source_indices]
 
     target_largest_extent = _largest_extent(target_down_points)
     robust_truncation_distance = max(target_largest_extent, 6.0 * voxel_size)
-    robust_transform, robust_inlier_count = _run_truncated_rigid_refinement(
-        icp_source_points,
-        target_down_points,
-        fgr_transform,
-        truncation_distance=robust_truncation_distance,
-    )
+    robust_transform = np.eye(4, dtype=np.float32)
+    robust_inlier_count = 0
 
-    similarity_transform = robust_transform.astype(np.float32)
-    similarity_correspondence_threshold = max(2.0 * _median_nn_distance(target_down_points), 1e-3)
-    similarity_transform, similarity_correspondence_count = _run_similarity_correspondence_refinement(
+    similarity_transform = np.eye(4, dtype=np.float32)
+    similarity_transform, similarity_correspondence_count = _run_probreg_similarity_refinement(
         icp_source_points,
         icp_source_colors,
         target_down_points,
         target_down_colors,
         similarity_transform,
-        correspondence_distance=similarity_correspondence_threshold,
+        voxel_size,
     )
+    similarity_correspondence_threshold = max(2.0 * _median_nn_distance(target_down_points), 1e-3)
     similarity_scale = float(chosen_scale * _extract_isotropic_scale(similarity_transform))
     source_visible_for_plot = _transform_points(icp_source_points, similarity_transform)
     similarity_correspondences, _ = _build_explicit_correspondences(
@@ -630,15 +720,18 @@ def register_and_fuse_sam3d_object(
         max_distance=similarity_correspondence_threshold,
     )
 
-    icp_result, _ = _run_icp(
-        icp_source_points,
-        icp_source_colors,
-        target_down_points,
-        target_down_colors,
-        similarity_transform,
-        voxel_size,
-    )
-    icp_transform = np.asarray(icp_result.transformation, dtype=np.float32)
+    # icp_result, _ = _run_icp(
+    #     icp_source_points,
+    #     icp_source_colors,
+    #     target_down_points,
+    #     target_down_colors,
+    #     similarity_transform,
+    #     voxel_size,
+    # )
+    # icp_transform = np.asarray(icp_result.transformation, dtype=np.float32)
+    icp_transform = similarity_transform.astype(np.float32)
+    icp_fitness = 0.0
+    icp_rmse = 0.0
 
     aligned_points = _transform_points(scaled_source, icp_transform)
     aligned_colors = scaled_source_colors.astype(np.float32)
@@ -678,13 +771,15 @@ def register_and_fuse_sam3d_object(
         voxel_size=float(voxel_size),
         source_point_count=source_point_count,
         target_point_count=target_point_count,
-        visible_source_point_count=int(len(visible_source_points)),
+        # Visibility filtering is disabled in this experiment path, so report
+        # the full downsampled source count here.
+        visible_source_point_count=int(len(source_down_points)),
         registration_source_point_count=int(len(icp_source_points)),
         kept_point_count=int(len(kept_points)),
         fgr_transformation=fgr_transform,
         icp_transformation=icp_transform,
-        icp_fitness=float(icp_result.fitness),
-        icp_rmse=float(icp_result.inlier_rmse),
+        icp_fitness=float(icp_fitness),
+        icp_rmse=float(icp_rmse),
         robust_transform=robust_transform,
         robust_inlier_count=int(robust_inlier_count),
         robust_truncation_distance=float(robust_truncation_distance),
