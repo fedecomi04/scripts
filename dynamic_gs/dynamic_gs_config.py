@@ -11,7 +11,7 @@ from .dynamic_gs_model import DynamicGSModelConfig
 from .dynamic_gs_pipeline import DynamicGSPipelineConfig
 from .dynamic_gs_trainer import NoSaveTrainer
 
-STATIC_NUM_STEPS = 1000
+STATIC_NUM_STEPS = 6000
 DYNAMIC_STEPS_PER_FRAME = 50   # optimization epochs per dynamic frame
 DEFAULT_MAX_NUM_STEPS = STATIC_NUM_STEPS + DYNAMIC_STEPS_PER_FRAME  # updated at runtime
 

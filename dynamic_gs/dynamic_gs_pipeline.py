@@ -31,7 +31,7 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     datamanager: DynamicGSDataManagerConfig = field(default_factory=DynamicGSDataManagerConfig)
     model: DynamicGSModelConfig = field(default_factory=DynamicGSModelConfig)
 
-    static_num_steps: int = 100
+    static_num_steps: int = 3000
     dynamic_steps_per_frame: int = 300
 class DynamicGSPipeline(VanillaPipeline):
     config: DynamicGSPipelineConfig
@@ -120,7 +120,7 @@ class DynamicGSPipeline(VanillaPipeline):
                 f"inliers={motion_estimate.inlier_count}"
             )
             return
-        moved_count = self.model.apply_rigid_object_transform(
+        moved_count = self.model.apply_rigid_object_transform_from_reference(
             motion_estimate.rotation, motion_estimate.translation,
         )
         CONSOLE.log(
@@ -146,7 +146,7 @@ class DynamicGSPipeline(VanillaPipeline):
         seeded = self._cotracker_motion.initialize(
             rgb=rs00_rgb, depth=rs00_depth, camera=camera, mask=mask,
         )
-        CONSOLE.log(f"[dynamic-gs] CoTracker seed on RS00 -> tracks={seeded}, ready={self._cotracker_motion.ready}")
+        CONSOLE.log(f"[dynamic-gs] CoTracker reference seed on D0 -> tracks={seeded}, ready={self._cotracker_motion.ready}")
 
     # ---- Image helpers ----
 
@@ -384,10 +384,11 @@ class DynamicGSPipeline(VanillaPipeline):
         self._live_tracker_seeded = True
         self._timing["D0.5_seed_live_tracker"].append(time.time() - t0)
 
-        # --- TIMING: D0.6 CoTracker init (load model, sample seed points from f0_live on D0 live image) ---
+        # --- TIMING: D0.6 CoTracker init (freeze D0 as reference, sample points once, backproject reference 3D once) ---
         t0 = time.time()
         live_rgb_fullres = self.model.get_live_rgb(batch, apply_training_downscale=False)
         self._initialize_cotracker(live_rgb_fullres, batch["depth_image"], camera, f0_live)
+        self.model.capture_reference_object_pose()
         self._timing["D0.6_cotracker_init"].append(time.time() - t0)
 
         f0_live_resized = self._resize_mask_to(
@@ -445,13 +446,12 @@ class DynamicGSPipeline(VanillaPipeline):
         )
 
     def _prepare_frame_n(self, camera, batch, live_rgb, gt_rgb, gt_depth, gripper_mask, frame_name, debug_dir):
-        """Frame N>=1: live SAM2 → CoTracker → rigid transform → render → rendered obj mask → CDN."""
+        """Frame N>=1: live SAM2 → reference-frame CoTracker → absolute rigid transform → render → rendered obj mask → CDN."""
         t_total = time.time()
 
         # --- TIMING: DN.1 SAM2 live mask propagation (propagate object mask D(N-1) → DN on live images) ---
         t0 = time.time()
         fdn_live = None
-        prev_live_mask = self._live_tracker_mask.detach().clone() if self._live_tracker_mask is not None else None
         if self._live_tracker_seeded:
             fdn_live = query_sam2_propagated_mask(
                 self.model._get_sam2_video_predictor(),
@@ -463,24 +463,18 @@ class DynamicGSPipeline(VanillaPipeline):
             self._live_tracker_mask = fdn_live.detach().clone()
         self._timing["DN.1_sam2_live_propagation"].append(time.time() - t0)
 
-        # --- TIMING: DN.2 CoTracker reseed (run FAST on previous-frame object mask before tracking) ---
+        # --- TIMING: DN.2 CoTracker reference mode (no reseed; keep D0 query points fixed) ---
         if self._sam3d_inserted:
             t0 = time.time()
-            if prev_live_mask is not None and self._cotracker_motion is not None:
-                self._cotracker_motion.replace_tracking_points(prev_live_mask)
             self._timing["DN.2_cotracker_refresh"].append(time.time() - t0)
 
-            # --- TIMING: DN.3 CoTracker advance + rigid transform (track, filter by current mask, RANSAC, apply SE(3)) ---
+            # --- TIMING: DN.3 CoTracker absolute rigid transform (reference D0 -> DN, current-mask filter, RANSAC, apply absolute SE(3)) ---
             t0 = time.time()
             self._apply_cotracker_motion(camera, batch, current_mask=fdn_live)
             self._timing["DN.3_cotracker_advance"].append(time.time() - t0)
 
-            # --- TIMING: DN.4 CoTracker filter by mask (extra cleanup outside SAM2 object mask) ---
+            # --- TIMING: DN.4 CoTracker post-filter skipped (reference queries stay fixed) ---
             t0 = time.time()
-            if fdn_live is not None and self._cotracker_motion is not None:
-                removed = self._cotracker_motion.filter_points_by_mask(fdn_live)
-                if removed > 0:
-                    CONSOLE.log(f"[dynamic-gs] CoTracker: filtered {removed} points outside object mask")
             self._timing["DN.4_cotracker_filter"].append(time.time() - t0)
 
         # --- TIMING: DN.5 Render RDN (render full scene after rigid transform applied to object Gaussians) ---
@@ -638,16 +632,16 @@ class DynamicGSPipeline(VanillaPipeline):
             ("D0.3_sam3d_insertion", "SAM3D object insertion (CPD similarity + dedup + insert Gaussians)"),
             ("D0.4_render_object_mask", "Render object mask (rasterize object_flags Gaussians from simulation)"),
             ("D0.5_seed_live_tracker", "Seed live SAM2 tracker (store D0 live RGB + mask)"),
-            ("D0.6_cotracker_init", "CoTracker initialization (load model, sample seed points from f0_live on D0)"),
+            ("D0.6_cotracker_init", "CoTracker initialization (freeze D0 reference frame, sample points once, cache reference 3D)"),
             ("D0.7_render_rs00", "Render RS00 (re-render scene after SAM3D insertion)"),
             ("D0.8_change_mask_cd0", "Change mask CD0 (MSSIM RS00 vs D0, excluding gripper + object)"),
             ("D0.9_debug_images", "Debug images (save overlay PNGs to disk)"),
         ]
         dn_keys = [
             ("DN.1_sam2_live_propagation", "SAM2 live mask propagation (D(N-1) -> DN on live images)"),
-            ("DN.2_cotracker_refresh", "CoTracker refresh tracking points (fill gaps from SAM2 mask)"),
-            ("DN.3_cotracker_advance", "CoTracker advance + rigid transform (2-frame track, RANSAC, apply SE(3))"),
-            ("DN.4_cotracker_filter", "CoTracker filter by mask (remove drifted points outside object mask)"),
+            ("DN.2_cotracker_refresh", "CoTracker reference mode (no reseed; D0 query points stay fixed)"),
+            ("DN.3_cotracker_advance", "CoTracker absolute rigid transform (D0 -> DN, RANSAC, apply absolute SE(3))"),
+            ("DN.4_cotracker_filter", "CoTracker post-filter skipped in reference mode"),
             ("DN.5_render_rdn", "Render RDN (render scene after rigid transform)"),
             ("DN.6_render_object_mask", "Render object mask (rasterize object_flags Gaussians from simulation)"),
             ("DN.7_change_mask_cdn", "Change mask CDN (MSSIM RDN vs DN, excluding gripper + union object mask)"),

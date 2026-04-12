@@ -62,6 +62,8 @@ class CoTrackerMotionEstimator:
         self._previous_depth: Optional[np.ndarray] = None
         self._previous_intrinsics: Optional[np.ndarray] = None
         self._previous_camera_to_world: Optional[np.ndarray] = None
+        self._reference_mask: Optional[Tensor] = None
+        self._reference_world_points: Optional[np.ndarray] = None
         self._current_points_xy: Optional[np.ndarray] = None
 
     @property
@@ -71,6 +73,7 @@ class CoTrackerMotionEstimator:
             and self._previous_depth is not None
             and self._previous_intrinsics is not None
             and self._previous_camera_to_world is not None
+            and self._reference_world_points is not None
             and self._current_points_xy is not None
             and len(self._current_points_xy) >= self.min_track_points
         )
@@ -86,6 +89,7 @@ class CoTrackerMotionEstimator:
         self._previous_depth = self._prepare_depth_image(depth)
         self._previous_intrinsics = self._extract_intrinsics(camera)
         self._previous_camera_to_world = self._extract_camera_to_world(camera)
+        self._reference_mask = self._resize_mask(mask, self._previous_rgb.shape[:2]).detach().clone()
         if self._previous_depth.shape != self._previous_rgb.shape[:2]:
             raise RuntimeError(
                 "CoTracker initialization requires RGB and depth at the same resolution, "
@@ -97,22 +101,22 @@ class CoTrackerMotionEstimator:
             rgb=self._previous_rgb,
             output_shape=self._previous_rgb.shape[:2],
         )
-        self._current_points_xy = sampled_points
-        return int(len(sampled_points))
+        reference_depth_values, reference_depth_valid = self._sample_depth_bilinear(self._previous_depth, sampled_points)
+        sampled_points = sampled_points[reference_depth_valid]
+        reference_depth_values = reference_depth_values[reference_depth_valid]
+        self._current_points_xy = sampled_points.astype(np.float32)
+        self._reference_world_points = self._backproject_to_world(
+            self._current_points_xy,
+            reference_depth_values,
+            self._previous_intrinsics,
+            self._previous_camera_to_world,
+        )
+        return int(len(self._current_points_xy))
 
     def replace_tracking_points(self, mask: Tensor) -> int:
-        """Replace all tracking points with fresh samples from the given mask."""
-        output_shape = self._previous_rgb.shape[:2] if self._previous_rgb is not None else None
-        candidates = self._sample_mask_points(
-            mask,
-            max_points=self.query_point_count,
-            rgb=self._previous_rgb,
-            output_shape=output_shape,
-        )
-        if len(candidates) == 0:
-            return 0
-        self._current_points_xy = candidates.astype(np.float32)
-        return int(len(candidates))
+        """Reference-query mode keeps the original sampled points fixed."""
+        del mask
+        return 0
 
     def filter_points_by_mask(self, mask: Tensor) -> int:
         """Remove tracked points that fall outside the given mask. Returns count removed."""
@@ -145,42 +149,8 @@ class CoTrackerMotionEstimator:
         return removed
 
     def refresh_tracking_points(self, mask: Tensor) -> int:
-        if self._current_points_xy is None:
-            self._current_points_xy = np.zeros((0, 2), dtype=np.float32)
-        remaining = self.query_point_count - len(self._current_points_xy)
-        if remaining <= 0:
-            return 0
-
-        output_shape = self._previous_rgb.shape[:2] if self._previous_rgb is not None else None
-        candidates = self._sample_mask_points(
-            mask,
-            max_points=max(self.query_point_count * 2, remaining),
-            rgb=self._previous_rgb,
-            output_shape=output_shape,
-        )
-        if len(candidates) == 0:
-            return 0
-
-        existing = self._current_points_xy
-        keep: list[np.ndarray] = []
-        min_distance_sq = max(self.point_refresh_min_distance, 0.0) ** 2
-        for candidate in candidates:
-            if len(keep) >= remaining:
-                break
-            if len(existing) > 0:
-                existing_dist_sq = np.sum((existing - candidate[None, :]) ** 2, axis=1)
-                if np.any(existing_dist_sq < min_distance_sq):
-                    continue
-            if keep:
-                keep_dist_sq = np.sum((np.stack(keep, axis=0) - candidate[None, :]) ** 2, axis=1)
-                if np.any(keep_dist_sq < min_distance_sq):
-                    continue
-            keep.append(candidate.astype(np.float32))
-
-        if not keep:
-            return 0
-        self._current_points_xy = np.concatenate([self._current_points_xy, np.stack(keep, axis=0)], axis=0)
-        return int(len(keep))
+        del mask
+        return 0
 
     def estimate_and_advance(
         self,
@@ -204,7 +174,6 @@ class CoTrackerMotionEstimator:
             )
 
         if not self.ready:
-            self._advance_state(current_rgb_prepared, current_depth_prepared, current_intrinsics, current_camera_to_world)
             return CoTrackerMotionEstimate(
                 success=False,
                 rotation=identity,
@@ -251,16 +220,10 @@ class CoTrackerMotionEstimator:
             )
 
         correspondence_mask = visibility_now.copy()
-        previous_depth_values, previous_depth_valid = self._sample_depth_bilinear(self._previous_depth, self._current_points_xy)
         current_depth_values, current_depth_valid = self._sample_depth_bilinear(current_depth_prepared, current_points_xy)
-        correspondence_mask &= previous_depth_valid & current_depth_valid
+        correspondence_mask &= current_depth_valid
 
-        prev_world = self._backproject_to_world(
-            self._current_points_xy[correspondence_mask],
-            previous_depth_values[correspondence_mask],
-            self._previous_intrinsics,
-            self._previous_camera_to_world,
-        )
+        prev_world = self._reference_world_points[correspondence_mask]
         curr_world = self._backproject_to_world(
             current_points_xy[correspondence_mask],
             current_depth_values[correspondence_mask],
@@ -274,6 +237,7 @@ class CoTrackerMotionEstimator:
         inlier_count = 0
         mean_residual = float("inf")
         median_residual = float("inf")
+        track_count_after = int(correspondence_mask.sum())
         tracked_inlier_mask = np.zeros((len(current_points_xy),), dtype=bool)
 
         if len(prev_world) >= self.min_track_points and len(curr_world) >= self.min_track_points:
@@ -294,21 +258,8 @@ class CoTrackerMotionEstimator:
                 success = inlier_count >= self.min_track_points
                 tracked_indices = np.nonzero(correspondence_mask)[0]
                 tracked_inlier_mask[tracked_indices[inlier_mask]] = True
-
                 if success:
-                    next_points = current_points_xy[tracked_inlier_mask]
-                    if len(next_points) >= self.min_track_points:
-                        self._current_points_xy = next_points.astype(np.float32)
-                    else:
-                        self._current_points_xy = current_points_xy[visibility_now].astype(np.float32)
-                else:
-                    self._current_points_xy = current_points_xy[visibility_now].astype(np.float32)
-            else:
-                self._current_points_xy = current_points_xy[visibility_now].astype(np.float32)
-        else:
-            self._current_points_xy = current_points_xy[visibility_now].astype(np.float32)
-
-        self._advance_state(current_rgb_prepared, current_depth_prepared, current_intrinsics, current_camera_to_world)
+                    track_count_after = inlier_count
 
         return CoTrackerMotionEstimate(
             success=success,
@@ -317,7 +268,7 @@ class CoTrackerMotionEstimator:
             correspondence_count=int(correspondence_mask.sum()),
             inlier_count=inlier_count,
             track_count_before=track_count_before,
-            track_count_after=self.current_track_count,
+            track_count_after=track_count_after,
             mean_residual=mean_residual,
             median_residual=median_residual,
             previous_points_xy=debug_prev_points,

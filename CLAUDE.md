@@ -419,6 +419,26 @@ python scripts/save_data_img_depth_mask_pose.py    # Collects RGB, depth, grippe
 python scripts/joint_state_merger.py               # Merges robot + gripper joint states
 ```
 
+Mask generation note:
+- The saved per-frame dataset masks live under `dynamic_scene/masks/` and are written by `RobotModelMaskSaver.save_mask(...)`.
+- To keep the background, `save_mask(...)` must use `keep_mask = robot_exclusion_mask` and must not combine it with `background_keep_mask` / `background_black_mask`.
+- To remove the background, restore the combination with `cv2.bitwise_and(robot_exclusion_mask, background_keep_mask)` or `cv2.bitwise_and(robot_black_mask, background_black_mask)`.
+- There are multiple mask saver variants in this repo:
+  - `scripts/save_data_img_depth_mask_pose.py`
+  - `scripts/old/save_dynaarm_camera1_rgb_tf_current.py`
+  - `scripts/old/ros1_robot_mask_saver_stl.py`
+  - `scripts/old/ros1_robot_mask_saver_stl_tfdata.py`
+- If the background still looks masked after code changes, the usual reason is that the masks were generated earlier. In that case, regenerate the dataset masks; changing the script alone does not modify existing `.png` masks already on disk.
+
+Simulator background note:
+- For dynamic-gs / Splatfacto, the correct place to set the Gazebo background is the model render background, not the dataparser `mask_color`.
+- `mask_color` rewrites masked input pixels in the dataset loader and can make the training images look wrong.
+- The correct implementation is in `DynamicGSModel.populate_modules()`: call `self.set_background(torch.tensor((0.86, 0.92, 1.0), ...))` and override `_get_background_color()` to return that fixed color.
+- The Nerfstudio viewer also overrides Splatfacto background from the viewer control panel on every render (`viewer/render_state_machine.py`), so the viewer default background must also be set to the Gazebo color. In this repo that default now lives in:
+  - `nerfstudio/nerfstudio/viewer/control_panel.py`
+  - `nerfstudio/nerfstudio/viewer_legacy/server/control_panel.py`
+- Keep the `NoRefineStrategy`, `strategy_state`, means-grad hook, and `_apply_phase_trainability()` inside `populate_modules()`. Accidentally moving them below `_get_background_color()` makes them unreachable and can severely slow or break the dynamic transition.
+
 ### Output Structure
 
 ```

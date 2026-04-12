@@ -5,7 +5,7 @@ import gc
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Literal, Type, Union
+from typing import Dict, Literal, Tuple, Type, Union
 
 import numpy as np
 import torch
@@ -51,6 +51,9 @@ except ImportError as exc:  # pragma: no cover - import-time dependency guard
 class DynamicGSModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: DynamicGSModel)
 
+    use_simulator_background: bool = True
+    simulator_background_rgb: Tuple[float, float, float] = (0.86, 0.92, 1.0)
+
     depth_lambda: float = 0.4
     active_mask_dilate_radius: int = 0
     output_depth_during_training: bool = True
@@ -95,6 +98,8 @@ class DynamicGSModel(SplatfactoModel):
         self._sam2_video_predictor = None
         self._reference_flagged_indices = None
         self._reference_flagged_means = None
+        self._reference_object_means = None
+        self._reference_object_quats = None
         self._optimizers_wrapper = None
         self._persistent_object_membership_ready = False
         self._scene_opt_hooks = []
@@ -140,6 +145,10 @@ class DynamicGSModel(SplatfactoModel):
 
     def populate_modules(self):
         super().populate_modules()
+        if self.config.use_simulator_background:
+            self.set_background(
+                torch.tensor(self.config.simulator_background_rgb, device=self.means.device, dtype=torch.float32)
+            )
         num_points = self.num_points
         self.register_buffer(
             "object_flags",
@@ -165,6 +174,11 @@ class DynamicGSModel(SplatfactoModel):
         self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
         self.gauss_params["means"].register_hook(self._mask_means_grad)
         self._apply_phase_trainability()
+
+    def _get_background_color(self):
+        if self.config.use_simulator_background:
+            return self.background_color.to(self.means.device)
+        return super()._get_background_color()
 
     def step_cb(self, optimizers, step):
         super().step_cb(optimizers, step)
@@ -385,6 +399,42 @@ class DynamicGSModel(SplatfactoModel):
         self.gauss_params["quats"][object_mask] = transformed_quats
         return object_count
 
+    @torch.no_grad()
+    def capture_reference_object_pose(self) -> int:
+        object_mask = self.object_flags.squeeze(-1) > 0.5
+        object_count = int(object_mask.sum().item())
+        if object_count == 0:
+            self._reference_object_means = None
+            self._reference_object_quats = None
+            return 0
+        self._reference_object_means = self.means[object_mask].detach().clone()
+        self._reference_object_quats = self.quats[object_mask].detach().clone()
+        return object_count
+
+    @torch.no_grad()
+    def apply_rigid_object_transform_from_reference(self, rotation, translation) -> int:
+        object_mask = self.object_flags.squeeze(-1) > 0.5
+        object_count = int(object_mask.sum().item())
+        if object_count == 0:
+            return 0
+        if self._reference_object_means is None or self._reference_object_quats is None:
+            return 0
+        if self._reference_object_means.shape[0] != object_count or self._reference_object_quats.shape[0] != object_count:
+            CONSOLE.log("[dynamic-gs] reference object pose count mismatch; skipping absolute rigid transform.")
+            return 0
+        rotation_tensor = torch.as_tensor(rotation, device=self.means.device, dtype=self.means.dtype).reshape(3, 3)
+        translation_tensor = torch.as_tensor(translation, device=self.means.device, dtype=self.means.dtype).reshape(3)
+        if not torch.isfinite(rotation_tensor).all() or not torch.isfinite(translation_tensor).all():
+            return 0
+        transformed_means = self._reference_object_means @ rotation_tensor.transpose(0, 1) + translation_tensor[None, :]
+        delta_quat = self._rotation_matrix_to_quaternion(rotation_tensor).expand(object_count, -1)
+        transformed_quats = self._normalize_quaternions(
+            self._quaternion_multiply(delta_quat, self._reference_object_quats)
+        )
+        self.gauss_params["means"][object_mask] = transformed_means
+        self.gauss_params["quats"][object_mask] = transformed_quats
+        return object_count
+
     def _has_persistent_object_membership(self) -> bool:
         if self._persistent_object_membership_ready:
             return True
@@ -401,6 +451,8 @@ class DynamicGSModel(SplatfactoModel):
         self._dynamic_ready = False
         self._reference_flagged_indices = None
         self._reference_flagged_means = None
+        self._reference_object_means = None
+        self._reference_object_quats = None
         self._grad2d_accum = None
         self._grad2d_count = None
         self._opt_step = 0

@@ -813,12 +813,14 @@ class RobotMaskSaver:
                 robot_pixels,
             )
 
-        background_black_mask = self._compute_background_black_mask(seq)
-        if background_black_mask is None:
-            background_black_mask = np.full(robot_black_mask.shape, 255, dtype=np.uint8)
-            mask = robot_black_mask
-        else:
-            mask = cv2.bitwise_and(robot_black_mask, background_black_mask)
+        # Background masking disabled: keep the full background and only exclude the robot.
+        # background_black_mask = self._compute_background_black_mask(seq)
+        # if background_black_mask is None:
+        #     background_black_mask = np.full(robot_black_mask.shape, 255, dtype=np.uint8)
+        #     mask = robot_black_mask
+        # else:
+        #     mask = cv2.bitwise_and(robot_black_mask, background_black_mask)
+        mask = robot_black_mask
 
         mask_path = self._mask_path_for_seq(seq)
         if not cv2.imwrite(str(mask_path), mask):
