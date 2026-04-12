@@ -31,7 +31,7 @@ DynamicGS = MethodSpecification(
             dynamic_steps_per_frame=DYNAMIC_STEPS_PER_FRAME,
             datamanager=DynamicGSDataManagerConfig(),
             model=DynamicGSModelConfig(
-                camera_optimizer=CameraOptimizerConfig(mode="off"),
+                camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),
                 output_depth_during_training=True,
                 stop_split_at=0,
                 reuse_sam3d_generated_ply=True,
@@ -60,6 +60,10 @@ DynamicGS = MethodSpecification(
             },
             "quats": {
                 "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
+                "scheduler": None,
+            },
+            "camera_opt": {
+                "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
                 "scheduler": None,
             },
         },

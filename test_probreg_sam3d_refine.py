@@ -2,8 +2,8 @@
 """Standalone probreg refinement test on saved SAM3D registration clouds.
 
 This script does not touch dynamic-gs training code. It reuses the saved
-arm_05460 fusion artifacts, starts from the saved FGR transform, and runs
-probreg rigid CPD with scale update enabled as an offline refinement test.
+arm_05460 fusion artifacts, starts from the saved similarity transform, and
+runs probreg rigid CPD with scale update enabled as an offline refinement test.
 
 Outputs are saved next to the existing SAM3D debug artifacts.
 """
@@ -106,12 +106,12 @@ def main() -> None:
 
     source_ref_path = Path(values["source_reg_ref_ply"])
     target_ref_path = Path(values["target_reg_ref_ply"])
-    fgr_transform = np.asarray(ast.literal_eval(values["fgr_transformation"]), dtype=np.float32)
+    initial_similarity_transform = np.asarray(ast.literal_eval(values["similarity_transform"]), dtype=np.float32)
     voxel_size = float(values["voxel_size"])
 
     source_ref = _load_points(source_ref_path)
     target_ref = _load_points(target_ref_path)
-    source_init = _transform_points(source_ref, fgr_transform)
+    source_init = _transform_points(source_ref, initial_similarity_transform)
 
     probreg_voxel = max(2.0 * voxel_size, 1e-3)
     source_probreg = _voxel_downsample(source_init, probreg_voxel)
@@ -135,7 +135,7 @@ def main() -> None:
         probreg_tf.scale,
         probreg_tf.rot,
         probreg_tf.t,
-    ) @ fgr_transform
+    ) @ initial_similarity_transform
 
     before_mean, before_median = _nn_stats(source_init, target_ref)
     after_mean, after_median = _nn_stats(refined_full, target_ref)
@@ -156,7 +156,15 @@ def main() -> None:
     fig = plt.figure(figsize=(16, 8))
     ax0 = fig.add_subplot(121, projection="3d")
     ax0.scatter(target_plot[:, 0], target_plot[:, 1], target_plot[:, 2], s=2.0, c="royalblue", alpha=0.7, label="target")
-    ax0.scatter(source_plot[:, 0], source_plot[:, 1], source_plot[:, 2], s=1.0, c="crimson", alpha=0.45, label="source after FGR")
+    ax0.scatter(
+        source_plot[:, 0],
+        source_plot[:, 1],
+        source_plot[:, 2],
+        s=1.0,
+        c="crimson",
+        alpha=0.45,
+        label="source after initial alignment",
+    )
     _set_equal_axes(ax0, all_points)
     ax0.set_title(f"Before probreg\nmean={before_mean:.6f}, median={before_median:.6f}")
     ax0.legend(loc="upper right")
@@ -186,7 +194,7 @@ def main() -> None:
                 f"probreg_voxel: {probreg_voxel}",
                 f"source_probreg_count: {len(source_probreg)}",
                 f"target_probreg_count: {len(target_probreg)}",
-                f"initial_fgr_transform: {fgr_transform.tolist()}",
+                f"initial_similarity_transform: {initial_similarity_transform.tolist()}",
                 f"probreg_scale: {float(probreg_tf.scale)}",
                 f"probreg_rotation: {np.asarray(probreg_tf.rot).tolist()}",
                 f"probreg_translation: {np.asarray(probreg_tf.t).tolist()}",

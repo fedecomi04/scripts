@@ -36,7 +36,7 @@ python scripts/test_sam3d_single_object.py
 # Test ESAM interactive mask queries
 python scripts/test_esam_from_change_mask.py
 
-# Test PROBREG/ICP point cloud registration
+# Test SAM3D fusion alignment
 python scripts/test_probreg_sam3d_refine.py
 
 # Visualize SAM3D outputs
@@ -81,7 +81,7 @@ DynamicGSModel          (dynamic_gs_model.py)
      - change_mask_image: (H,W,1) non-persistent buffer — current frame's CDN mask
      - _mask_means_grad: backward hook filtering means gradients
      - apply_rigid_object_transform: rotates+translates means+quats for object Gaussians
-     - insert_sam3d_object: FGR→PROBREG→ICP registration + Gaussian insertion
+     - insert_sam3d_object: bbox scale + CPD similarity registration + Gaussian insertion
      - prepare_dynamic_update: ESAM interactive segmentation + change mask + flag Gaussians
      - render_object_mask: rasterize only object Gaussians using gsplat rasterization
      - refresh_dynamic_state_after_insertion: re-flags Gaussians after SAM3D insertion
@@ -113,7 +113,7 @@ DynamicGSDataManager    (dynamic_gs_datamanager.py)
 | `active_mask.py` | Change detection from RGB/depth deltas; MSSIM-based `build_change_mask`; morphological filtering |
 | `cotracker_motion.py` | `CoTrackerMotionEstimator`: pairwise CoTracker3 tracking + RANSAC rigid transform; `refresh_tracking_points` fills coverage gaps from SAM2 mask; `filter_points_by_mask` removes drift |
 | `sam3d.py` | SAM3D subprocess invocation (`run_sam3d_single_object_subprocess`); output path management; PLY loading |
-| `sam3d_fusion.py` | Point cloud registration (FGR → PROBREG → ICP); Gaussian insertion and deduplication via `register_and_fuse_sam3d_object` |
+| `sam3d_fusion.py` | Point cloud registration via bbox scale + centroid alignment + voxel downsampling + probreg CPD similarity; Gaussian insertion and deduplication via `register_and_fuse_sam3d_object` |
 | `sam2.py` | SAM2 video predictor (`build_sam2_tiny_video_predictor`); `query_sam2_propagated_mask` for pairwise frame-to-frame mask propagation |
 | `esam.py` | ESAM interactive object mask query (`query_esam_mask`); `build_esam_ti` model builder |
 | `depth_loss.py` | `masked_l1_depth_loss`: per-pixel L1 depth loss masked to valid regions |
@@ -200,7 +200,7 @@ LR is zeroed (not disabled) for inactive groups. When transitioning to the dynam
 
 1. Saves the rendered RGB and live object mask to disk (required as SAM3D inputs).
 2. Calls `run_sam3d_single_object_subprocess` — launches a separate Python process running SAM3D (`sam-3d-objects`) which generates a Gaussian `.ply` file.
-3. `register_and_fuse_sam3d_object` loads the PLY, applies FGR → PROBREG → ICP registration to align the generated point cloud with the existing scene depth, then appends the new Gaussians to the existing set.
+3. `register_and_fuse_sam3d_object` loads the PLY, then aligns it with the existing object cloud using bbox scale + centroid alignment + voxel downsampling + probreg CPD similarity, and appends only non-overlapping Gaussians to the existing set.
 4. `refresh_dynamic_state_after_insertion` re-runs Gaussian flagging to label the newly inserted points as object members.
 
 Key parameters: `reuse_sam3d_generated_ply=True` (default) skips the subprocess if a PLY already exists from a previous run. Set to `False` when you need fresh generation (e.g., for accurate timing measurements or after changing the object).
@@ -300,9 +300,9 @@ From an initial SfM pointcloud, optimize all Gaussian parameters except `means` 
 - Subprocess: launch `sam-3d-objects` with RS image + F0_live mask → generates a Gaussian `.ply` file
 - One-time cost; skip on re-runs with `reuse_sam3d_generated_ply=True`
 
-#### D0.3 SAM3D insertion: FGR + PROBREG + ICP + dedup (5.53s, 6.8%)
+#### D0.3 SAM3D insertion: bbox scale + CPD similarity + dedup (5.53s, 6.8%)
 
-- Load generated PLY, register against existing scene: bbox scale init → centroid alignment → FGR → visible-source filtering → truncated rigid refinement → point-to-point ICP
+- Load generated PLY, register against existing object cloud: bbox scale init → centroid alignment → voxel downsample → probreg CPD similarity refinement → dedup
 - Deduplicate overlapping Gaussians → append to `means`, `features_dc`, etc.
 - Mark newly inserted Gaussians as `object_flags = 1`
 
@@ -437,7 +437,7 @@ outputs/<run_date>/dynamic-gs/<timestamp>/
 - **CoTracker3**: Loaded via `torch.hub` from `facebookresearch/co-tracker` or from a local checkpoint path set in `cotracker_checkpoint_path`.
 - **SAM2**: Tiny video predictor loaded via `build_sam2_tiny_video_predictor` for mask propagation.
 - **ESAM**: Interactive segmentation model for frame 0 object mask extraction.
-- **PROBREG / Open3D**: Used in `sam3d_fusion.py` for point cloud registration (FGR + ICP).
+- **PROBREG / Open3D**: Used in `sam3d_fusion.py` for point cloud registration and CPD-based similarity refinement.
 
 ### Timing Instrumentation
 

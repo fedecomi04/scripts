@@ -71,7 +71,7 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     cotracker_query_point_count: int = 256
     cotracker_min_track_points: int = 12
     cotracker_ransac_iterations: int = 128
-    cotracker_ransac_inlier_threshold: float = 0.02
+    cotracker_ransac_inlier_threshold: float = 0.008
     cotracker_point_refresh_min_distance: float = 8.0
     cotracker_checkpoint_path: str = ""
     cotracker_hub_repo: str = "facebookresearch/co-tracker"
@@ -725,6 +725,9 @@ class DynamicGSModel(SplatfactoModel):
         output_stem = f"{frame_name}_sam3d"
         run_device = torch.device(self.means.device)
         sam3d_outputs = get_sam3d_output_paths(debug_dir, output_stem)
+        preferred_sam3d_ply = debug_dir / f"{frame_name}_d0_true_sam3d_raw_output.ply"
+        if preferred_sam3d_ply.exists():
+            sam3d_outputs["ply_path"] = preferred_sam3d_ply
         existing_indices = existing_indices.detach().cpu()
         existing_means_np = existing_means.detach().cpu().numpy()
         existing_colors_np = existing_colors.detach().cpu().numpy()
@@ -813,17 +816,10 @@ class DynamicGSModel(SplatfactoModel):
             f"target_point_count: {insertion_result.target_point_count}",
             f"visible_source_point_count: {insertion_result.visible_source_point_count}",
             f"registration_source_point_count: {insertion_result.registration_source_point_count}",
-            f"fgr_transformation: {insertion_result.fgr_transformation.tolist()}",
-            f"robust_transform: {insertion_result.robust_transform.tolist()}",
-            f"robust_inlier_count: {insertion_result.robust_inlier_count}",
-            f"robust_truncation_distance: {insertion_result.robust_truncation_distance}",
             f"similarity_transform: {insertion_result.similarity_transform.tolist()}",
             f"similarity_correspondence_count: {insertion_result.similarity_correspondence_count}",
             f"similarity_scale: {insertion_result.similarity_scale}",
             f"correspondence_threshold: {insertion_result.correspondence_threshold}",
-            f"icp_transformation: {insertion_result.icp_transformation.tolist()}",
-            f"icp_fitness: {insertion_result.icp_fitness}",
-            f"icp_rmse: {insertion_result.icp_rmse}",
             f"kept_points_after_dedup: {insertion_result.kept_point_count}",
             f"dedup_threshold: {insertion_result.dedup_threshold}",
             f"persistent_object_count: {int(persistent_membership_stats['persistent_object_count'])}",

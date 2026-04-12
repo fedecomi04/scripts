@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -26,6 +27,7 @@ class CoTrackerMotionEstimate:
     # Debug: pixel coordinates of tracked points (None if not ready)
     previous_points_xy: Optional[np.ndarray] = None  # (K, 2) on previous frame
     current_points_xy: Optional[np.ndarray] = None    # (K, 2) on current frame
+    tracked_inlier_mask: Optional[np.ndarray] = None  # (K,) True only for RANSAC inliers
     previous_rgb: Optional[Tensor] = None             # previous frame image
     current_rgb: Optional[Tensor] = None              # current frame image
 
@@ -92,6 +94,7 @@ class CoTrackerMotionEstimator:
         sampled_points = self._sample_mask_points(
             mask,
             max_points=self.query_point_count,
+            rgb=self._previous_rgb,
             output_shape=self._previous_rgb.shape[:2],
         )
         self._current_points_xy = sampled_points
@@ -101,7 +104,10 @@ class CoTrackerMotionEstimator:
         """Replace all tracking points with fresh samples from the given mask."""
         output_shape = self._previous_rgb.shape[:2] if self._previous_rgb is not None else None
         candidates = self._sample_mask_points(
-            mask, max_points=self.query_point_count, output_shape=output_shape,
+            mask,
+            max_points=self.query_point_count,
+            rgb=self._previous_rgb,
+            output_shape=output_shape,
         )
         if len(candidates) == 0:
             return 0
@@ -149,6 +155,7 @@ class CoTrackerMotionEstimator:
         candidates = self._sample_mask_points(
             mask,
             max_points=max(self.query_point_count * 2, remaining),
+            rgb=self._previous_rgb,
             output_shape=output_shape,
         )
         if len(candidates) == 0:
@@ -175,7 +182,13 @@ class CoTrackerMotionEstimator:
         self._current_points_xy = np.concatenate([self._current_points_xy, np.stack(keep, axis=0)], axis=0)
         return int(len(keep))
 
-    def estimate_and_advance(self, current_rgb: Tensor, current_depth: Tensor, current_camera: Cameras) -> CoTrackerMotionEstimate:
+    def estimate_and_advance(
+        self,
+        current_rgb: Tensor,
+        current_depth: Tensor,
+        current_camera: Cameras,
+        current_mask: Tensor | None = None,
+    ) -> CoTrackerMotionEstimate:
         identity = np.eye(3, dtype=np.float32)
         zero = np.zeros((3,), dtype=np.float32)
         track_count_before = self.current_track_count
@@ -229,6 +242,13 @@ class CoTrackerMotionEstimator:
             width=current_depth_prepared.shape[1],
             height=current_depth_prepared.shape[0],
         )
+        if current_mask is not None:
+            visibility_now = self._filter_points_by_mask_array(
+                current_points_xy,
+                visibility_now,
+                current_mask,
+                output_shape=current_depth_prepared.shape,
+            )
 
         correspondence_mask = visibility_now.copy()
         previous_depth_values, previous_depth_valid = self._sample_depth_bilinear(self._previous_depth, self._current_points_xy)
@@ -254,6 +274,7 @@ class CoTrackerMotionEstimator:
         inlier_count = 0
         mean_residual = float("inf")
         median_residual = float("inf")
+        tracked_inlier_mask = np.zeros((len(current_points_xy),), dtype=bool)
 
         if len(prev_world) >= self.min_track_points and len(curr_world) >= self.min_track_points:
             ransac_result = self._estimate_rigid_transform_ransac(
@@ -271,11 +292,10 @@ class CoTrackerMotionEstimator:
                 mean_residual = float(ransac_result["mean_residual"])
                 median_residual = float(ransac_result["median_residual"])
                 success = inlier_count >= self.min_track_points
+                tracked_indices = np.nonzero(correspondence_mask)[0]
+                tracked_inlier_mask[tracked_indices[inlier_mask]] = True
 
                 if success:
-                    tracked_inlier_mask = np.zeros_like(visibility_now)
-                    tracked_indices = np.nonzero(correspondence_mask)[0]
-                    tracked_inlier_mask[tracked_indices[inlier_mask]] = True
                     next_points = current_points_xy[tracked_inlier_mask]
                     if len(next_points) >= self.min_track_points:
                         self._current_points_xy = next_points.astype(np.float32)
@@ -302,6 +322,7 @@ class CoTrackerMotionEstimator:
             median_residual=median_residual,
             previous_points_xy=debug_prev_points,
             current_points_xy=current_points_xy,
+            tracked_inlier_mask=tracked_inlier_mask,
             previous_rgb=debug_prev_rgb,
             current_rgb=current_rgb_prepared,
         )
@@ -390,18 +411,69 @@ class CoTrackerMotionEstimator:
         return resized[0, 0]
 
     @staticmethod
-    def _sample_mask_points(mask: Tensor, max_points: int, output_shape: tuple[int, int] | None = None) -> np.ndarray:
-        mask = CoTrackerMotionEstimator._resize_mask(mask, output_shape)
-        mask_np = (mask.detach().float().cpu().numpy() > 0.5)
+    def _subsample_points(points_xy: np.ndarray, max_points: int) -> np.ndarray:
+        if len(points_xy) <= max_points:
+            return points_xy.astype(np.float32)
+        keep = np.linspace(0, len(points_xy) - 1, num=max_points)
+        keep = np.unique(np.round(keep).astype(np.int64))
+        return points_xy[keep].astype(np.float32)
+
+    @staticmethod
+    def _shrink_mask_for_sampling(mask_np: np.ndarray) -> np.ndarray:
         ys, xs = np.nonzero(mask_np)
         if len(xs) == 0:
+            return mask_np
+        side = max(int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1))
+        margin_px = max(1, int(round(0.025 * side)))
+        kernel_size = 2 * margin_px + 1
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        inner_mask = cv2.erode(mask_np.astype(np.uint8), kernel, iterations=1) > 0
+        return inner_mask if np.any(inner_mask) else mask_np
+
+    @staticmethod
+    def _sample_mask_points(
+        mask: Tensor,
+        max_points: int,
+        rgb: Tensor | None = None,
+        output_shape: tuple[int, int] | None = None,
+    ) -> np.ndarray:
+        mask = CoTrackerMotionEstimator._resize_mask(mask, output_shape)
+        mask_np = (mask.detach().float().cpu().numpy() > 0.5)
+        sample_mask_np = CoTrackerMotionEstimator._shrink_mask_for_sampling(mask_np)
+        ys, xs = np.nonzero(sample_mask_np)
+        if len(xs) == 0:
             return np.zeros((0, 2), dtype=np.float32)
+
+        if rgb is not None:
+            rgb_np = rgb.detach().float().cpu().numpy()
+            if rgb_np.shape[:2] != mask_np.shape:
+                rgb_np = cv2.resize(rgb_np, (mask_np.shape[1], mask_np.shape[0]), interpolation=cv2.INTER_LINEAR)
+            rgb_np = np.clip(rgb_np, 0.0, 255.0).astype(np.uint8)
+            if rgb_np.ndim == 3 and rgb_np.shape[-1] >= 3:
+                gray = cv2.cvtColor(rgb_np[..., :3], cv2.COLOR_RGB2GRAY)
+            else:
+                gray = rgb_np[..., 0] if rgb_np.ndim == 3 else rgb_np
+            gray = gray.copy()
+            gray[~sample_mask_np] = 0
+
+            detector = cv2.FastFeatureDetector_create(threshold=28, nonmaxSuppression=True)
+            keypoints = detector.detect(gray, None)
+            if keypoints:
+                keypoints = sorted(keypoints, key=lambda kp: kp.response, reverse=True)
+                fast_points: list[list[float]] = []
+                for kp in keypoints:
+                    x = int(round(kp.pt[0]))
+                    y = int(round(kp.pt[1]))
+                    if x < 0 or x >= sample_mask_np.shape[1] or y < 0 or y >= sample_mask_np.shape[0]:
+                        continue
+                    if not sample_mask_np[y, x]:
+                        continue
+                    fast_points.append([float(x), float(y)])
+                if fast_points:
+                    return CoTrackerMotionEstimator._subsample_points(np.asarray(fast_points, dtype=np.float32), max_points)
+
         coords = np.stack([xs, ys], axis=1).astype(np.float32)
-        if len(coords) <= max_points:
-            return coords
-        rng = np.random.default_rng(42)
-        chosen = rng.choice(len(coords), size=max_points, replace=False)
-        return coords[chosen]
+        return CoTrackerMotionEstimator._subsample_points(coords, max_points)
 
     @staticmethod
     def _filter_points_in_image(
@@ -416,6 +488,22 @@ class CoTrackerMotionEstimator:
         valid &= points_xy[:, 1] >= 0.0
         valid &= points_xy[:, 1] <= max(height - 1, 0)
         return points_xy, visibility & valid
+
+    @staticmethod
+    def _filter_points_by_mask_array(
+        points_xy: np.ndarray,
+        visibility: np.ndarray,
+        mask: Tensor,
+        output_shape: tuple[int, int],
+    ) -> np.ndarray:
+        resized_mask = CoTrackerMotionEstimator._resize_mask(mask, output_shape)
+        mask_np = (resized_mask.detach().float().cpu().numpy() > 0.5)
+        if mask_np.size == 0:
+            return np.zeros_like(visibility, dtype=bool)
+
+        xs = np.clip(np.round(points_xy[:, 0]).astype(np.int64), 0, mask_np.shape[1] - 1)
+        ys = np.clip(np.round(points_xy[:, 1]).astype(np.int64), 0, mask_np.shape[0] - 1)
+        return visibility & mask_np[ys, xs]
 
     @staticmethod
     def _sample_depth_bilinear(depth: np.ndarray, points_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -488,12 +576,14 @@ class CoTrackerMotionEstimator:
         camera_points = np.stack(
             [
                 (x - cx) * z / max(fx, 1e-8),
-                (y - cy) * z / max(fy, 1e-8),
-                z,
+                -(y - cy) * z / max(fy, 1e-8),
+                -z,
             ],
             axis=1,
         ).astype(np.float32)
 
+        # Nerfstudio camera_to_worlds use OpenGL-style camera coordinates:
+        # +X right, +Y up, +Z back, and the camera looks along -Z.
         rotation = camera_to_world[:, :3]
         translation = camera_to_world[:, 3]
         return (camera_points @ rotation.T + translation[None, :]).astype(np.float32)
@@ -566,6 +656,7 @@ class CoTrackerMotionEstimator:
         if best_inlier_mask is None or best_inlier_count < min_inliers:
             return None
 
+        # The applied rigid transform is refit using only the final inlier set.
         refined_transform = self._estimate_rigid_transform(
             source_points[best_inlier_mask],
             target_points[best_inlier_mask],

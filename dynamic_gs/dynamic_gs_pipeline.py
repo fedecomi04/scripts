@@ -100,7 +100,7 @@ class DynamicGSPipeline(VanillaPipeline):
         ]
         log_path.write_text("\n".join(log_lines) + "\n")
 
-    def _apply_cotracker_motion(self, camera, batch) -> None:
+    def _apply_cotracker_motion(self, camera, batch, current_mask=None) -> None:
         if self._cotracker_motion is None or not self._cotracker_motion.ready:
             return
         current_live_rgb = self.model.get_live_rgb(batch, apply_training_downscale=False)
@@ -108,6 +108,7 @@ class DynamicGSPipeline(VanillaPipeline):
             current_rgb=current_live_rgb,
             current_depth=batch["depth_image"],
             current_camera=camera,
+            current_mask=current_mask,
         )
         frame_name = self.datamanager.get_current_dynamic_frame_name()
         self._write_cotracker_motion_log(frame_name, motion_estimate)
@@ -185,6 +186,9 @@ class DynamicGSPipeline(VanillaPipeline):
     def _get_debug_dir(self) -> Path:
         return Path(self.datamanager.config.data) / self.datamanager.config.dynamic_subdir / "debug"
 
+    def _get_cotracker_debug_dir(self) -> Path:
+        return self._get_debug_dir() / "cotracker_debug"
+
     def _save_cotracker_debug(self, frame_name: str, est) -> None:
         """Save side-by-side image: previous frame with points → current frame with tracked points + lines."""
         if est.previous_points_xy is None or est.current_points_xy is None:
@@ -210,29 +214,33 @@ class DynamicGSPipeline(VanillaPipeline):
 
         prev_pts = est.previous_points_xy  # (K, 2) x,y
         curr_pts = est.current_points_xy   # (K, 2) x,y
+        inlier_mask = est.tracked_inlier_mask
         n = min(len(prev_pts), len(curr_pts))
 
         for i in range(n):
             px, py = int(prev_pts[i, 0]), int(prev_pts[i, 1])
             cx, cy = int(curr_pts[i, 0]) + w, int(curr_pts[i, 1])
+            is_inlier = bool(inlier_mask[i]) if inlier_mask is not None and i < len(inlier_mask) else False
+            point_color = [0, 255, 0] if is_inlier else [255, 0, 0]
+            line_color = [0, 180, 0] if is_inlier else [180, 0, 0]
 
-            # Draw green dots (3x3) on both panels
-            for dy in range(-1, 2):
-                for dx in range(-1, 2):
-                    if 0 <= py+dy < h and 0 <= px+dx < w:
-                        canvas[py+dy, px+dx] = [0, 255, 0]
-                    if 0 <= cy+dy < h and 0 <= cx+dx < 2*w:
-                        canvas[cy+dy, cx+dx] = [0, 255, 0]
-
-            # Draw yellow connecting line
+            # Draw the correspondence line first so the point color remains visible on top.
             steps = max(abs(cx - px), abs(cy - py), 1)
             for t in range(steps + 1):
                 lx = int(px + (cx - px) * t / steps)
                 ly = int(py + (cy - py) * t / steps)
-                if 0 <= ly < h and 0 <= lx < 2*w:
-                    canvas[ly, lx] = [255, 255, 0]
+                if 0 <= ly < h and 0 <= lx < 2 * w:
+                    canvas[ly, lx] = line_color
 
-        dbg = self._get_debug_dir()
+            # Draw inliers in green and everything else in red, with a larger marker.
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    if 0 <= py + dy < h and 0 <= px + dx < w:
+                        canvas[py + dy, px + dx] = point_color
+                    if 0 <= cy + dy < h and 0 <= cx + dx < 2 * w:
+                        canvas[cy + dy, cx + dx] = point_color
+
+        dbg = self._get_cotracker_debug_dir()
         dbg.mkdir(parents=True, exist_ok=True)
         Image.fromarray(canvas).save(dbg / f"{frame_name}_cotracker.png")
 
@@ -335,7 +343,7 @@ class DynamicGSPipeline(VanillaPipeline):
         self._save_image(stats["render_object_mask"], debug_dir / f"{frame_name}_render_object_mask.png")
         self._save_image(stats["live_object_mask"], debug_dir / f"{frame_name}_live_object_mask.png")
 
-        # --- TIMING: D0.2 SAM3D generation (subprocess) + D0.3 SAM3D insertion (FGR+ICP+dedup+insert) ---
+        # --- TIMING: D0.2 SAM3D generation (subprocess) + D0.3 SAM3D insertion (CPD similarity + dedup + insert) ---
         if not self._sam3d_inserted and self.model.config.use_sam3d_object_init:
             sam3d_stats = self.model.initialize_object_from_sam3d(
                 render_image_path=debug_dir / f"{frame_name}_render.png",
@@ -443,6 +451,7 @@ class DynamicGSPipeline(VanillaPipeline):
         # --- TIMING: DN.1 SAM2 live mask propagation (propagate object mask D(N-1) → DN on live images) ---
         t0 = time.time()
         fdn_live = None
+        prev_live_mask = self._live_tracker_mask.detach().clone() if self._live_tracker_mask is not None else None
         if self._live_tracker_seeded:
             fdn_live = query_sam2_propagated_mask(
                 self.model._get_sam2_video_predictor(),
@@ -454,19 +463,19 @@ class DynamicGSPipeline(VanillaPipeline):
             self._live_tracker_mask = fdn_live.detach().clone()
         self._timing["DN.1_sam2_live_propagation"].append(time.time() - t0)
 
-        # --- TIMING: DN.2 CoTracker refresh (fill point gaps from SAM2 mask) ---
+        # --- TIMING: DN.2 CoTracker reseed (run FAST on previous-frame object mask before tracking) ---
         if self._sam3d_inserted:
             t0 = time.time()
-            if fdn_live is not None and self._cotracker_motion is not None:
-                self._cotracker_motion.refresh_tracking_points(fdn_live)
+            if prev_live_mask is not None and self._cotracker_motion is not None:
+                self._cotracker_motion.replace_tracking_points(prev_live_mask)
             self._timing["DN.2_cotracker_refresh"].append(time.time() - t0)
 
-            # --- TIMING: DN.3 CoTracker advance + rigid transform (2-frame tracking, RANSAC, apply SE(3)) ---
+            # --- TIMING: DN.3 CoTracker advance + rigid transform (track, filter by current mask, RANSAC, apply SE(3)) ---
             t0 = time.time()
-            self._apply_cotracker_motion(camera, batch)
+            self._apply_cotracker_motion(camera, batch, current_mask=fdn_live)
             self._timing["DN.3_cotracker_advance"].append(time.time() - t0)
 
-            # --- TIMING: DN.4 CoTracker filter by mask (remove drifted points outside SAM2 object mask) ---
+            # --- TIMING: DN.4 CoTracker filter by mask (extra cleanup outside SAM2 object mask) ---
             t0 = time.time()
             if fdn_live is not None and self._cotracker_motion is not None:
                 removed = self._cotracker_motion.filter_points_by_mask(fdn_live)
@@ -626,7 +635,7 @@ class DynamicGSPipeline(VanillaPipeline):
             ("D0.1d_esam_live", "  -> ESAM on live image"),
             ("D0.1e_gaussian_flagging", "  -> Gaussian flagging (project centers, build active mask)"),
             ("D0.2_sam3d_generation", "SAM3D object generation (subprocess)"),
-            ("D0.3_sam3d_insertion", "SAM3D object insertion (FGR + ICP + dedup + insert Gaussians)"),
+            ("D0.3_sam3d_insertion", "SAM3D object insertion (CPD similarity + dedup + insert Gaussians)"),
             ("D0.4_render_object_mask", "Render object mask (rasterize object_flags Gaussians from simulation)"),
             ("D0.5_seed_live_tracker", "Seed live SAM2 tracker (store D0 live RGB + mask)"),
             ("D0.6_cotracker_init", "CoTracker initialization (load model, sample seed points from f0_live on D0)"),

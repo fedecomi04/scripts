@@ -51,13 +51,6 @@ class Sam3DInsertionResult:
     visible_source_point_count: int
     registration_source_point_count: int
     kept_point_count: int
-    fgr_transformation: np.ndarray
-    icp_transformation: np.ndarray
-    icp_fitness: float
-    icp_rmse: float
-    robust_transform: np.ndarray
-    robust_inlier_count: int
-    robust_truncation_distance: float
     similarity_transform: np.ndarray
     similarity_correspondence_count: int
     similarity_scale: float
@@ -400,32 +393,6 @@ def _run_probreg_similarity_refinement(
     return refined_transform.astype(np.float32), correspondence_count
 
 
-def _estimate_rigid_transform(source_points: np.ndarray, target_points: np.ndarray) -> np.ndarray:
-    if len(source_points) < 3 or len(target_points) < 3:
-        return np.eye(4, dtype=np.float32)
-
-    source_centroid = source_points.mean(axis=0)
-    target_centroid = target_points.mean(axis=0)
-    source_centered = source_points - source_centroid[None, :]
-    target_centered = target_points - target_centroid[None, :]
-
-    covariance = source_centered.T @ target_centered
-    try:
-        u, _, vt = np.linalg.svd(covariance, full_matrices=False)
-    except np.linalg.LinAlgError:
-        return np.eye(4, dtype=np.float32)
-
-    rotation = vt.T @ u.T
-    if np.linalg.det(rotation) < 0:
-        vt[-1, :] *= -1.0
-        rotation = vt.T @ u.T
-
-    transform = np.eye(4, dtype=np.float32)
-    transform[:3, :3] = rotation.astype(np.float32)
-    transform[:3, 3] = (target_centroid - rotation @ source_centroid).astype(np.float32)
-    return transform
-
-
 def register_and_fuse_sam3d_object(
     source_points: np.ndarray,
     source_colors: np.ndarray,
@@ -461,21 +428,11 @@ def register_and_fuse_sam3d_object(
     voxel_size = max(3.0 * max(target_spacing, source_spacing), 1e-3)
     source_down_points, source_down_colors = _voxel_downsample(scaled_source, scaled_source_colors, voxel_size)
     target_down_points, target_down_colors = _voxel_downsample(target_points, target_colors, voxel_size)
-    fgr_transform = np.eye(4, dtype=np.float32)
-    fgr_aligned_points = source_down_points.astype(np.float32)
-
-    icp_source_points = source_down_points
-    icp_source_colors = source_down_colors
-
-    target_largest_extent = _largest_extent(target_down_points)
-    robust_truncation_distance = max(target_largest_extent, 6.0 * voxel_size)
-    robust_transform = np.eye(4, dtype=np.float32)
-    robust_inlier_count = 0
 
     similarity_transform = np.eye(4, dtype=np.float32)
     similarity_transform, similarity_correspondence_count = _run_probreg_similarity_refinement(
-        icp_source_points,
-        icp_source_colors,
+        source_down_points,
+        source_down_colors,
         target_down_points,
         target_down_colors,
         similarity_transform,
@@ -483,20 +440,16 @@ def register_and_fuse_sam3d_object(
     )
     similarity_correspondence_threshold = max(2.0 * _median_nn_distance(target_down_points), 1e-3)
     similarity_scale = float(chosen_scale * _extract_isotropic_scale(similarity_transform))
-    source_visible_for_plot = _transform_points(icp_source_points, similarity_transform)
+    source_visible_for_plot = _transform_points(source_down_points, similarity_transform)
     similarity_correspondences, _ = _build_explicit_correspondences(
         source_visible_for_plot,
         target_down_points,
         max_distance=similarity_correspondence_threshold,
     )
 
-    icp_transform = similarity_transform.astype(np.float32)
-    icp_fitness = 0.0
-    icp_rmse = 0.0
-
-    aligned_points = _transform_points(scaled_source, icp_transform)
+    aligned_points = _transform_points(scaled_source, similarity_transform)
     aligned_colors = scaled_source_colors.astype(np.float32)
-    final_scale = float(chosen_scale * _extract_isotropic_scale(icp_transform))
+    final_scale = float(chosen_scale * _extract_isotropic_scale(similarity_transform))
 
     dedup_threshold = 1.5 * target_spacing
     target_pcd = _to_pcd(target_points, target_colors)
@@ -508,9 +461,9 @@ def register_and_fuse_sam3d_object(
     correspondence_plot_path = ""
     if debug_dir is not None and output_stem is not None:
         debug_dir = Path(debug_dir)
-        save_point_cloud(debug_dir / f"{output_stem}_source_reg_ref.ply", icp_source_points, icp_source_colors)
+        save_point_cloud(debug_dir / f"{output_stem}_source_reg_ref.ply", source_down_points, source_down_colors)
         save_point_cloud(debug_dir / f"{output_stem}_target_reg_ref.ply", target_down_points, target_down_colors)
-        save_point_cloud(debug_dir / f"{output_stem}_source_visible_work_iter_00.ply", source_visible_for_plot, icp_source_colors)
+        save_point_cloud(debug_dir / f"{output_stem}_source_visible_work_iter_00.ply", source_visible_for_plot, source_down_colors)
         correspondence_plot_path = str(
             _save_correspondence_plot(
                 debug_dir,
@@ -535,15 +488,8 @@ def register_and_fuse_sam3d_object(
         # Visibility filtering is disabled in this experiment path, so report
         # the full downsampled source count here.
         visible_source_point_count=int(len(source_down_points)),
-        registration_source_point_count=int(len(icp_source_points)),
+        registration_source_point_count=int(len(source_down_points)),
         kept_point_count=int(len(kept_points)),
-        fgr_transformation=fgr_transform,
-        icp_transformation=icp_transform,
-        icp_fitness=float(icp_fitness),
-        icp_rmse=float(icp_rmse),
-        robust_transform=robust_transform,
-        robust_inlier_count=int(robust_inlier_count),
-        robust_truncation_distance=float(robust_truncation_distance),
         similarity_transform=similarity_transform,
         similarity_correspondence_count=int(similarity_correspondence_count),
         similarity_scale=float(similarity_scale),
