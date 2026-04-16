@@ -4,10 +4,11 @@ from .active_mask import (
     combine_object_masks,
     dilate_binary_mask,
     extract_projected_centers_and_radii,
+    keep_largest_component,
 )
 from .cotracker_motion import CoTrackerMotionEstimate, CoTrackerMotionEstimator
 from .depth_loss import masked_l1_depth_loss
-from .esam import ESAM_NUM_PROMPT_POINTS, build_esam_ti, query_esam_mask
+from .esam import ESAM_NUM_PROMPT_POINTS, ESAM_PROMPT_KEEP_RATIO, build_esam_ti, query_esam_mask
 from .no_refine_strategy import NoRefineStrategy
 from .rigid_regularization import estimate_rigid_transform_kabsch, rigid_or_static_loss
 from .sam3d import (
@@ -27,7 +28,9 @@ __all__ = [
     "combine_object_masks",
     "dilate_binary_mask",
     "ESAM_NUM_PROMPT_POINTS",
+    "ESAM_PROMPT_KEEP_RATIO",
     "extract_projected_centers_and_radii",
+    "keep_largest_component",
     "masked_l1_depth_loss",
     "NoRefineStrategy",
     "estimate_rigid_transform_kabsch",

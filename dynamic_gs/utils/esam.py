@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - optional dependency at import time
 ESAM_CHECKPOINT_URL = "https://github.com/yformer/EfficientSAM/raw/main/weights/efficient_sam_vitt.pt"
 ESAM_CHECKPOINT_PATH = Path.home() / ".cache" / "efficient_sam" / "efficient_sam_vitt.pt"
 ESAM_NUM_PROMPT_POINTS = 8
+ESAM_PROMPT_KEEP_RATIO = 0.8
 
 
 def _to_mask_numpy(mask: torch.Tensor) -> np.ndarray:
@@ -25,7 +26,7 @@ def _to_mask_numpy(mask: torch.Tensor) -> np.ndarray:
     return (mask.float().cpu().numpy() > 0.5)
 
 
-def compute_prompt_interior(mask: torch.Tensor, keep_ratio: float = 0.9) -> tuple[torch.Tensor, torch.Tensor]:
+def compute_prompt_interior(mask: torch.Tensor, keep_ratio: float = ESAM_PROMPT_KEEP_RATIO) -> tuple[torch.Tensor, torch.Tensor]:
     mask_np = _to_mask_numpy(mask)
     if not np.any(mask_np):
         empty = torch.zeros(mask_np.shape, dtype=torch.bool, device=mask.device)
@@ -111,28 +112,67 @@ def _select_esam_mask(predicted_logits: torch.Tensor, predicted_iou: torch.Tenso
     return candidate_masks[best_index]
 
 
-def query_esam_mask(
+def _run_esam_query(
     model,
-    rendered_rgb: torch.Tensor,
-    change_mask: torch.Tensor,
-    num_points: int = ESAM_NUM_PROMPT_POINTS,
+    image_tensor: torch.Tensor,
+    prompt_region: torch.Tensor,
+    num_points: int,
+    keep_ratio: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    inner_mask, distance_map = compute_prompt_interior(change_mask, keep_ratio=0.9)
+    inner_mask, distance_map = compute_prompt_interior(prompt_region, keep_ratio=keep_ratio)
     points_xy = sample_interior_points(inner_mask, distance_map, num_points=num_points)
     if points_xy.shape[0] == 0:
         empty = torch.zeros_like(inner_mask)
         return empty, inner_mask, points_xy
 
-    image = rendered_rgb.detach().float()
-    if image.ndim != 3 or image.shape[-1] != 3:
-        raise ValueError("Rendered RGB image must have shape [H, W, 3].")
-
-    image_tensor = image.permute(2, 0, 1).unsqueeze(0).to(rendered_rgb.device)
-    point_tensor = points_xy.float().view(1, 1, -1, 2).to(rendered_rgb.device)
-    label_tensor = torch.ones((1, 1, points_xy.shape[0]), dtype=torch.float32, device=rendered_rgb.device)
+    point_tensor = points_xy.float().view(1, 1, -1, 2).to(image_tensor.device)
+    label_tensor = torch.ones((1, 1, points_xy.shape[0]), dtype=torch.float32, device=image_tensor.device)
 
     with torch.no_grad():
         predicted_logits, predicted_iou = model(image_tensor, point_tensor, label_tensor)
 
     esam_mask = _select_esam_mask(predicted_logits, predicted_iou, inner_mask)
-    return esam_mask.to(change_mask.device), inner_mask, points_xy
+    return esam_mask.to(prompt_region.device), inner_mask, points_xy
+
+
+def query_esam_mask(
+    model,
+    rendered_rgb: torch.Tensor,
+    change_mask: torch.Tensor,
+    num_points: int = ESAM_NUM_PROMPT_POINTS,
+    keep_ratio: float = ESAM_PROMPT_KEEP_RATIO,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    image = rendered_rgb.detach().float()
+    if image.ndim != 3 or image.shape[-1] != 3:
+        raise ValueError("Rendered RGB image must have shape [H, W, 3].")
+
+    image_tensor = image.permute(2, 0, 1).unsqueeze(0).to(rendered_rgb.device)
+    prompt_region = change_mask.float()
+    final_mask = torch.zeros_like(change_mask, dtype=torch.bool)
+    final_inner_mask = torch.zeros_like(change_mask, dtype=torch.bool)
+    final_points_xy = torch.zeros((0, 2), dtype=torch.long, device=change_mask.device)
+
+    for _ in range(3):
+        esam_mask, inner_mask, points_xy = _run_esam_query(
+            model,
+            image_tensor,
+            prompt_region,
+            num_points=num_points,
+            keep_ratio=keep_ratio,
+        )
+        final_mask = esam_mask
+        final_inner_mask = inner_mask
+        final_points_xy = points_xy
+
+        if points_xy.shape[0] == 0 or not torch.any(esam_mask):
+            break
+
+        mask_inner, _ = compute_prompt_interior(esam_mask.float(), keep_ratio=keep_ratio)
+        points_inside_final_inner = mask_inner[points_xy[:, 1], points_xy[:, 0]]
+        if bool(torch.all(points_inside_final_inner)):
+            final_inner_mask = mask_inner
+            break
+
+        prompt_region = esam_mask.float()
+
+    return final_mask.to(change_mask.device), final_inner_mask, final_points_xy

@@ -92,6 +92,49 @@ def remove_small_components(mask, min_area):
     return keep.to(mask.device).float()[..., None]
 
 
+def keep_largest_component(mask):
+    """Keep only the largest connected component of a binary mask."""
+
+    mask = _to_hw1(mask)
+    mask_cpu = (mask[..., 0] > 0.5).detach().cpu()
+    if not torch.any(mask_cpu):
+        return torch.zeros_like(mask)
+
+    visited = torch.zeros_like(mask_cpu, dtype=torch.bool)
+    keep = torch.zeros_like(mask_cpu, dtype=torch.bool)
+    height, width = mask_cpu.shape
+    best_component = []
+
+    for start_y, start_x in torch.nonzero(mask_cpu, as_tuple=False).tolist():
+        if visited[start_y, start_x]:
+            continue
+
+        queue = deque([(start_y, start_x)])
+        visited[start_y, start_x] = True
+        component = []
+
+        while queue:
+            y, x = queue.popleft()
+            component.append((y, x))
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if ny < 0 or ny >= height or nx < 0 or nx >= width:
+                    continue
+                if visited[ny, nx] or not mask_cpu[ny, nx]:
+                    continue
+                visited[ny, nx] = True
+                queue.append((ny, nx))
+
+        if len(component) > len(best_component):
+            best_component = component
+
+    if best_component:
+        ys, xs = zip(*best_component)
+        keep[list(ys), list(xs)] = True
+
+    return keep.to(mask.device).float()[..., None]
+
+
 def combine_object_masks(render_mask, live_mask, valid_mask=None):
     """Build the optimization mask from rendered and live object masks."""
 

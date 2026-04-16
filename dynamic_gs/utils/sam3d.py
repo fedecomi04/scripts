@@ -19,12 +19,17 @@ SAM3D_CONFIG_PATH = SAM3D_REPO_ROOT / "checkpoints" / "hf" / "pipeline.yaml"
 SAM3D_RUNTIME_CONFIG_PATH = SAM3D_REPO_ROOT / "checkpoints" / "hf" / "pipeline_runtime_small.yaml"
 
 
-def get_sam3d_output_paths(output_dir: Path, output_stem: str) -> Dict[str, Path]:
+def get_sam3d_output_paths(
+    output_dir: Path,
+    output_stem: str,
+    image_dir: Path | None = None,
+) -> Dict[str, Path]:
     output_dir = Path(output_dir)
+    image_dir = Path(image_dir) if image_dir is not None else output_dir
     return {
         "ply_path": output_dir / f"{output_stem}_raw_output.ply",
         "pose_path": output_dir / f"{output_stem}_pose.json",
-        "preview_path": output_dir / f"{output_stem}_preview.png",
+        "preview_path": image_dir / f"{output_stem}_preview.png",
         "run_info_path": output_dir / f"{output_stem}_run_info.txt",
         "glb_path": output_dir / f"{output_stem}_mesh.glb",
     }
@@ -112,6 +117,7 @@ def prepare_cropped_sam3d_inputs(
     object_mask_path: Path,
     output_dir: Path,
     output_stem: str,
+    image_dir: Path | None = None,
     padding: int = 32,
 ) -> Dict[str, Path]:
     """Crop the SAM3D inputs tightly around the object mask for lighter inference."""
@@ -119,7 +125,9 @@ def prepare_cropped_sam3d_inputs(
     render_image_path = Path(render_image_path)
     object_mask_path = Path(object_mask_path)
     output_dir = Path(output_dir)
+    image_dir = Path(image_dir) if image_dir is not None else output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    image_dir.mkdir(parents=True, exist_ok=True)
 
     image_pil = Image.open(render_image_path).convert("RGB")
     image_rgb = np.array(image_pil)
@@ -148,8 +156,8 @@ def prepare_cropped_sam3d_inputs(
     cropped_image = image_rgb[crop_y0:crop_y1, crop_x0:crop_x1]
     cropped_mask = mask[crop_y0:crop_y1, crop_x0:crop_x1]
 
-    cropped_render_path = output_dir / f"{output_stem}_crop_render.png"
-    cropped_mask_path = output_dir / f"{output_stem}_crop_mask.png"
+    cropped_render_path = image_dir / f"{output_stem}_crop_render.png"
+    cropped_mask_path = image_dir / f"{output_stem}_crop_mask.png"
     Image.fromarray(cropped_image).save(cropped_render_path)
     Image.fromarray((cropped_mask > 0).astype(np.uint8) * 255).save(cropped_mask_path)
 
@@ -182,14 +190,17 @@ def run_sam3d_single_object(
     object_mask_path: Path,
     output_dir: Path,
     output_stem: str,
+    image_dir: Path | None = None,
     max_side: int = 192,
 ) -> Dict[str, Path]:
     render_image_path = Path(render_image_path)
     object_mask_path = Path(object_mask_path)
     output_dir = Path(output_dir)
+    image_dir = Path(image_dir) if image_dir is not None else output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    image_dir.mkdir(parents=True, exist_ok=True)
 
-    output_paths = get_sam3d_output_paths(output_dir, output_stem)
+    output_paths = get_sam3d_output_paths(output_dir, output_stem, image_dir=image_dir)
     ply_path = output_paths["ply_path"]
     glb_path = output_paths["glb_path"]
     pose_path = output_paths["pose_path"]
@@ -303,6 +314,7 @@ def run_sam3d_single_object_subprocess(
     object_mask_path: Path,
     output_dir: Path,
     output_stem: str,
+    image_dir: Path | None = None,
     max_side: int = 192,
 ) -> Dict[str, Path]:
     """Run the working SAM3D generation path in a fresh Python process.
@@ -314,7 +326,9 @@ def run_sam3d_single_object_subprocess(
     render_image_path = Path(render_image_path)
     object_mask_path = Path(object_mask_path)
     output_dir = Path(output_dir)
+    image_dir = Path(image_dir) if image_dir is not None else output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    image_dir.mkdir(parents=True, exist_ok=True)
 
     command = [
         sys.executable,
@@ -327,6 +341,8 @@ def run_sam3d_single_object_subprocess(
         str(output_dir),
         "--output-stem",
         output_stem,
+        "--image-dir",
+        str(image_dir),
         "--max-side",
         str(max_side),
     ]
@@ -345,7 +361,7 @@ def run_sam3d_single_object_subprocess(
             f"STDERR:\n{completed.stderr}"
         )
 
-    return get_sam3d_output_paths(output_dir, output_stem)
+    return get_sam3d_output_paths(output_dir, output_stem, image_dir=image_dir)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -354,6 +370,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--object-mask", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--output-stem", type=str, required=True)
+    parser.add_argument("--image-dir", type=Path, default=None)
     parser.add_argument("--max-side", type=int, default=192)
     return parser.parse_args()
 
@@ -366,6 +383,7 @@ def _main() -> int:
             object_mask_path=args.object_mask,
             output_dir=args.output_dir,
             output_stem=args.output_stem,
+            image_dir=args.image_dir,
             max_side=args.max_side,
         )
         return 0

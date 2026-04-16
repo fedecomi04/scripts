@@ -8,7 +8,7 @@ from typing import Literal, Optional, Type
 
 import torch
 import torch.nn.functional as TF
-from PIL import Image
+from PIL import Image, ImageDraw
 from nerfstudio.engine.callbacks import TrainingCallbackAttributes
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline, VanillaPipelineConfig
 from nerfstudio.utils import profiler
@@ -85,14 +85,20 @@ class DynamicGSPipeline(VanillaPipeline):
         return mask is not None and bool(torch.any(mask > 0.5))
 
     def _write_cotracker_motion_log(self, frame_name: str, motion_estimate) -> None:
-        debug_dir = self.datamanager.get_dynamic_debug_dir()
+        debug_dir = self._get_debug_dir()
+        debug_dir.mkdir(parents=True, exist_ok=True)
         log_path = debug_dir / f"{frame_name}_cotracker_motion.txt"
         log_lines = [
             f"success: {motion_estimate.success}",
+            f"ready: {motion_estimate.ready}",
             f"correspondence_count: {motion_estimate.correspondence_count}",
             f"inlier_count: {motion_estimate.inlier_count}",
             f"track_count_before: {motion_estimate.track_count_before}",
             f"track_count_after: {motion_estimate.track_count_after}",
+            f"raw_visible_count: {motion_estimate.raw_visible_count}",
+            f"mask_visible_count: {motion_estimate.mask_visible_count}",
+            f"depth_valid_count: {motion_estimate.depth_valid_count}",
+            f"used_mask_fallback: {motion_estimate.used_mask_fallback}",
             f"mean_residual: {motion_estimate.mean_residual}",
             f"median_residual: {motion_estimate.median_residual}",
             f"rotation: {motion_estimate.rotation.tolist()}",
@@ -101,7 +107,15 @@ class DynamicGSPipeline(VanillaPipeline):
         log_path.write_text("\n".join(log_lines) + "\n")
 
     def _apply_cotracker_motion(self, camera, batch, current_mask=None) -> None:
-        if self._cotracker_motion is None or not self._cotracker_motion.ready:
+        if self._cotracker_motion is None:
+            return
+        if not self._cotracker_motion.ready:
+            frame_name = self.datamanager.get_current_dynamic_frame_name()
+            CONSOLE.log(
+                f"[dynamic-gs] CoTracker skipped for {frame_name}: tracker not ready "
+                f"({self._cotracker_motion.current_track_count} tracks, "
+                f"min={self._cotracker_motion.min_track_points})"
+            )
             return
         current_live_rgb = self.model.get_live_rgb(batch, apply_training_downscale=False)
         motion_estimate = self._cotracker_motion.estimate_and_advance(
@@ -116,17 +130,27 @@ class DynamicGSPipeline(VanillaPipeline):
         if not motion_estimate.success:
             CONSOLE.log(
                 f"[dynamic-gs] CoTracker rigid motion unavailable for {frame_name}: "
+                f"raw={motion_estimate.raw_visible_count}, "
+                f"mask={motion_estimate.mask_visible_count}, "
+                f"depth={motion_estimate.depth_valid_count}, "
                 f"correspondences={motion_estimate.correspondence_count}, "
-                f"inliers={motion_estimate.inlier_count}"
+                f"inliers={motion_estimate.inlier_count}, "
+                f"mask_fallback={motion_estimate.used_mask_fallback}"
             )
             return
         moved_count = self.model.apply_rigid_object_transform_from_reference(
             motion_estimate.rotation, motion_estimate.translation,
         )
+        if moved_count == 0:
+            CONSOLE.log(
+                f"[dynamic-gs] CoTracker estimated motion for {frame_name}, "
+                "but no object Gaussians were moved. Check object_flags/reference pose consistency."
+            )
         CONSOLE.log(
             f"[dynamic-gs] CoTracker rigid motion -> {frame_name}, moved={moved_count}, "
             f"inliers={motion_estimate.inlier_count}/{motion_estimate.correspondence_count}, "
-            f"median residual={motion_estimate.median_residual:.5f}"
+            f"median residual={motion_estimate.median_residual:.5f}, "
+            f"mask_fallback={motion_estimate.used_mask_fallback}"
         )
 
     def _initialize_cotracker(self, rs00_rgb, rs00_depth, camera, mask) -> None:
@@ -146,7 +170,19 @@ class DynamicGSPipeline(VanillaPipeline):
         seeded = self._cotracker_motion.initialize(
             rgb=rs00_rgb, depth=rs00_depth, camera=camera, mask=mask,
         )
-        CONSOLE.log(f"[dynamic-gs] CoTracker reference seed on D0 -> tracks={seeded}, ready={self._cotracker_motion.ready}")
+        CONSOLE.log(
+            f"[dynamic-gs] CoTracker reference seed on D0 -> "
+            f"fast={self._cotracker_motion.last_init_fast_point_count}, "
+            f"sampled={self._cotracker_motion.last_init_sampled_count}, "
+            f"depth_valid={self._cotracker_motion.last_init_depth_valid_count}, "
+            f"dense_fallback={self._cotracker_motion.last_init_used_dense_fallback}, "
+            f"tracks={seeded}, ready={self._cotracker_motion.ready}"
+        )
+        if seeded < self._cotracker_motion.min_track_points:
+            CONSOLE.log(
+                f"[dynamic-gs] CoTracker seeded too few D0 points: "
+                f"{seeded} < min_track_points={self._cotracker_motion.min_track_points}"
+            )
 
     # ---- Image helpers ----
 
@@ -160,6 +196,63 @@ class DynamicGSPipeline(VanillaPipeline):
         if tensor.shape[-1] == 1:
             tensor = tensor.repeat(1, 1, 3)
         image_uint8 = tensor.mul(255).byte().cpu().numpy()
+        Image.fromarray(image_uint8).save(path)
+
+    @staticmethod
+    def _save_image_with_points(image, points_xy, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        tensor = image.detach().float().clamp(0.0, 1.0)
+        if tensor.ndim == 2:
+            tensor = tensor[..., None]
+        if tensor.shape[-1] == 1:
+            tensor = tensor.repeat(1, 1, 3)
+
+        image_uint8 = tensor.mul(255).byte().cpu().numpy()
+        pil_image = Image.fromarray(image_uint8)
+
+        if points_xy is not None and points_xy.numel() > 0:
+            draw = ImageDraw.Draw(pil_image)
+            radius = max(2, int(round(0.006 * max(pil_image.size))))
+            for point in points_xy.detach().cpu().tolist():
+                x = int(round(point[0]))
+                y = int(round(point[1]))
+                draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=(255, 0, 0), outline=(255, 255, 255))
+
+        pil_image.save(path)
+
+    @staticmethod
+    def _resize_points(points_xy, source_shape, target_shape):
+        if points_xy is None or points_xy.numel() == 0:
+            return points_xy
+        source_h, source_w = source_shape[:2]
+        target_h, target_w = target_shape[:2]
+        scaled = points_xy.detach().clone().float()
+        scaled[:, 0] *= float(target_w) / float(max(source_w, 1))
+        scaled[:, 1] *= float(target_h) / float(max(source_h, 1))
+        return scaled
+
+    @staticmethod
+    def _save_depth_image(depth, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tensor = depth.detach().float()
+        if tensor.ndim == 3 and tensor.shape[-1] == 1:
+            tensor = tensor[..., 0]
+        valid = torch.isfinite(tensor) & (tensor > 0.0)
+        image = torch.zeros((*tensor.shape, 3), dtype=torch.float32, device=tensor.device)
+        if bool(valid.any()):
+            valid_values = tensor[valid]
+            depth_min = float(valid_values.min().item())
+            depth_max = float(valid_values.max().item())
+            if depth_max > depth_min:
+                normalized = (tensor - depth_min) / (depth_max - depth_min)
+            else:
+                normalized = torch.zeros_like(tensor)
+            normalized = (1.0 - normalized).clamp(0.0, 1.0)
+            image[valid] = normalized[valid][..., None].expand(-1, 3)
+        image_uint8 = image.mul(255).byte().cpu().numpy()
         Image.fromarray(image_uint8).save(path)
 
     @staticmethod
@@ -310,7 +403,6 @@ class DynamicGSPipeline(VanillaPipeline):
         self.datamanager.set_dynamic_frame_idx(frame_idx)
         camera, batch = self.datamanager.get_current_dynamic_train_batch()
         frame_name = self.datamanager.get_dynamic_frame_name(frame_idx)
-        debug_dir = self.datamanager.get_dynamic_debug_dir()
         is_first = self._global_frame_counter == 0
 
         # All mask/change operations at training resolution for consistency
@@ -321,13 +413,22 @@ class DynamicGSPipeline(VanillaPipeline):
         gripper_mask = self.model._get_batch_mask(batch)
 
         if is_first:
-            self._prepare_frame_0(camera, batch, live_rgb, gt_rgb, gt_depth, gripper_mask, frame_name, debug_dir)
+            init_debug_dir = self.datamanager.get_initialization_debug_dir()
+            init_artifact_dir = self.datamanager.get_initialization_artifact_dir()
+            self._prepare_frame_0(
+                camera, batch, live_rgb, gt_rgb, gt_depth, gripper_mask,
+                frame_name, init_debug_dir, init_artifact_dir,
+            )
         else:
+            debug_dir = self._get_debug_dir()
             self._prepare_frame_n(camera, batch, live_rgb, gt_rgb, gt_depth, gripper_mask, frame_name, debug_dir)
 
         self._global_frame_counter += 1
 
-    def _prepare_frame_0(self, camera, batch, live_rgb, gt_rgb, gt_depth, gripper_mask, frame_name, debug_dir):
+    def _prepare_frame_0(
+        self, camera, batch, live_rgb, gt_rgb, gt_depth, gripper_mask,
+        frame_name, debug_dir, artifact_dir,
+    ):
         """Bootstrap: ESAM → SAM3D → rendered object mask → seed live tracker → CoTracker → CD0."""
         t_total = time.time()
 
@@ -338,19 +439,46 @@ class DynamicGSPipeline(VanillaPipeline):
         # Record substep breakdown for the timing report
         for k, v in stats.get("prepare_dynamic_update_substeps", {}).items():
             self._timing[k].append(v)
+        render_mask_plain_path = debug_dir / f"{frame_name}_render_object_mask_binary.png"
+        self._save_image(live_rgb, debug_dir / f"{frame_name}_live_input.png")
+        self._save_depth_image(gt_depth, debug_dir / f"{frame_name}_live_depth.png")
         self._save_image(stats["rendered_rgb"], debug_dir / f"{frame_name}_render.png")
-        self._save_image(stats["change_mask"], debug_dir / f"{frame_name}_change_mask.png")
-        self._save_image(stats["render_object_mask"], debug_dir / f"{frame_name}_render_object_mask.png")
-        self._save_image(stats["live_object_mask"], debug_dir / f"{frame_name}_live_object_mask.png")
+        self._save_depth_image(stats["rendered_depth"], debug_dir / f"{frame_name}_render_depth.png")
+        self._save_image_with_points(stats["change_mask"], None, debug_dir / f"{frame_name}_change_mask.png")
+        self._save_image(stats["render_object_mask"], render_mask_plain_path)
+        self._save_image_with_points(
+            stats["render_object_mask"],
+            stats.get("render_prompt_points"),
+            debug_dir / f"{frame_name}_render_object_mask.png",
+        )
+        self._save_image(stats["live_object_mask"], debug_dir / f"{frame_name}_live_object_mask_binary.png")
+        self._save_image_with_points(
+            stats["live_object_mask"],
+            stats.get("live_prompt_points"),
+            debug_dir / f"{frame_name}_live_object_mask.png",
+        )
+        self._save_image_with_points(stats["optim_mask"], None, debug_dir / f"{frame_name}_optim_mask.png")
+        self._save_image_with_points(
+            stats["render_propagation_mask"],
+            stats.get("render_prompt_points"),
+            debug_dir / f"{frame_name}_render_propagation_mask.png",
+        )
+        self._save_image_with_points(
+            stats["live_propagation_mask"],
+            stats.get("live_prompt_points"),
+            debug_dir / f"{frame_name}_live_propagation_mask.png",
+        )
+        if gripper_mask is not None:
+            self._save_image_with_points(gripper_mask.float(), None, debug_dir / f"{frame_name}_gripper_mask.png")
 
         # --- TIMING: D0.2 SAM3D generation (subprocess) + D0.3 SAM3D insertion (CPD similarity + dedup + insert) ---
         if not self._sam3d_inserted and self.model.config.use_sam3d_object_init:
             sam3d_stats = self.model.initialize_object_from_sam3d(
                 render_image_path=debug_dir / f"{frame_name}_render.png",
-                object_mask_path=debug_dir / f"{frame_name}_live_object_mask.png",
+                object_mask_path=render_mask_plain_path,
                 render_object_mask=stats["render_object_mask"],
                 rendered_depth=stats["rendered_depth"],
-                camera=camera, debug_dir=debug_dir, frame_name=frame_name,
+                camera=camera, image_debug_dir=debug_dir, artifact_dir=artifact_dir, frame_name=frame_name,
             )
             if sam3d_stats:
                 self._timing["D0.2_sam3d_generation"].append(sam3d_stats.get("sam3d_generation_time", 0.0))
@@ -396,6 +524,18 @@ class DynamicGSPipeline(VanillaPipeline):
             rendered_obj_mask.shape[0], rendered_obj_mask.shape[1],
         ).to(self.model.device)
         combined_obj_mask = torch.maximum(rendered_obj_mask, f0_live_resized)
+        resized_live_prompt_points = self._resize_points(
+            stats.get("live_prompt_points"),
+            f0_live.shape,
+            rendered_obj_mask.shape,
+        )
+        self._save_image_with_points(rendered_obj_mask, None, debug_dir / f"{frame_name}_rendered_object_mask.png")
+        self._save_image_with_points(
+            f0_live_resized,
+            resized_live_prompt_points,
+            debug_dir / f"{frame_name}_live_object_mask_resized.png",
+        )
+        self._save_image_with_points(combined_obj_mask, None, debug_dir / f"{frame_name}_combined_object_mask.png")
 
         # --- TIMING: D0.7 Render RS00 (re-render scene after SAM3D object insertion) ---
         t0 = time.time()
@@ -410,7 +550,7 @@ class DynamicGSPipeline(VanillaPipeline):
 
         # --- TIMING: D0.9 Debug images (save ~9 overlay PNGs to disk) ---
         t0 = time.time()
-        dbg = self._get_debug_dir()
+        dbg = debug_dir
         self._save_overlay(gt_rgb, cd0, dbg / f"{frame_name}_live_w_cd0.png")
         self._save_overlay(rs00_rgb, cd0, dbg / f"{frame_name}_render_w_cd0.png")
         self._save_overlay(rs00_rgb, rendered_obj_mask, dbg / f"{frame_name}_render_w_objmask.png", color=(0, 0, 1))
@@ -420,7 +560,7 @@ class DynamicGSPipeline(VanillaPipeline):
             self._save_overlay(gt_rgb, gripper_mask, dbg / f"{frame_name}_live_w_gripper.png", color=(0, 1, 0))
         self._save_image(gt_rgb, dbg / f"{frame_name}_live.png")
         self._save_image(rs00_rgb, dbg / f"{frame_name}_rs00.png")
-        self._save_image(cd0, dbg / f"{frame_name}_cd0.png")
+        self._save_image_with_points(cd0, None, dbg / f"{frame_name}_cd0.png")
         self._timing["D0.9_debug_images"].append(time.time() - t0)
 
         self.model._set_optim_mask(cd0)

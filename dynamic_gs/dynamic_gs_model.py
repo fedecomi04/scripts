@@ -19,6 +19,7 @@ from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils.spherical_harmonics import RGB2SH
 
 from .utils import (
+    ESAM_PROMPT_KEEP_RATIO,
     ESAM_NUM_PROMPT_POINTS,
     NoRefineStrategy,
     Sam3DInsertionResult,
@@ -29,6 +30,7 @@ from .utils import (
     combine_object_masks,
     dilate_binary_mask,
     extract_projected_centers_and_radii,
+    keep_largest_component,
     load_sam3d_gaussian_ply,
     masked_l1_depth_loss,
     get_sam3d_output_paths,
@@ -83,6 +85,7 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     scene_opt_refine_every: int = 100
     scene_opt_densify_grad_thresh: float = 0.0002
     scene_opt_cull_alpha_thresh: float = 0.1
+    esam_prompt_keep_ratio: float = ESAM_PROMPT_KEEP_RATIO
     object_mask_dilate_px: int = 1
 
 
@@ -93,6 +96,7 @@ class DynamicGSModel(SplatfactoModel):
         self.phase = "static"  # type: Literal["static", "dynamic"]
         self._base_lrs = {}  # type: Dict[str, float]
         self._initial_scheduler_states = {}  # type: Dict[str, Dict]
+        self._camera_opt_index_warning_logged = False
         self._dynamic_ready = False
         self._esam_model = None
         self._sam2_video_predictor = None
@@ -551,18 +555,50 @@ class DynamicGSModel(SplatfactoModel):
         self._refresh_gaussian_optimizers(reset_means_optimizer=True)
         return torch.arange(old_num_points, self.num_points, device=self.means.device, dtype=torch.long)
 
-    def _get_render_projection_params(self, camera) -> tuple[np.ndarray, np.ndarray, int, int]:
-        if self.training:
-            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
-        else:
-            optimized_camera_to_world = camera.camera_to_worlds
+    def _should_apply_camera_optimizer(self, camera: Cameras) -> bool:
+        if not self.training or self.phase != "static" or self.camera_optimizer.config.mode == "off":
+            return False
+        if camera.metadata is None or "cam_idx" not in camera.metadata:
+            return False
+        camera_idx = int(camera.metadata["cam_idx"])
+        if 0 <= camera_idx < self.camera_optimizer.num_cameras:
+            return True
+        if not self._camera_opt_index_warning_logged:
+            CONSOLE.log(
+                f"[dynamic-gs] skipping camera optimizer for cam_idx={camera_idx}; "
+                f"valid range is [0, {self.camera_optimizer.num_cameras - 1}]"
+            )
+            self._camera_opt_index_warning_logged = True
+        return False
 
-        camera_scale_fac = self._get_downscale_factor()
-        camera.rescale_output_resolution(1 / camera_scale_fac)
+    def _get_optimized_camera_to_world(self, camera: Cameras) -> Tensor:
+        if self._should_apply_camera_optimizer(camera):
+            return self.camera_optimizer.apply_to_camera(camera)
+        return camera.camera_to_worlds
+
+    @staticmethod
+    def _clone_camera(camera: Cameras) -> Cameras:
+        return camera.to(camera.device)
+
+    def _get_scaled_camera(self, camera: Cameras) -> tuple[Cameras, float]:
+        camera_scale_fac = float(self._get_downscale_factor())
+        if camera_scale_fac <= 0:
+            raise RuntimeError(f"Invalid camera downscale factor: {camera_scale_fac}")
+        scaled_camera = self._clone_camera(camera)
+        scaled_camera.rescale_output_resolution(1.0 / camera_scale_fac)
+        width, height = int(scaled_camera.width.item()), int(scaled_camera.height.item())
+        if width <= 0 or height <= 0:
+            raise RuntimeError(
+                f"Invalid scaled camera resolution {width}x{height} from factor {camera_scale_fac}"
+            )
+        return scaled_camera, camera_scale_fac
+
+    def _get_render_projection_params(self, camera) -> tuple[np.ndarray, np.ndarray, int, int]:
+        optimized_camera_to_world = self._get_optimized_camera_to_world(camera)
+        scaled_camera, _ = self._get_scaled_camera(camera)
         viewmat = get_viewmat(optimized_camera_to_world)[0].detach().cpu().numpy().astype(np.float32)
-        intrinsics = camera.get_intrinsics_matrices()[0].detach().cpu().numpy().astype(np.float32)
-        width, height = int(camera.width.item()), int(camera.height.item())
-        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore[arg-type]
+        intrinsics = scaled_camera.get_intrinsics_matrices()[0].detach().cpu().numpy().astype(np.float32)
+        width, height = int(scaled_camera.width.item()), int(scaled_camera.height.item())
         return viewmat, intrinsics, width, height
 
     @staticmethod
@@ -761,7 +797,8 @@ class DynamicGSModel(SplatfactoModel):
         render_object_mask: Tensor,
         rendered_depth: Tensor,
         camera,
-        debug_dir: Path,
+        image_debug_dir: Path,
+        artifact_dir: Path,
         frame_name: str,
     ) -> Dict[str, Union[int, float, str]]:
         if not self.config.use_sam3d_object_init:
@@ -776,8 +813,8 @@ class DynamicGSModel(SplatfactoModel):
 
         output_stem = f"{frame_name}_sam3d"
         run_device = torch.device(self.means.device)
-        sam3d_outputs = get_sam3d_output_paths(debug_dir, output_stem)
-        preferred_sam3d_ply = debug_dir / f"{frame_name}_d0_true_sam3d_raw_output.ply"
+        sam3d_outputs = get_sam3d_output_paths(artifact_dir, output_stem, image_dir=image_debug_dir)
+        preferred_sam3d_ply = artifact_dir / f"{frame_name}_d0_true_sam3d_raw_output.ply"
         if preferred_sam3d_ply.exists():
             sam3d_outputs["ply_path"] = preferred_sam3d_ply
         existing_indices = existing_indices.detach().cpu()
@@ -801,14 +838,16 @@ class DynamicGSModel(SplatfactoModel):
                 sam3d_inputs = prepare_cropped_sam3d_inputs(
                     render_image_path,
                     object_mask_path,
-                    debug_dir,
+                    artifact_dir,
                     output_stem,
+                    image_dir=image_debug_dir,
                 )
                 sam3d_outputs = run_sam3d_single_object_subprocess(
                     sam3d_inputs["render_image_path"],
                     sam3d_inputs["object_mask_path"],
-                    debug_dir,
+                    artifact_dir,
                     output_stem,
+                    image_dir=image_debug_dir,
                     max_side=80,
                 )
             finally:
@@ -826,10 +865,11 @@ class DynamicGSModel(SplatfactoModel):
             source_colors=source_colors,
             target_points=existing_means_np,
             target_colors=existing_colors_np,
-            debug_dir=debug_dir,
+            debug_dir=image_debug_dir,
+            artifact_dir=artifact_dir,
             output_stem=output_stem,
         )
-        aligned_path = debug_dir / f"{output_stem}_aligned_output.ply"
+        aligned_path = artifact_dir / f"{output_stem}_aligned_output.ply"
         save_point_cloud(aligned_path, insertion_result.aligned_points, insertion_result.aligned_colors)
 
         if insertion_result.kept_point_count > 0:
@@ -840,7 +880,7 @@ class DynamicGSModel(SplatfactoModel):
             )
         else:
             inserted_indices = torch.zeros((0,), dtype=torch.long, device=self.means.device)
-        fused_path = debug_dir / f"{output_stem}_fused_object_only.ply"
+        fused_path = artifact_dir / f"{output_stem}_fused_object_only.ply"
         fused_points = existing_means_np
         fused_colors = existing_colors_np
         if insertion_result.kept_point_count > 0:
@@ -859,7 +899,7 @@ class DynamicGSModel(SplatfactoModel):
             fused_colors,
         )
 
-        log_path = debug_dir / f"{output_stem}_fusion_log.txt"
+        log_path = artifact_dir / f"{output_stem}_fusion_log.txt"
         log_lines = [
             f"frame_name: {frame_name}",
             f"chosen_scale: {insertion_result.chosen_scale}",
@@ -883,8 +923,8 @@ class DynamicGSModel(SplatfactoModel):
             f"raw_sam3d_output_ply: {sam3d_outputs['ply_path']}",
             f"aligned_sam3d_output_ply: {aligned_path}",
             f"fused_object_only_ply: {fused_path}",
-            f"source_reg_ref_ply: {debug_dir / f'{output_stem}_source_reg_ref.ply'}",
-            f"target_reg_ref_ply: {debug_dir / f'{output_stem}_target_reg_ref.ply'}",
+            f"source_reg_ref_ply: {artifact_dir / f'{output_stem}_source_reg_ref.ply'}",
+            f"target_reg_ref_ply: {artifact_dir / f'{output_stem}_target_reg_ref.ply'}",
             f"correspondence_plot_path: {insertion_result.correspondence_plot_path}",
         ]
         log_path.write_text("\n".join(log_lines) + "\n")
@@ -1055,6 +1095,8 @@ class DynamicGSModel(SplatfactoModel):
             )
             if self.config.active_mask_dilate_radius > 0:
                 change_mask = dilate_binary_mask(change_mask, self.config.active_mask_dilate_radius)
+            if external_object_mask is None and torch.any(change_mask > 0.5):
+                change_mask = keep_largest_component(change_mask)
             _substeps["D0.1b_change_mask"] = time.time() - _t
 
             # --- Object segmentation ---
@@ -1083,13 +1125,26 @@ class DynamicGSModel(SplatfactoModel):
                     )
                     render_object_mask_source = "sam2"
                 else:
-                    render_object_mask, _, render_prompt_points = query_esam_mask(
+                    initial_render_object_mask, _, initial_render_prompt_points = query_esam_mask(
                         self._get_esam_model(),
                         outputs["rgb"],
                         change_mask,
                         num_points=ESAM_NUM_PROMPT_POINTS,
+                        keep_ratio=self.config.esam_prompt_keep_ratio,
                     )
-                    render_object_mask_source = "esam"
+                    if torch.any(initial_render_object_mask > 0.5):
+                        render_object_mask, _, render_prompt_points = query_esam_mask(
+                            self._get_esam_model(),
+                            outputs["rgb"],
+                            initial_render_object_mask.float(),
+                            num_points=ESAM_NUM_PROMPT_POINTS,
+                            keep_ratio=self.config.esam_prompt_keep_ratio,
+                        )
+                        render_object_mask_source = "esam_refined"
+                    else:
+                        render_object_mask = initial_render_object_mask
+                        render_prompt_points = initial_render_prompt_points
+                        render_object_mask_source = "esam"
                 _substeps["D0.1c_esam_render"] = time.time() - _t
 
                 live_prompt_points = torch.zeros((0, 2), dtype=torch.long, device=outputs["rgb"].device)
@@ -1109,6 +1164,7 @@ class DynamicGSModel(SplatfactoModel):
                         live_rgb,
                         change_mask,
                         num_points=ESAM_NUM_PROMPT_POINTS,
+                        keep_ratio=self.config.esam_prompt_keep_ratio,
                     )
                     live_object_mask_source = "esam"
                 _substeps["D0.1d_esam_live"] = time.time() - _t
@@ -1202,6 +1258,8 @@ class DynamicGSModel(SplatfactoModel):
                 "live_object_mask_source": live_object_mask_source,
                 "render_prompt_point_count": int(render_prompt_points.shape[0]),
                 "live_prompt_point_count": int(live_prompt_points.shape[0]),
+                "render_prompt_points": render_prompt_points,
+                "live_prompt_points": live_prompt_points,
                 "render_object_mask": render_object_mask,
                 "live_object_mask": live_object_mask,
                 "optim_mask": optim_mask,
@@ -1225,12 +1283,10 @@ class DynamicGSModel(SplatfactoModel):
         try:
             camera = camera.to(self.device)
             optimized_camera_to_world = camera.camera_to_worlds
-            camera_scale_fac = self._get_downscale_factor()
-            camera.rescale_output_resolution(1 / camera_scale_fac)
+            scaled_camera, _ = self._get_scaled_camera(camera)
             viewmat = get_viewmat(optimized_camera_to_world)
-            K = camera.get_intrinsics_matrices().to(self.device)
-            width, height = int(camera.width.item()), int(camera.height.item())
-            camera.rescale_output_resolution(camera_scale_fac)
+            K = scaled_camera.get_intrinsics_matrices().to(self.device)
+            width, height = int(scaled_camera.width.item()), int(scaled_camera.height.item())
 
             obj_mask = self.object_flags.squeeze(-1) > 0.5
             if not obj_mask.any():
@@ -1280,9 +1336,7 @@ class DynamicGSModel(SplatfactoModel):
 
         if self.training:
             assert camera.shape[0] == 1, "Only one camera at a time"
-            optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
-        else:
-            optimized_camera_to_world = camera.camera_to_worlds
+        optimized_camera_to_world = self._get_optimized_camera_to_world(camera)
 
         if self.crop_box is not None and not self.training:
             crop_ids = self.crop_box.within(self.means).squeeze()
@@ -1320,13 +1374,11 @@ class DynamicGSModel(SplatfactoModel):
 
         colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
 
-        camera_scale_fac = self._get_downscale_factor()
-        camera.rescale_output_resolution(1 / camera_scale_fac)
+        scaled_camera, _ = self._get_scaled_camera(camera)
         viewmat = get_viewmat(optimized_camera_to_world)
-        K = camera.get_intrinsics_matrices().to(self.device)
-        width, height = int(camera.width.item()), int(camera.height.item())
+        K = scaled_camera.get_intrinsics_matrices().to(self.device)
+        width, height = int(scaled_camera.width.item()), int(scaled_camera.height.item())
         self.last_size = (height, width)
-        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore[arg-type]
 
         if self.config.rasterize_mode not in ["antialiased", "classic"]:
             raise ValueError(f"Unknown rasterize_mode: {self.config.rasterize_mode}")
@@ -1465,7 +1517,7 @@ class DynamicGSModel(SplatfactoModel):
             "depth_loss": self.config.depth_lambda * depth_loss,
             "rigid_static_loss": self.config.rigid_static_lambda * rigid_static_reg,
         }
-        if self.training:
+        if self.training and self.phase == "static":
             self.camera_optimizer.get_loss_dict(loss_dict)
         return loss_dict
 

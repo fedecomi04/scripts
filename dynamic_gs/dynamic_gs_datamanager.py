@@ -157,8 +157,14 @@ class DynamicGSDataManager(DataManager):
     def get_current_dynamic_frame_name(self) -> str:
         return self.get_dynamic_frame_name(self.current_dynamic_frame_idx)
 
+    def get_initialization_debug_dir(self) -> Path:
+        return Path(self.config.data) / self.config.dynamic_subdir / "initialization_debug"
+
+    def get_initialization_artifact_dir(self) -> Path:
+        return Path(self.config.data) / self.config.dynamic_subdir / "initialization_artifacts"
+
     def get_dynamic_debug_dir(self) -> Path:
-        return Path(self.config.data) / self.config.dynamic_subdir / "render_masks_esam"
+        return self.get_initialization_debug_dir()
 
     def _get_dynamic_batch(self, frame_idx: int, split: Literal["train", "eval"]):
         if split == "train":

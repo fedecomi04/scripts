@@ -399,6 +399,7 @@ def register_and_fuse_sam3d_object(
     target_points: np.ndarray,
     target_colors: np.ndarray,
     debug_dir: Path | None = None,
+    artifact_dir: Path | None = None,
     output_stem: str | None = None,
 ) -> Sam3DInsertionResult:
     if len(source_points) == 0:
@@ -461,9 +462,6 @@ def register_and_fuse_sam3d_object(
     correspondence_plot_path = ""
     if debug_dir is not None and output_stem is not None:
         debug_dir = Path(debug_dir)
-        save_point_cloud(debug_dir / f"{output_stem}_source_reg_ref.ply", source_down_points, source_down_colors)
-        save_point_cloud(debug_dir / f"{output_stem}_target_reg_ref.ply", target_down_points, target_down_colors)
-        save_point_cloud(debug_dir / f"{output_stem}_source_visible_work_iter_00.ply", source_visible_for_plot, source_down_colors)
         correspondence_plot_path = str(
             _save_correspondence_plot(
                 debug_dir,
@@ -474,6 +472,11 @@ def register_and_fuse_sam3d_object(
                 similarity_correspondence_threshold,
             )
         )
+    if artifact_dir is not None and output_stem is not None:
+        artifact_dir = Path(artifact_dir)
+        save_point_cloud(artifact_dir / f"{output_stem}_source_reg_ref.ply", source_down_points, source_down_colors)
+        save_point_cloud(artifact_dir / f"{output_stem}_target_reg_ref.ply", target_down_points, target_down_colors)
+        save_point_cloud(artifact_dir / f"{output_stem}_source_visible_work_iter_00.ply", source_visible_for_plot, source_down_colors)
 
     return Sam3DInsertionResult(
         aligned_points=aligned_points,

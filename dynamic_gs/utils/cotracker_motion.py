@@ -16,12 +16,17 @@ if TYPE_CHECKING:
 @dataclass
 class CoTrackerMotionEstimate:
     success: bool
+    ready: bool
     rotation: np.ndarray
     translation: np.ndarray
     correspondence_count: int
     inlier_count: int
     track_count_before: int
     track_count_after: int
+    raw_visible_count: int
+    mask_visible_count: int
+    depth_valid_count: int
+    used_mask_fallback: bool
     mean_residual: float
     median_residual: float
     # Debug: pixel coordinates of tracked points (None if not ready)
@@ -65,6 +70,10 @@ class CoTrackerMotionEstimator:
         self._reference_mask: Optional[Tensor] = None
         self._reference_world_points: Optional[np.ndarray] = None
         self._current_points_xy: Optional[np.ndarray] = None
+        self.last_init_fast_point_count = 0
+        self.last_init_sampled_count = 0
+        self.last_init_depth_valid_count = 0
+        self.last_init_used_dense_fallback = False
 
     @property
     def ready(self) -> bool:
@@ -101,7 +110,19 @@ class CoTrackerMotionEstimator:
             rgb=self._previous_rgb,
             output_shape=self._previous_rgb.shape[:2],
         )
+        self.last_init_fast_point_count = int(len(sampled_points))
+        self.last_init_used_dense_fallback = False
+        if len(sampled_points) < self.min_track_points:
+            sampled_points = self._sample_mask_points(
+                mask,
+                max_points=self.query_point_count,
+                rgb=None,
+                output_shape=self._previous_rgb.shape[:2],
+            )
+            self.last_init_used_dense_fallback = True
+        self.last_init_sampled_count = int(len(sampled_points))
         reference_depth_values, reference_depth_valid = self._sample_depth_bilinear(self._previous_depth, sampled_points)
+        self.last_init_depth_valid_count = int(reference_depth_valid.sum())
         sampled_points = sampled_points[reference_depth_valid]
         reference_depth_values = reference_depth_values[reference_depth_valid]
         self._current_points_xy = sampled_points.astype(np.float32)
@@ -176,12 +197,17 @@ class CoTrackerMotionEstimator:
         if not self.ready:
             return CoTrackerMotionEstimate(
                 success=False,
+                ready=False,
                 rotation=identity,
                 translation=zero,
                 correspondence_count=0,
                 inlier_count=0,
                 track_count_before=track_count_before,
                 track_count_after=self.current_track_count,
+                raw_visible_count=0,
+                mask_visible_count=0,
+                depth_valid_count=0,
+                used_mask_fallback=False,
                 mean_residual=float("inf"),
                 median_residual=float("inf"),
             )
@@ -211,17 +237,30 @@ class CoTrackerMotionEstimator:
             width=current_depth_prepared.shape[1],
             height=current_depth_prepared.shape[0],
         )
+        raw_visibility = visibility_now.copy()
+        raw_visible_count = int(raw_visibility.sum())
+
+        used_mask_fallback = False
+        mask_visible_count = raw_visible_count
         if current_mask is not None:
-            visibility_now = self._filter_points_by_mask_array(
+            masked_visibility = self._filter_points_by_mask_array(
                 current_points_xy,
                 visibility_now,
                 current_mask,
                 output_shape=current_depth_prepared.shape,
             )
+            mask_visible_count = int(masked_visibility.sum())
+            if mask_visible_count >= self.min_track_points:
+                visibility_now = masked_visibility
+            else:
+                visibility_now = raw_visibility
+                used_mask_fallback = current_mask is not None
 
         correspondence_mask = visibility_now.copy()
         current_depth_values, current_depth_valid = self._sample_depth_bilinear(current_depth_prepared, current_points_xy)
-        correspondence_mask &= current_depth_valid
+        depth_compatible_mask = correspondence_mask & current_depth_valid
+        depth_valid_count = int(depth_compatible_mask.sum())
+        correspondence_mask = depth_compatible_mask
 
         prev_world = self._reference_world_points[correspondence_mask]
         curr_world = self._backproject_to_world(
@@ -263,12 +302,17 @@ class CoTrackerMotionEstimator:
 
         return CoTrackerMotionEstimate(
             success=success,
+            ready=True,
             rotation=rotation,
             translation=translation,
             correspondence_count=int(correspondence_mask.sum()),
             inlier_count=inlier_count,
             track_count_before=track_count_before,
             track_count_after=track_count_after,
+            raw_visible_count=raw_visible_count,
+            mask_visible_count=mask_visible_count,
+            depth_valid_count=depth_valid_count,
+            used_mask_fallback=used_mask_fallback,
             mean_residual=mean_residual,
             median_residual=median_residual,
             previous_points_xy=debug_prev_points,
@@ -473,8 +517,8 @@ class CoTrackerMotionEstimator:
             & (y <= max(height - 1, 0))
         )
 
-        x0 = np.floor(x).astype(np.int64)
-        y0 = np.floor(y).astype(np.int64)
+        x0 = np.clip(np.floor(x).astype(np.int64), 0, max(width - 1, 0))
+        y0 = np.clip(np.floor(y).astype(np.int64), 0, max(height - 1, 0))
         x1 = np.clip(x0 + 1, 0, max(width - 1, 0))
         y1 = np.clip(y0 + 1, 0, max(height - 1, 0))
 
@@ -504,6 +548,7 @@ class CoTrackerMotionEstimator:
             + d11 * wx * wy
         ).astype(np.float32)
         valid &= np.isfinite(depth_values) & (depth_values > 0.0)
+        depth_values[~valid] = 0.0
         return depth_values, valid
 
     @staticmethod
