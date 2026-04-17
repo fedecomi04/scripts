@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -49,6 +50,9 @@ class DynamicGSPipeline(VanillaPipeline):
         self._live_tracker_mask = None
         self._live_tracker_seeded = False
         self._timing = defaultdict(list)
+        self._timing_report_written = False
+        self._cpd_info: dict = {}
+        atexit.register(self._write_timing_report)
         super().__init__(
             config=config,
             device=device,
@@ -483,6 +487,25 @@ class DynamicGSPipeline(VanillaPipeline):
             if sam3d_stats:
                 self._timing["D0.2_sam3d_generation"].append(sam3d_stats.get("sam3d_generation_time", 0.0))
                 self._timing["D0.3_sam3d_insertion"].append(sam3d_stats.get("sam3d_insertion_time", 0.0))
+                # Record D0.3 sub-step breakdown
+                for sub_key in (
+                    "D0.3a_load_ply",
+                    "D0.3b_registration",
+                    "D0.3b1_nn_distances",
+                    "D0.3b2_voxel_downsample",
+                    "D0.3b3_cpd_refinement",
+                    "D0.3b4_correspondences",
+                    "D0.3b5_dedup",
+                    "D0.3b6_plot_and_save",
+                    "D0.3c_save_aligned_ply",
+                    "D0.3d_insert_gaussians",
+                    "D0.3e_persistent_membership",
+                    "D0.3f_save_fused_and_log",
+                ):
+                    if sub_key in sam3d_stats:
+                        self._timing[sub_key].append(sam3d_stats[sub_key])
+                # CPD metadata is a dict, not a float — store separately
+                self._cpd_info = sam3d_stats.get("D0.3b3_cpd_meta", {})
                 self._sam3d_inserted = True
                 self.model.refresh_dynamic_state_after_insertion(
                     camera, stats["render_object_mask"], stats["optim_mask"],
@@ -757,7 +780,17 @@ class DynamicGSPipeline(VanillaPipeline):
         CONSOLE.log(f"  Grand total measured: {all_times:.1f}s")
 
     def _write_timing_report(self):
-        """Write a detailed timing report file with per-phase breakdowns and percentages."""
+        """Write a detailed timing report file with per-phase breakdowns and percentages.
+
+        Called both at the last training step and via atexit so that Ctrl+C
+        interrupts still produce a report.  Missing timing keys (e.g. because
+        the run was interrupted before that phase completed) show 0.0s; the
+        last collected value for each key is always used as-is.
+        """
+        if self._timing_report_written:
+            return
+        self._timing_report_written = True
+
         from datetime import datetime
 
         # --- Descriptions for each timer key (chronological within phase) ---
@@ -769,7 +802,19 @@ class DynamicGSPipeline(VanillaPipeline):
             ("D0.1d_esam_live", "  -> ESAM on live image"),
             ("D0.1e_gaussian_flagging", "  -> Gaussian flagging (project centers, build active mask)"),
             ("D0.2_sam3d_generation", "SAM3D object generation (subprocess)"),
-            ("D0.3_sam3d_insertion", "SAM3D object insertion (CPD similarity + dedup + insert Gaussians)"),
+            ("D0.3_sam3d_insertion", "SAM3D object insertion (total)"),
+            ("D0.3a_load_ply", "  -> Load SAM3D PLY (plyfile read from disk)"),
+            ("D0.3b_registration", "  -> Registration total (bbox scale + centroid + downsample + CPD + dedup)"),
+            ("D0.3b1_nn_distances", "    -> Median NN distances for voxel size (Open3D, source + target)"),
+            ("D0.3b2_voxel_downsample", "    -> Voxel downsample (source + target)"),
+            ("D0.3b3_cpd_refinement", "    -> Probreg CPD similarity refinement (maxiter=50, tol=1e-2)"),
+            ("D0.3b4_correspondences", "    -> Explicit correspondence build + point transforms"),
+            ("D0.3b5_dedup", "    -> Dedup distance computation (Open3D point cloud distance)"),
+            ("D0.3b6_plot_and_save", "    -> Correspondence plot (matplotlib 3D) + artifact PLY saves"),
+            ("D0.3c_save_aligned_ply", "  -> Save aligned PLY"),
+            ("D0.3d_insert_gaussians", "  -> Insert Gaussians (k_nearest for scale, param concat, optimizer rebuild)"),
+            ("D0.3e_persistent_membership", "  -> Persistent membership (sklearn KNN over all candidate Gaussians)"),
+            ("D0.3f_save_fused_and_log", "  -> Save fused PLY + write fusion log"),
             ("D0.4_render_object_mask", "Render object mask (rasterize object_flags Gaussians from simulation)"),
             ("D0.5_seed_live_tracker", "Seed live SAM2 tracker (store D0 live RGB + mask)"),
             ("D0.6_cotracker_init", "CoTracker initialization (freeze D0 reference frame, sample points once, cache reference 3D)"),
@@ -789,8 +834,14 @@ class DynamicGSPipeline(VanillaPipeline):
         ]
 
         lines = []
-        lines.append("=== PIPELINE TIMING REPORT ===")
+        total_steps = self._total_train_steps()
+        completed_steps = len(self._timing.get("static_step", [])) + len(self._timing.get("dynamic_step", []))
+        interrupted = completed_steps < total_steps
+        header = "=== PIPELINE TIMING REPORT (INTERRUPTED — PARTIAL) ===" if interrupted else "=== PIPELINE TIMING REPORT ==="
+        lines.append(header)
         lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if interrupted:
+            lines.append(f"WARNING: training stopped early ({completed_steps}/{total_steps} steps). Timings below reflect only what was collected.")
         lines.append(
             f"Config: static_num_steps={self.config.static_num_steps}, "
             f"dynamic_steps_per_frame={self.config.dynamic_steps_per_frame}, "
@@ -820,6 +871,21 @@ class DynamicGSPipeline(VanillaPipeline):
             t = sum(vals) if vals else 0.0
             pct = (t / d0_phase_total * 100) if d0_phase_total > 0 else 0.0
             lines.append(f"  {key:<42s} {t:>8.2f}s  {pct:>6.1f}%    {desc}")
+            if key == "D0.3b3_cpd_refinement" and self._cpd_info:
+                m = self._cpd_info
+                if m.get("stop_reason") == "tol":
+                    lines.append(
+                        f"  {'':42s}                      "
+                        f"CPD converged at iteration {m['iterations']}/{m['maxiter']} "
+                        f"(tol={m['tol']:.0e} reached)"
+                    )
+                elif m.get("stop_reason") == "maxiter":
+                    q_delta = m.get("last_q_delta")
+                    q_str = f"{q_delta:.3e}" if q_delta is not None else "unavailable"
+                    lines.append(
+                        f"  {'':42s}                      "
+                        f"CPD hit maxiter={m['maxiter']}, last |q_delta|={q_str}"
+                    )
         lines.append("")
 
         # --- Phase 3: Dynamic loop ---

@@ -35,6 +35,46 @@ def get_sam3d_output_paths(
     }
 
 
+def resolve_sam3d_pose_path(raw_ply_path: Path, fallback_pose_path: Path | None = None) -> Path | None:
+    raw_ply_path = Path(raw_ply_path)
+    candidates: list[Path] = []
+    if raw_ply_path.name.endswith("_raw_output.ply"):
+        candidates.append(raw_ply_path.with_name(raw_ply_path.name[: -len("_raw_output.ply")] + "_pose.json"))
+    if fallback_pose_path is not None:
+        candidates.append(Path(fallback_pose_path))
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_sam3d_pose(path: Path) -> Dict[str, np.ndarray]:
+    payload = json.loads(Path(path).read_text())
+    pose: Dict[str, np.ndarray] = {}
+    for key in ("translation", "rotation", "scale"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        pose[key] = np.asarray(value, dtype=np.float32).reshape(-1)
+    return pose
+
+
+def sam3d_pose_has_rotation(path: Path | None) -> bool:
+    if path is None or not Path(path).exists():
+        return False
+    try:
+        pose = load_sam3d_pose(Path(path))
+    except Exception:
+        return False
+    rotation = pose.get("rotation")
+    return rotation is not None and rotation.size == 4 and np.isfinite(rotation).all()
+
+
 def _load_binary_mask(mask_path: Path, target_size: tuple[int, int]) -> np.ndarray:
     mask_image = Image.open(mask_path).convert("L")
     if mask_image.size != target_size:
@@ -191,7 +231,7 @@ def run_sam3d_single_object(
     output_dir: Path,
     output_stem: str,
     image_dir: Path | None = None,
-    max_side: int = 192,
+    max_side: int = 518,
 ) -> Dict[str, Path]:
     render_image_path = Path(render_image_path)
     object_mask_path = Path(object_mask_path)
@@ -275,6 +315,8 @@ def run_sam3d_single_object(
         value = output.get(key)
         if value is not None:
             pose_data[key] = torch.as_tensor(value).detach().cpu().reshape(-1).tolist()
+    if "rotation" not in pose_data or len(pose_data["rotation"]) != 4:
+        raise RuntimeError("SAM3D did not return a valid object rotation pose.")
     if pose_data:
         pose_path.write_text(json.dumps(pose_data, indent=2) + "\n")
 
@@ -315,7 +357,7 @@ def run_sam3d_single_object_subprocess(
     output_dir: Path,
     output_stem: str,
     image_dir: Path | None = None,
-    max_side: int = 192,
+    max_side: int = 518,
 ) -> Dict[str, Path]:
     """Run the working SAM3D generation path in a fresh Python process.
 
@@ -361,7 +403,14 @@ def run_sam3d_single_object_subprocess(
             f"STDERR:\n{completed.stderr}"
         )
 
-    return get_sam3d_output_paths(output_dir, output_stem, image_dir=image_dir)
+    output_paths = get_sam3d_output_paths(output_dir, output_stem, image_dir=image_dir)
+    resolved_pose_path = resolve_sam3d_pose_path(output_paths["ply_path"], output_paths["pose_path"])
+    if not sam3d_pose_has_rotation(resolved_pose_path):
+        raise RuntimeError(
+            f"SAM3D subprocess produced `{output_paths['ply_path']}` but no valid rotation pose sidecar was found."
+        )
+    output_paths["pose_path"] = resolved_pose_path if resolved_pose_path is not None else output_paths["pose_path"]
+    return output_paths
 
 
 def _parse_args() -> argparse.Namespace:
@@ -371,7 +420,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--output-stem", type=str, required=True)
     parser.add_argument("--image-dir", type=Path, default=None)
-    parser.add_argument("--max-side", type=int, default=192)
+    parser.add_argument("--max-side", type=int, default=518)
     return parser.parse_args()
 
 

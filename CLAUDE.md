@@ -118,8 +118,8 @@ DynamicGSDataManager    (dynamic_gs_datamanager.py)
 |--------|------|
 | `active_mask.py` | Change detection from RGB/depth deltas; MSSIM-based `build_change_mask`; morphological filtering |
 | `cotracker_motion.py` | `CoTrackerMotionEstimator`: fixed-reference CoTracker3 tracking + 3D backprojection + RANSAC rigid transform; FAST+NMS point sampling inside an eroded mask; current-mask filtering before RANSAC |
-| `sam3d.py` | SAM3D subprocess invocation (`run_sam3d_single_object_subprocess`); output path management; PLY loading |
-| `sam3d_fusion.py` | Point cloud registration via bbox scale + centroid alignment + voxel downsampling + probreg CPD similarity; Gaussian insertion and deduplication via `register_and_fuse_sam3d_object` |
+| `sam3d.py` | SAM3D subprocess invocation (`run_sam3d_single_object_subprocess`); output path management; pose sidecar save/resolve/validation |
+| `sam3d_fusion.py` | SAM3D rotation-aware object initialization: apply SAM3D quaternion in camera/world frame, then current bbox scale + centroid alignment + voxel downsampling + probreg CPD similarity; Gaussian insertion and deduplication via `register_and_fuse_sam3d_object` |
 | `sam2.py` | SAM2 video predictor (`build_sam2_tiny_video_predictor`); `query_sam2_propagated_mask` for pairwise frame-to-frame mask propagation |
 | `esam.py` | ESAM interactive object mask query (`query_esam_mask`); `build_esam_ti` model builder |
 | `depth_loss.py` | `masked_l1_depth_loss`: per-pixel L1 depth loss masked to valid regions |
@@ -210,10 +210,10 @@ LR is zeroed (not disabled) for inactive groups. When transitioning to the dynam
 
 1. Saves the rendered RGB and live object mask to disk (required as SAM3D inputs).
 2. Calls `run_sam3d_single_object_subprocess` — launches a separate Python process running SAM3D (`sam-3d-objects`) which generates a Gaussian `.ply` file.
-3. `register_and_fuse_sam3d_object` loads the PLY, then aligns it with the existing object cloud using bbox scale + centroid alignment + voxel downsampling + probreg CPD similarity, and appends only non-overlapping Gaussians to the existing set.
+3. `register_and_fuse_sam3d_object` loads the PLY and the matching SAM3D pose sidecar, applies only the SAM3D rotation as the source orientation prior, then uses the current pipeline's bbox scale + centroid translation + voxel downsampling + probreg CPD similarity, and appends only non-overlapping Gaussians to the existing set.
 4. `refresh_dynamic_state_after_insertion` re-runs Gaussian flagging to label the newly inserted points as object members.
 
-Key parameters: `reuse_sam3d_generated_ply=True` (default) skips the subprocess if a PLY already exists from a previous run. Set to `False` when you need fresh generation (e.g., for accurate timing measurements or after changing the object). If `{frame_name}_d0_true_sam3d_raw_output.ply` exists in the debug directory, the pipeline prefers that file as the SAM3D source for insertion.
+Key parameters: `reuse_sam3d_generated_ply=True` (default) skips the subprocess only when both the cached PLY and a valid matching pose sidecar with `rotation` exist. Set to `False` when you need fresh generation (e.g., for accurate timing measurements or after changing the object). If `{frame_name}_d0_true_sam3d_raw_output.ply` exists in the debug directory, the pipeline prefers that file as the SAM3D source for insertion only when its matching pose sidecar is also valid.
 
 SAM3D checkpoints live in `third_party/sam-3d-objects/checkpoints/hf/`. The pipeline uses `pipeline_runtime_small.yaml` which requires only: `ss_generator`, `slat_generator`, `ss_decoder`, `slat_decoder_gs`. The mesh and GS4 decoders are null and their checkpoints are not needed.
 

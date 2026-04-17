@@ -14,12 +14,14 @@ Gaussians are kept. This file intentionally uses geometry-first registration wit
 RGB used only for the CPD refinement and the final Gaussian insertion.
 """
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import torch
 from nerfstudio.utils.spherical_harmonics import SH2RGB
+from .sam3d import load_sam3d_pose
 
 try:
     import open3d as o3d
@@ -35,6 +37,8 @@ try:
     from probreg import cpd
 except ImportError:  # pragma: no cover - training env dependency
     cpd = None
+
+SAM3D_P3D_TO_NS_CAMERA = np.diag([-1.0, 1.0, -1.0]).astype(np.float32)
 
 
 @dataclass
@@ -56,6 +60,8 @@ class Sam3DInsertionResult:
     similarity_scale: float
     correspondence_threshold: float
     correspondence_plot_path: str
+    timing: dict = field(default_factory=dict)
+    used_sam3d_rotation_init: bool = False
 
 
 def _require_open3d():
@@ -80,6 +86,45 @@ def load_sam3d_gaussian_ply(ply_path: Path) -> tuple[np.ndarray, np.ndarray]:
     else:
         rgb = np.full((xyz.shape[0], 3), 0.5, dtype=np.float32)
     return xyz, rgb
+
+
+def load_sam3d_rotation_wxyz(pose_path: Path) -> np.ndarray:
+    pose = load_sam3d_pose(pose_path)
+    rotation = pose.get("rotation")
+    if rotation is None or rotation.size != 4 or not np.isfinite(rotation).all():
+        raise ValueError(f"SAM3D pose sidecar does not contain a valid rotation quaternion: {pose_path}")
+    return rotation.astype(np.float32)
+
+
+def _quaternion_wxyz_to_rotation_matrix(quaternion: np.ndarray) -> np.ndarray:
+    w, x, y, z = np.asarray(quaternion, dtype=np.float64).reshape(4)
+    norm = np.sqrt(w * w + x * x + y * y + z * z)
+    if norm <= 1e-12:
+        return np.eye(3, dtype=np.float32)
+    w /= norm
+    x /= norm
+    y /= norm
+    z /= norm
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _apply_sam3d_rotation_init(
+    source_points: np.ndarray,
+    rotation_wxyz: np.ndarray,
+    camera_to_world_rotation: np.ndarray,
+) -> np.ndarray:
+    rotation_p3d = _quaternion_wxyz_to_rotation_matrix(rotation_wxyz)
+    rotated_p3d = source_points.astype(np.float32) @ rotation_p3d
+    rotated_ns = rotated_p3d @ SAM3D_P3D_TO_NS_CAMERA
+    camera_to_world_rotation = np.asarray(camera_to_world_rotation, dtype=np.float32).reshape(3, 3)
+    return (rotated_ns @ camera_to_world_rotation.T).astype(np.float32)
 
 
 def _to_pcd(points: np.ndarray, colors: np.ndarray | None = None):
@@ -347,11 +392,25 @@ def _run_probreg_similarity_refinement(
     target_colors: np.ndarray,
     init_transform: np.ndarray,
     voxel_size: float,
-) -> tuple[np.ndarray, int]:
+) -> tuple[np.ndarray, int, dict]:
+    """Returns (refined_transform, correspondence_count, cpd_meta).
+
+    cpd_meta keys:
+      iterations     – EM iterations actually executed
+      stop_reason    – "tol" if tolerance was met early, "maxiter" if hard cap was hit
+      maxiter        – configured hard cap
+      tol            – configured convergence tolerance
+      last_q_delta   – |q - q_prev| at the last iteration (None if unavailable); used
+                       to show the actual convergence value when maxiter is reached
+    """
+    _MAXITER = 70
+    _TOL = 1e-2
+    _empty_meta: dict = {"iterations": 0, "stop_reason": "skipped", "maxiter": _MAXITER, "tol": _TOL, "last_q_delta": None}
+
     if cpd is None:
-        return init_transform.astype(np.float32), 0
+        return init_transform.astype(np.float32), 0, _empty_meta
     if len(source_points) < 3 or len(target_points) < 3:
-        return init_transform.astype(np.float32), 0
+        return init_transform.astype(np.float32), 0, _empty_meta
 
     transformed_source = _transform_points(source_points, init_transform)
     source_probreg_points = transformed_source
@@ -359,7 +418,7 @@ def _run_probreg_similarity_refinement(
     target_probreg_points = target_points
     target_probreg_colors = target_colors
     if len(source_probreg_points) < 3 or len(target_probreg_points) < 3:
-        return init_transform.astype(np.float32), 0
+        return init_transform.astype(np.float32), 0, _empty_meta
 
     if len(source_probreg_colors) != len(source_probreg_points):
         source_probreg_colors = np.full((len(source_probreg_points), 3), 0.5, dtype=np.float32)
@@ -368,19 +427,47 @@ def _run_probreg_similarity_refinement(
 
     source_probreg_pcd = _to_pcd(source_probreg_points, source_probreg_colors)
     target_probreg_pcd = _to_pcd(target_probreg_points, target_probreg_colors)
+
+    # Callback fires once per completed EM step with the current result object.
+    # probreg exposes the Q-function value as result.q in supported versions;
+    # we track consecutive Q deltas to report the actual convergence value when
+    # maxiter is hit instead of just saying "not reached".
+    _iter_count = [0]
+    _q_values: list = []
+    def _iter_cb(result):
+        _iter_count[0] += 1
+        q = getattr(result, "q", None)
+        if q is not None:
+            try:
+                _q_values.append(float(q))
+            except (TypeError, ValueError):
+                pass
+
     try:
         probreg_result = cpd.registration_cpd(
             source_probreg_pcd,
             target_probreg_pcd,
             tf_type_name="rigid",
             update_scale=True,
-            maxiter=80,
-            tol=1e-6,
+            maxiter=_MAXITER,
+            tol=_TOL,
             w=0.5,
             use_color=True,
+            callbacks=[_iter_cb],
         )
     except Exception:
-        return init_transform.astype(np.float32), 0
+        return init_transform.astype(np.float32), 0, _empty_meta
+
+    iterations_run = _iter_count[0]
+    stop_reason = "maxiter" if iterations_run >= _MAXITER else "tol"
+    last_q_delta = abs(_q_values[-1] - _q_values[-2]) if len(_q_values) >= 2 else None
+    cpd_meta = {
+        "iterations": iterations_run,
+        "stop_reason": stop_reason,
+        "maxiter": _MAXITER,
+        "tol": _TOL,
+        "last_q_delta": last_q_delta,
+    }
 
     probreg_transform = _compose_similarity_transform(
         probreg_result.transformation.scale,
@@ -390,7 +477,7 @@ def _run_probreg_similarity_refinement(
     refined_transform = probreg_transform @ init_transform.astype(np.float32)
 
     correspondence_count = int(min(len(source_probreg_points), len(target_probreg_points)))
-    return refined_transform.astype(np.float32), correspondence_count
+    return refined_transform.astype(np.float32), correspondence_count, cpd_meta
 
 
 def register_and_fuse_sam3d_object(
@@ -398,6 +485,8 @@ def register_and_fuse_sam3d_object(
     source_colors: np.ndarray,
     target_points: np.ndarray,
     target_colors: np.ndarray,
+    source_rotation_wxyz: np.ndarray | None = None,
+    camera_to_world_rotation: np.ndarray | None = None,
     debug_dir: Path | None = None,
     artifact_dir: Path | None = None,
     output_stem: str | None = None,
@@ -413,6 +502,13 @@ def register_and_fuse_sam3d_object(
     target_colors = _ensure_rgb_colors(target_colors, len(target_points))
     source_point_count = int(len(source_points))
     target_point_count = int(len(target_points))
+    used_sam3d_rotation_init = False
+
+    if source_rotation_wxyz is not None:
+        if camera_to_world_rotation is None:
+            raise ValueError("camera_to_world_rotation is required when using SAM3D rotation initialization.")
+        source_points = _apply_sam3d_rotation_init(source_points, source_rotation_wxyz, camera_to_world_rotation)
+        used_sam3d_rotation_init = True
 
     source_diag = _bbox_diagonal(source_points)
     target_diag = _bbox_diagonal(target_points)
@@ -424,14 +520,23 @@ def register_and_fuse_sam3d_object(
     scaled_source = target_centroid[None, :] + chosen_scale * (source_points - source_centroid[None, :])
     scaled_source_colors = source_colors
 
+    # --- TIMING: D0.3b1 median NN distances (Open3D nearest-neighbor for voxel size estimation) ---
+    _t = time.time()
     target_spacing = _median_nn_distance(target_points)
     source_spacing = _median_nn_distance(scaled_source)
+    t_nn_distances = time.time() - _t
+
+    # --- TIMING: D0.3b2 voxel downsampling (both source and target clouds) ---
+    _t = time.time()
     voxel_size = max(3.0 * max(target_spacing, source_spacing), 1e-3)
     source_down_points, source_down_colors = _voxel_downsample(scaled_source, scaled_source_colors, voxel_size)
     target_down_points, target_down_colors = _voxel_downsample(target_points, target_colors, voxel_size)
+    t_voxel_downsample = time.time() - _t
 
+    # --- TIMING: D0.3b3 probreg CPD similarity refinement (up to _MAXITER iterations, early-stop at _TOL) ---
+    _t = time.time()
     similarity_transform = np.eye(4, dtype=np.float32)
-    similarity_transform, similarity_correspondence_count = _run_probreg_similarity_refinement(
+    similarity_transform, similarity_correspondence_count, cpd_meta = _run_probreg_similarity_refinement(
         source_down_points,
         source_down_colors,
         target_down_points,
@@ -439,6 +544,10 @@ def register_and_fuse_sam3d_object(
         similarity_transform,
         voxel_size,
     )
+    t_cpd_refinement = time.time() - _t
+
+    # --- TIMING: D0.3b4 explicit correspondence building (KD-tree per-point search) ---
+    _t = time.time()
     similarity_correspondence_threshold = max(2.0 * _median_nn_distance(target_down_points), 1e-3)
     similarity_scale = float(chosen_scale * _extract_isotropic_scale(similarity_transform))
     source_visible_for_plot = _transform_points(source_down_points, similarity_transform)
@@ -447,18 +556,23 @@ def register_and_fuse_sam3d_object(
         target_down_points,
         max_distance=similarity_correspondence_threshold,
     )
-
     aligned_points = _transform_points(scaled_source, similarity_transform)
     aligned_colors = scaled_source_colors.astype(np.float32)
     final_scale = float(chosen_scale * _extract_isotropic_scale(similarity_transform))
+    t_correspondences = time.time() - _t
 
+    # --- TIMING: D0.3b5 dedup distance computation (Open3D point cloud distance) ---
+    _t = time.time()
     dedup_threshold = 1.5 * target_spacing
     target_pcd = _to_pcd(target_points, target_colors)
     distances = np.asarray(_to_pcd(aligned_points).compute_point_cloud_distance(target_pcd), dtype=np.float32)
     keep_mask = np.isfinite(distances) & (distances >= dedup_threshold)
     kept_points = aligned_points[keep_mask].astype(np.float32)
     kept_colors = aligned_colors[keep_mask].astype(np.float32)
+    t_dedup = time.time() - _t
 
+    # --- TIMING: D0.3b6 correspondence plot + artifact PLY saves ---
+    _t = time.time()
     correspondence_plot_path = ""
     if debug_dir is not None and output_stem is not None:
         debug_dir = Path(debug_dir)
@@ -477,6 +591,7 @@ def register_and_fuse_sam3d_object(
         save_point_cloud(artifact_dir / f"{output_stem}_source_reg_ref.ply", source_down_points, source_down_colors)
         save_point_cloud(artifact_dir / f"{output_stem}_target_reg_ref.ply", target_down_points, target_down_colors)
         save_point_cloud(artifact_dir / f"{output_stem}_source_visible_work_iter_00.ply", source_visible_for_plot, source_down_colors)
+    t_plot_and_save = time.time() - _t
 
     return Sam3DInsertionResult(
         aligned_points=aligned_points,
@@ -498,4 +613,14 @@ def register_and_fuse_sam3d_object(
         similarity_scale=float(similarity_scale),
         correspondence_threshold=float(similarity_correspondence_threshold),
         correspondence_plot_path=correspondence_plot_path,
+        timing={
+            "D0.3b1_nn_distances": t_nn_distances,
+            "D0.3b2_voxel_downsample": t_voxel_downsample,
+            "D0.3b3_cpd_refinement": t_cpd_refinement,
+            "D0.3b3_cpd_meta": cpd_meta,
+            "D0.3b4_correspondences": t_correspondences,
+            "D0.3b5_dedup": t_dedup,
+            "D0.3b6_plot_and_save": t_plot_and_save,
+        },
+        used_sam3d_rotation_init=used_sam3d_rotation_init,
     )

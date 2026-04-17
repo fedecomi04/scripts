@@ -32,14 +32,17 @@ from .utils import (
     extract_projected_centers_and_radii,
     keep_largest_component,
     load_sam3d_gaussian_ply,
+    load_sam3d_rotation_wxyz,
     masked_l1_depth_loss,
     get_sam3d_output_paths,
     prepare_cropped_sam3d_inputs,
     query_esam_mask,
     query_sam2_propagated_mask,
+    resolve_sam3d_pose_path,
     register_and_fuse_sam3d_object,
     rigid_or_static_loss,
     run_sam3d_single_object_subprocess,
+    sam3d_pose_has_rotation,
     save_point_cloud,
 )
 
@@ -815,8 +818,10 @@ class DynamicGSModel(SplatfactoModel):
         run_device = torch.device(self.means.device)
         sam3d_outputs = get_sam3d_output_paths(artifact_dir, output_stem, image_dir=image_debug_dir)
         preferred_sam3d_ply = artifact_dir / f"{frame_name}_d0_true_sam3d_raw_output.ply"
-        if preferred_sam3d_ply.exists():
+        preferred_pose_path = resolve_sam3d_pose_path(preferred_sam3d_ply, sam3d_outputs["pose_path"])
+        if preferred_sam3d_ply.exists() and sam3d_pose_has_rotation(preferred_pose_path):
             sam3d_outputs["ply_path"] = preferred_sam3d_ply
+            sam3d_outputs["pose_path"] = preferred_pose_path
         existing_indices = existing_indices.detach().cpu()
         existing_means_np = existing_means.detach().cpu().numpy()
         existing_colors_np = existing_colors.detach().cpu().numpy()
@@ -824,11 +829,23 @@ class DynamicGSModel(SplatfactoModel):
         if existing_indices.numel() > 0:
             self.sam3d_init_target_flags[existing_indices.to(self.sam3d_init_target_flags.device)] = 1.0
 
+        current_pose_path = resolve_sam3d_pose_path(sam3d_outputs["ply_path"], sam3d_outputs["pose_path"])
+        if current_pose_path is not None:
+            sam3d_outputs["pose_path"] = current_pose_path
+
         # --- TIMING: SAM3D generation (subprocess that creates 3D point cloud from RGB + mask) ---
         t_sam3d_gen = time.time()
-        reused_cached_sam3d = self.config.reuse_sam3d_generated_ply and sam3d_outputs["ply_path"].exists()
+        cached_rotation_ready = sam3d_pose_has_rotation(current_pose_path)
+        reused_cached_sam3d = (
+            self.config.reuse_sam3d_generated_ply and sam3d_outputs["ply_path"].exists() and cached_rotation_ready
+        )
         if reused_cached_sam3d:
             CONSOLE.log(f"[dynamic-gs] reusing cached SAM3D point cloud: {sam3d_outputs['ply_path']}")
+        elif self.config.reuse_sam3d_generated_ply and sam3d_outputs["ply_path"].exists():
+            CONSOLE.log(
+                f"[dynamic-gs] cached SAM3D point cloud found but no valid rotation pose sidecar exists; "
+                f"regenerating {sam3d_outputs['ply_path']}"
+            )
         else:
             self.to("cpu")
             gc.collect()
@@ -848,30 +865,58 @@ class DynamicGSModel(SplatfactoModel):
                     artifact_dir,
                     output_stem,
                     image_dir=image_debug_dir,
-                    max_side=80,
+                    max_side=518,
                 )
             finally:
                 self.to(run_device)
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+            resolved_pose_path = resolve_sam3d_pose_path(sam3d_outputs["ply_path"], sam3d_outputs["pose_path"])
+            if not sam3d_pose_has_rotation(resolved_pose_path):
+                raise RuntimeError(
+                    f"SAM3D output `{sam3d_outputs['ply_path']}` is missing a valid rotation pose sidecar."
+                )
+            sam3d_outputs["pose_path"] = resolved_pose_path
         sam3d_generation_time = time.time() - t_sam3d_gen
 
         # --- TIMING: SAM3D insertion (CPD registration, dedup, Gaussian insertion) ---
+        # Sub-steps are timed individually below to identify bottlenecks.
         t_sam3d_ins = time.time()
+
+        # --- TIMING: D0.3a load SAM3D PLY (plyfile read from disk) ---
+        _t = time.time()
         source_points, source_colors = load_sam3d_gaussian_ply(sam3d_outputs["ply_path"])
+        source_rotation_wxyz = load_sam3d_rotation_wxyz(sam3d_outputs["pose_path"])
+        t_load_ply = time.time() - _t
+
+        # --- TIMING: D0.3b registration (bbox scale + centroid + voxel downsample + CPD + dedup distances) ---
+        _t = time.time()
+        optimized_camera_to_world = self._get_optimized_camera_to_world(camera)
+        if optimized_camera_to_world.ndim == 3:
+            optimized_camera_to_world = optimized_camera_to_world[0]
+        camera_to_world_rotation = optimized_camera_to_world[:3, :3].detach().cpu().numpy().astype(np.float32)
         insertion_result: Sam3DInsertionResult = register_and_fuse_sam3d_object(
             source_points=source_points,
             source_colors=source_colors,
             target_points=existing_means_np,
             target_colors=existing_colors_np,
+            source_rotation_wxyz=source_rotation_wxyz,
+            camera_to_world_rotation=camera_to_world_rotation,
             debug_dir=image_debug_dir,
             artifact_dir=artifact_dir,
             output_stem=output_stem,
         )
+        t_registration = time.time() - _t
+
+        # --- TIMING: D0.3c save aligned PLY ---
+        _t = time.time()
         aligned_path = artifact_dir / f"{output_stem}_aligned_output.ply"
         save_point_cloud(aligned_path, insertion_result.aligned_points, insertion_result.aligned_colors)
+        t_save_aligned = time.time() - _t
 
+        # --- TIMING: D0.3d insert Gaussians (k_nearest for scale, param concat, optimizer rebuild) ---
+        _t = time.time()
         if insertion_result.kept_point_count > 0:
             inserted_indices = self.insert_object_gaussians(
                 torch.from_numpy(insertion_result.kept_points),
@@ -880,6 +925,8 @@ class DynamicGSModel(SplatfactoModel):
             )
         else:
             inserted_indices = torch.zeros((0,), dtype=torch.long, device=self.means.device)
+        t_insert_gaussians = time.time() - _t
+
         fused_path = artifact_dir / f"{output_stem}_fused_object_only.ply"
         fused_points = existing_means_np
         fused_colors = existing_colors_np
@@ -887,12 +934,18 @@ class DynamicGSModel(SplatfactoModel):
             fused_points = np.concatenate([fused_points, insertion_result.kept_points], axis=0)
             fused_colors = np.concatenate([fused_colors, insertion_result.kept_colors], axis=0)
 
+        # --- TIMING: D0.3e persistent membership (sklearn KNN over all ~300K+ candidate Gaussians) ---
+        _t = time.time()
         persistent_membership_stats = self._build_persistent_object_membership(
             fused_object_points=fused_points,
             initial_target_points=existing_means_np,
             initial_target_indices=existing_indices.to(self.means.device),
             inserted_indices=inserted_indices,
         )
+        t_persistent_membership = time.time() - _t
+
+        # --- TIMING: D0.3f save fused PLY + write log ---
+        _t = time.time()
         save_point_cloud(
             fused_path,
             fused_points,
@@ -908,6 +961,8 @@ class DynamicGSModel(SplatfactoModel):
             f"target_point_count: {insertion_result.target_point_count}",
             f"visible_source_point_count: {insertion_result.visible_source_point_count}",
             f"registration_source_point_count: {insertion_result.registration_source_point_count}",
+            f"used_sam3d_rotation_init: {int(insertion_result.used_sam3d_rotation_init)}",
+            f"sam3d_rotation_pose_json: {sam3d_outputs['pose_path']}",
             f"similarity_transform: {insertion_result.similarity_transform.tolist()}",
             f"similarity_correspondence_count: {insertion_result.similarity_correspondence_count}",
             f"similarity_scale: {insertion_result.similarity_scale}",
@@ -928,6 +983,8 @@ class DynamicGSModel(SplatfactoModel):
             f"correspondence_plot_path: {insertion_result.correspondence_plot_path}",
         ]
         log_path.write_text("\n".join(log_lines) + "\n")
+        t_save_fused_and_log = time.time() - _t
+
         sam3d_insertion_time = time.time() - t_sam3d_ins
 
         return {
@@ -936,15 +993,25 @@ class DynamicGSModel(SplatfactoModel):
             "sam3d_generated_points": insertion_result.source_point_count,
             "visible_source_points_used_for_scale": insertion_result.visible_source_point_count,
             "kept_points_after_dedup": insertion_result.kept_point_count,
+            "used_sam3d_rotation_init": int(insertion_result.used_sam3d_rotation_init),
             "persistent_object_count": int(persistent_membership_stats["persistent_object_count"]),
             "dedup_threshold": insertion_result.dedup_threshold,
             "reused_cached_sam3d": int(reused_cached_sam3d),
             "raw_sam3d_output_ply": str(sam3d_outputs["ply_path"]),
+            "sam3d_rotation_pose_json": str(sam3d_outputs["pose_path"]),
             "aligned_sam3d_output_ply": str(aligned_path),
             "fused_object_only_ply": str(fused_path),
             "fusion_log_path": str(log_path),
             "sam3d_generation_time": sam3d_generation_time,
             "sam3d_insertion_time": sam3d_insertion_time,
+            # Sub-step breakdown for D0.3 (insertion only, not generation)
+            "D0.3a_load_ply": t_load_ply,
+            "D0.3b_registration": t_registration,
+            **{k: v for k, v in insertion_result.timing.items()},
+            "D0.3c_save_aligned_ply": t_save_aligned,
+            "D0.3d_insert_gaussians": t_insert_gaussians,
+            "D0.3e_persistent_membership": t_persistent_membership,
+            "D0.3f_save_fused_and_log": t_save_fused_and_log,
         }
 
     @torch.no_grad()
