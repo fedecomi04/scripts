@@ -9,14 +9,16 @@ from nerfstudio.plugins.types import MethodSpecification
 from .dynamic_gs_datamanager import DynamicGSDataManagerConfig
 from .dynamic_gs_model import DynamicGSModelConfig
 from .dynamic_gs_pipeline import DynamicGSPipelineConfig
+from .dynamic_gs_trainer import NoSaveTrainer
 
 STATIC_NUM_STEPS = 4000
-DYNAMIC_STEPS_PER_FRAME = 500
-DEFAULT_MAX_NUM_STEPS = STATIC_NUM_STEPS + DYNAMIC_STEPS_PER_FRAME
+DYNAMIC_STEPS_PER_FRAME = 50   # optimization epochs per dynamic frame
+DEFAULT_MAX_NUM_STEPS = STATIC_NUM_STEPS + DYNAMIC_STEPS_PER_FRAME  # updated at runtime
 
 
 DynamicGS = MethodSpecification(
     config=TrainerConfig(
+        _target=NoSaveTrainer,
         method_name="dynamic-gs",
         steps_per_eval_image=100,
         steps_per_eval_batch=0,
@@ -29,9 +31,10 @@ DynamicGS = MethodSpecification(
             dynamic_steps_per_frame=DYNAMIC_STEPS_PER_FRAME,
             datamanager=DynamicGSDataManagerConfig(),
             model=DynamicGSModelConfig(
-                camera_optimizer=CameraOptimizerConfig(mode="off"),
+                camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),
                 output_depth_during_training=True,
                 stop_split_at=0,
+                reuse_sam3d_generated_ply=True,
             ),
         ),
         optimizers={
@@ -57,6 +60,10 @@ DynamicGS = MethodSpecification(
             },
             "quats": {
                 "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
+                "scheduler": None,
+            },
+            "camera_opt": {
+                "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
                 "scheduler": None,
             },
         },

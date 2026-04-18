@@ -681,11 +681,13 @@ class RobotMaskGenerator:
 
     def save_mask(self, stamp: rospy.Time, rgb_path: Path, mask_path: Path) -> None:
         robot_exclusion_mask = self._render_robot_exclusion_mask(stamp, MASK_RENDER_CAMERA_FRAME)
-        background_keep_mask = self._compute_background_keep_mask(rgb_path)
-        if background_keep_mask is None:
-            keep_mask = robot_exclusion_mask
-        else:
-            keep_mask = cv2.bitwise_and(robot_exclusion_mask, background_keep_mask)
+        # Background masking disabled: keep the full background and only exclude the robot.
+        # background_keep_mask = self._compute_background_keep_mask(rgb_path)
+        # if background_keep_mask is None:
+        #     keep_mask = robot_exclusion_mask
+        # else:
+        #     keep_mask = cv2.bitwise_and(robot_exclusion_mask, background_keep_mask)
+        keep_mask = robot_exclusion_mask
         keep_mask = self._refine_keep_mask(keep_mask)
 
         if not cv2.imwrite(str(mask_path), keep_mask):
