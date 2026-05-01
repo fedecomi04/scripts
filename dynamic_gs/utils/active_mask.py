@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections import deque
-
+import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.ndimage import label as _scipy_label
 
 OFFICIAL_RGB_MSSSIM_THRESHOLD = 0.10
 OFFICIAL_FILTER_CLOSE_RADIUS = 10
@@ -60,79 +60,70 @@ def remove_small_components(mask, min_area):
     if min_area <= 1:
         return (mask > 0.5).float()
 
-    mask_cpu = (mask[..., 0] > 0.5).detach().cpu()
-    visited = torch.zeros_like(mask_cpu, dtype=torch.bool)
-    keep = torch.zeros_like(mask_cpu, dtype=torch.bool)
-    height, width = mask_cpu.shape
+    binary = mask[..., 0] > 0.5
+    if not torch.any(binary):
+        return torch.zeros_like(mask)
 
-    for start_y, start_x in torch.nonzero(mask_cpu, as_tuple=False).tolist():
-        if visited[start_y, start_x]:
-            continue
+    labels_np, num = _scipy_label(binary.detach().cpu().numpy())
+    if num == 0:
+        return torch.zeros_like(mask)
 
-        queue = deque([(start_y, start_x)])
-        visited[start_y, start_x] = True
-        component = []
-
-        while queue:
-            y, x = queue.popleft()
-            component.append((y, x))
-            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                ny, nx = y + dy, x + dx
-                if ny < 0 or ny >= height or nx < 0 or nx >= width:
-                    continue
-                if visited[ny, nx] or not mask_cpu[ny, nx]:
-                    continue
-                visited[ny, nx] = True
-                queue.append((ny, nx))
-
-        if len(component) >= min_area:
-            ys, xs = zip(*component)
-            keep[list(ys), list(xs)] = True
-
-    return keep.to(mask.device).float()[..., None]
+    areas = np.bincount(labels_np.ravel(), minlength=num + 1)
+    keep_labels = areas >= min_area
+    keep_labels[0] = False
+    keep_np = keep_labels[labels_np]
+    return torch.from_numpy(keep_np).to(device=mask.device).float()[..., None]
 
 
 def keep_largest_component(mask):
     """Keep only the largest connected component of a binary mask."""
 
     mask = _to_hw1(mask)
-    mask_cpu = (mask[..., 0] > 0.5).detach().cpu()
-    if not torch.any(mask_cpu):
+    binary = mask[..., 0] > 0.5
+    if not torch.any(binary):
         return torch.zeros_like(mask)
 
-    visited = torch.zeros_like(mask_cpu, dtype=torch.bool)
-    keep = torch.zeros_like(mask_cpu, dtype=torch.bool)
-    height, width = mask_cpu.shape
-    best_component = []
+    labels_np, num = _scipy_label(binary.detach().cpu().numpy())
+    if num == 0:
+        return torch.zeros_like(mask)
 
-    for start_y, start_x in torch.nonzero(mask_cpu, as_tuple=False).tolist():
-        if visited[start_y, start_x]:
-            continue
+    areas = np.bincount(labels_np.ravel(), minlength=num + 1)
+    areas[0] = 0
+    best = int(np.argmax(areas))
+    keep_np = labels_np == best
+    return torch.from_numpy(keep_np).to(device=mask.device).float()[..., None]
 
-        queue = deque([(start_y, start_x)])
-        visited[start_y, start_x] = True
-        component = []
 
-        while queue:
-            y, x = queue.popleft()
-            component.append((y, x))
-            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                ny, nx = y + dy, x + dx
-                if ny < 0 or ny >= height or nx < 0 or nx >= width:
-                    continue
-                if visited[ny, nx] or not mask_cpu[ny, nx]:
-                    continue
-                visited[ny, nx] = True
-                queue.append((ny, nx))
+def keep_largest_component_with_min_area(mask, min_area):
+    """Combined `remove_small_components(min_area)` + `keep_largest_component`.
 
-        if len(component) > len(best_component):
-            best_component = component
+    Returns the single largest connected component of *mask*, but only if
+    its area is at least *min_area* pixels; otherwise returns an empty
+    mask. Replaces the prior two-scipy-label-call sequence (one inside
+    the cleanup recipe + one in the caller) with a single CPU
+    round-trip, which is the dominant cost on 800×800 masks.
+    """
 
-    if best_component:
-        ys, xs = zip(*best_component)
-        keep[list(ys), list(xs)] = True
+    mask = _to_hw1(mask)
+    if min_area <= 1:
+        return keep_largest_component(mask)
 
-    return keep.to(mask.device).float()[..., None]
+    binary = mask[..., 0] > 0.5
+    if not torch.any(binary):
+        return torch.zeros_like(mask)
+
+    labels_np, num = _scipy_label(binary.detach().cpu().numpy())
+    if num == 0:
+        return torch.zeros_like(mask)
+
+    areas = np.bincount(labels_np.ravel(), minlength=num + 1)
+    areas[0] = 0
+    best = int(np.argmax(areas))
+    if int(areas[best]) < int(min_area):
+        return torch.zeros_like(mask)
+
+    keep_np = labels_np == best
+    return torch.from_numpy(keep_np).to(device=mask.device).float()[..., None]
 
 
 def combine_object_masks(render_mask, live_mask, valid_mask=None):
@@ -277,7 +268,11 @@ def _apply_cleanup_recipe(mask, valid_mask=None, close_radius=0, open_radius=0, 
         cleaned = close_binary_mask(cleaned, close_radius)
     if open_radius > 0:
         cleaned = open_binary_mask(cleaned, open_radius)
-    cleaned = remove_small_components(cleaned, min_area)
+    # Combined "drop tiny + keep largest" — one scipy.label CPU round-trip
+    # instead of two. The caller in `prepare_dynamic_update` skips the
+    # outer `keep_largest_component` when no dilation runs in between,
+    # because this already produces the single largest component.
+    cleaned = keep_largest_component_with_min_area(cleaned, min_area)
     if valid_mask is not None:
         cleaned = cleaned * _to_hw1(valid_mask)
     if torch.any(cleaned):

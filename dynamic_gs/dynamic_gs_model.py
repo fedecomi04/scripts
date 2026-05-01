@@ -13,10 +13,12 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from nerfstudio.cameras.cameras import Cameras
+from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig, get_viewmat
 from nerfstudio.utils.math import k_nearest_sklearn
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils.spherical_harmonics import RGB2SH
+from nerfstudio.viewer.viewer_elements import ViewerDropdown
 
 from .utils import (
     ESAM_PROMPT_KEEP_RATIO,
@@ -37,6 +39,7 @@ from .utils import (
     get_sam3d_output_paths,
     prepare_cropped_sam3d_inputs,
     query_esam_mask,
+    query_esam_mask_pair,
     query_sam2_propagated_mask,
     resolve_sam3d_pose_path,
     register_and_fuse_sam3d_object,
@@ -80,7 +83,6 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     cotracker_min_track_points: int = 12
     cotracker_ransac_iterations: int = 128
     cotracker_ransac_inlier_threshold: float = 0.008
-    cotracker_point_refresh_min_distance: float = 8.0
     cotracker_checkpoint_path: str = ""
     cotracker_hub_repo: str = "facebookresearch/co-tracker"
     cotracker_hub_model: str = "cotracker3_offline"
@@ -90,6 +92,18 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     scene_opt_cull_alpha_thresh: float = 0.1
     esam_prompt_keep_ratio: float = ESAM_PROMPT_KEEP_RATIO
     object_mask_dilate_px: int = 1
+
+    # SAM3 pre-static graspable object prefusion
+    use_sam3_graspable_prefusion: bool = True
+    sam3_prompt_text: str = "objects on table that could be grasped"
+    sam3_conda_env_name: str = "sam3_dynamic_gs"
+    sam3_candidate_min_area_ratio: float = 0.002
+    sam3_candidate_max_area_ratio: float = 0.25
+    sam3_candidate_dedup_iou: float = 0.6
+    sam3_candidate_max_objects: int = 8
+    sam3_confidence_threshold: float = 0.3
+    sam3_min_score: float = 0.4
+    sam3_reuse_cached: bool = True
 
 
 class DynamicGSModel(SplatfactoModel):
@@ -142,11 +156,19 @@ class DynamicGSModel(SplatfactoModel):
                 dtype=self.object_flags.dtype,
                 device=self.object_flags.device,
             )
+            self._buffers["object_instance_ids"] = torch.zeros(
+                num_points,
+                1,
+                dtype=torch.long,
+                device=self.object_instance_ids.device,
+            )
 
         if "object_flags" not in state_dict:
             state_dict["object_flags"] = torch.zeros_like(self.object_flags)
         if "sam3d_init_target_flags" not in state_dict:
             state_dict["sam3d_init_target_flags"] = torch.zeros_like(self.sam3d_init_target_flags)
+        if "object_instance_ids" not in state_dict:
+            state_dict["object_instance_ids"] = torch.zeros_like(self.object_instance_ids)
 
         super().load_state_dict(state_dict, **kwargs)
 
@@ -173,6 +195,11 @@ class DynamicGSModel(SplatfactoModel):
             persistent=True,
         )
         self.register_buffer(
+            "object_instance_ids",
+            torch.zeros(num_points, 1, dtype=torch.long, device=self.means.device),
+            persistent=True,
+        )
+        self.register_buffer(
             "change_mask_image",
             torch.zeros(1, 1, 1, dtype=self.means.dtype, device=self.means.device),
             persistent=False,
@@ -181,6 +208,67 @@ class DynamicGSModel(SplatfactoModel):
         self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
         self.gauss_params["means"].register_hook(self._mask_means_grad)
         self._apply_phase_trainability()
+
+        # Viewer-only per-object isolator. Default "All" leaves the render untouched;
+        # pipeline calls go through get_outputs() directly and bypass this entirely.
+        self._viewer_object_options: Tuple[str, ...] = ("All", "Background")
+        self.viewer_object_selector = ViewerDropdown(
+            "Visualize Object",
+            "All",
+            options=list(self._viewer_object_options),
+            hint="Render only the selected object's Gaussians (uses object_instance_ids).",
+        )
+
+    def _refresh_viewer_object_options(self) -> None:
+        if self.object_instance_ids.numel() == 0:
+            return
+        ids_tensor = self.object_instance_ids.squeeze(-1)
+        nonzero = ids_tensor[ids_tensor > 0]
+        unique_ids = sorted(int(i) for i in torch.unique(nonzero).tolist()) if nonzero.numel() > 0 else []
+        options = ("All", "Background", *(f"Object {i}" for i in unique_ids))
+        if options == self._viewer_object_options:
+            return
+        self._viewer_object_options = options
+        try:
+            self.viewer_object_selector.set_options(list(options))
+        except Exception:
+            pass  # gui not yet bound to viser
+
+    def _viewer_keep_mask(self, selection: str) -> Tensor | None:
+        """Boolean (N,) mask of Gaussians to keep, or None to skip filtering."""
+        ids = self.object_instance_ids.squeeze(-1)
+        if ids.shape[0] != self.num_points:
+            return None
+        if selection == "Background":
+            return ids == 0
+        if selection.startswith("Object "):
+            try:
+                target = int(selection.split(" ", 1)[1])
+            except ValueError:
+                return None
+            return ids == target
+        return None
+
+    def get_outputs_for_camera(self, camera: Cameras, obb_box: OrientedBox | None = None):
+        self._refresh_viewer_object_options()
+        selection = self.viewer_object_selector.value
+        if selection == "All" or self.training:
+            return super().get_outputs_for_camera(camera, obb_box=obb_box)
+
+        keep = self._viewer_keep_mask(selection)
+        if keep is None or bool(keep.all()):
+            return super().get_outputs_for_camera(camera, obb_box=obb_box)
+
+        # Hide non-selected Gaussians by driving their opacity to sigmoid(-1e9) ≈ 0.
+        op_param = self.gauss_params["opacities"]
+        with torch.no_grad():
+            saved = op_param.data.clone()
+            op_param.data[~keep] = -1.0e9
+        try:
+            return super().get_outputs_for_camera(camera, obb_box=obb_box)
+        finally:
+            with torch.no_grad():
+                op_param.data.copy_(saved)
 
     def _get_background_color(self):
         if self.config.use_simulator_background:
@@ -468,24 +556,29 @@ class DynamicGSModel(SplatfactoModel):
         object_flags = self.object_flags
         current_active = self.current_active_mask
         sam3d_init_target_flags = self.sam3d_init_target_flags
+        object_instance_ids = self.object_instance_ids
         if (
             object_flags.shape[0] == num_points
             and current_active.shape[0] == num_points
             and sam3d_init_target_flags.shape[0] == num_points
+            and object_instance_ids.shape[0] == num_points
         ):
             return
 
         new_object_flags = torch.zeros(num_points, 1, dtype=object_flags.dtype, device=object_flags.device)
         new_current_active = torch.zeros(num_points, dtype=torch.bool, device=current_active.device)
         new_sam3d_init_target_flags = torch.zeros(num_points, 1, dtype=sam3d_init_target_flags.dtype, device=sam3d_init_target_flags.device)
+        new_instance_ids = torch.zeros(num_points, 1, dtype=torch.long, device=object_instance_ids.device)
         keep = min(object_flags.shape[0], num_points)
         if keep > 0:
             new_object_flags[:keep] = object_flags[:keep]
             new_current_active[:keep] = current_active[:keep]
             new_sam3d_init_target_flags[:keep] = sam3d_init_target_flags[:keep]
+            new_instance_ids[:keep] = object_instance_ids[:keep]
         self._buffers["object_flags"] = new_object_flags
         self._buffers["current_active_mask"] = new_current_active
         self._buffers["sam3d_init_target_flags"] = new_sam3d_init_target_flags
+        self._buffers["object_instance_ids"] = new_instance_ids
 
     def _refresh_gaussian_optimizers(self, reset_means_optimizer: bool) -> None:
         if not hasattr(self, "optimizers"):
@@ -541,7 +634,42 @@ class DynamicGSModel(SplatfactoModel):
             "opacities": opacities,
         }
 
-    def insert_object_gaussians(self, new_xyz: Tensor, new_rgb: Tensor, object_flag: bool = True) -> Tensor:
+    @torch.no_grad()
+    def delete_gaussian_indices(self, indices: Tensor) -> int:
+        """Remove Gaussians at the given indices, updating params, buffers, and optimizers.
+
+        Returns the number of Gaussians deleted.
+        """
+        if indices is None or indices.numel() == 0:
+            return 0
+        device = self.means.device
+        num_points = self.num_points
+        indices = indices.to(device=device, dtype=torch.long).unique()
+        valid = (indices >= 0) & (indices < num_points)
+        indices = indices[valid]
+        if indices.numel() == 0:
+            return 0
+
+        keep = torch.ones(num_points, dtype=torch.bool, device=device)
+        keep[indices] = False
+        n_deleted = int((~keep).sum().item())
+
+        for name in ["means", "features_dc", "features_rest", "scales", "quats", "opacities"]:
+            sliced = self.gauss_params[name].detach()[keep]
+            self.gauss_params[name] = torch.nn.Parameter(sliced)
+
+        self._buffers["object_flags"] = self.object_flags[keep]
+        self._buffers["sam3d_init_target_flags"] = self.sam3d_init_target_flags[keep]
+        self._buffers["object_instance_ids"] = self.object_instance_ids[keep]
+        if self.current_active_mask.shape[0] == num_points:
+            self._buffers["current_active_mask"] = self.current_active_mask[keep]
+
+        self._refresh_gaussian_optimizers(reset_means_optimizer=True)
+        return n_deleted
+
+    def insert_object_gaussians(
+        self, new_xyz: Tensor, new_rgb: Tensor, object_flag: bool = True, instance_id: int = 0,
+    ) -> Tensor:
         num_new = new_xyz.shape[0]
         if num_new == 0:
             return torch.zeros((0,), dtype=torch.long, device=self.means.device)
@@ -555,6 +683,8 @@ class DynamicGSModel(SplatfactoModel):
         self._resize_dynamic_buffers(self.num_points)
         if object_flag:
             self.object_flags[old_num_points:] = 1.0
+        if instance_id > 0:
+            self.object_instance_ids[old_num_points:] = instance_id
         self._refresh_gaussian_optimizers(reset_means_optimizer=True)
         return torch.arange(old_num_points, self.num_points, device=self.means.device, dtype=torch.long)
 
@@ -687,6 +817,72 @@ class DynamicGSModel(SplatfactoModel):
             "target_radius": float(target_radius),
             "near_proxy_count": float(int(near_proxy.sum())),
             "near_target_count": float(int(near_target.sum())),
+        }
+
+    @torch.no_grad()
+    def _propagate_instance_membership(
+        self,
+        fused_object_points: np.ndarray,
+        initial_target_indices: Tensor,
+        inserted_indices: Tensor,
+        instance_id: int,
+    ) -> Dict[str, float]:
+        """Propagate per-object identity for Phase 0 multi-object prefusion.
+
+        Unlike ``_build_persistent_object_membership()`` which overwrites
+        ``object_flags`` entirely (erasing prior identity), this method writes
+        only to ``object_instance_ids`` for unassigned (``== 0``) Gaussians,
+        preserving identity across sequential calls for different objects.
+        ``object_flags`` is NOT touched — it stays 0 until D0 selection.
+        """
+        num_points = self.num_points
+        device = self.object_instance_ids.device
+
+        initial_target_indices = initial_target_indices.to(device=device, dtype=torch.long)
+        inserted_indices = inserted_indices.to(device=device, dtype=torch.long)
+        if initial_target_indices.numel() > 0:
+            self.object_instance_ids[initial_target_indices] = instance_id
+        if inserted_indices.numel() > 0:
+            self.object_instance_ids[inserted_indices] = instance_id
+
+        # Find unassigned candidates near the fused object points
+        all_indices = torch.arange(num_points, device=device, dtype=torch.long)
+        assigned_mask = self.object_instance_ids.squeeze(-1) > 0
+        candidate_indices = all_indices[~assigned_mask]
+        if candidate_indices.numel() == 0:
+            return {
+                "instance_id": instance_id,
+                "instance_count": int(assigned_mask.sum().item()),
+                "proxy_radius": 0.0,
+                "near_proxy_count": 0,
+            }
+
+        candidate_points = self.means[candidate_indices].detach().cpu().numpy().astype(np.float32)
+        proxy_points = fused_object_points.astype(np.float32)
+
+        from sklearn.neighbors import NearestNeighbors
+
+        proxy_spacing = self._estimate_spacing(proxy_points)
+        proxy_radius = max(0.003, 1.5 * proxy_spacing)
+
+        near_proxy = np.zeros((len(candidate_points),), dtype=bool)
+        if len(proxy_points) > 0:
+            proxy_nn = NearestNeighbors(n_neighbors=1, algorithm="auto", metric="euclidean").fit(proxy_points)
+            proxy_distances, _ = proxy_nn.kneighbors(candidate_points)
+            near_proxy = np.isfinite(proxy_distances[:, 0]) & (proxy_distances[:, 0] <= proxy_radius)
+
+        if np.any(near_proxy):
+            keep_candidate_indices = candidate_indices[
+                torch.from_numpy(near_proxy).to(device=device, dtype=torch.bool)
+            ]
+            self.object_instance_ids[keep_candidate_indices] = instance_id
+
+        total_for_instance = int((self.object_instance_ids.squeeze(-1) == instance_id).sum().item())
+        return {
+            "instance_id": instance_id,
+            "instance_count": total_for_instance,
+            "proxy_radius": float(proxy_radius),
+            "near_proxy_count": int(near_proxy.sum()),
         }
 
     def _get_existing_object_subset(
@@ -1104,6 +1300,7 @@ class DynamicGSModel(SplatfactoModel):
         use_render_sam2=False,
         use_live_sam2=False,
         external_object_mask=None,
+        skip_object_flags_write=False,
     ):
         """Generate the change mask and active Gaussian subset for one dynamic frame.
 
@@ -1162,8 +1359,14 @@ class DynamicGSModel(SplatfactoModel):
             )
             if self.config.active_mask_dilate_radius > 0:
                 change_mask = dilate_binary_mask(change_mask, self.config.active_mask_dilate_radius)
-            if external_object_mask is None and torch.any(change_mask > 0.5):
-                change_mask = keep_largest_component(change_mask)
+                # Dilation can fuse previously separate components, so we
+                # need to relabel and pick the largest of the new
+                # connected regions. When dilation is off (the default),
+                # `build_change_mask`'s cleanup already returned the
+                # single largest component — no second scipy.label is
+                # needed.
+                if external_object_mask is None and torch.any(change_mask > 0.5):
+                    change_mask = keep_largest_component(change_mask)
             _substeps["D0.1b_change_mask"] = time.time() - _t
 
             # --- Object segmentation ---
@@ -1179,62 +1382,83 @@ class DynamicGSModel(SplatfactoModel):
                 render_prompt_points = torch.zeros((0, 2), dtype=torch.long, device=self.device)
                 live_prompt_points = render_prompt_points
             else:
-                # Bootstrap path: use ESAM / SAM2 internally
+                # Bootstrap path: use ESAM / SAM2 internally.
+                # When neither image uses SAM2 (the common D0 case), run a single
+                # batched ESAM forward pass on `[render, live]`. The change mask
+                # is the prompt for both, so the EDT + interior point sampling
+                # only needs to run once. The combined timing is reported under
+                # `D0.1c_esam_render` and `D0.1d_esam_live` is left at 0.
                 render_prompt_points = torch.zeros((0, 2), dtype=torch.long, device=outputs["rgb"].device)
-                # --- TIMING: D0.1c ESAM on render (query_esam_mask on rendered image; includes model load on first call) ---
+                live_prompt_points = torch.zeros((0, 2), dtype=torch.long, device=outputs["rgb"].device)
+                use_render_sam2_path = (
+                    use_render_sam2
+                    and previous_rendered_rgb is not None
+                    and previous_render_object_mask is not None
+                )
+                use_live_sam2_path = (
+                    use_live_sam2
+                    and previous_live_rgb is not None
+                    and previous_live_object_mask is not None
+                )
+
                 _t = time.time()
-                if use_render_sam2 and previous_rendered_rgb is not None and previous_render_object_mask is not None:
-                    render_object_mask = query_sam2_propagated_mask(
-                        self._get_sam2_video_predictor(),
-                        previous_rendered_rgb,
-                        outputs["rgb"],
-                        previous_render_object_mask,
-                    )
-                    render_object_mask_source = "sam2"
-                else:
-                    initial_render_object_mask, _, initial_render_prompt_points = query_esam_mask(
+                if not use_render_sam2_path and not use_live_sam2_path:
+                    (render_tuple, live_tuple) = query_esam_mask_pair(
                         self._get_esam_model(),
                         outputs["rgb"],
+                        live_rgb,
                         change_mask,
                         num_points=ESAM_NUM_PROMPT_POINTS,
                         keep_ratio=self.config.esam_prompt_keep_ratio,
                     )
-                    if torch.any(initial_render_object_mask > 0.5):
+                    render_object_mask, _, render_prompt_points = render_tuple
+                    live_object_mask, _, live_prompt_points = live_tuple
+                    render_object_mask_source = "esam"
+                    live_object_mask_source = "esam"
+                    _substeps["D0.1c_esam_render"] = time.time() - _t
+                    _substeps["D0.1d_esam_live"] = 0.0
+                else:
+                    # Mixed / fallback paths — at most one image goes through ESAM
+                    # and the other uses SAM2 propagation. Each is timed in its
+                    # respective sub-key.
+                    if use_render_sam2_path:
+                        render_object_mask = query_sam2_propagated_mask(
+                            self._get_sam2_video_predictor(),
+                            previous_rendered_rgb,
+                            outputs["rgb"],
+                            previous_render_object_mask,
+                        )
+                        render_object_mask_source = "sam2"
+                    else:
                         render_object_mask, _, render_prompt_points = query_esam_mask(
                             self._get_esam_model(),
                             outputs["rgb"],
-                            initial_render_object_mask.float(),
+                            change_mask,
                             num_points=ESAM_NUM_PROMPT_POINTS,
                             keep_ratio=self.config.esam_prompt_keep_ratio,
                         )
-                        render_object_mask_source = "esam_refined"
-                    else:
-                        render_object_mask = initial_render_object_mask
-                        render_prompt_points = initial_render_prompt_points
                         render_object_mask_source = "esam"
-                _substeps["D0.1c_esam_render"] = time.time() - _t
+                    _substeps["D0.1c_esam_render"] = time.time() - _t
 
-                live_prompt_points = torch.zeros((0, 2), dtype=torch.long, device=outputs["rgb"].device)
-                # --- TIMING: D0.1d ESAM on live (query_esam_mask on live/GT image) ---
-                _t = time.time()
-                if use_live_sam2 and previous_live_rgb is not None and previous_live_object_mask is not None:
-                    live_object_mask = query_sam2_propagated_mask(
-                        self._get_sam2_video_predictor(),
-                        previous_live_rgb,
-                        live_rgb,
-                        previous_live_object_mask,
-                    )
-                    live_object_mask_source = "sam2"
-                else:
-                    live_object_mask, _, live_prompt_points = query_esam_mask(
-                        self._get_esam_model(),
-                        live_rgb,
-                        change_mask,
-                        num_points=ESAM_NUM_PROMPT_POINTS,
-                        keep_ratio=self.config.esam_prompt_keep_ratio,
-                    )
-                    live_object_mask_source = "esam"
-                _substeps["D0.1d_esam_live"] = time.time() - _t
+                    _t = time.time()
+                    if use_live_sam2_path:
+                        live_object_mask = query_sam2_propagated_mask(
+                            self._get_sam2_video_predictor(),
+                            previous_live_rgb,
+                            live_rgb,
+                            previous_live_object_mask,
+                        )
+                        live_object_mask_source = "sam2"
+                    else:
+                        live_object_mask, _, live_prompt_points = query_esam_mask(
+                            self._get_esam_model(),
+                            live_rgb,
+                            change_mask,
+                            num_points=ESAM_NUM_PROMPT_POINTS,
+                            keep_ratio=self.config.esam_prompt_keep_ratio,
+                        )
+                        live_object_mask_source = "esam"
+                    _substeps["D0.1d_esam_live"] = time.time() - _t
 
                 render_object_mask = (
                     render_object_mask[..., None].float()
@@ -1289,7 +1513,8 @@ class DynamicGSModel(SplatfactoModel):
                         "falling back to visible Gaussians."
                     )
                     active = torch.isfinite(radii) & (radii > 0)
-                self.object_flags.copy_(active.float()[:, None])
+                if not skip_object_flags_write:
+                    self.object_flags.copy_(active.float()[:, None])
 
             self.current_active_mask.copy_(active)
             flagged_indices = torch.nonzero(active, as_tuple=False).squeeze(-1)
@@ -1653,6 +1878,7 @@ class DynamicGSModel(SplatfactoModel):
             self._buffers["object_flags"] = self.object_flags[keep_mask]
             self._buffers["current_active_mask"] = self.current_active_mask[keep_mask]
             self._buffers["sam3d_init_target_flags"] = self.sam3d_init_target_flags[keep_mask]
+            self._buffers["object_instance_ids"] = self.object_instance_ids[keep_mask]
             if self._grad2d_accum is not None:
                 self._grad2d_accum = self._grad2d_accum[keep_mask]
                 self._grad2d_count = self._grad2d_count[keep_mask]

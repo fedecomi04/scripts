@@ -49,6 +49,8 @@ class Sam3DInsertionResult:
     kept_colors: np.ndarray
     chosen_scale: float
     dedup_threshold: float
+    source_spacing: float
+    target_spacing: float
     voxel_size: float
     source_point_count: int
     target_point_count: int
@@ -561,14 +563,11 @@ def register_and_fuse_sam3d_object(
     final_scale = float(chosen_scale * _extract_isotropic_scale(similarity_transform))
     t_correspondences = time.time() - _t
 
-    # --- TIMING: D0.3b5 dedup distance computation (Open3D point cloud distance) ---
+    # --- TIMING: D0.3b5 dedup (disabled — keep all generated SAM3D points; existing-splat pruning is done in the pipeline using source_spacing) ---
     _t = time.time()
-    dedup_threshold = 1.5 * target_spacing
-    target_pcd = _to_pcd(target_points, target_colors)
-    distances = np.asarray(_to_pcd(aligned_points).compute_point_cloud_distance(target_pcd), dtype=np.float32)
-    keep_mask = np.isfinite(distances) & (distances >= dedup_threshold)
-    kept_points = aligned_points[keep_mask].astype(np.float32)
-    kept_colors = aligned_colors[keep_mask].astype(np.float32)
+    dedup_threshold = 0.0
+    kept_points = aligned_points.astype(np.float32)
+    kept_colors = aligned_colors.astype(np.float32)
     t_dedup = time.time() - _t
 
     # --- TIMING: D0.3b6 correspondence plot + artifact PLY saves ---
@@ -600,6 +599,8 @@ def register_and_fuse_sam3d_object(
         kept_colors=kept_colors,
         chosen_scale=float(final_scale),
         dedup_threshold=float(dedup_threshold),
+        source_spacing=float(source_spacing),
+        target_spacing=float(target_spacing),
         voxel_size=float(voxel_size),
         source_point_count=source_point_count,
         target_point_count=target_point_count,

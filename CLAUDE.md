@@ -50,22 +50,73 @@ python scripts/generate_pipeline_presentation.py /path/to/dataset_root
 
 ## Architecture
 
-### Two-Phase Training
+### Three-Phase Training
 
-**Phase 1 — Static (steps 0–5999 in the current runtime config):** Optimizes the standard Splatfacto Gaussian scene. `means` LR is zeroed, so static training updates appearance/orientation/opacity/scale but not Gaussian positions. Gaussian refinement (densification/pruning) is disabled via `NoRefineStrategy`.
+Phase 0 is split into two non-contiguous halves so the static optimization
+sees only the SfM seed scene, then the SAM3D Gaussians are inserted just
+in time for the dynamic phase (this protects SAM3D's back-side Gaussians
+from opacity erosion during static photometric optimization).
 
-**Phase 2 — Dynamic (from step 6000, 50 steps/frame in the current runtime config):** Per-frame optimization of the dynamic sequence. The phase transition resets the `means` optimizer state and scheduler. `means` gradients are masked so object Gaussians are moved by rigid transforms, while non-object Gaussians can still be optimized by scene optimization.
+**Phase 0a — Pre-Static SAM3 + SAM3D Generation (optional, in `__init__`):**
+When `use_sam3_graspable_prefusion=True` and `sam3_prompt_text` is non-empty,
+SAM3 discovers graspable objects via text prompt on the first static image,
+then SAM3D generates 3D Gaussians for each discovered mask in one subprocess
+(one model load, sequential per-mask, full image + metric pointmap from
+the static depth — see `dynamic_gs/utils/sam3d.py:run_sam3d_multi_object`).
+Per-object PLYs and pose JSONs are written to disk; the Gaussian scene is
+NOT mutated yet. Runs in `_run_sam3_and_sam3d_generation()` from `__init__`
+after `_sync_phase(0)`. Result is stashed on `self._sam3d_generation_outputs`.
 
-- **Frame 0 bootstrap:** `prepare_dynamic_update` (render RS + change mask + ESAM on render/live + Gaussian flagging) → SAM3D 3D generation → CPD-based fusion/insertion → render object mask → seed SAM2 tracker → CoTracker initialization on D0 live image/depth/mask → capture reference object pose → compute CD0
+**Phase 1 — Static (steps 0 → static_num_steps − 1):** Optimizes the
+standard Splatfacto Gaussian scene on the SfM seed. `means` LR is zeroed,
+so static training updates appearance/orientation/opacity/scale but not
+Gaussian positions. Gaussian refinement (densification/pruning) is
+disabled via `NoRefineStrategy`. **No SAM3D objects are present in the
+scene during this phase.**
+
+**Phase 0b — Post-Static Fusion (at static→dynamic transition):** When
+`_sync_phase` detects the boundary it calls `_fuse_sam3d_objects_into_scene(
+self._sam3d_generation_outputs)` — for each pre-generated PLY: back-project
+the SAM3 mask through the static depth → registration target, run
+`register_and_fuse_sam3d_object` (rotation init from pose quaternion +
+bbox-scale + centroid + voxel + probreg CPD similarity), insert Gaussians
+via `insert_object_gaussians`, propagate `object_instance_ids` (each
+object gets a unique 1..K id). `object_flags` stays 0 until D0 selection.
+The trained scene's render depth gives `_get_existing_object_subset` a
+denser target than the SfM seeds alone, so propagation is more robust
+than it would have been pre-static.
+
+The fusion camera uses the **post-static optimized pose**: after 4000 static
+steps the Nerfstudio `CameraOptimizer` has trained an SO3xR3 offset that
+makes `transforms.json[frame_idx_0]` reproject the recorded image. We
+build a single-frame `Cameras` slice, set `metadata["cam_idx"]`, call
+`self.model.camera_optimizer.apply_to_camera(camera).detach()` directly
+(bypassing the model's `_should_apply_camera_optimizer` phase guard which
+returns False here because `phase` already flipped to `"dynamic"` when
+this runs), and overwrite `camera.camera_to_worlds` with the optimized
+c2w. Downstream `get_outputs`, `_backproject_mask_to_world`, and the
+c2w extraction inside `register_and_fuse_sam3d_object` then all see the
+optimized pose, which slightly improves reprojection alignment between
+the SAM3D object cloud and the static-depth registration target.
+
+**Phase 2 — Dynamic (from step `static_num_steps`, `dynamic_steps_per_frame`
+steps/frame):** Per-frame optimization of the dynamic sequence. The phase
+transition resets the `means` optimizer state and scheduler. `means`
+gradients are masked so object Gaussians are moved by rigid transforms,
+while non-object Gaussians can still be optimized by scene optimization.
+
+- **Frame 0 bootstrap (Path A — prefused):** `prepare_dynamic_update(skip_object_flags_write=True)` → select moved object from pre-fused candidates via ESAM overlap → set `object_flags = (object_instance_ids == selected_k).float()` + `_persistent_object_membership_ready = True` → rendered object mask → seed SAM2 tracker → CoTracker init → CD0. No SAM3D generation/insertion at D0.
+- **Frame 0 bootstrap (Path B — no prefusion):** `prepare_dynamic_update` (render RS + change mask + ESAM on render/live + Gaussian flagging) → SAM3D 3D generation → CPD-based fusion/insertion → render object mask → seed SAM2 tracker → CoTracker initialization on D0 live image/depth/mask → capture reference object pose → compute CD0
 - **Frame N tracking:** SAM2 propagation of live object mask → CoTracker reference-frame tracking from fixed D0 to current DN → current-mask filtering before 3D fitting → RANSAC rigid transform in 3D → apply absolute rigid transform to the stored reference object pose → render RDN → render object mask → compute CDN
 
 ### Phase Transition Details
 
 `_sync_phase(step)` is called at the start of every `get_train_loss_dict`. It:
 1. Detects phase changes (static → dynamic) and calls `model.set_phase(phase)`.
-2. Detects frame transitions within the dynamic phase and calls `_prepare_dynamic_frame()`.
-3. `model.set_phase("dynamic")` sets `requires_grad` on all Gaussian parameter groups, registers scene optimization gradient hooks on features/opacities/scales/quats, and resets the `means` optimizer + scheduler.
-4. The `max_num_iterations` in the Nerfstudio trainer is updated to `static_num_steps + total_dynamic_frames * dynamic_steps_per_frame` at callback time.
+2. **At the static→dynamic boundary, runs Phase 0b fusion** — calls `_fuse_sam3d_objects_into_scene(self._sam3d_generation_outputs)` if generation produced objects pre-static. This insertion happens AFTER `model.set_phase("dynamic")` so the scene-opt + means-grad hooks just registered are then re-bound by `insert_object_gaussians` → `_refresh_gaussian_optimizers` onto the resized parameter tensors. The hooks read `object_flags` at backward time, so writing `object_flags` later in D0 Path A still engages them correctly.
+3. Detects frame transitions within the dynamic phase and calls `_prepare_dynamic_frame()`.
+4. `model.set_phase("dynamic")` sets `requires_grad` on all Gaussian parameter groups, registers scene optimization gradient hooks on features/opacities/scales/quats, and resets the `means` optimizer + scheduler.
+5. The `max_num_iterations` in the Nerfstudio trainer is updated to `static_num_steps + total_dynamic_frames * dynamic_steps_per_frame` at callback time.
 
 ### Gradient Masking Strategy
 
@@ -80,7 +131,8 @@ During the dynamic phase, two separate masking mechanisms run in parallel:
 ```
 DynamicGSModel          (dynamic_gs_model.py)
   └─ extends SplatfactoModel
-     - object_flags: (N,1) persistent buffer — 1.0 for object Gaussians, 0.0 for scene
+     - object_flags: (N,1) float persistent buffer — 1.0 for active dynamic object Gaussians, 0.0 for scene
+     - object_instance_ids: (N,1) long persistent buffer — 0=scene, 1..K=Phase 0 pre-fused object ID
      - sam3d_init_target_flags: (N,1) persistent buffer — flags added by SAM3D
      - current_active_mask: (N,) non-persistent buffer — change mask projected to Gaussians
      - change_mask_image: (H,W,1) non-persistent buffer — current frame's CDN mask
@@ -88,19 +140,30 @@ DynamicGSModel          (dynamic_gs_model.py)
      - apply_rigid_object_transform_from_reference: applies the current rigid transform to the stored reference object pose
      - capture_reference_object_pose: stores object means/quats once at D0
      - initialize_object_from_sam3d: bbox scale + CPD similarity registration + Gaussian insertion
-     - prepare_dynamic_update: ESAM interactive segmentation + change mask + flag Gaussians
+     - prepare_dynamic_update: ESAM segmentation + change mask + flag Gaussians (skip_object_flags_write param)
      - render_object_mask: rasterize only object Gaussians using gsplat rasterization
      - refresh_dynamic_state_after_insertion: re-flags Gaussians after SAM3D insertion
+     - _propagate_instance_membership: Phase 0 per-object identity propagation (writes object_instance_ids)
+     - _build_persistent_object_membership: D0 binary object membership (writes object_flags — NOT for Phase 0)
 
 DynamicGSPipeline       (dynamic_gs_pipeline.py)
   └─ extends VanillaPipeline
      - _timing: defaultdict(list) — per-step timing accumulator
      - _cotracker_motion: CoTrackerMotionEstimator instance (frame 0+)
      - _live_tracker_rgb/mask: previous live frame for SAM2 propagation
-     - _prepare_frame_0(): full bootstrap sequence
+     - _sam3d_generation_outputs: dict|None — {sam3_objects, sam3d_results} stash
+                                  written by Phase 0a, consumed by Phase 0b
+     - _run_sam3_and_sam3d_generation(): Phase 0a — SAM3 segmentation + SAM3D
+                                          multi-object generation (full image
+                                          + metric pointmap), called from __init__
+     - _fuse_sam3d_objects_into_scene(): Phase 0b — register + insert + propagate
+                                         instance ids, called from _sync_phase at
+                                         the static→dynamic boundary
+     - _prepare_frame_0(): D0 bootstrap with Path A (prefused) / Path B (old SAM3D) branching
      - _prepare_frame_n(): absolute-reference dynamic update sequence
      - _compute_change_mask(): MSSIM change detection excluding gripper+object
      - _print_timing_summary(): logs full pipeline timing at last step
+     - _write_timing_report(): writes <data_root>/timing_report.txt at exit
 
 DynamicGSDataManager    (dynamic_gs_datamanager.py)
   └─ Wraps two FullImageDatamanager instances
@@ -116,12 +179,13 @@ DynamicGSDataManager    (dynamic_gs_datamanager.py)
 
 | Module | Role |
 |--------|------|
-| `active_mask.py` | Change detection from RGB/depth deltas; MSSIM-based `build_change_mask`; morphological filtering |
+| `active_mask.py` | Change detection from RGB/depth deltas; MSSIM-based `build_change_mask`; morphological filtering; `keep_largest_component_with_min_area` combines the prior `remove_small_components` + `keep_largest_component` into a single scipy.label CPU round-trip |
 | `cotracker_motion.py` | `CoTrackerMotionEstimator`: fixed-reference CoTracker3 tracking + 3D backprojection + RANSAC rigid transform; FAST+NMS point sampling inside an eroded mask; current-mask filtering before RANSAC |
-| `sam3d.py` | SAM3D subprocess invocation (`run_sam3d_single_object_subprocess`); output path management; pose sidecar save/resolve/validation |
+| `sam3_segmentation.py` | SAM3 text-prompted segmentation: worker (`run_sam3_segmentation`) runs in `sam3_dynamic_gs` conda env; subprocess launcher (`run_sam3_subprocess`) uses `conda run`; mask filtering (area, border, IoU dedup) |
+| `sam3d.py` | SAM3D subprocess invocation: single-object (`run_sam3d_single_object_subprocess`, uses cropping), multi-object (`run_sam3d_multi_object_subprocess`, no cropping, one model load); output path management; pose sidecar save/resolve/validation |
 | `sam3d_fusion.py` | SAM3D rotation-aware object initialization: apply SAM3D quaternion in camera/world frame, then current bbox scale + centroid alignment + voxel downsampling + probreg CPD similarity; Gaussian insertion and deduplication via `register_and_fuse_sam3d_object` |
 | `sam2.py` | SAM2 video predictor (`build_sam2_tiny_video_predictor`); `query_sam2_propagated_mask` for pairwise frame-to-frame mask propagation |
-| `esam.py` | ESAM interactive object mask query (`query_esam_mask`); `build_esam_ti` model builder |
+| `esam.py` | ESAM interactive object mask query (`query_esam_mask`, `query_esam_mask_pair`); `build_esam_ti` model builder; input downsampled to `ESAM_MAX_SIDE=512` and a single forward pass (no inner convergence loop) |
 | `depth_loss.py` | `masked_l1_depth_loss`: per-pixel L1 depth loss masked to valid regions |
 | `rigid_regularization.py` | `rigid_or_static_loss`: Kabsch-based rigid body consistency loss; promotes coherent group motion |
 | `no_refine_strategy.py` | `NoRefineStrategy`: disables gsplat's default Gaussian refinement (densification + pruning) |
@@ -129,9 +193,17 @@ DynamicGSDataManager    (dynamic_gs_datamanager.py)
 ### Key Configuration (`dynamic_gs_config.py`)
 
 ```python
-STATIC_NUM_STEPS = 6000
+STATIC_NUM_STEPS = 4000
 DYNAMIC_STEPS_PER_FRAME = 50
 ```
+
+Pipeline-level config in `DynamicGSPipelineConfig`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `static_num_steps` | 4000 | Number of static training steps before the dynamic phase |
+| `dynamic_steps_per_frame` | 50 | Optimization steps per dynamic frame |
+| `save_debug_images` | True | Gates per-frame debug PNG saves (D0.1f / D0.9 / DN.8). Set False to remove ~210ms from D0 and ~600ms from each dynamic frame; SAM3D Path B inputs (`render.png`, `render_object_mask_binary.png`) are still saved when needed |
 
 Key model parameters in `DynamicGSModelConfig` (inherits from `SplatfactoModelConfig`):
 
@@ -162,9 +234,29 @@ Key model parameters in `DynamicGSModelConfig` (inherits from `SplatfactoModelCo
 | `cotracker_min_track_points` | 12 | Min tracked points required to compute rigid transform |
 | `cotracker_ransac_iterations` | 128 | RANSAC iterations for outlier rejection |
 | `cotracker_ransac_inlier_threshold` | 0.008 | Inlier threshold (meters in 3D) |
-| `cotracker_point_refresh_min_distance` | 8.0 | Min pixel distance for new refresh points |
 | `cotracker_checkpoint_path` | "" | Path to local CoTracker3 checkpoint (empty = torch.hub) |
 | `cotracker_hub_model` | "cotracker3_offline" | Model name for torch.hub loading |
+| `use_sam3_graspable_prefusion` | True | Enable Phase 0 pre-static SAM3 object discovery and fusion |
+| `sam3_prompt_text` | "" | Text prompt for SAM3 segmentation (empty = Phase 0 skipped) |
+| `sam3_conda_env_name` | "sam3_dynamic_gs" | Conda env for SAM3 subprocess (Python 3.12+, PyTorch 2.7+, CUDA 12.6+) |
+| `sam3_candidate_min_area_ratio` | 0.002 | Min mask area as fraction of image area (0.2%) |
+| `sam3_candidate_max_area_ratio` | 0.25 | Max mask area as fraction of image area (25%) |
+| `sam3_candidate_dedup_iou` | 0.6 | IoU threshold for deduplicating overlapping SAM3 masks |
+| `sam3_candidate_max_objects` | 8 | Max objects to keep from SAM3 |
+| `sam3_reuse_cached` | True | Reuse cached SAM3/SAM3D outputs if they exist |
+
+### Per-Object Identity Buffers
+
+| Buffer | Type | Purpose | When set |
+|--------|------|---------|----------|
+| `object_instance_ids` | `torch.long` (N,1) | Persistent multi-object identity from Phase 0 | Pre-static fusion: `instance_id=k` (1..K) |
+| `object_flags` | `float` (N,1) | Single active dynamic object indicator | D0 selection: `(object_instance_ids == selected_k).float()` |
+| `sam3d_init_target_flags` | `float` (N,1) | SfM Gaussians targeted by old D0 SAM3D insertion | D0 Path B only |
+
+- `object_instance_ids` is set during Phase 0 via `_propagate_instance_membership()`. It survives `load_state_dict`, `_resize_dynamic_buffers`, and the prune path.
+- `object_flags` is set at D0 either by `prepare_dynamic_update()` (Path B) or by the pipeline's moved-object selection (Path A).
+- `_propagate_instance_membership()` writes to `object_instance_ids` for unassigned Gaussians only; `_build_persistent_object_membership()` writes to `object_flags` and is NOT used for Phase 0.
+- `prepare_dynamic_update()` accepts `skip_object_flags_write=True` to prevent overwriting `object_flags` when pre-fused objects exist. The pipeline sets `_persistent_object_membership_ready = True` after D0 object selection in Path A.
 
 ### Optimizer Groups
 
@@ -198,11 +290,45 @@ LR is zeroed (not disabled) for inactive groups. When transitioning to the dynam
    - Refits the final rigid transform using only the final inlier set
    - Returns `CoTrackerMotionEstimate` with R, t, inlier stats, residuals, and a per-track inlier mask for debug coloring
 
-3. **Reference mode:** `refresh_tracking_points` and `replace_tracking_points` are effectively disabled; the D0 query points stay fixed for the whole sequence.
+3. **Reference mode:** the D0 query points stay fixed for the whole sequence (no per-frame reseeding or post-filter).
 
 4. **`CoTrackerMotionEstimate.success`**: False if `inlier_count < min_track_points` or RANSAC failed. The pipeline skips the rigid transform on failure and logs a warning.
 
 **Known limitation:** CoTracker3 is used in offline mode on 2-frame pairs. Confidence scores (`vis`, `conf`) are uniformly ~1.0 on such short sequences because the model has no temporal context to detect drift. Confidence-based filtering was investigated and removed.
+
+### Dynamic Tracking Roadmap (open work)
+
+The dynamic phase has two conceptually independent jobs and they should
+be treated separately when optimizing:
+
+1. **Object tracking — per-frame, must be real-time.** Current cost is
+   dominated by `DN.3_cotracker_advance` (≈410 ms/frame). The pipeline
+   currently rebuilds a 2-frame `[D0, DN]` video tensor and runs the
+   offline CoTracker3 forward for every frame. The reference-mode
+   refactor already kept the D0 query points fixed — but the CoTracker
+   forward itself is not stateful, so the encoder cost on the D0 frame
+   is paid every frame even though that frame never changes. Plus
+   RANSAC + SVD on CPU. This is where the next round of work should
+   focus. Possible directions: switch to the online CoTracker variant
+   so D0 features are cached, drop `cotracker_query_point_count` /
+   `cotracker_ransac_iterations` from their current 256 / 128 defaults,
+   or skip the CoTracker forward entirely on frames where the SAM2
+   mask centroid hasn't moved enough to matter.
+2. **Optimization of unseen parts via change detection — currently a
+   hard-coded "if change detected, optimize for X epochs" rule.** Not
+   yet real-time-bound. The user's plan is to redesign this later;
+   today the change mask CDN simply gates the next 50 training-step
+   loss masks (`dynamic_steps_per_frame=50`), regardless of whether
+   the change is small enough to be ignored or large enough to need
+   more steps. Do not optimize this until the user's redesign is
+   specified.
+
+These two paths share `DN.7_change_mask_cdn` (≈240 ms/frame) — the MSSIM
+compute is needed both to seed the optimization and (potentially) to
+gate it. The change-detection optimizations already shipped in D0
+(`build_change_mask` cleanup collapsed to one scipy.label, ESAM
+batched/downsampled) flow through to DN automatically; the remaining
+cost here is the multiscale SSIM convolutions themselves.
 
 ### SAM3D Integration
 
@@ -261,14 +387,118 @@ Post-initialization dynamic debug remains under `<data_root>/dynamic_scene/debug
 
 ### Timing Profile
 
-Timing is instrumented in `get_train_loss_dict` and `_prepare_frame_{0,n}` using `self._timing` (a `defaultdict(list)`). The exact numbers depend strongly on:
+Timing is instrumented in `get_train_loss_dict`, `_run_sam3_and_sam3d_generation`,
+`_fuse_sam3d_objects_into_scene`, and `_prepare_frame_{0,n}` using
+`self._timing` (a `defaultdict(list)`). The exact numbers depend on whether
+SAM3D generation is cached, the static-step budget, whether debug images
+are saved, and GPU model. **Always check the generated
+`<data_root>/timing_report.txt` from the actual run.**
 
-- whether SAM3D generation is reused or forced fresh
-- the current static-step budget (`STATIC_NUM_STEPS`, currently 6000)
-- whether debug images are enabled
-- GPU model and the current renderer/background configuration
+#### Reference numbers (4-object scene, 4000 static steps + ~119 dynamic frames × 50 steps, 8 GiB GPU)
 
-For current numbers, always trust the generated `<data_root>/timing_report.txt` from the run you are analyzing instead of hard-coded values in this document.
+The values below are from a representative run **after the change-detection
+optimizations** (ESAM pre-warm + downsample to 512 + batched render/live
+forward + bbox-restricted EDT + combined scipy.label cleanup) and
+**after the optimized-camera-pose fusion fix**. The numbers will shift
+once the dynamic-phase tracking / scene-opt work lands, so always check
+the generated `<data_root>/timing_report.txt` from the actual run.
+
+| Phase | Total | Notes |
+|---|---|---|
+| Phase 0a generation | reported as `S0.4a_generation_total` | Cached on re-runs (`sam3_reuse_cached=True`) |
+| Phase 0b fusion | reported as `S0.4b_fusion_total` | Per-object CPD, runs at static→dynamic boundary |
+| Phase 1 — static training | ≈12 ms/step × 4000 ≈ 49 s | |
+| Phase 2 — D0 bootstrap | ≈1.2 s | Down from ≈3.6 s pre-optimization |
+| Phase 3 — dynamic loop | per-frame prep + training, see below | |
+
+Within Phase 0 (uncached, 4-object scene):
+
+| Substep | Time | Notes |
+|---|---|---|
+| `S0.2_sam3d_multi_generation` | ≈380 s | Dominant. Cached on re-runs |
+| `S0.3_fusion_obj_*` | 1.8 s — 58 s/object | Probreg CPD; scales with point count |
+| `S0.1_sam3_segmentation` | ≈0 s when cached | |
+
+D0 bootstrap (Path A, post-optimization):
+
+| Substep | Time |
+|---|---|
+| `D0.1_initial_change_detection` | ≈0.29 s (was ≈0.70 s) |
+|   `D0.1a_forward_render` | ≈0.03 s |
+|   `D0.1b_change_mask` | ≈0.09 s (single scipy.label) |
+|   `D0.1c_esam_render` | ≈0.16 s (batched render+live in one forward) |
+|   `D0.1d_esam_live` | 0.00 s (batched into D0.1c) |
+|   `D0.1e_gaussian_flagging` | ≈0.01 s |
+|   `D0.1f_post_save` | ≈0.21 s with debug saves on, ≈0 s off |
+
+Per-frame averages in the dynamic loop (DN, with default `save_debug_images=True`):
+
+| Substep | Time/frame | Notes |
+|---|---|---|
+| `DN.8_debug_images` | ≈600 ms | Disk I/O — set `save_debug_images=False` to drop to ≈0 |
+| `DN.3_cotracker_advance` | ≈410 ms | Reference-mode CoTracker3 + RANSAC |
+| `DN.7_change_mask_cdn` | ≈240 ms | MSSIM + cleanup; uses `_compute_change_mask` (pipeline) which still calls the full `build_change_mask` recipe |
+| `DN.1_sam2_live_propagation` | ≈110 ms | SAM2 tiny video predictor |
+| `DN.5_render_rdn` | ≈15 ms | gsplat rasterize |
+| `DN.6_render_object_mask` | ≈3 ms | object-only rasterize |
+
+Per-frame dynamic training step (50 steps/frame):
+
+| Substep | Time/step |
+|---|---|
+| `DT.1 dynamic_step` | ≈58 ms |
+
+**Hotspot summary (open work — see "Dynamic Tracking Roadmap" below):**
+
+1. **`DN.3_cotracker_advance`** ≈410 ms — the per-frame CoTracker3 forward + RANSAC. This is the biggest blocker for real-time per-frame tracking. Algorithm-bound; reduce only by lowering `cotracker_query_point_count` (currently 256) or `cotracker_ransac_iterations` (128), or by switching from offline to online inference, or by replacing the 2-frame video re-build with a state-keeping interface.
+2. **`DN.7_change_mask_cdn`** ≈240 ms — MSSIM compute. Cleanup recipe is already collapsed to one scipy.label, but the 3-level multiscale SSIM convolutions still dominate.
+3. **`DN.8_debug_images`** ≈600 ms — pure disk I/O. Already gated by `save_debug_images=False` for production runs.
+4. **`S0.2_sam3d_multi_generation`** ≈380 s for 4 objects — dominated by SAM3D inference, cached on re-runs.
+
+#### Known timing instrumentation notes
+
+These are NOT bugs — they explain how the timing report is structured.
+
+1. **Phase 0 is reported as separate `S0.4a_generation_total` (Phase 0a,
+   runs in `__init__`) and `S0.4b_fusion_total` (Phase 0b, runs at the
+   static→dynamic boundary).** The report shows both totals plus a
+   combined "Phase total" header. The two halves run minutes apart on
+   the wall clock, so lumping them together was misleading.
+
+2. **`DN.2_cotracker_refresh` and `DN.4_cotracker_filter` were removed.**
+   Reference-mode CoTracker keeps the D0 query points fixed for the whole
+   sequence — there is no per-frame refresh and no post-filter.
+
+3. **ESAM is pre-warmed in `DynamicGSPipeline.__init__`** with two
+   dummy forwards (batch=1 and batch=2 at 512×512) so both the ~300 ms
+   one-time model load and the CUDA kernel JIT for both batch shapes
+   are paid before training starts, not inside `D0.1c_esam_render`.
+   `query_esam_mask` and `query_esam_mask_pair` also: (a) downsample
+   the input to a max side of `ESAM_MAX_SIDE = 512` (encoder cost is
+   quadratic in input area), (b) run a single ESAM forward (no inner
+   convergence loop), and (c) restrict `compute_prompt_interior`'s
+   `distance_transform_edt` to the prompt mask's bounding box.
+
+4. **Render and live ESAM are batched** when neither side uses SAM2 (the
+   common D0 case). `prepare_dynamic_update` calls `query_esam_mask_pair`
+   once: it computes the prompt-interior EDT + sample points once
+   (the prompt is shared) and forwards a stacked `(2,3,H,W)` image batch.
+   The combined cost lands under `D0.1c_esam_render`; `D0.1d_esam_live`
+   is 0 in this path. The mixed/SAM2 fallback path still calls
+   `query_esam_mask` twice and reports D0.1c / D0.1d separately.
+
+5. **`D0.1b_change_mask`** uses `keep_largest_component_with_min_area`,
+   a single scipy.label CPU round-trip that replaces the prior
+   `remove_small_components` (one scipy.label) + outer
+   `keep_largest_component` (another scipy.label) sequence. The outer
+   `keep_largest_component` in `prepare_dynamic_update` only runs when
+   `active_mask_dilate_radius > 0` (default 0), since dilation can fuse
+   previously-separate components and require relabeling.
+
+6. **`save_debug_images=False`** removes the `D0.1f_post_save`,
+   `D0.9_debug_images`, and `DN.8_debug_images` saves entirely. The
+   SAM3D Path B branch still saves the two SAM3D-required files
+   (`render.png`, `render_object_mask_binary.png`) when needed.
 
 ## Pipeline Step-by-Step Reference (Corrected + Timed)
 
@@ -288,18 +518,17 @@ For current numbers, always trust the generated `<data_root>/timing_report.txt` 
 
 ### Phase 1 — Static Training
 
-From an initial SfM pointcloud, optimize all Gaussian parameters except `means` (LR=0). No densification/pruning (`NoRefineStrategy`). The current runtime config uses 6000 static steps before the dynamic bootstrap starts.
+From an initial SfM pointcloud, optimize all Gaussian parameters except `means` (LR=0). No densification/pruning (`NoRefineStrategy`). The current runtime config uses 4000 static steps before the dynamic bootstrap starts.
 
 ### Phase 2 — Dynamic Frame 0 Bootstrap
 
-#### D0.1 Initial change detection
+#### D0.1 Initial change detection (≈0.29 s total, was ≈0.70 s)
 
-1. **D0.1a** Forward render (0.15s): call `get_outputs(camera)` in eval mode → RS image + depth
-2. **D0.1b** Change mask: `build_change_mask(...)` — RGB MS-SSIM comparison plus cleanup recipe → C0
-3. Sample points from C0 interior (90% inward erosion from mask boundary) — these points lie inside the object on both RS and D0 (object barely moved)
-4. **D0.1c** ESAM on RS (0.24s, incl. one-time model load): `query_esam_mask(esam, RS_rgb, C0)` → F0_render
-5. **D0.1d** ESAM on D0 live (0.11s): `query_esam_mask(esam, D0_rgb, C0)` → F0_live
-6. **D0.1e** Gaussian flagging (0.79s): project ~300K+ Gaussian centers to 2D (`extract_projected_centers_and_radii`), check which fall inside union(F0_render, F0_live) (`build_active_mask`) → set `object_flags = 1` for object Gaussians
+1. **D0.1a** Forward render (≈0.03 s): call `get_outputs(camera)` in eval mode → RS image + depth
+2. **D0.1b** Change mask (≈0.09 s): `build_change_mask(...)` — RGB MS-SSIM + single-scipy.label cleanup → C0
+3. **D0.1c** ESAM on render+live in one batched forward (≈0.16 s): `query_esam_mask_pair(esam, RS_rgb, D0_rgb, C0)` → (F0_render, F0_live). The change mask C0 is the shared prompt for both, so EDT + interior point sampling runs once. ESAM is pre-warmed at pipeline init, and the input is downsampled to `ESAM_MAX_SIDE=512` before the forward; the output mask is upsampled with nearest-neighbor.
+4. **D0.1d** ESAM on D0 live: 0 s in the batched path (folded into D0.1c). Only the SAM2-mixed fallback path runs a second ESAM forward and times it under D0.1d.
+5. **D0.1e** Gaussian flagging (≈0.01 s): project ~300K+ Gaussian centers to 2D (`extract_projected_centers_and_radii`), check which fall inside union(F0_render, F0_live) (`build_active_mask`) → set `object_flags = 1` for object Gaussians (suppressed via `skip_object_flags_write=True` in Path A; the pipeline writes the per-instance flags itself)
 
 #### D0.2 SAM3D object generation
 
@@ -355,24 +584,19 @@ From an initial SfM pointcloud, optimize all Gaussian parameters except `means` 
 - Updates `_live_tracker_rgb` and `_live_tracker_mask` for next frame
 - **Live tracker only.** No render tracker exists. FRN does not exist.
 
-#### DN.2 CoTracker reference mode
-
-- No reseeding in the current pipeline
-- The D0 query points stay fixed for the whole sequence
-
 #### DN.3 CoTracker absolute rigid transform
 
 - Build a 2-frame video `[D0_reference_frame, current_live_frame DN]`, query CoTracker3 with the fixed D0 seed points
 - Filter tracked current-frame points by the current SAM2 mask before depth sampling and RANSAC
 - Back-project the surviving current-frame points to 3D using DN depth + camera intrinsics/extrinsics
 - RANSAC (128 iterations, 3-point minimal samples) → SVD rigid body fit → SE(3) = (R, t)
-- If inliers ≥ 12: `apply_rigid_object_transform_from_reference(R, t)` — applies the current transform to the stored reference object pose instead of incrementally moving the previous-frame Gaussians
+- If inliers ≥ 12: `apply_rigid_object_transform_from_reference(R, t)` — applies the absolute transform to the stored reference object pose instead of incrementally moving the previous-frame Gaussians
 - If RANSAC fails: skip transform, log warning
 - Writes `{frame_name}_cotracker_motion.txt` with R, t, inlier count, residuals
 
-#### DN.4 CoTracker post-filter
-
-- Skipped in the current reference-query implementation because current-mask filtering already happens before rigid fitting
+(DN.2 reseed and DN.4 post-filter are not present in the current
+reference-mode implementation — D0 query points stay fixed for the whole
+sequence and current-mask filtering already runs inside DN.3.)
 
 #### DN.5 Render RDN
 
@@ -468,7 +692,8 @@ The method currently uses `NoSaveTrainer`, so checkpoint saving is intentionally
 
 ### Third-Party Dependencies (`third_party/`)
 
-- **`sam-3d-objects/`**: SAM3D model for single-view 3D object reconstruction from RGB + mask. Uses `pipeline_runtime_small.yaml`. Required checkpoints: `ss_generator`, `slat_generator`, `ss_decoder`, `slat_decoder_gs`. The mesh decoder, GS4 decoder, and `ss_encoder` are not used.
+- **`sam-3d-objects/`**: SAM3D model for single-view 3D object reconstruction from RGB + mask. Uses `pipeline_runtime_small.yaml`. Required checkpoints: `ss_generator`, `slat_generator`, `ss_decoder`, `slat_decoder_gs`. The mesh decoder, GS4 decoder, and `ss_encoder` are not used. Multi-object path (`run_sam3d_multi_object`) loads the model once and processes masks sequentially on the full image (no cropping).
+- **SAM3** ([github.com/facebookresearch/sam3](https://github.com/facebookresearch/sam3)): Text-prompted segmentation for Phase 0 object discovery. Requires separate conda env `sam3_dynamic_gs` (Python 3.12+, PyTorch 2.7+, CUDA 12.6+) because the training env is incompatible. Invoked via `conda run -n sam3_dynamic_gs python`.
 - **CoTracker3**: Loaded via `torch.hub` from `facebookresearch/co-tracker` or from a local checkpoint path set in `cotracker_checkpoint_path`.
 - **SAM2**: Tiny video predictor loaded via `build_sam2_tiny_video_predictor` for mask propagation.
 - **ESAM**: Interactive segmentation model for frame 0 object mask extraction.
@@ -493,9 +718,11 @@ The comment before each timer block describes what is being timed so that future
 
 | Phase | Keys | Location |
 |-------|------|----------|
+| Phase 0a | `S0.1`, `S0.2`, `S0.4a_generation_total` | `_run_sam3_and_sam3d_generation` |
+| Phase 0b | `S0.3_fusion_obj_*`, `S0.4b_fusion_total` | `_fuse_sam3d_objects_into_scene` |
 | Static | `static_step` | `get_train_loss_dict` |
-| Frame 0 | `D0.1` through `D0.10` | `_prepare_frame_0` |
-| Frame N | `DN.1` through `DN.9` | `_prepare_frame_n` |
+| Frame 0 | `D0.1` through `D0.10` (incl. `D0.1a-f`, `D0.3a-f`) | `_prepare_frame_0` + `prepare_dynamic_update` + `initialize_object_from_sam3d` |
+| Frame N | `DN.1`, `DN.3`, `DN.5` through `DN.9` | `_prepare_frame_n` |
 | Dynamic training | `dynamic_step` | `get_train_loss_dict` |
 
 SAM3D generation vs insertion timing is split inside `initialize_object_from_sam3d()` in `dynamic_gs_model.py`, which returns `sam3d_generation_time` and `sam3d_insertion_time` in its stats dict. The pipeline reads these to populate `D0.2` and `D0.3`.

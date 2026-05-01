@@ -21,7 +21,19 @@ from .utils import (
     CoTrackerMotionEstimator,
     build_change_mask,
     dilate_binary_mask,
+    extract_projected_centers_and_radii,
+    load_sam3d_gaussian_ply,
+    load_sam3d_rotation_wxyz,
     query_sam2_propagated_mask,
+    register_and_fuse_sam3d_object,
+    save_point_cloud,
+)
+from .utils.sam3_segmentation import load_sam3_masks, run_sam3_subprocess
+from .utils.sam3d import (
+    get_sam3d_output_paths,
+    resolve_sam3d_pose_path,
+    run_sam3d_multi_object_subprocess,
+    sam3d_pose_has_rotation,
 )
 
 
@@ -34,6 +46,11 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
 
     static_num_steps: int = 3000
     dynamic_steps_per_frame: int = 300
+    save_debug_images: bool = True
+    """If False, skip the per-frame debug PNG saves (D0.1f / D0.9 /
+    DN.8). The saves are pure disk I/O and not part of the change
+    detection critical path; disabling them removes ~210ms from D0
+    and ~600ms from each dynamic frame."""
 class DynamicGSPipeline(VanillaPipeline):
     config: DynamicGSPipelineConfig
 
@@ -52,6 +69,10 @@ class DynamicGSPipeline(VanillaPipeline):
         self._timing = defaultdict(list)
         self._timing_report_written = False
         self._cpd_info: dict = {}
+        # Holds the SAM3 + SAM3D generation outputs (mask metadata + per-object PLY/pose
+        # paths) produced pre-static. ``None`` means generation didn't run, ran with 0
+        # objects, or was disabled — in which case the post-static fusion is a no-op.
+        self._sam3d_generation_outputs: Optional[dict] = None
         atexit.register(self._write_timing_report)
         super().__init__(
             config=config,
@@ -63,7 +84,54 @@ class DynamicGSPipeline(VanillaPipeline):
         )
         self.total_dynamic_frames = self.datamanager.get_num_dynamic_frames()
         self.total_dynamic_steps = self.total_dynamic_frames * self.config.dynamic_steps_per_frame
+
+        # Pre-load ESAM at pipeline init so the ~300ms one-time model load
+        # AND the first-call CUDA kernel JIT for our input shape are paid
+        # here (well before D0) rather than inside the timed
+        # `D0.1c_esam_render` window. We run two dummy forwards — one with
+        # batch=2 for the common D0 path (`query_esam_mask_pair`) and one
+        # with batch=1 for fallback / SAM2-mixed paths — so all kernels
+        # are JIT-compiled before training starts.
+        try:
+            esam_model = self.model._get_esam_model()
+            try:
+                from .utils.esam import ESAM_MAX_SIDE
+            except Exception:
+                ESAM_MAX_SIDE = 512
+            warm_device = torch.device(self.model.device)
+            with torch.no_grad():
+                dummy_img = torch.zeros(
+                    (1, 3, ESAM_MAX_SIDE, ESAM_MAX_SIDE),
+                    device=warm_device,
+                    dtype=torch.float32,
+                )
+                dummy_pts = torch.zeros(
+                    (1, 1, 1, 2), device=warm_device, dtype=torch.float32
+                )
+                dummy_lbl = torch.ones(
+                    (1, 1, 1), device=warm_device, dtype=torch.float32
+                )
+                esam_model(dummy_img, dummy_pts, dummy_lbl)
+                # Batch=2 forward to JIT the kernels used by query_esam_mask_pair.
+                dummy_img2 = dummy_img.expand(2, 3, ESAM_MAX_SIDE, ESAM_MAX_SIDE).contiguous()
+                dummy_pts2 = dummy_pts.expand(2, 1, 1, 2).contiguous()
+                dummy_lbl2 = dummy_lbl.expand(2, 1, 1).contiguous()
+                esam_model(dummy_img2, dummy_pts2, dummy_lbl2)
+            if warm_device.type == "cuda":
+                torch.cuda.synchronize(warm_device)
+        except Exception as exc:
+            CONSOLE.log(f"[dynamic-gs] ESAM warm-up skipped: {exc}")
+
         self._sync_phase(0)
+
+        # Pre-static: run SAM3 segmentation + SAM3D 3D object generation now, so
+        # the per-object PLYs and pose sidecars exist on disk before static
+        # optimization begins. Fusion (insertion into the trained scene) is
+        # deferred to the static→dynamic transition in ``_sync_phase`` so that
+        # SAM3D's back-side Gaussians don't get opacity-eroded by static
+        # photometric optimization.
+        if self.model.config.use_sam3_graspable_prefusion and self.model.config.sam3_prompt_text:
+            self._sam3d_generation_outputs = self._run_sam3_and_sam3d_generation()
 
     def _reset_dynamic_segmentation_state(self) -> None:
         self._sam3d_inserted = False
@@ -72,6 +140,701 @@ class DynamicGSPipeline(VanillaPipeline):
         self._live_tracker_rgb = None
         self._live_tracker_mask = None
         self._live_tracker_seeded = False
+
+    def _run_sam3_and_sam3d_generation(self) -> Optional[dict]:
+        """Pre-static: run SAM3 mask discovery + SAM3D 3D object generation.
+
+        Saves per-object Gaussian PLYs and pose sidecars under
+        ``initialization_artifacts/`` but does NOT mutate the Gaussian
+        scene. Fusion (insertion + instance-id propagation) happens at
+        the static→dynamic transition via
+        ``_fuse_sam3d_objects_into_scene``.
+
+        Returns a dict ``{"sam3_objects": [...], "sam3d_results": [...]}``,
+        or ``None`` if SAM3 found 0 objects.
+        """
+        import gc
+        import json
+        import numpy as np
+
+        t_total = time.time()
+        model_cfg = self.model.config
+        debug_dir = self.datamanager.get_initialization_debug_dir()
+        artifact_dir = self.datamanager.get_initialization_artifact_dir()
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        # First static image bytes + depth + intrinsics. We don't need a
+        # camera tensor here — generation does no rendering. Fusion will
+        # re-fetch its own camera at the static→dynamic transition.
+        batch = self.datamanager.static_manager.cached_train[0]
+        static_image = batch["image"]  # (H, W, 3) uint8 or float [0,1]
+
+        static_ds = self.datamanager.static_manager.train_dataset
+        depth_filenames = static_ds.metadata.get("depth_filenames")
+        depth_scale = float(static_ds.metadata.get("depth_unit_scale_factor", 1.0))
+        frame_idx_0 = int(batch.get("image_idx", 0))
+        static_depth_m = None
+        if depth_filenames is not None and frame_idx_0 < len(depth_filenames):
+            try:
+                depth_pil = Image.open(Path(depth_filenames[frame_idx_0]))
+                depth_np = np.array(depth_pil).astype(np.float32) * depth_scale
+                static_depth_m = torch.from_numpy(depth_np)
+            except Exception as exc:
+                CONSOLE.log(f"[phase-0] warning: failed to load static depth ({exc})")
+
+        static_intrinsics = {
+            "fx": float(static_ds.cameras.fx[frame_idx_0].item()),
+            "fy": float(static_ds.cameras.fy[frame_idx_0].item()),
+            "cx": float(static_ds.cameras.cx[frame_idx_0].item()),
+            "cy": float(static_ds.cameras.cy[frame_idx_0].item()),
+        }
+
+        # Save static image (with gripper blacked out) for the SAM3 worker.
+        static_image_path = debug_dir / "static0_rgb.png"
+        img_cpu = static_image.cpu()
+        if img_cpu.dtype == torch.uint8:
+            static_np = img_cpu.numpy()
+        else:
+            static_np = (img_cpu.numpy() * 255).clip(0, 255).astype(np.uint8)
+        gripper_mask_t = batch.get("mask")
+        if gripper_mask_t is not None:
+            m = gripper_mask_t.detach().cpu()
+            if m.ndim == 3 and m.shape[-1] == 1:
+                m = m.squeeze(-1)
+            keep = (m > 0.5).numpy()
+            if keep.shape != static_np.shape[:2]:
+                resized = Image.fromarray(keep.astype(np.uint8) * 255).resize(
+                    (static_np.shape[1], static_np.shape[0]), Image.NEAREST
+                )
+                keep = np.array(resized) > 127
+            static_np = static_np.copy()
+            static_np[~keep] = 0
+        Image.fromarray(static_np).save(static_image_path)
+
+        results_json = debug_dir / "static0_sam3_results.json"
+        sam3_cached = model_cfg.sam3_reuse_cached and results_json.exists()
+
+        # Move model + cached images off GPU so the SAM3/SAM3D subprocesses
+        # have headroom on small GPUs.
+        run_device = torch.device(self.model.means.device)
+        if not sam3_cached:
+            self.model.to("cpu")
+            for mgr in [self.datamanager.static_manager, self.datamanager.dynamic_manager]:
+                if hasattr(mgr, "cached_train"):
+                    for batch_iter in mgr.cached_train:
+                        for k in list(batch_iter.keys()):
+                            if hasattr(batch_iter[k], "cpu") and hasattr(batch_iter[k], "device"):
+                                if str(batch_iter[k].device).startswith("cuda"):
+                                    batch_iter[k] = batch_iter[k].cpu()
+                if hasattr(mgr, "cached_eval"):
+                    for batch_iter in mgr.cached_eval:
+                        for k in list(batch_iter.keys()):
+                            if hasattr(batch_iter[k], "cpu") and hasattr(batch_iter[k], "device"):
+                                if str(batch_iter[k].device).startswith("cuda"):
+                                    batch_iter[k] = batch_iter[k].cpu()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        try:
+            # SAM3 segmentation
+            t_sam3 = time.time()
+            if sam3_cached:
+                sam3_objects = load_sam3_masks(results_json)
+                CONSOLE.log(f"[phase-0] reusing cached SAM3 results: {len(sam3_objects)} objects")
+            else:
+                sam3_objects = run_sam3_subprocess(
+                    image_path=static_image_path,
+                    text_prompt=model_cfg.sam3_prompt_text,
+                    output_dir=debug_dir,
+                    output_stem="static0",
+                    sam3_conda_env=model_cfg.sam3_conda_env_name,
+                    min_area_ratio=model_cfg.sam3_candidate_min_area_ratio,
+                    max_area_ratio=model_cfg.sam3_candidate_max_area_ratio,
+                    dedup_iou=model_cfg.sam3_candidate_dedup_iou,
+                    max_objects=model_cfg.sam3_candidate_max_objects,
+                    confidence_threshold=model_cfg.sam3_confidence_threshold,
+                    min_score=model_cfg.sam3_min_score,
+                )
+            self._timing["S0.1_sam3_segmentation"].append(time.time() - t_sam3)
+
+            if not sam3_objects:
+                CONSOLE.log("[phase-0] SAM3 found 0 objects; skipping Phase 0 prefusion")
+                return None
+
+            CONSOLE.log(f"[phase-0] SAM3 discovered {len(sam3_objects)} objects")
+            self._save_sam3_debug_plots(
+                rgb_path=static_image_path,
+                sam3_objects=sam3_objects,
+                out_dir=debug_dir,
+                prefix="static0",
+            )
+
+            # SAM3D multi-object generation (full image + metric pointmap
+            # from the static-scene depth, no crop). See sam3d.py and
+            # scripts/old/test_sam3d_strategies.py for the rationale.
+            t_sam3d = time.time()
+            output_stems = [f"static0_obj_{i:02d}_sam3d" for i in range(len(sam3_objects))]
+            sam3d_results: list = [None] * len(sam3_objects)
+
+            to_run_indices: list[int] = []
+            to_run_mask_paths: list[Path] = []
+            to_run_stems: list[str] = []
+            for obj_i, sam3_obj in enumerate(sam3_objects):
+                stem = output_stems[obj_i]
+                paths = get_sam3d_output_paths(artifact_dir, stem, image_dir=debug_dir)
+                pose_path_resolved = resolve_sam3d_pose_path(paths["ply_path"], paths["pose_path"])
+                if model_cfg.sam3_reuse_cached and paths["ply_path"].exists() and sam3d_pose_has_rotation(pose_path_resolved):
+                    if pose_path_resolved is not None:
+                        paths["pose_path"] = pose_path_resolved
+                    sam3d_results[obj_i] = paths
+                    CONSOLE.log(f"[phase-0] object {obj_i}: reusing cached SAM3D output")
+                else:
+                    to_run_indices.append(obj_i)
+                    to_run_mask_paths.append(Path(sam3_obj["mask_path"]))
+                    to_run_stems.append(stem)
+
+            full_depth_path = None
+            full_intrinsics_path = None
+            if static_depth_m is not None and to_run_indices:
+                H_img, W_img = int(static_np.shape[0]), int(static_np.shape[1])
+                full_depth_path = artifact_dir / "static0_full_depth_meters.tiff"
+                Image.fromarray(static_depth_m.cpu().numpy().astype(np.float32)).save(full_depth_path)
+                full_intrinsics_path = artifact_dir / "static0_full_intrinsics.json"
+                full_intrinsics_path.write_text(
+                    json.dumps(
+                        {
+                            **static_intrinsics,
+                            "width": W_img,
+                            "height": H_img,
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
+
+            if to_run_indices:
+                try:
+                    multi_results = run_sam3d_multi_object_subprocess(
+                        render_image_path=static_image_path,
+                        object_mask_paths=to_run_mask_paths,
+                        output_dir=artifact_dir,
+                        output_stems=to_run_stems,
+                        image_dir=debug_dir,
+                        max_side=518,
+                        depth_path=full_depth_path,
+                        intrinsics_path=full_intrinsics_path,
+                    )
+                except Exception as exc:
+                    CONSOLE.log(f"[phase-0] SAM3D multi-object subprocess failed: {exc}")
+                    multi_results = [{} for _ in to_run_indices]
+
+                for idx, result in zip(to_run_indices, multi_results):
+                    if result:
+                        sam3d_results[idx] = result
+                        CONSOLE.log(f"[phase-0] object {idx}: SAM3D generation complete")
+                    else:
+                        sam3d_results[idx] = {}
+                        CONSOLE.log(f"[phase-0] object {idx}: SAM3D failed (empty result)")
+
+            sam3d_results = [r if r else {} for r in sam3d_results]
+            self._timing["S0.2_sam3d_multi_generation"].append(time.time() - t_sam3d)
+        finally:
+            if not sam3_cached:
+                self.model.to(run_device)
+                for mgr in [self.datamanager.static_manager, self.datamanager.dynamic_manager]:
+                    if hasattr(mgr, "cached_train"):
+                        for batch_iter in mgr.cached_train:
+                            for k in list(batch_iter.keys()):
+                                if hasattr(batch_iter[k], "to") and hasattr(batch_iter[k], "device"):
+                                    if not str(batch_iter[k].device).startswith("cuda"):
+                                        batch_iter[k] = batch_iter[k].to(run_device)
+                    if hasattr(mgr, "cached_eval"):
+                        for batch_iter in mgr.cached_eval:
+                            for k in list(batch_iter.keys()):
+                                if hasattr(batch_iter[k], "to") and hasattr(batch_iter[k], "device"):
+                                    if not str(batch_iter[k].device).startswith("cuda"):
+                                        batch_iter[k] = batch_iter[k].to(run_device)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # Phase 0a (pre-static, in __init__): SAM3 segmentation + SAM3D
+        # multi-object generation. Reported separately from 0b in the timing
+        # summary because the two halves run minutes apart on the timeline.
+        self._timing["S0.4a_generation_total"].append(time.time() - t_total)
+        CONSOLE.log(
+            f"[phase-0] generation complete: {len(sam3_objects)} masks, "
+            f"{sum(1 for r in sam3d_results if r)} SAM3D PLYs ready; "
+            f"fusion deferred to static→dynamic transition"
+        )
+        return {
+            "sam3_objects": sam3_objects,
+            "sam3d_results": sam3d_results,
+        }
+
+    def _fuse_sam3d_objects_into_scene(self, gen_outputs: dict) -> dict:
+        """Post-static: take the pre-generated SAM3D PLYs and fuse them
+        into the trained scene. Runs at the static→dynamic transition.
+
+        After ``static_num_steps`` of static optimization, the rendered
+        depth used by ``_get_existing_object_subset`` is meaningful (vs
+        being garbage at __init__ time when only SfM seeds exist), so
+        instance-id propagation gets a denser set of seed Gaussians.
+        SAM3D's back-side Gaussians also never see static photometric
+        optimization, so they are not opacity-eroded before D0.
+        """
+        import json
+        import numpy as np
+
+        t_total = time.time()
+        sam3_objects = gen_outputs.get("sam3_objects") or []
+        sam3d_results = gen_outputs.get("sam3d_results") or []
+        if not sam3_objects:
+            return {}
+
+        debug_dir = self.datamanager.get_initialization_debug_dir()
+        artifact_dir = self.datamanager.get_initialization_artifact_dir()
+
+        batch = self.datamanager.static_manager.cached_train[0]
+        static_image = batch["image"]
+        frame_idx_0 = int(batch.get("image_idx", 0))
+        camera = self.datamanager.static_manager.train_dataset.cameras[
+            frame_idx_0 : frame_idx_0 + 1
+        ].to(self.device)
+
+        # Apply the post-static camera-optimizer offset to the fusion camera.
+        # `_should_apply_camera_optimizer` returns False here because phase
+        # already flipped to "dynamic", so we call `apply_to_camera` directly
+        # and overwrite `camera_to_worlds` once. Downstream `get_outputs`,
+        # `_backproject_mask_to_world`, and the c2w read inside
+        # `register_and_fuse_sam3d_object` all see the optimized pose.
+        camera.metadata = dict(camera.metadata or {})
+        camera.metadata["cam_idx"] = frame_idx_0
+        if (
+            self.model.camera_optimizer.config.mode != "off"
+            and 0 <= frame_idx_0 < self.model.camera_optimizer.num_cameras
+        ):
+            optimized_c2w = self.model.camera_optimizer.apply_to_camera(camera).detach()
+            if optimized_c2w.shape == camera.camera_to_worlds.shape:
+                camera.camera_to_worlds = optimized_c2w
+                CONSOLE.log(
+                    f"[phase-0] using post-static optimized pose for cam_idx={frame_idx_0}"
+                )
+
+        static_ds = self.datamanager.static_manager.train_dataset
+        depth_filenames = static_ds.metadata.get("depth_filenames")
+        depth_scale = float(static_ds.metadata.get("depth_unit_scale_factor", 1.0))
+        static_depth_m = None
+        if depth_filenames is not None and frame_idx_0 < len(depth_filenames):
+            try:
+                depth_pil = Image.open(Path(depth_filenames[frame_idx_0]))
+                depth_np = np.array(depth_pil).astype(np.float32) * depth_scale
+                static_depth_m = torch.from_numpy(depth_np)
+            except Exception as exc:
+                CONSOLE.log(f"[phase-0] warning: failed to load static depth ({exc}); falling back to SfM targets")
+
+        manifest: dict = {}
+        for obj_idx, (sam3_obj, sam3d_out) in enumerate(zip(sam3_objects, sam3d_results)):
+            instance_id = obj_idx + 1
+            if not sam3d_out:
+                CONSOLE.log(f"[phase-0] skipping object {obj_idx}: SAM3D failed or empty")
+                continue
+
+            t_fusion = time.time()
+
+            # Re-render every iteration. ``insert_object_gaussians`` mutates the
+            # Gaussian count, so ``model.info`` (populated by the previous render)
+            # goes stale and ``_get_existing_object_subset`` →
+            # ``extract_projected_centers_and_radii`` raises a length-mismatch.
+            with torch.no_grad():
+                outputs = self.model.get_outputs(camera)
+            render_h, render_w = outputs["rgb"].shape[:2]
+
+            ply_path = sam3d_out["ply_path"]
+            pose_path = sam3d_out["pose_path"]
+            try:
+                source_points, source_colors = load_sam3d_gaussian_ply(ply_path)
+                source_rotation_wxyz = load_sam3d_rotation_wxyz(pose_path)
+            except Exception as exc:
+                CONSOLE.log(f"[phase-0] skipping object {obj_idx}: {exc}")
+                continue
+
+            obj_mask_np = np.array(Image.open(sam3_obj["mask_path"]).convert("L"))
+            obj_mask_tensor = torch.from_numpy((obj_mask_np > 127).astype(np.float32))
+            obj_mask_tensor = obj_mask_tensor[..., None].to(self.device)
+            if obj_mask_tensor.shape[0] != render_h or obj_mask_tensor.shape[1] != render_w:
+                obj_mask_tensor = torch.nn.functional.interpolate(
+                    obj_mask_tensor.permute(2, 0, 1).unsqueeze(0),
+                    size=(render_h, render_w),
+                    mode="nearest",
+                ).squeeze(0).permute(1, 2, 0)
+
+            existing_indices, existing_means, existing_colors = self.model._get_existing_object_subset(
+                obj_mask_tensor,
+                outputs["depth"],
+            )
+            existing_indices_cpu = existing_indices.detach().cpu()
+            existing_means_np = existing_means.detach().cpu().numpy()
+            existing_colors_np = existing_colors.detach().cpu().numpy()
+
+            # Dense registration target via back-projection through the static
+            # depth image (Gazebo GT). Falls back to SfM seeds when depth is
+            # unavailable.
+            target_points_np = existing_means_np
+            target_colors_np = existing_colors_np
+            if static_depth_m is not None:
+                target_points_np, target_colors_np = self._backproject_mask_to_world(
+                    obj_mask_tensor.squeeze(-1).cpu().numpy() > 0.5,
+                    static_depth_m,
+                    static_image,
+                    camera,
+                )
+            if target_points_np.shape[0] < 3:
+                CONSOLE.log(
+                    f"[phase-0] skipping object {obj_idx}: only {target_points_np.shape[0]} target points for registration"
+                )
+                continue
+
+            # `camera.camera_to_worlds` was already overwritten with the
+            # post-static optimized pose above, so read it directly.
+            c2w_rotation = camera.camera_to_worlds[0, :3, :3].detach().cpu().numpy().astype(np.float32)
+
+            insertion_result = register_and_fuse_sam3d_object(
+                source_points=source_points,
+                source_colors=source_colors,
+                target_points=target_points_np,
+                target_colors=target_colors_np,
+                source_rotation_wxyz=source_rotation_wxyz,
+                camera_to_world_rotation=c2w_rotation,
+                debug_dir=debug_dir,
+                artifact_dir=artifact_dir,
+                output_stem=f"static0_obj_{obj_idx:02d}_sam3d",
+            )
+
+            if insertion_result.kept_point_count > 0:
+                inserted_indices = self.model.insert_object_gaussians(
+                    torch.from_numpy(insertion_result.kept_points),
+                    torch.from_numpy(insertion_result.kept_colors),
+                    object_flag=False,
+                    instance_id=instance_id,
+                )
+            else:
+                inserted_indices = torch.zeros((0,), dtype=torch.long, device=self.model.means.device)
+
+            # Step 2: flag only the inserted Gaussians as belonging to this object.
+            # `insert_object_gaussians(..., instance_id=k)` already wrote
+            # `object_instance_ids = k` for the appended SAM3D points and nothing else.
+            # We deliberately skip `_propagate_instance_membership` here — we do NOT want
+            # SfM Gaussians dragged along with the moving object. Anything in the object's
+            # footprint that isn't SAM3D should be deleted in step 3, not flagged.
+
+            # Step 3: prune everything in the object's footprint that isn't SAM3D.
+            # A non-other-object, non-just-inserted Gaussian is removed if it lies near:
+            #   - inserted SAM3D cloud (proxy_radius = max(0.003, 1.5 × proxy_spacing))
+            #   - mask-selected existing splat   (target_radius = max(0.002, 6.0 × target_spacing))
+            # Carve-outs:
+            #   - never the just-inserted SAM3D points themselves (would self-match d=0)
+            #   - never Gaussians belonging to a different already-fused object.
+            n_pruned_existing = 0
+            if insertion_result.kept_point_count > 0:
+                device = self.model.means.device
+                num_points_before_prune = self.model.num_points
+                instance_ids_flat = self.model.object_instance_ids.squeeze(-1)
+                not_other_object = (instance_ids_flat == 0) | (instance_ids_flat == instance_id)
+                eligible = not_other_object.clone()
+                if inserted_indices.numel() > 0:
+                    eligible[inserted_indices] = False
+
+                if bool(eligible.any().item()):
+                    from sklearn.neighbors import NearestNeighbors as _PruneNN
+
+                    candidate_indices = torch.nonzero(eligible, as_tuple=False).squeeze(-1)
+                    candidate_pts_np = (
+                        self.model.means[candidate_indices].detach().cpu().numpy().astype(np.float32)
+                    )
+
+                    proxy_points_np = insertion_result.kept_points.astype(np.float32)
+                    proxy_spacing = self.model._estimate_spacing(proxy_points_np)
+                    proxy_radius = max(0.003, 1.5 * proxy_spacing)
+                    proxy_nn = _PruneNN(n_neighbors=1, algorithm="auto", metric="euclidean").fit(proxy_points_np)
+                    proxy_d, _ = proxy_nn.kneighbors(candidate_pts_np)
+                    near_proxy_np = np.isfinite(proxy_d[:, 0]) & (proxy_d[:, 0] <= proxy_radius)
+
+                    target_pts_np = existing_means_np.astype(np.float32)
+                    near_target_np = np.zeros((len(candidate_pts_np),), dtype=bool)
+                    target_radius = 0.0
+                    if len(target_pts_np) > 0:
+                        target_spacing = self.model._estimate_spacing(target_pts_np)
+                        target_radius = max(0.002, 6.0 * target_spacing)
+                        target_nn = _PruneNN(n_neighbors=1, algorithm="auto", metric="euclidean").fit(target_pts_np)
+                        target_d, _ = target_nn.kneighbors(candidate_pts_np)
+                        near_target_np = np.isfinite(target_d[:, 0]) & (target_d[:, 0] <= target_radius)
+
+                    prune_mask_np = near_proxy_np | near_target_np
+                    if prune_mask_np.any():
+                        prune_indices = candidate_indices[
+                            torch.from_numpy(prune_mask_np).to(device=device)
+                        ]
+                        # Belt-and-braces: indexing through `eligible` already excluded
+                        # inserted_indices, but if `existing_indices` happened to alias
+                        # any inserted index (cannot happen — different ranges), this
+                        # would catch it.
+                        n_pruned_existing = self.model.delete_gaussian_indices(prune_indices)
+
+            self._timing[f"S0.3_fusion_obj_{obj_idx}"].append(time.time() - t_fusion)
+
+            instance_count = int(
+                (self.model.object_instance_ids.squeeze(-1) == instance_id).sum().item()
+            )
+            manifest[instance_id] = {
+                "object_index": obj_idx,
+                "mask_path": str(sam3_obj["mask_path"]),
+                "ply_path": str(ply_path),
+                "score": sam3_obj.get("score", 0.0),
+                "existing_gaussians": int(existing_indices.numel()),
+                "inserted_gaussians": int(inserted_indices.numel()),
+                "pruned_existing_gaussians": int(n_pruned_existing),
+                "instance_count": instance_count,
+                "kept_points": insertion_result.kept_point_count,
+                "chosen_scale": insertion_result.chosen_scale,
+                "source_spacing": float(insertion_result.source_spacing),
+            }
+            CONSOLE.log(
+                f"[phase-0] object {obj_idx} (instance_id={instance_id}): "
+                f"existing={existing_indices.numel()}, inserted={inserted_indices.numel()}, "
+                f"pruned_existing={n_pruned_existing}, "
+                f"instance_total={instance_count}, "
+                f"scale={insertion_result.chosen_scale:.4f}"
+            )
+
+        manifest_path = artifact_dir / "phase0_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+
+        fusion_time = time.time() - t_total
+        # Phase 0b (post-static, at static→dynamic transition): per-object
+        # CPD register + insert + propagate. Reported separately from 0a in
+        # the timing summary.
+        self._timing["S0.4b_fusion_total"].append(fusion_time)
+        num_prefused = int((self.model.object_instance_ids > 0).any(dim=-1).sum().item())
+        CONSOLE.log(
+            f"[phase-0] fusion complete: {len(manifest)} objects fused, "
+            f"{num_prefused} Gaussians with instance IDs, "
+            f"fusion time={fusion_time:.2f}s"
+        )
+        return manifest
+
+    def _backproject_mask_to_world(
+        self,
+        mask_bool_np,
+        depth_image: torch.Tensor,
+        rgb_image: torch.Tensor,
+        camera,
+    ):
+        """Back-project an image-plane mask through a depth image into world 3D points.
+
+        Args:
+            mask_bool_np: (H_mask, W_mask) boolean array on CPU.
+            depth_image: (H, W) depth in meters (CPU tensor).
+            rgb_image: (H, W, 3) uint8 or float RGB (CPU or GPU tensor).
+            camera: ``Cameras`` with at least one element (we use index 0).
+
+        Returns:
+            ``(points_np, colors_np)`` where ``points_np`` is ``(N, 3)`` float32 in world
+            coordinates and ``colors_np`` is ``(N, 3)`` float32 in [0, 1].  Points with
+            missing/zero depth are filtered out.
+        """
+        import numpy as np
+
+        H, W = int(depth_image.shape[0]), int(depth_image.shape[1])
+
+        # Resize mask to depth resolution via nearest-neighbor
+        if mask_bool_np.shape != (H, W):
+            mask_resized = np.array(
+                Image.fromarray(mask_bool_np.astype(np.uint8) * 255).resize((W, H), Image.NEAREST),
+                dtype=np.uint8,
+            ) > 127
+        else:
+            mask_resized = mask_bool_np
+
+        depth_np = depth_image.detach().cpu().numpy().astype(np.float32)
+
+        # Resize rgb to depth resolution and convert to float [0,1]
+        if hasattr(rgb_image, "detach"):
+            rgb_cpu = rgb_image.detach().cpu()
+        else:
+            rgb_cpu = rgb_image
+        rgb_np = rgb_cpu.numpy() if hasattr(rgb_cpu, "numpy") else np.asarray(rgb_cpu)
+        if rgb_np.dtype == np.uint8:
+            rgb_np = rgb_np.astype(np.float32) / 255.0
+        else:
+            rgb_np = rgb_np.astype(np.float32)
+        if rgb_np.shape[:2] != (H, W):
+            rgb_np = np.array(
+                Image.fromarray((rgb_np * 255).clip(0, 255).astype(np.uint8)).resize((W, H), Image.BILINEAR),
+                dtype=np.float32,
+            ) / 255.0
+
+        ys, xs = np.where(mask_resized & (depth_np > 1e-4))
+        if ys.size == 0:
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+
+        z = depth_np[ys, xs]
+
+        # Filter depth outliers from mask-boundary bleed: keep only pixels whose depth is
+        # within ±3×MAD of the median depth inside the mask.  MAD is robust to outliers.
+        if z.size >= 10:
+            med = float(np.median(z))
+            mad = float(np.median(np.abs(z - med))) + 1e-6
+            keep = np.abs(z - med) < 3.0 * 1.4826 * mad
+            if keep.sum() >= 3:
+                ys = ys[keep]
+                xs = xs[keep]
+                z = z[keep]
+
+        # Camera intrinsics for frame 0
+        fx = float(camera.fx[0].item())
+        fy = float(camera.fy[0].item())
+        cx = float(camera.cx[0].item())
+        cy = float(camera.cy[0].item())
+        c2w = camera.camera_to_worlds[0].detach().cpu().numpy().astype(np.float32)  # (3, 4)
+
+        # Intrinsics are defined at the original image resolution; if depth is at a different
+        # resolution, scale them.
+        src_H = int(camera.height[0].item()) if hasattr(camera.height[0], "item") else int(camera.height[0])
+        src_W = int(camera.width[0].item()) if hasattr(camera.width[0], "item") else int(camera.width[0])
+        if (H, W) != (src_H, src_W):
+            sx = W / float(src_W)
+            sy = H / float(src_H)
+            fx *= sx
+            fy *= sy
+            cx *= sx
+            cy *= sy
+
+        # Back-project: camera frame, Nerfstudio/OpenGL convention (x right, y up, z backwards)
+        # so forward direction is -z.  This matches nerfstudio.cameras.cameras.Cameras.
+        x_cam = (xs.astype(np.float32) - cx) / fx * z
+        y_cam = -(ys.astype(np.float32) - cy) / fy * z
+        z_cam = -z
+        pts_cam = np.stack([x_cam, y_cam, z_cam], axis=-1)  # (N, 3)
+
+        # Transform to world: p_w = R @ p_c + t
+        R = c2w[:3, :3]
+        t = c2w[:3, 3]
+        pts_world = pts_cam @ R.T + t[None, :]
+        colors = rgb_np[ys, xs]  # (N, 3)
+        return pts_world.astype(np.float32), colors.astype(np.float32)
+
+    def _save_sam3_debug_plots(
+        self,
+        rgb_path: Path,
+        sam3_objects: list,
+        out_dir: Path,
+        prefix: str = "static0",
+    ) -> None:
+        """Save debug plots for SAM3 segmentation: overview (all objects) + per-object overlays.
+
+        Produces:
+          - {prefix}_sam3_overview.png: the input RGB with all masks tinted by distinct
+            colors, plus bboxes + scores labeled on each object.
+          - {prefix}_obj_{i:02d}_overlay.png: input RGB with a single object's mask
+            tinted red, its bbox and score labeled.
+        """
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont
+
+        rgb_pil = Image.open(rgb_path).convert("RGB")
+        rgb_np = np.array(rgb_pil, dtype=np.uint8)
+        H, W = rgb_np.shape[:2]
+
+        palette = np.array(
+            [
+                (255, 0, 0), (0, 128, 255), (0, 200, 0), (255, 128, 0),
+                (200, 0, 200), (0, 200, 200), (255, 255, 0), (128, 64, 255),
+            ],
+            dtype=np.uint8,
+        )
+
+        try:
+            font = ImageFont.truetype("DejaVuSans-Bold.ttf", 18)
+        except Exception:
+            font = ImageFont.load_default()
+
+        # Overview image: all objects
+        overview = rgb_np.astype(np.float32)
+        for i, obj in enumerate(sam3_objects):
+            mask_path = obj.get("mask_path")
+            if not mask_path:
+                continue
+            m = np.array(Image.open(mask_path).convert("L"), dtype=np.uint8)
+            if m.shape != (H, W):
+                m = np.array(
+                    Image.fromarray(m).resize((W, H), Image.NEAREST),
+                    dtype=np.uint8,
+                )
+            mask_bool = m > 127
+            color = palette[i % len(palette)].astype(np.float32)
+            alpha = 0.5
+            overview[mask_bool] = overview[mask_bool] * (1 - alpha) + color * alpha
+
+        overview_img = Image.fromarray(overview.clip(0, 255).astype(np.uint8))
+        draw = ImageDraw.Draw(overview_img)
+        for i, obj in enumerate(sam3_objects):
+            bbox = obj.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+            x0, y0, x1, y1 = [int(round(v)) for v in bbox]
+            color = tuple(int(c) for c in palette[i % len(palette)])
+            draw.rectangle([x0, y0, x1, y1], outline=color, width=3)
+            label = f"#{i} s={obj.get('score', 0.0):.2f}"
+            # Text background for readability
+            text_xy = (x0 + 2, max(0, y0 - 22))
+            try:
+                tb = draw.textbbox(text_xy, label, font=font)
+                draw.rectangle(tb, fill=(0, 0, 0))
+            except Exception:
+                pass
+            draw.text(text_xy, label, fill=color, font=font)
+
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        overview_img.save(out_dir / f"{prefix}_sam3_overview.png")
+
+        # Per-object overlays
+        for i, obj in enumerate(sam3_objects):
+            mask_path = obj.get("mask_path")
+            if not mask_path:
+                continue
+            m = np.array(Image.open(mask_path).convert("L"), dtype=np.uint8)
+            if m.shape != (H, W):
+                m = np.array(
+                    Image.fromarray(m).resize((W, H), Image.NEAREST),
+                    dtype=np.uint8,
+                )
+            mask_bool = m > 127
+            per_img = rgb_np.astype(np.float32).copy()
+            per_img[mask_bool] = per_img[mask_bool] * 0.5 + np.array([255, 0, 0], dtype=np.float32) * 0.5
+            per_pil = Image.fromarray(per_img.clip(0, 255).astype(np.uint8))
+            draw = ImageDraw.Draw(per_pil)
+            bbox = obj.get("bbox")
+            if bbox and len(bbox) == 4:
+                x0, y0, x1, y1 = [int(round(v)) for v in bbox]
+                draw.rectangle([x0, y0, x1, y1], outline=(255, 255, 0), width=3)
+                label = f"obj_{i:02d} score={obj.get('score', 0.0):.3f} area={obj.get('mask_area', 0)}"
+                text_xy = (x0 + 2, max(0, y0 - 22))
+                try:
+                    tb = draw.textbbox(text_xy, label, font=font)
+                    draw.rectangle(tb, fill=(0, 0, 0))
+                except Exception:
+                    pass
+                draw.text(text_xy, label, fill=(255, 255, 0), font=font)
+            per_pil.save(out_dir / f"{prefix}_obj_{i:02d}_overlay.png")
+
+        CONSOLE.log(
+            f"[phase-0] saved SAM3 debug plots: {prefix}_sam3_overview.png + "
+            f"{len(sam3_objects)} per-object overlays in {out_dir}"
+        )
 
     @staticmethod
     def _resize_mask_to(mask: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
@@ -166,7 +929,6 @@ class DynamicGSPipeline(VanillaPipeline):
             min_track_points=self.model.config.cotracker_min_track_points,
             ransac_iterations=self.model.config.cotracker_ransac_iterations,
             ransac_inlier_threshold=self.model.config.cotracker_ransac_inlier_threshold,
-            point_refresh_min_distance=self.model.config.cotracker_point_refresh_min_distance,
             checkpoint_path=self.model.config.cotracker_checkpoint_path,
             hub_repo=self.model.config.cotracker_hub_repo,
             hub_model=self.model.config.cotracker_hub_model,
@@ -436,47 +1198,118 @@ class DynamicGSPipeline(VanillaPipeline):
         """Bootstrap: ESAM → SAM3D → rendered object mask → seed live tracker → CoTracker → CD0."""
         t_total = time.time()
 
+        # Check if Phase 0 prefusion already inserted objects
+        has_prefused = (self.model.object_instance_ids > 0).any().item()
+
         # --- TIMING: D0.1 Initial change detection (render RS, MSSIM change mask, ESAM on RS + D0, flag Gaussians) ---
         t0 = time.time()
-        stats = self.model.prepare_dynamic_update(camera, batch)
+        stats = self.model.prepare_dynamic_update(
+            camera, batch, skip_object_flags_write=has_prefused,
+        )
         self._timing["D0.1_initial_change_detection"].append(time.time() - t0)
         # Record substep breakdown for the timing report
         for k, v in stats.get("prepare_dynamic_update_substeps", {}).items():
             self._timing[k].append(v)
-        render_mask_plain_path = debug_dir / f"{frame_name}_render_object_mask_binary.png"
-        self._save_image(live_rgb, debug_dir / f"{frame_name}_live_input.png")
-        self._save_depth_image(gt_depth, debug_dir / f"{frame_name}_live_depth.png")
-        self._save_image(stats["rendered_rgb"], debug_dir / f"{frame_name}_render.png")
-        self._save_depth_image(stats["rendered_depth"], debug_dir / f"{frame_name}_render_depth.png")
-        self._save_image_with_points(stats["change_mask"], None, debug_dir / f"{frame_name}_change_mask.png")
-        self._save_image(stats["render_object_mask"], render_mask_plain_path)
-        self._save_image_with_points(
-            stats["render_object_mask"],
-            stats.get("render_prompt_points"),
-            debug_dir / f"{frame_name}_render_object_mask.png",
-        )
-        self._save_image(stats["live_object_mask"], debug_dir / f"{frame_name}_live_object_mask_binary.png")
-        self._save_image_with_points(
-            stats["live_object_mask"],
-            stats.get("live_prompt_points"),
-            debug_dir / f"{frame_name}_live_object_mask.png",
-        )
-        self._save_image_with_points(stats["optim_mask"], None, debug_dir / f"{frame_name}_optim_mask.png")
-        self._save_image_with_points(
-            stats["render_propagation_mask"],
-            stats.get("render_prompt_points"),
-            debug_dir / f"{frame_name}_render_propagation_mask.png",
-        )
-        self._save_image_with_points(
-            stats["live_propagation_mask"],
-            stats.get("live_prompt_points"),
-            debug_dir / f"{frame_name}_live_propagation_mask.png",
-        )
-        if gripper_mask is not None:
-            self._save_image_with_points(gripper_mask.float(), None, debug_dir / f"{frame_name}_gripper_mask.png")
 
-        # --- TIMING: D0.2 SAM3D generation (subprocess) + D0.3 SAM3D insertion (CPD similarity + dedup + insert) ---
-        if not self._sam3d_inserted and self.model.config.use_sam3d_object_init:
+        # --- TIMING: D0.1f Post-D0.1 debug image saves (~10 PNGs from prepare_dynamic_update; gated by save_debug_images) ---
+        t0 = time.time()
+        render_mask_plain_path = debug_dir / f"{frame_name}_render_object_mask_binary.png"
+        if self.config.save_debug_images:
+            self._save_image(live_rgb, debug_dir / f"{frame_name}_live_input.png")
+            self._save_depth_image(gt_depth, debug_dir / f"{frame_name}_live_depth.png")
+            self._save_image(stats["rendered_rgb"], debug_dir / f"{frame_name}_render.png")
+            self._save_depth_image(stats["rendered_depth"], debug_dir / f"{frame_name}_render_depth.png")
+            self._save_image_with_points(stats["change_mask"], None, debug_dir / f"{frame_name}_change_mask.png")
+            self._save_image(stats["render_object_mask"], render_mask_plain_path)
+            self._save_image_with_points(
+                stats["render_object_mask"],
+                stats.get("render_prompt_points"),
+                debug_dir / f"{frame_name}_render_object_mask.png",
+            )
+            self._save_image(stats["live_object_mask"], debug_dir / f"{frame_name}_live_object_mask_binary.png")
+            self._save_image_with_points(
+                stats["live_object_mask"],
+                stats.get("live_prompt_points"),
+                debug_dir / f"{frame_name}_live_object_mask.png",
+            )
+            self._save_image_with_points(stats["optim_mask"], None, debug_dir / f"{frame_name}_optim_mask.png")
+            self._save_image_with_points(
+                stats["render_propagation_mask"],
+                stats.get("render_prompt_points"),
+                debug_dir / f"{frame_name}_render_propagation_mask.png",
+            )
+            self._save_image_with_points(
+                stats["live_propagation_mask"],
+                stats.get("live_prompt_points"),
+                debug_dir / f"{frame_name}_live_propagation_mask.png",
+            )
+            if gripper_mask is not None:
+                self._save_image_with_points(gripper_mask.float(), None, debug_dir / f"{frame_name}_gripper_mask.png")
+        self._timing["D0.1f_post_save"].append(time.time() - t0)
+
+        # --- D0.2-D0.3: Path A (prefused) vs Path B (old SAM3D insertion) ---
+        if has_prefused:
+            # Path A: select the moved object from pre-fused candidates
+            t0 = time.time()
+            esam_mask = stats["optim_mask"]  # combined ESAM/change mask
+            if esam_mask.ndim == 3:
+                esam_mask_2d = esam_mask[..., 0]
+            else:
+                esam_mask_2d = esam_mask
+
+            # Project Gaussians with object_instance_ids > 0 to 2D
+            centers_2d, radii = extract_projected_centers_and_radii(self.model.info, self.model.num_points)
+            instance_ids = self.model.object_instance_ids.squeeze(-1)  # (N,)
+            prefused_mask = instance_ids > 0
+
+            # Find unique instance IDs and compute overlap
+            unique_ids = torch.unique(instance_ids[prefused_mask])
+            best_overlap = -1
+            best_id = 0
+            h, w = esam_mask_2d.shape[:2]
+            for uid in unique_ids:
+                uid_val = uid.item()
+                uid_mask = (instance_ids == uid_val) & torch.isfinite(radii) & (radii > 0)
+                uid_centers = centers_2d[uid_mask]
+                # Count how many projected centers fall inside the ESAM mask
+                cx = torch.round(uid_centers[:, 0]).long()
+                cy = torch.round(uid_centers[:, 1]).long()
+                in_bounds = (cx >= 0) & (cx < w) & (cy >= 0) & (cy < h)
+                if not in_bounds.any():
+                    continue
+                in_mask = esam_mask_2d[cy[in_bounds], cx[in_bounds]] > 0.5
+                overlap = int(in_mask.sum().item())
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_id = uid_val
+
+            if best_id > 0:
+                self.model.object_flags.copy_(
+                    (self.model.object_instance_ids == best_id).float()
+                )
+                self.model._persistent_object_membership_ready = True
+                CONSOLE.log(
+                    f"[dynamic-gs] Path A: selected pre-fused object instance_id={best_id} "
+                    f"(overlap={best_overlap} Gaussians, "
+                    f"total={int((instance_ids == best_id).sum().item())})"
+                )
+            else:
+                CONSOLE.log("[dynamic-gs] Path A: no pre-fused object overlaps ESAM mask; falling back to ESAM flags")
+                # Fall through — object_flags were not set by prepare_dynamic_update
+                # because skip_object_flags_write=True, but the ESAM active mask is still
+                # in current_active_mask. Copy it to object_flags as a last resort.
+                self.model.object_flags.copy_(self.model.current_active_mask.float()[:, None])
+
+            self._timing["D0.2_sam3d_generation"].append(0.0)
+            self._timing["D0.3_sam3d_insertion"].append(time.time() - t0)
+            self._sam3d_inserted = True  # prevent old path from running
+
+        elif not self._sam3d_inserted and self.model.config.use_sam3d_object_init:
+            # Path B's SAM3D subprocess needs render.png + render_mask_plain_path
+            # on disk; save them now if D0.1f skipped them.
+            if not self.config.save_debug_images:
+                self._save_image(stats["rendered_rgb"], debug_dir / f"{frame_name}_render.png")
+                self._save_image(stats["render_object_mask"], render_mask_plain_path)
             sam3d_stats = self.model.initialize_object_from_sam3d(
                 render_image_path=debug_dir / f"{frame_name}_render.png",
                 object_mask_path=render_mask_plain_path,
@@ -552,13 +1385,14 @@ class DynamicGSPipeline(VanillaPipeline):
             f0_live.shape,
             rendered_obj_mask.shape,
         )
-        self._save_image_with_points(rendered_obj_mask, None, debug_dir / f"{frame_name}_rendered_object_mask.png")
-        self._save_image_with_points(
-            f0_live_resized,
-            resized_live_prompt_points,
-            debug_dir / f"{frame_name}_live_object_mask_resized.png",
-        )
-        self._save_image_with_points(combined_obj_mask, None, debug_dir / f"{frame_name}_combined_object_mask.png")
+        if self.config.save_debug_images:
+            self._save_image_with_points(rendered_obj_mask, None, debug_dir / f"{frame_name}_rendered_object_mask.png")
+            self._save_image_with_points(
+                f0_live_resized,
+                resized_live_prompt_points,
+                debug_dir / f"{frame_name}_live_object_mask_resized.png",
+            )
+            self._save_image_with_points(combined_obj_mask, None, debug_dir / f"{frame_name}_combined_object_mask.png")
 
         # --- TIMING: D0.7 Render RS00 (re-render scene after SAM3D object insertion) ---
         t0 = time.time()
@@ -573,17 +1407,18 @@ class DynamicGSPipeline(VanillaPipeline):
 
         # --- TIMING: D0.9 Debug images (save ~9 overlay PNGs to disk) ---
         t0 = time.time()
-        dbg = debug_dir
-        self._save_overlay(gt_rgb, cd0, dbg / f"{frame_name}_live_w_cd0.png")
-        self._save_overlay(rs00_rgb, cd0, dbg / f"{frame_name}_render_w_cd0.png")
-        self._save_overlay(rs00_rgb, rendered_obj_mask, dbg / f"{frame_name}_render_w_objmask.png", color=(0, 0, 1))
-        self._save_overlay(gt_rgb, f0_live_resized, dbg / f"{frame_name}_live_w_f0live.png", color=(0, 0, 1))
-        self._save_overlay(rs00_rgb, combined_obj_mask, dbg / f"{frame_name}_render_w_combined.png", color=(0, 1, 1))
-        if gripper_mask is not None:
-            self._save_overlay(gt_rgb, gripper_mask, dbg / f"{frame_name}_live_w_gripper.png", color=(0, 1, 0))
-        self._save_image(gt_rgb, dbg / f"{frame_name}_live.png")
-        self._save_image(rs00_rgb, dbg / f"{frame_name}_rs00.png")
-        self._save_image_with_points(cd0, None, dbg / f"{frame_name}_cd0.png")
+        if self.config.save_debug_images:
+            dbg = debug_dir
+            self._save_overlay(gt_rgb, cd0, dbg / f"{frame_name}_live_w_cd0.png")
+            self._save_overlay(rs00_rgb, cd0, dbg / f"{frame_name}_render_w_cd0.png")
+            self._save_overlay(rs00_rgb, rendered_obj_mask, dbg / f"{frame_name}_render_w_objmask.png", color=(0, 0, 1))
+            self._save_overlay(gt_rgb, f0_live_resized, dbg / f"{frame_name}_live_w_f0live.png", color=(0, 0, 1))
+            self._save_overlay(rs00_rgb, combined_obj_mask, dbg / f"{frame_name}_render_w_combined.png", color=(0, 1, 1))
+            if gripper_mask is not None:
+                self._save_overlay(gt_rgb, gripper_mask, dbg / f"{frame_name}_live_w_gripper.png", color=(0, 1, 0))
+            self._save_image(gt_rgb, dbg / f"{frame_name}_live.png")
+            self._save_image(rs00_rgb, dbg / f"{frame_name}_rs00.png")
+            self._save_image_with_points(cd0, None, dbg / f"{frame_name}_cd0.png")
         self._timing["D0.9_debug_images"].append(time.time() - t0)
 
         self.model._set_optim_mask(cd0)
@@ -626,19 +1461,11 @@ class DynamicGSPipeline(VanillaPipeline):
             self._live_tracker_mask = fdn_live.detach().clone()
         self._timing["DN.1_sam2_live_propagation"].append(time.time() - t0)
 
-        # --- TIMING: DN.2 CoTracker reference mode (no reseed; keep D0 query points fixed) ---
+        # --- TIMING: DN.3 CoTracker absolute rigid transform (reference D0 -> DN, current-mask filter, RANSAC, apply absolute SE(3)) ---
         if self._sam3d_inserted:
-            t0 = time.time()
-            self._timing["DN.2_cotracker_refresh"].append(time.time() - t0)
-
-            # --- TIMING: DN.3 CoTracker absolute rigid transform (reference D0 -> DN, current-mask filter, RANSAC, apply absolute SE(3)) ---
             t0 = time.time()
             self._apply_cotracker_motion(camera, batch, current_mask=fdn_live)
             self._timing["DN.3_cotracker_advance"].append(time.time() - t0)
-
-            # --- TIMING: DN.4 CoTracker post-filter skipped (reference queries stay fixed) ---
-            t0 = time.time()
-            self._timing["DN.4_cotracker_filter"].append(time.time() - t0)
 
         # --- TIMING: DN.5 Render RDN (render full scene after rigid transform applied to object Gaussians) ---
         t0 = time.time()
@@ -668,18 +1495,19 @@ class DynamicGSPipeline(VanillaPipeline):
 
         # --- TIMING: DN.8 Debug images (save ~9 overlay PNGs to disk) ---
         t0 = time.time()
-        dbg = self._get_debug_dir()
-        self._save_overlay(gt_rgb, cdn, dbg / f"{frame_name}_live_w_cdn.png")
-        self._save_overlay(rdn_rgb, cdn, dbg / f"{frame_name}_render_w_cdn.png")
-        self._save_overlay(rdn_rgb, rendered_obj_mask, dbg / f"{frame_name}_render_w_objmask.png", color=(0, 0, 1))
-        if fdn_live is not None:
-            self._save_overlay(gt_rgb, fdn_live, dbg / f"{frame_name}_live_w_fdn.png", color=(0, 0, 1))
-        self._save_overlay(rdn_rgb, combined_obj_mask, dbg / f"{frame_name}_render_w_combined.png", color=(0, 1, 1))
-        if gripper_mask is not None:
-            self._save_overlay(gt_rgb, gripper_mask, dbg / f"{frame_name}_live_w_gripper.png", color=(0, 1, 0))
-        self._save_image(gt_rgb, dbg / f"{frame_name}_live.png")
-        self._save_image(rdn_rgb, dbg / f"{frame_name}_rdn.png")
-        self._save_image(cdn, dbg / f"{frame_name}_cdn.png")
+        if self.config.save_debug_images:
+            dbg = self._get_debug_dir()
+            self._save_overlay(gt_rgb, cdn, dbg / f"{frame_name}_live_w_cdn.png")
+            self._save_overlay(rdn_rgb, cdn, dbg / f"{frame_name}_render_w_cdn.png")
+            self._save_overlay(rdn_rgb, rendered_obj_mask, dbg / f"{frame_name}_render_w_objmask.png", color=(0, 0, 1))
+            if fdn_live is not None:
+                self._save_overlay(gt_rgb, fdn_live, dbg / f"{frame_name}_live_w_fdn.png", color=(0, 0, 1))
+            self._save_overlay(rdn_rgb, combined_obj_mask, dbg / f"{frame_name}_render_w_combined.png", color=(0, 1, 1))
+            if gripper_mask is not None:
+                self._save_overlay(gt_rgb, gripper_mask, dbg / f"{frame_name}_live_w_gripper.png", color=(0, 1, 0))
+            self._save_image(gt_rgb, dbg / f"{frame_name}_live.png")
+            self._save_image(rdn_rgb, dbg / f"{frame_name}_rdn.png")
+            self._save_image(cdn, dbg / f"{frame_name}_cdn.png")
         self._timing["DN.8_debug_images"].append(time.time() - t0)
 
         self.model._set_optim_mask(cdn)
@@ -716,6 +1544,11 @@ class DynamicGSPipeline(VanillaPipeline):
             self.model.set_phase(phase, reset_means_optimizer=phase == "dynamic")
             if phase == "dynamic":
                 self._reset_dynamic_segmentation_state()
+                # Phase 0b: insert pre-generated SAM3D objects now that the
+                # static scene is trained (back-side Gaussians never see
+                # static photometric optimization).
+                if self._sam3d_generation_outputs:
+                    self._fuse_sam3d_objects_into_scene(self._sam3d_generation_outputs)
             CONSOLE.log(f"[dynamic-gs] phase -> {phase} at step {step}")
 
         if phase == "static":
@@ -763,6 +1596,10 @@ class DynamicGSPipeline(VanillaPipeline):
     def _print_timing_summary(self):
         """Print a concise timing summary to the console log."""
         CONSOLE.log("[timing] === FULL PIPELINE SUMMARY ===")
+        for key in sorted(k for k in self._timing if k.startswith("S0.")):
+            vals = self._timing[key]
+            if vals:
+                CONSOLE.log(f"  {key}: {sum(vals):.2f}s")
         s = self._timing["static_step"]
         if s:
             CONSOLE.log(f"  Static phase: {len(s)} steps, {sum(s):.1f}s total, {sum(s)/len(s)*1000:.1f}ms/step avg")
@@ -789,6 +1626,15 @@ class DynamicGSPipeline(VanillaPipeline):
         """
         if self._timing_report_written:
             return
+        # If the pipeline failed during __init__ before datamanager was set,
+        # there is nothing to write.  Access via object.__getattribute__ to
+        # avoid nn.Module's AttributeError on missing children.
+        try:
+            datamanager = object.__getattribute__(self, "datamanager")
+        except AttributeError:
+            return
+        if datamanager is None or not hasattr(datamanager, "config"):
+            return
         self._timing_report_written = True
 
         from datetime import datetime
@@ -801,6 +1647,7 @@ class DynamicGSPipeline(VanillaPipeline):
             ("D0.1c_esam_render", "  -> ESAM on render (includes model load on first call)"),
             ("D0.1d_esam_live", "  -> ESAM on live image"),
             ("D0.1e_gaussian_flagging", "  -> Gaussian flagging (project centers, build active mask)"),
+            ("D0.1f_post_save", "  -> Post-D0.1 debug image saves (~10 PNGs of inputs/intermediates)"),
             ("D0.2_sam3d_generation", "SAM3D object generation (subprocess)"),
             ("D0.3_sam3d_insertion", "SAM3D object insertion (total)"),
             ("D0.3a_load_ply", "  -> Load SAM3D PLY (plyfile read from disk)"),
@@ -824,9 +1671,7 @@ class DynamicGSPipeline(VanillaPipeline):
         ]
         dn_keys = [
             ("DN.1_sam2_live_propagation", "SAM2 live mask propagation (D(N-1) -> DN on live images)"),
-            ("DN.2_cotracker_refresh", "CoTracker reference mode (no reseed; D0 query points stay fixed)"),
             ("DN.3_cotracker_advance", "CoTracker absolute rigid transform (D0 -> DN, RANSAC, apply absolute SE(3))"),
-            ("DN.4_cotracker_filter", "CoTracker post-filter skipped in reference mode"),
             ("DN.5_render_rdn", "Render RDN (render scene after rigid transform)"),
             ("DN.6_render_object_mask", "Render object mask (rasterize object_flags Gaussians from simulation)"),
             ("DN.7_change_mask_cdn", "Change mask CDN (MSSIM RDN vs DN, excluding gripper + union object mask)"),
@@ -848,6 +1693,41 @@ class DynamicGSPipeline(VanillaPipeline):
             f"total_dynamic_frames={self.total_dynamic_frames}"
         )
         lines.append("")
+
+        # --- Phase 0: split into 0a (pre-static generation) + 0b (post-static fusion) ---
+        # The two halves run minutes apart on the timeline (generation in
+        # __init__, fusion at the static→dynamic boundary), so we report
+        # them separately. Combined "Phase 0 total" is shown at the bottom
+        # of the section for backward-compatible interpretation.
+        s0_gen_vals = self._timing.get("S0.4a_generation_total", [])
+        s0_fuse_vals = self._timing.get("S0.4b_fusion_total", [])
+        s0_gen_total = sum(s0_gen_vals) if s0_gen_vals else 0.0
+        s0_fuse_total = sum(s0_fuse_vals) if s0_fuse_vals else 0.0
+        s0_phase_total = s0_gen_total + s0_fuse_total
+        if s0_phase_total > 0:
+            s0_keys: list[tuple[str, str]] = [
+                ("S0.1_sam3_segmentation", "SAM3 text-prompted segmentation (subprocess in sam3_dynamic_gs env)"),
+                ("S0.2_sam3d_multi_generation", "SAM3D multi-object generation (single subprocess, sequential per-mask)"),
+                ("S0.4a_generation_total", "Phase 0a total (generation, runs in __init__ pre-static)"),
+            ]
+            # Per-object fusion keys (Phase 0b)
+            for key in sorted(k for k in self._timing if k.startswith("S0.3_fusion_obj_")):
+                obj_idx = key.split("_")[-1]
+                s0_keys.append((key, f"Object {obj_idx} fusion (register + insert + propagate)"))
+            s0_keys.append(("S0.4b_fusion_total", "Phase 0b total (fusion, runs at static→dynamic boundary)"))
+
+            lines.append("--- PHASE 0: SAM3D OBJECT INITIALIZATION (0a generation + 0b fusion) ---")
+            lines.append(
+                f"Phase total: {s0_phase_total:.1f}s  "
+                f"(0a generation: {s0_gen_total:.1f}s, 0b fusion: {s0_fuse_total:.1f}s)"
+            )
+            lines.append("")
+            for key, desc in s0_keys:
+                vals = self._timing.get(key, [])
+                t = sum(vals) if vals else 0.0
+                pct = (t / s0_phase_total * 100) if s0_phase_total > 0 else 0.0
+                lines.append(f"  {key:<42s} {t:>8.2f}s  {pct:>6.1f}%    {desc}")
+            lines.append("")
 
         # --- Phase 1: Static ---
         s = self._timing["static_step"]
@@ -935,7 +1815,10 @@ class DynamicGSPipeline(VanillaPipeline):
         report_text = "\n".join(lines)
 
         # Write to data root (same level as CLAUDE.md equivalent for the data)
-        data_root = Path(self.datamanager.config.data)
+        try:
+            data_root = Path(datamanager.config.data)
+        except AttributeError:
+            return
         report_path = data_root / "timing_report.txt"
         report_path.write_text(report_text)
         CONSOLE.log(f"[timing] Report written to {report_path}")

@@ -47,7 +47,6 @@ class CoTrackerMotionEstimator:
         min_track_points: int,
         ransac_iterations: int,
         ransac_inlier_threshold: float,
-        point_refresh_min_distance: float,
         checkpoint_path: str = "",
         hub_repo: str = "facebookresearch/co-tracker",
         hub_model: str = "cotracker3_offline",
@@ -57,7 +56,6 @@ class CoTrackerMotionEstimator:
         self.min_track_points = max(int(min_track_points), 3)
         self.ransac_iterations = max(int(ransac_iterations), 1)
         self.ransac_inlier_threshold = float(ransac_inlier_threshold)
-        self.point_refresh_min_distance = float(point_refresh_min_distance)
         self.checkpoint_path = checkpoint_path.strip()
         self.hub_repo = hub_repo
         self.hub_model = hub_model
@@ -67,7 +65,6 @@ class CoTrackerMotionEstimator:
         self._previous_depth: Optional[np.ndarray] = None
         self._previous_intrinsics: Optional[np.ndarray] = None
         self._previous_camera_to_world: Optional[np.ndarray] = None
-        self._reference_mask: Optional[Tensor] = None
         self._reference_world_points: Optional[np.ndarray] = None
         self._current_points_xy: Optional[np.ndarray] = None
         self.last_init_fast_point_count = 0
@@ -98,7 +95,6 @@ class CoTrackerMotionEstimator:
         self._previous_depth = self._prepare_depth_image(depth)
         self._previous_intrinsics = self._extract_intrinsics(camera)
         self._previous_camera_to_world = self._extract_camera_to_world(camera)
-        self._reference_mask = self._resize_mask(mask, self._previous_rgb.shape[:2]).detach().clone()
         if self._previous_depth.shape != self._previous_rgb.shape[:2]:
             raise RuntimeError(
                 "CoTracker initialization requires RGB and depth at the same resolution, "
@@ -133,45 +129,6 @@ class CoTrackerMotionEstimator:
             self._previous_camera_to_world,
         )
         return int(len(self._current_points_xy))
-
-    def replace_tracking_points(self, mask: Tensor) -> int:
-        """Reference-query mode keeps the original sampled points fixed."""
-        del mask
-        return 0
-
-    def filter_points_by_mask(self, mask: Tensor) -> int:
-        """Remove tracked points that fall outside the given mask. Returns count removed."""
-        if self._current_points_xy is None or len(self._current_points_xy) == 0:
-            return 0
-        # Convert mask to numpy binary at the resolution matching the tracked points
-        m = mask.detach().float()
-        if m.ndim == 3:
-            m = m[..., 0]
-        m = (m > 0.5).cpu().numpy()
-        # Scale points to mask resolution if needed
-        if self._previous_rgb is not None:
-            pts_h, pts_w = self._previous_rgb.shape[:2]
-            mask_h, mask_w = m.shape
-            scale_x = mask_w / pts_w if pts_w > 0 else 1.0
-            scale_y = mask_h / pts_h if pts_h > 0 else 1.0
-        else:
-            scale_x, scale_y = 1.0, 1.0
-        keep = []
-        for pt in self._current_points_xy:
-            mx = int(round(pt[0] * scale_x))
-            my = int(round(pt[1] * scale_y))
-            mx = max(0, min(mx, m.shape[1] - 1))
-            my = max(0, min(my, m.shape[0] - 1))
-            keep.append(m[my, mx])
-        keep = np.array(keep, dtype=bool)
-        removed = int((~keep).sum())
-        if removed > 0 and keep.any():
-            self._current_points_xy = self._current_points_xy[keep]
-        return removed
-
-    def refresh_tracking_points(self, mask: Tensor) -> int:
-        del mask
-        return 0
 
     def estimate_and_advance(
         self,
@@ -321,18 +278,6 @@ class CoTrackerMotionEstimator:
             previous_rgb=debug_prev_rgb,
             current_rgb=current_rgb_prepared,
         )
-
-    def _advance_state(
-        self,
-        rgb: Tensor,
-        depth: np.ndarray,
-        intrinsics: np.ndarray,
-        camera_to_world: np.ndarray,
-    ) -> None:
-        self._previous_rgb = rgb
-        self._previous_depth = depth
-        self._previous_intrinsics = intrinsics
-        self._previous_camera_to_world = camera_to_world
 
     def _get_predictor(self):
         if self._predictor is not None:
