@@ -62,6 +62,14 @@ class Sam3DInsertionResult:
     similarity_scale: float
     correspondence_threshold: float
     correspondence_plot_path: str
+    # Full canonical-source-frame -> world 4x4 (rotation*scale | translation).
+    # Composes the bbox-scale recentering with ``similarity_transform``:
+    #   aligned_world = canonical_to_world_4x4 @ canonical_source_homog
+    # This is the transform FoundationPose needs as ``mesh_to_world``: it
+    # places a mesh given in the same canonical frame as the SAM3D Gaussian
+    # PLY (and the Open3D Poisson reconstruction of it) into world space at
+    # the same location as the inserted Gaussians.
+    canonical_to_world_4x4: np.ndarray = field(default_factory=lambda: np.eye(4, dtype=np.float64))
     timing: dict = field(default_factory=dict)
     used_sam3d_rotation_init: bool = False
 
@@ -150,6 +158,81 @@ def _ensure_rgb_colors(colors: np.ndarray, point_count: int) -> np.ndarray:
     if float(np.min(colors_np)) < 0.0 or float(np.max(colors_np)) > 1.0:
         return SH2RGB(torch.from_numpy(colors_np)).clamp(0.0, 1.0).cpu().numpy().astype(np.float32)
     return np.clip(colors_np, 0.0, 1.0).astype(np.float32)
+
+
+def reconstruct_mesh_from_gaussian_ply(
+    gaussian_ply_path: Path,
+    mesh_ply_path: Path,
+    voxel_size: float = 0.005,
+    poisson_depth: int = 8,
+    density_quantile_trim: float = 0.05,
+) -> bool:
+    """Build a triangle mesh PLY from a SAM3D Gaussian-splat PLY using Open3D Poisson.
+
+    The SAM3D triangle-mesh decoder OOMs on 8 GiB GPUs (its 256^3 FlexiCubes
+    grid pins ~740 MB on GPU). FoundationPose still needs a triangle mesh,
+    so we reconstruct one from the Gaussian *centers*: voxel-downsample,
+    re-estimate normals (the SAM3D PLY's nx/ny/nz are an artifact of the
+    splat format and not always reliable), orient them consistently with
+    tangent-plane propagation, then run Open3D's Poisson surface
+    reconstruction. The lowest-density vertices are trimmed to remove the
+    convex-hull "skirt" Poisson tends to add far from the data.
+
+    Returns True if a non-empty mesh was written.
+    """
+    o3d = _require_open3d()
+    plyfile_mod = _require_plyfile()
+    ply = plyfile_mod.read(str(gaussian_ply_path))
+    vertex = ply["vertex"].data
+    if vertex.size == 0:
+        return False
+    points = np.stack(
+        [vertex["x"], vertex["y"], vertex["z"]], axis=1
+    ).astype(np.float64)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+
+    if voxel_size > 0.0:
+        pcd = pcd.voxel_down_sample(voxel_size=float(voxel_size))
+    if len(pcd.points) < 16:
+        return False
+
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=max(2.0 * float(voxel_size), 0.01), max_nn=30
+        )
+    )
+    try:
+        pcd.orient_normals_consistent_tangent_plane(k=20)
+    except Exception:
+        # Fallback: orient toward the centroid (gives a stable inward/outward).
+        centroid = np.asarray(pcd.points).mean(axis=0)
+        pcd.orient_normals_towards_camera_location(centroid)
+
+    mesh, densities = (
+        o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=int(poisson_depth), scale=1.1, linear_fit=False
+        )
+    )
+    if len(mesh.triangles) == 0:
+        return False
+
+    # Trim the bottom-quantile density vertices (Poisson's hallucinated skirt).
+    densities_np = np.asarray(densities)
+    if densities_np.size > 0 and 0.0 < density_quantile_trim < 1.0:
+        threshold = np.quantile(densities_np, density_quantile_trim)
+        mask = densities_np < threshold
+        if mask.any():
+            mesh.remove_vertices_by_mask(mask)
+
+    if len(mesh.triangles) == 0:
+        return False
+
+    mesh.compute_vertex_normals()
+    Path(mesh_ply_path).parent.mkdir(parents=True, exist_ok=True)
+    o3d.io.write_triangle_mesh(str(mesh_ply_path), mesh)
+    return True
 
 
 def save_point_cloud(path: Path, points: np.ndarray, colors: np.ndarray | None = None) -> None:
@@ -561,6 +644,22 @@ def register_and_fuse_sam3d_object(
     aligned_points = _transform_points(scaled_source, similarity_transform)
     aligned_colors = scaled_source_colors.astype(np.float32)
     final_scale = float(chosen_scale * _extract_isotropic_scale(similarity_transform))
+
+    # Compose the full canonical-source-frame -> world 4x4. The fusion
+    # pipeline does:
+    #   scaled_source = target_centroid + chosen_scale * (canonical - source_centroid)
+    #   world         = similarity_transform @ scaled_source
+    # Equivalently:
+    #   world = similarity_transform @ T(target_centroid - chosen_scale * source_centroid) @ S(chosen_scale) @ canonical
+    align_trans = np.eye(4, dtype=np.float64)
+    align_trans[:3, 3] = (
+        target_centroid.astype(np.float64) - float(chosen_scale) * source_centroid.astype(np.float64)
+    )
+    bbox_scale = np.eye(4, dtype=np.float64) * float(chosen_scale)
+    bbox_scale[3, 3] = 1.0
+    canonical_to_world_4x4 = (
+        similarity_transform.astype(np.float64) @ align_trans @ bbox_scale
+    )
     t_correspondences = time.time() - _t
 
     # --- TIMING: D0.3b5 dedup (disabled — keep all generated SAM3D points; existing-splat pruning is done in the pipeline using source_spacing) ---
@@ -614,6 +713,7 @@ def register_and_fuse_sam3d_object(
         similarity_scale=float(similarity_scale),
         correspondence_threshold=float(similarity_correspondence_threshold),
         correspondence_plot_path=correspondence_plot_path,
+        canonical_to_world_4x4=canonical_to_world_4x4,
         timing={
             "D0.3b1_nn_distances": t_nn_distances,
             "D0.3b2_voxel_downsample": t_voxel_downsample,

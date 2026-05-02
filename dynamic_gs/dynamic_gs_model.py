@@ -28,7 +28,6 @@ from .utils import (
     build_active_mask,
     build_change_mask,
     build_esam_ti,
-    build_sam2_tiny_video_predictor,
     combine_object_masks,
     dilate_binary_mask,
     extract_projected_centers_and_radii,
@@ -40,7 +39,6 @@ from .utils import (
     prepare_cropped_sam3d_inputs,
     query_esam_mask,
     query_esam_mask_pair,
-    query_sam2_propagated_mask,
     resolve_sam3d_pose_path,
     register_and_fuse_sam3d_object,
     rigid_or_static_loss,
@@ -67,7 +65,7 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     output_depth_during_training: bool = True
 
     change_mask_depth_threshold: float = 0.02
-    change_mask_rgb_threshold: float = 0.15
+    change_mask_rgb_threshold: float = 0.10
     change_mask_use_rgb: bool = False
     change_mask_blur_kernel_size: int = 5
     change_mask_blur_sigma: float = 1.0
@@ -78,14 +76,15 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     use_sam3d_object_init: bool = True
     reuse_sam3d_generated_ply: bool = True
     enable_dynamic_mean_optimization: bool = False
-    enable_cotracker_rigid_motion: bool = True
-    cotracker_query_point_count: int = 256
-    cotracker_min_track_points: int = 12
-    cotracker_ransac_iterations: int = 128
-    cotracker_ransac_inlier_threshold: float = 0.008
-    cotracker_checkpoint_path: str = ""
-    cotracker_hub_repo: str = "facebookresearch/co-tracker"
-    cotracker_hub_model: str = "cotracker3_offline"
+    # FoundationPose 6D tracker (replaces the previous CoTracker3 + Kabsch-RANSAC path).
+    # Provides per-frame mesh-to-camera pose; pipeline converts to world-frame
+    # absolute (R, t) for ``apply_rigid_object_transform_from_reference``.
+    enable_fp_rigid_motion: bool = True
+    fp_refiner_run_name: str = "2023-10-28-18-33-37"
+    fp_scorer_run_name: str = "2024-01-11-20-02-45"
+    fp_init_refine_iter: int = 0
+    fp_track_refine_iter: int = 2
+    fp_mesh_unit_scale: float = 1.0
     enable_scene_optimization: bool = True
     scene_opt_refine_every: int = 100
     scene_opt_densify_grad_thresh: float = 0.0002
@@ -95,7 +94,7 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
 
     # SAM3 pre-static graspable object prefusion
     use_sam3_graspable_prefusion: bool = True
-    sam3_prompt_text: str = "objects on table that could be grasped"
+    sam3_prompt_text: str = "the can on the table"
     sam3_conda_env_name: str = "sam3_dynamic_gs"
     sam3_candidate_min_area_ratio: float = 0.002
     sam3_candidate_max_area_ratio: float = 0.25
@@ -116,7 +115,6 @@ class DynamicGSModel(SplatfactoModel):
         self._camera_opt_index_warning_logged = False
         self._dynamic_ready = False
         self._esam_model = None
-        self._sam2_video_predictor = None
         self._reference_flagged_indices = None
         self._reference_flagged_means = None
         self._reference_object_means = None
@@ -149,6 +147,11 @@ class DynamicGSModel(SplatfactoModel):
                 num_points,
                 dtype=torch.bool,
                 device=self.current_active_mask.device,
+            )
+            self._buffers["scene_opt_active_mask"] = torch.zeros(
+                num_points,
+                dtype=torch.bool,
+                device=self.scene_opt_active_mask.device,
             )
             self._buffers["sam3d_init_target_flags"] = torch.zeros(
                 num_points,
@@ -186,6 +189,19 @@ class DynamicGSModel(SplatfactoModel):
         )
         self.register_buffer(
             "current_active_mask",
+            torch.zeros(num_points, dtype=torch.bool, device=self.means.device),
+            persistent=False,
+        )
+        # Per-Gaussian "scene-opt active" mask: True iff the Gaussian's 2D
+        # footprint overlaps the current change region AND it is not flagged
+        # as belonging to the moved object. Read by `_mask_means_grad` and
+        # the scene-opt parameter hooks to gate gradients during the dynamic
+        # phase, so a Gaussian only gets pushed by the masked loss when its
+        # geometry actually intersects the change region (per-Gaussian gate
+        # on top of the per-pixel loss mask). Refreshed once per dynamic
+        # frame by `update_scene_opt_active_mask` after CDN is computed.
+        self.register_buffer(
+            "scene_opt_active_mask",
             torch.zeros(num_points, dtype=torch.bool, device=self.means.device),
             persistent=False,
         )
@@ -348,11 +364,18 @@ class DynamicGSModel(SplatfactoModel):
         if self.phase != "dynamic":
             return grad
         if self.config.enable_scene_optimization:
-            eligible = self._get_eligible_mask()
-            if not eligible.any():
+            # Per-Gaussian gate: only Gaussians whose 2D footprint overlaps
+            # the change region AND that are not object-flagged receive
+            # `means` gradients. Without this, every non-object Gaussian
+            # whose footprint extends into a CDN pixel — including ones
+            # geometrically far behind the change region — would get pulled
+            # by the masked loss. The buffer is refreshed once per dynamic
+            # frame by `update_scene_opt_active_mask` after CDN is computed.
+            active = self.scene_opt_active_mask
+            if active.shape[0] != grad.shape[0] or not active.any():
                 return torch.zeros_like(grad)
-            return grad * eligible.to(device=grad.device, dtype=grad.dtype).unsqueeze(-1)
-        if self.config.enable_cotracker_rigid_motion or not self.config.enable_dynamic_mean_optimization:
+            return grad * active.to(device=grad.device, dtype=grad.dtype).unsqueeze(-1)
+        if self.config.enable_fp_rigid_motion or not self.config.enable_dynamic_mean_optimization:
             return torch.zeros_like(grad)
         mask = self.current_active_mask.to(device=grad.device, dtype=grad.dtype).unsqueeze(-1)
         return grad * mask
@@ -378,6 +401,46 @@ class DynamicGSModel(SplatfactoModel):
                 ).squeeze(0).permute(1, 2, 0)
         return mask
 
+    @torch.no_grad()
+    def update_scene_opt_active_mask(self, change_mask: Tensor) -> int:
+        """Refresh the per-Gaussian scene-opt activation mask from the current CDN.
+
+        A Gaussian is "active for scene optimization" iff its 2D footprint
+        overlaps ``change_mask`` AND it is not flagged as belonging to the
+        moved object. The means/scene-opt gradient hooks read the resulting
+        ``scene_opt_active_mask`` buffer to gate gradients during the dynamic
+        phase, so the masked loss can only push Gaussians whose geometry
+        actually intersects the change region (per-Gaussian gate on top of
+        the per-pixel loss mask).
+
+        Should be called once per dynamic frame, AFTER computing CDN/CD0,
+        using the most recent ``self.info`` (from the RDN/RS00 render that
+        produced the change mask). Returns the number of active Gaussians.
+        """
+        if not self.config.enable_scene_optimization:
+            self.scene_opt_active_mask.zero_()
+            return 0
+        if self.info is None or self.num_points == 0:
+            self.scene_opt_active_mask.zero_()
+            return 0
+        try:
+            centers_2d, radii = extract_projected_centers_and_radii(self.info, self.num_points)
+        except Exception:
+            self.scene_opt_active_mask.zero_()
+            return 0
+
+        mask_2d = change_mask
+        if mask_2d.ndim == 3 and mask_2d.shape[-1] == 1:
+            mask_2d = mask_2d[..., 0]
+        in_change = build_active_mask(mask_2d, centers_2d, radii)
+        not_object = ~(self.object_flags.squeeze(-1) > 0.5)
+        active = in_change & not_object
+        if self.scene_opt_active_mask.shape != active.shape:
+            self._buffers["scene_opt_active_mask"] = active.clone()
+        else:
+            self.scene_opt_active_mask.copy_(active)
+        return int(active.sum().item())
+
     # ---- Scene optimization: frame buffer + support count ----
 
     def _get_eligible_mask(self) -> Tensor:
@@ -388,10 +451,13 @@ class DynamicGSModel(SplatfactoModel):
         def hook(grad):
             if grad is None:
                 return grad
-            eligible = self._get_eligible_mask()
-            if not eligible.any():
+            # Same per-Gaussian "in change region AND not object" gate as
+            # `_mask_means_grad`. The buffer `scene_opt_active_mask` is
+            # refreshed once per dynamic frame by the pipeline after CDN.
+            active = self.scene_opt_active_mask
+            if active.shape[0] != grad.shape[0] or not active.any():
                 return torch.zeros_like(grad)
-            return grad * eligible.to(dtype=grad.dtype).view(-1, *([1] * (grad.ndim - 1)))
+            return grad * active.to(dtype=grad.dtype).view(-1, *([1] * (grad.ndim - 1)))
         return hook
 
     def _register_scene_opt_hooks(self) -> None:
@@ -555,11 +621,13 @@ class DynamicGSModel(SplatfactoModel):
     def _resize_dynamic_buffers(self, num_points: int) -> None:
         object_flags = self.object_flags
         current_active = self.current_active_mask
+        scene_opt_active = self.scene_opt_active_mask
         sam3d_init_target_flags = self.sam3d_init_target_flags
         object_instance_ids = self.object_instance_ids
         if (
             object_flags.shape[0] == num_points
             and current_active.shape[0] == num_points
+            and scene_opt_active.shape[0] == num_points
             and sam3d_init_target_flags.shape[0] == num_points
             and object_instance_ids.shape[0] == num_points
         ):
@@ -567,16 +635,19 @@ class DynamicGSModel(SplatfactoModel):
 
         new_object_flags = torch.zeros(num_points, 1, dtype=object_flags.dtype, device=object_flags.device)
         new_current_active = torch.zeros(num_points, dtype=torch.bool, device=current_active.device)
+        new_scene_opt_active = torch.zeros(num_points, dtype=torch.bool, device=scene_opt_active.device)
         new_sam3d_init_target_flags = torch.zeros(num_points, 1, dtype=sam3d_init_target_flags.dtype, device=sam3d_init_target_flags.device)
         new_instance_ids = torch.zeros(num_points, 1, dtype=torch.long, device=object_instance_ids.device)
         keep = min(object_flags.shape[0], num_points)
         if keep > 0:
             new_object_flags[:keep] = object_flags[:keep]
             new_current_active[:keep] = current_active[:keep]
+            new_scene_opt_active[:keep] = scene_opt_active[:keep]
             new_sam3d_init_target_flags[:keep] = sam3d_init_target_flags[:keep]
             new_instance_ids[:keep] = object_instance_ids[:keep]
         self._buffers["object_flags"] = new_object_flags
         self._buffers["current_active_mask"] = new_current_active
+        self._buffers["scene_opt_active_mask"] = new_scene_opt_active
         self._buffers["sam3d_init_target_flags"] = new_sam3d_init_target_flags
         self._buffers["object_instance_ids"] = new_instance_ids
 
@@ -663,6 +734,8 @@ class DynamicGSModel(SplatfactoModel):
         self._buffers["object_instance_ids"] = self.object_instance_ids[keep]
         if self.current_active_mask.shape[0] == num_points:
             self._buffers["current_active_mask"] = self.current_active_mask[keep]
+        if self.scene_opt_active_mask.shape[0] == num_points:
+            self._buffers["scene_opt_active_mask"] = self.scene_opt_active_mask[keep]
 
         self._refresh_gaussian_optimizers(reset_means_optimizer=True)
         return n_deleted
@@ -1283,30 +1356,23 @@ class DynamicGSModel(SplatfactoModel):
             self._esam_model = build_esam_ti(torch.device(self.device))
         return self._esam_model
 
-    def _get_sam2_video_predictor(self):
-        if self._sam2_video_predictor is None:
-            self._sam2_video_predictor = build_sam2_tiny_video_predictor(torch.device(self.device))
-        return self._sam2_video_predictor
-
     @torch.no_grad()
     def prepare_dynamic_update(
         self,
         camera,
         batch,
-        previous_rendered_rgb=None,
-        previous_render_object_mask=None,
-        previous_live_rgb=None,
-        previous_live_object_mask=None,
-        use_render_sam2=False,
-        use_live_sam2=False,
         external_object_mask=None,
         skip_object_flags_write=False,
     ):
         """Generate the change mask and active Gaussian subset for one dynamic frame.
 
-        When *external_object_mask* is provided (subsequent frames where SAM2
-        already ran in the pipeline), internal ESAM/SAM2 calls are skipped and the
-        change-mask comparison additionally masks out the object region.
+        Object segmentation is done with a single batched ESAM forward on
+        ``[render, live]`` (no SAM2 propagation — FoundationPose handles
+        per-frame object pose, so the projected object Gaussians give the
+        authoritative mask in the pipeline). When *external_object_mask* is
+        provided, internal ESAM is skipped and that mask is used directly for
+        both render and live, and the change-mask comparison additionally masks
+        it out.
         """
 
         if "depth_image" not in batch:
@@ -1371,7 +1437,7 @@ class DynamicGSModel(SplatfactoModel):
 
             # --- Object segmentation ---
             if external_object_mask is not None:
-                # Object mask was already computed externally (SAM2 in pipeline)
+                # Object mask was already computed externally
                 render_object_mask = external_object_mask.float()
                 if render_object_mask.ndim == 2:
                     render_object_mask = render_object_mask[..., None]
@@ -1382,83 +1448,28 @@ class DynamicGSModel(SplatfactoModel):
                 render_prompt_points = torch.zeros((0, 2), dtype=torch.long, device=self.device)
                 live_prompt_points = render_prompt_points
             else:
-                # Bootstrap path: use ESAM / SAM2 internally.
-                # When neither image uses SAM2 (the common D0 case), run a single
-                # batched ESAM forward pass on `[render, live]`. The change mask
-                # is the prompt for both, so the EDT + interior point sampling
-                # only needs to run once. The combined timing is reported under
-                # `D0.1c_esam_render` and `D0.1d_esam_live` is left at 0.
+                # Bootstrap path: a single batched ESAM forward pass on
+                # `[render, live]`. The change mask is the shared prompt, so the
+                # EDT + interior point sampling runs once. Combined timing is
+                # reported under `D0.1c_esam_render`; `D0.1d_esam_live` is 0.
                 render_prompt_points = torch.zeros((0, 2), dtype=torch.long, device=outputs["rgb"].device)
                 live_prompt_points = torch.zeros((0, 2), dtype=torch.long, device=outputs["rgb"].device)
-                use_render_sam2_path = (
-                    use_render_sam2
-                    and previous_rendered_rgb is not None
-                    and previous_render_object_mask is not None
-                )
-                use_live_sam2_path = (
-                    use_live_sam2
-                    and previous_live_rgb is not None
-                    and previous_live_object_mask is not None
-                )
 
                 _t = time.time()
-                if not use_render_sam2_path and not use_live_sam2_path:
-                    (render_tuple, live_tuple) = query_esam_mask_pair(
-                        self._get_esam_model(),
-                        outputs["rgb"],
-                        live_rgb,
-                        change_mask,
-                        num_points=ESAM_NUM_PROMPT_POINTS,
-                        keep_ratio=self.config.esam_prompt_keep_ratio,
-                    )
-                    render_object_mask, _, render_prompt_points = render_tuple
-                    live_object_mask, _, live_prompt_points = live_tuple
-                    render_object_mask_source = "esam"
-                    live_object_mask_source = "esam"
-                    _substeps["D0.1c_esam_render"] = time.time() - _t
-                    _substeps["D0.1d_esam_live"] = 0.0
-                else:
-                    # Mixed / fallback paths — at most one image goes through ESAM
-                    # and the other uses SAM2 propagation. Each is timed in its
-                    # respective sub-key.
-                    if use_render_sam2_path:
-                        render_object_mask = query_sam2_propagated_mask(
-                            self._get_sam2_video_predictor(),
-                            previous_rendered_rgb,
-                            outputs["rgb"],
-                            previous_render_object_mask,
-                        )
-                        render_object_mask_source = "sam2"
-                    else:
-                        render_object_mask, _, render_prompt_points = query_esam_mask(
-                            self._get_esam_model(),
-                            outputs["rgb"],
-                            change_mask,
-                            num_points=ESAM_NUM_PROMPT_POINTS,
-                            keep_ratio=self.config.esam_prompt_keep_ratio,
-                        )
-                        render_object_mask_source = "esam"
-                    _substeps["D0.1c_esam_render"] = time.time() - _t
-
-                    _t = time.time()
-                    if use_live_sam2_path:
-                        live_object_mask = query_sam2_propagated_mask(
-                            self._get_sam2_video_predictor(),
-                            previous_live_rgb,
-                            live_rgb,
-                            previous_live_object_mask,
-                        )
-                        live_object_mask_source = "sam2"
-                    else:
-                        live_object_mask, _, live_prompt_points = query_esam_mask(
-                            self._get_esam_model(),
-                            live_rgb,
-                            change_mask,
-                            num_points=ESAM_NUM_PROMPT_POINTS,
-                            keep_ratio=self.config.esam_prompt_keep_ratio,
-                        )
-                        live_object_mask_source = "esam"
-                    _substeps["D0.1d_esam_live"] = time.time() - _t
+                (render_tuple, live_tuple) = query_esam_mask_pair(
+                    self._get_esam_model(),
+                    outputs["rgb"],
+                    live_rgb,
+                    change_mask,
+                    num_points=ESAM_NUM_PROMPT_POINTS,
+                    keep_ratio=self.config.esam_prompt_keep_ratio,
+                )
+                render_object_mask, _, render_prompt_points = render_tuple
+                live_object_mask, _, live_prompt_points = live_tuple
+                render_object_mask_source = "esam"
+                live_object_mask_source = "esam"
+                _substeps["D0.1c_esam_render"] = time.time() - _t
+                _substeps["D0.1d_esam_live"] = 0.0
 
                 render_object_mask = (
                     render_object_mask[..., None].float()
@@ -1532,13 +1543,6 @@ class DynamicGSModel(SplatfactoModel):
 
             _substeps["D0.1e_gaussian_flagging"] = time.time() - _t
 
-            # Compute scene-opt activated mask: non-object Gaussians in the change region
-            scene_opt_activated_mask = None
-            if self.config.enable_scene_optimization:
-                in_change = build_active_mask(change_mask.squeeze(-1), centers_2d, radii)
-                not_object = ~(self.object_flags.squeeze(-1) > 0.5)
-                scene_opt_activated_mask = in_change & not_object
-
             return {
                 "prepare_dynamic_update_substeps": _substeps,
                 "change_mask_pixels": int((change_mask[..., 0] > 0.5).sum().item()),
@@ -1561,7 +1565,6 @@ class DynamicGSModel(SplatfactoModel):
                 "rendered_rgb": outputs["rgb"],
                 "rendered_depth": outputs["depth"],
                 "change_mask": change_mask,
-                "scene_opt_activated_mask": scene_opt_activated_mask,
             }
         finally:
             if was_training:
@@ -1877,6 +1880,7 @@ class DynamicGSModel(SplatfactoModel):
                 self.gauss_params[name] = torch.nn.Parameter(self.gauss_params[name].detach()[keep_mask])
             self._buffers["object_flags"] = self.object_flags[keep_mask]
             self._buffers["current_active_mask"] = self.current_active_mask[keep_mask]
+            self._buffers["scene_opt_active_mask"] = self.scene_opt_active_mask[keep_mask]
             self._buffers["sam3d_init_target_flags"] = self.sam3d_init_target_flags[keep_mask]
             self._buffers["object_instance_ids"] = self.object_instance_ids[keep_mask]
             if self._grad2d_accum is not None:

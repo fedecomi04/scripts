@@ -5,6 +5,8 @@ import torch
 import torch.nn.functional as F
 from scipy.ndimage import label as _scipy_label
 
+# Fallback per-pixel MS-SSIM dissimilarity threshold for `build_change_mask`.
+# Used when the caller does not pass `rgb_threshold` explicitly.
 OFFICIAL_RGB_MSSSIM_THRESHOLD = 0.10
 OFFICIAL_FILTER_CLOSE_RADIUS = 10
 OFFICIAL_FILTER_OPEN_RADIUS = 3
@@ -287,24 +289,28 @@ def build_change_mask(
     gt_rgb=None,
     valid_mask=None,
     depth_threshold=0.02,
-    rgb_threshold=0.15,
+    rgb_threshold=None,
     use_rgb=True,
     blur_kernel_size=5,
     blur_sigma=1.0,
     filter_radius=1,
     min_component_size=64,
 ):
-    """Build the official dynamic-gs change mask.
+    """Build the dynamic-gs change mask.
 
-    Uses the RGB MS-SSIM score, thresholds it at 0.10, applies the selected
-    lvl10 cleanup recipe (c10_o3_a760), then re-applies the dataset image mask
-    from ``batch["mask"]`` as the safety constraint.
+    Uses the RGB MS-SSIM dissimilarity score, thresholds it at ``rgb_threshold``
+    (falls back to ``OFFICIAL_RGB_MSSSIM_THRESHOLD`` = 0.30 when caller passes
+    ``None``), applies the cleanup recipe (c10_o3_a760), then re-applies the
+    dataset image mask from ``batch["mask"]`` as the safety constraint.
     """
-    del pred_depth, gt_depth, depth_threshold, rgb_threshold, use_rgb, filter_radius, min_component_size
+    del pred_depth, gt_depth, depth_threshold, use_rgb, filter_radius, min_component_size
 
     if pred_rgb is None or gt_rgb is None:
         raise ValueError("dynamic-gs change mask requires both pred_rgb and gt_rgb.")
 
+    threshold = (
+        OFFICIAL_RGB_MSSSIM_THRESHOLD if rgb_threshold is None else float(rgb_threshold)
+    )
     basic_mask = _threshold_mask(
         _rgb_msssim_score(
             pred_rgb,
@@ -314,7 +320,7 @@ def build_change_mask(
             blur_sigma=blur_sigma,
         ),
         valid_mask=valid_mask,
-        threshold=OFFICIAL_RGB_MSSSIM_THRESHOLD,
+        threshold=threshold,
     )
     filtered_mask = _apply_cleanup_recipe(
         basic_mask,
