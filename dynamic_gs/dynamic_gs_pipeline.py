@@ -27,6 +27,7 @@ from .utils import (
     load_sam3d_gaussian_ply,
     load_sam3d_rotation_wxyz,
     reconstruct_mesh_from_gaussian_ply,
+    reconstruct_mesh_from_points,
     register_and_fuse_sam3d_object,
     save_point_cloud,
 )
@@ -461,33 +462,12 @@ class DynamicGSPipeline(VanillaPipeline):
                 CONSOLE.log(f"[phase-0] skipping object {obj_idx}: {exc}")
                 continue
 
-            # Open3D Poisson reconstruction from the SAM3D Gaussian centers
-            # produces a triangle mesh PLY for FoundationPose. The SAM3D
-            # mesh decoder OOMs on 8 GiB GPUs (its 256^3 FlexiCubes grid
-            # locks ~740 MB on GPU), so we reconstruct externally on CPU.
-            # Mesh frame matches the gaussian PLY (canonical SAM3D frame),
-            # which is the same frame the post-CPD `mesh_to_world_4x4`
-            # transforms.
+            # Mesh reconstruction is deferred to AFTER the cull+flag step so
+            # we can build it from the world-frame union of post-cull SAM3D +
+            # flagged init Gaussians. See the "Fused-mesh reconstruction"
+            # block below.
             mesh_path_for_manifest: Optional[str] = None
             mesh_ply_path = sam3d_out.get("mesh_ply_path")
-            if mesh_ply_path is not None:
-                t_mesh = time.time()
-                try:
-                    mesh_ok = reconstruct_mesh_from_gaussian_ply(
-                        gaussian_ply_path=Path(ply_path),
-                        mesh_ply_path=Path(mesh_ply_path),
-                    )
-                except Exception as exc:
-                    CONSOLE.log(f"[phase-0] mesh reconstruction failed for object {obj_idx}: {exc}")
-                    mesh_ok = False
-                self._timing[f"S0.3_mesh_recon_obj_{obj_idx}"].append(time.time() - t_mesh)
-                if mesh_ok and Path(mesh_ply_path).exists():
-                    mesh_path_for_manifest = str(mesh_ply_path)
-                    CONSOLE.log(
-                        f"[phase-0] object {obj_idx}: Poisson mesh reconstructed -> {mesh_ply_path}"
-                    )
-                else:
-                    CONSOLE.log(f"[phase-0] object {obj_idx}: Poisson mesh reconstruction produced no triangles")
 
             obj_mask_np = np.array(Image.open(sam3_obj["mask_path"]).convert("L"))
             obj_mask_tensor = torch.from_numpy((obj_mask_np > 127).astype(np.float32))
@@ -616,6 +596,7 @@ class DynamicGSPipeline(VanillaPipeline):
             #       registration target. Both radii hard-capped at MAX_RADIUS_M.
             MAX_RADIUS_M = 0.02
             n_flagged_existing = 0
+            match_indices = torch.zeros((0,), dtype=torch.long, device=self.model.means.device)
             if e_indices_flag.numel() > 0 and insertion_result.kept_point_count > 0:
                 device = self.model.means.device
                 instance_ids_flat = self.model.object_instance_ids.squeeze(-1)
@@ -659,13 +640,73 @@ class DynamicGSPipeline(VanillaPipeline):
             instance_count = int(
                 (self.model.object_instance_ids.squeeze(-1) == instance_id).sum().item()
             )
-            # FoundationPose tracker input: triangle mesh from Open3D Poisson
-            # reconstruction (above). The world-pose is the FULL canonical→
-            # world 4×4 — bbox-scale + centroid-align + post-CPD similarity
-            # composed — so that applying it to the Poisson mesh (which is in
-            # the same canonical SAM3D frame as the Gaussian PLY) places the
-            # mesh in world at exactly the location of the inserted Gaussians.
-            mesh_to_world = np.asarray(insertion_result.canonical_to_world_4x4, dtype=np.float64)
+
+            # Fused-mesh reconstruction. Build the FoundationPose mesh from the
+            # union of post-cull SAM3D inserts (back/bottom) + flagged init
+            # Gaussians (front/sides/top) — the actual rendered object as it
+            # exists after fusion. Both subsets are read from `model.means` in
+            # world frame, so `mesh_to_world` is identity. Falls back to the
+            # SAM3D-only canonical mesh if the union is too sparse for Poisson.
+            used_fused = False
+            if mesh_ply_path is not None:
+                t_mesh = time.time()
+                fused_pts_list = []
+                if inserted_indices.numel() > 0:
+                    fused_pts_list.append(
+                        self.model.means[inserted_indices].detach().cpu().numpy().astype(np.float32)
+                    )
+                if match_indices.numel() > 0:
+                    fused_pts_list.append(
+                        self.model.means[match_indices].detach().cpu().numpy().astype(np.float32)
+                    )
+
+                mesh_ok = False
+                if fused_pts_list:
+                    fused_pts_np = np.concatenate(fused_pts_list, axis=0)
+                    try:
+                        mesh_ok = reconstruct_mesh_from_points(
+                            points=fused_pts_np,
+                            mesh_ply_path=Path(mesh_ply_path),
+                        )
+                        used_fused = mesh_ok
+                    except Exception as exc:
+                        CONSOLE.log(
+                            f"[phase-0] fused mesh reconstruction failed for object {obj_idx}: {exc}"
+                        )
+
+                if not mesh_ok:
+                    try:
+                        mesh_ok = reconstruct_mesh_from_gaussian_ply(
+                            gaussian_ply_path=Path(ply_path),
+                            mesh_ply_path=Path(mesh_ply_path),
+                        )
+                    except Exception as exc:
+                        CONSOLE.log(
+                            f"[phase-0] SAM3D-only mesh fallback failed for object {obj_idx}: {exc}"
+                        )
+                        mesh_ok = False
+
+                self._timing[f"S0.3_mesh_recon_obj_{obj_idx}"].append(time.time() - t_mesh)
+                if mesh_ok and Path(mesh_ply_path).exists():
+                    mesh_path_for_manifest = str(mesh_ply_path)
+                    CONSOLE.log(
+                        f"[phase-0] object {obj_idx}: "
+                        f"{'fused' if used_fused else 'SAM3D-only fallback'} mesh -> {mesh_ply_path}"
+                    )
+                else:
+                    CONSOLE.log(
+                        f"[phase-0] object {obj_idx}: mesh reconstruction produced no triangles"
+                    )
+
+            # mesh_to_world: identity when the fused mesh was built (mesh
+            # already in world frame); canonical→world 4×4 from CPD when we
+            # fell back to the SAM3D-only mesh in canonical SAM3D frame.
+            if used_fused:
+                mesh_to_world = np.eye(4, dtype=np.float64)
+            else:
+                mesh_to_world = np.asarray(
+                    insertion_result.canonical_to_world_4x4, dtype=np.float64
+                )
 
             # Pre-build the FoundationPose tracker for this candidate now,
             # while the static→dynamic boundary is "free time". This pays the

@@ -160,35 +160,28 @@ def _ensure_rgb_colors(colors: np.ndarray, point_count: int) -> np.ndarray:
     return np.clip(colors_np, 0.0, 1.0).astype(np.float32)
 
 
-def reconstruct_mesh_from_gaussian_ply(
-    gaussian_ply_path: Path,
+def reconstruct_mesh_from_points(
+    points: np.ndarray,
     mesh_ply_path: Path,
     voxel_size: float = 0.005,
     poisson_depth: int = 8,
     density_quantile_trim: float = 0.05,
 ) -> bool:
-    """Build a triangle mesh PLY from a SAM3D Gaussian-splat PLY using Open3D Poisson.
+    """Build a triangle mesh PLY from an arbitrary point cloud using Open3D Poisson.
 
-    The SAM3D triangle-mesh decoder OOMs on 8 GiB GPUs (its 256^3 FlexiCubes
-    grid pins ~740 MB on GPU). FoundationPose still needs a triangle mesh,
-    so we reconstruct one from the Gaussian *centers*: voxel-downsample,
-    re-estimate normals (the SAM3D PLY's nx/ny/nz are an artifact of the
-    splat format and not always reliable), orient them consistently with
-    tangent-plane propagation, then run Open3D's Poisson surface
-    reconstruction. The lowest-density vertices are trimmed to remove the
-    convex-hull "skirt" Poisson tends to add far from the data.
+    Voxel-downsample, estimate normals via tangent-plane propagation, run
+    Poisson surface reconstruction, and trim the lowest-density vertices to
+    remove Poisson's convex-hull skirt. Returns True if a non-empty mesh was
+    written.
 
-    Returns True if a non-empty mesh was written.
+    The input ``points`` is expected to be (N, 3) float in whatever frame the
+    caller wants the mesh expressed in (e.g., world frame for the fused-result
+    path, canonical SAM3D frame for the SAM3D-only path).
     """
     o3d = _require_open3d()
-    plyfile_mod = _require_plyfile()
-    ply = plyfile_mod.read(str(gaussian_ply_path))
-    vertex = ply["vertex"].data
-    if vertex.size == 0:
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if points.shape[0] == 0:
         return False
-    points = np.stack(
-        [vertex["x"], vertex["y"], vertex["z"]], axis=1
-    ).astype(np.float64)
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
@@ -233,6 +226,38 @@ def reconstruct_mesh_from_gaussian_ply(
     Path(mesh_ply_path).parent.mkdir(parents=True, exist_ok=True)
     o3d.io.write_triangle_mesh(str(mesh_ply_path), mesh)
     return True
+
+
+def reconstruct_mesh_from_gaussian_ply(
+    gaussian_ply_path: Path,
+    mesh_ply_path: Path,
+    voxel_size: float = 0.005,
+    poisson_depth: int = 8,
+    density_quantile_trim: float = 0.05,
+) -> bool:
+    """Build a triangle mesh PLY from a SAM3D Gaussian-splat PLY using Open3D Poisson.
+
+    The SAM3D triangle-mesh decoder OOMs on 8 GiB GPUs (its 256^3 FlexiCubes
+    grid pins ~740 MB on GPU). FoundationPose still needs a triangle mesh,
+    so we reconstruct one from the Gaussian *centers*. Returns True if a
+    non-empty mesh was written. Mesh is in the canonical SAM3D frame (matches
+    the input PLY).
+    """
+    plyfile_mod = _require_plyfile()
+    ply = plyfile_mod.read(str(gaussian_ply_path))
+    vertex = ply["vertex"].data
+    if vertex.size == 0:
+        return False
+    points = np.stack(
+        [vertex["x"], vertex["y"], vertex["z"]], axis=1
+    ).astype(np.float64)
+    return reconstruct_mesh_from_points(
+        points=points,
+        mesh_ply_path=mesh_ply_path,
+        voxel_size=voxel_size,
+        poisson_depth=poisson_depth,
+        density_quantile_trim=density_quantile_trim,
+    )
 
 
 def save_point_cloud(path: Path, points: np.ndarray, colors: np.ndarray | None = None) -> None:

@@ -34,6 +34,7 @@ from .sam3d_fusion import (
     load_sam3d_gaussian_ply,
     load_sam3d_rotation_wxyz,
     reconstruct_mesh_from_gaussian_ply,
+    reconstruct_mesh_from_points,
     register_and_fuse_sam3d_object,
     save_point_cloud,
 )
@@ -69,6 +70,7 @@ __all__ = [
     "load_sam3d_gaussian_ply",
     "load_sam3d_rotation_wxyz",
     "reconstruct_mesh_from_gaussian_ply",
+    "reconstruct_mesh_from_points",
     "register_and_fuse_sam3d_object",
     "save_point_cloud",
 ]
