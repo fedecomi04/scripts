@@ -541,75 +541,118 @@ class DynamicGSPipeline(VanillaPipeline):
                 output_stem=f"static0_obj_{obj_idx:02d}_sam3d",
             )
 
-            if insertion_result.kept_point_count > 0:
+            # Cull tunables — see comments in the cull block below for what
+            # each one does. Bumping CULL_STRENGTH or TAU_FLOOR_M removes more
+            # SAM3D points on the camera-visible side; bumping CULL_DEPTH_TOL_M
+            # makes E denser (more existing Gaussians in the slab) so tau is
+            # estimated on a richer set.
+            CULL_STRENGTH = 1.3
+            TAU_FLOOR_M = 0.003
+            CULL_DEPTH_TOL_M = 0.015
+            FLAG_DEPTH_TOL_M = 0.02
+
+            # Pre-insertion mask-slab extractions. Both gate candidates by
+            # "projected center is in the object 2D mask AND projected depth is
+            # within depth_tol_m of the rendered front-surface depth", but with
+            # different tolerances tuned to their use:
+            #   * cull: defines E for SAM3D point removal.
+            #   * flag: slightly more generous, captures deeper interior
+            #     original Gaussians for membership without leaking onto the table.
+            # Both must run BEFORE insert_object_gaussians so self.info matches
+            # self.num_points (extract_projected_centers_and_radii enforces it).
+            e_indices_cull = self.model._get_object_mask_slab_indices(
+                obj_mask_tensor, outputs["depth"], depth_tol_m=CULL_DEPTH_TOL_M
+            )
+            e_indices_flag = self.model._get_object_mask_slab_indices(
+                obj_mask_tensor, outputs["depth"], depth_tol_m=FLAG_DEPTH_TOL_M
+            )
+
+            # Cull SAM3D points whose 1-NN in E_cull is within
+            # max(_estimate_spacing(E) * CULL_STRENGTH, TAU_FLOOR_M). Larger
+            # CULL_STRENGTH covers SAM3D points that fall in the gaps between
+            # E points (SfM-sparse front surface vs. SAM3D-dense mesh). Floor
+            # protects against locally dense E giving a tiny radius. Result:
+            # front/sides/top of the object stay as the SfM-trained Gaussians;
+            # SAM3D fills the camera-unobserved regions (back, bottom).
+            cull_pts_np = insertion_result.kept_points.astype(np.float32)
+            cull_colors_np = insertion_result.kept_colors.astype(np.float32)
+            n_culled_sam3d = 0
+            tau = 0.0
+            if cull_pts_np.shape[0] > 0 and e_indices_cull.numel() >= 2:
+                e_pts_np = (
+                    self.model.means[e_indices_cull].detach().cpu().numpy().astype(np.float32)
+                )
+                tau = max(
+                    self.model._estimate_spacing(e_pts_np) * CULL_STRENGTH,
+                    TAU_FLOOR_M,
+                )
+
+                from sklearn.neighbors import NearestNeighbors as _CullNN
+
+                e_nn = _CullNN(n_neighbors=1, algorithm="auto", metric="euclidean").fit(e_pts_np)
+                sam3d_d, _ = e_nn.kneighbors(cull_pts_np)
+                keep_mask = ~(np.isfinite(sam3d_d[:, 0]) & (sam3d_d[:, 0] <= tau))
+                n_culled_sam3d = int((~keep_mask).sum())
+                cull_pts_np = cull_pts_np[keep_mask]
+                cull_colors_np = cull_colors_np[keep_mask]
+
+            if cull_pts_np.shape[0] > 0:
                 inserted_indices = self.model.insert_object_gaussians(
-                    torch.from_numpy(insertion_result.kept_points),
-                    torch.from_numpy(insertion_result.kept_colors),
+                    torch.from_numpy(cull_pts_np),
+                    torch.from_numpy(cull_colors_np),
                     object_flag=False,
                     instance_id=instance_id,
                 )
             else:
                 inserted_indices = torch.zeros((0,), dtype=torch.long, device=self.model.means.device)
 
-            # Step 2: flag only the inserted Gaussians as belonging to this object.
-            # `insert_object_gaussians(..., instance_id=k)` already wrote
-            # `object_instance_ids = k` for the appended SAM3D points and nothing else.
-            # We deliberately skip `_propagate_instance_membership` here — we do NOT want
-            # SfM Gaussians dragged along with the moving object. Anything in the object's
-            # footprint that isn't SAM3D should be deleted in step 3, not flagged.
-
-            # Step 3: prune everything in the object's footprint that isn't SAM3D.
-            # A non-other-object, non-just-inserted Gaussian is removed if it lies near:
-            #   - inserted SAM3D cloud (proxy_radius = max(0.003, 1.5 × proxy_spacing))
-            #   - mask-selected existing splat   (target_radius = max(0.002, 6.0 × target_spacing))
-            # Carve-outs:
-            #   - never the just-inserted SAM3D points themselves (would self-match d=0)
-            #   - never Gaussians belonging to a different already-fused object.
-            n_pruned_existing = 0
-            if insertion_result.kept_point_count > 0:
+            # Flag the existing object Gaussians. Two-stage gate:
+            #   (1) candidate pool restricted to the mask-slab — center inside
+            #       the 2D object mask AND projected depth within depth_tol_m
+            #       of the rendered front surface. Mask-bound → table Gaussians
+            #       can never be flagged regardless of 3D proximity.
+            #   (2) within that pool, accept Gaussians within proxy_radius of
+            #       the inserted SAM3D cloud OR target_radius of the CPD
+            #       registration target. Both radii hard-capped at MAX_RADIUS_M.
+            MAX_RADIUS_M = 0.02
+            n_flagged_existing = 0
+            if e_indices_flag.numel() > 0 and insertion_result.kept_point_count > 0:
                 device = self.model.means.device
-                num_points_before_prune = self.model.num_points
                 instance_ids_flat = self.model.object_instance_ids.squeeze(-1)
-                not_other_object = (instance_ids_flat == 0) | (instance_ids_flat == instance_id)
-                eligible = not_other_object.clone()
-                if inserted_indices.numel() > 0:
-                    eligible[inserted_indices] = False
+                slab_owners = instance_ids_flat[e_indices_flag]
+                eligible_mask = (slab_owners == 0) | (slab_owners == instance_id)
+                candidate_indices = e_indices_flag.to(device=device)[eligible_mask]
 
-                if bool(eligible.any().item()):
-                    from sklearn.neighbors import NearestNeighbors as _PruneNN
+                if candidate_indices.numel() > 0:
+                    from sklearn.neighbors import NearestNeighbors as _MatchNN
 
-                    candidate_indices = torch.nonzero(eligible, as_tuple=False).squeeze(-1)
                     candidate_pts_np = (
                         self.model.means[candidate_indices].detach().cpu().numpy().astype(np.float32)
                     )
 
                     proxy_points_np = insertion_result.kept_points.astype(np.float32)
                     proxy_spacing = self.model._estimate_spacing(proxy_points_np)
-                    proxy_radius = max(0.003, 1.5 * proxy_spacing)
-                    proxy_nn = _PruneNN(n_neighbors=1, algorithm="auto", metric="euclidean").fit(proxy_points_np)
+                    proxy_radius = min(MAX_RADIUS_M, max(0.003, 1.5 * proxy_spacing))
+                    proxy_nn = _MatchNN(n_neighbors=1, algorithm="auto", metric="euclidean").fit(proxy_points_np)
                     proxy_d, _ = proxy_nn.kneighbors(candidate_pts_np)
                     near_proxy_np = np.isfinite(proxy_d[:, 0]) & (proxy_d[:, 0] <= proxy_radius)
 
                     target_pts_np = existing_means_np.astype(np.float32)
                     near_target_np = np.zeros((len(candidate_pts_np),), dtype=bool)
-                    target_radius = 0.0
                     if len(target_pts_np) > 0:
                         target_spacing = self.model._estimate_spacing(target_pts_np)
-                        target_radius = max(0.002, 6.0 * target_spacing)
-                        target_nn = _PruneNN(n_neighbors=1, algorithm="auto", metric="euclidean").fit(target_pts_np)
+                        target_radius = min(MAX_RADIUS_M, max(0.002, 6.0 * target_spacing))
+                        target_nn = _MatchNN(n_neighbors=1, algorithm="auto", metric="euclidean").fit(target_pts_np)
                         target_d, _ = target_nn.kneighbors(candidate_pts_np)
                         near_target_np = np.isfinite(target_d[:, 0]) & (target_d[:, 0] <= target_radius)
 
-                    prune_mask_np = near_proxy_np | near_target_np
-                    if prune_mask_np.any():
-                        prune_indices = candidate_indices[
-                            torch.from_numpy(prune_mask_np).to(device=device)
+                    match_mask_np = near_proxy_np | near_target_np
+                    if match_mask_np.any():
+                        match_indices = candidate_indices[
+                            torch.from_numpy(match_mask_np).to(device=device)
                         ]
-                        # Belt-and-braces: indexing through `eligible` already excluded
-                        # inserted_indices, but if `existing_indices` happened to alias
-                        # any inserted index (cannot happen — different ranges), this
-                        # would catch it.
-                        n_pruned_existing = self.model.delete_gaussian_indices(prune_indices)
+                        self.model.object_instance_ids[match_indices] = instance_id
+                        n_flagged_existing = int(match_indices.numel())
 
             self._timing[f"S0.3_fusion_obj_{obj_idx}"].append(time.time() - t_fusion)
 
@@ -660,8 +703,16 @@ class DynamicGSPipeline(VanillaPipeline):
                 "mesh_to_world_4x4": mesh_to_world.reshape(4, 4).tolist(),
                 "score": sam3_obj.get("score", 0.0),
                 "existing_gaussians": int(existing_indices.numel()),
+                "sam3d_pre_cull_count": int(insertion_result.kept_point_count),
+                "sam3d_culled": int(n_culled_sam3d),
+                "sam3d_cull_rate": (
+                    float(n_culled_sam3d) / float(insertion_result.kept_point_count)
+                    if insertion_result.kept_point_count > 0
+                    else 0.0
+                ),
+                "cull_tau_m": float(tau),
                 "inserted_gaussians": int(inserted_indices.numel()),
-                "pruned_existing_gaussians": int(n_pruned_existing),
+                "flagged_existing_gaussians": int(n_flagged_existing),
                 "instance_count": instance_count,
                 "kept_points": insertion_result.kept_point_count,
                 "chosen_scale": insertion_result.chosen_scale,
@@ -669,8 +720,10 @@ class DynamicGSPipeline(VanillaPipeline):
             }
             CONSOLE.log(
                 f"[phase-0] object {obj_idx} (instance_id={instance_id}): "
-                f"existing={existing_indices.numel()}, inserted={inserted_indices.numel()}, "
-                f"pruned_existing={n_pruned_existing}, "
+                f"existing={existing_indices.numel()}, "
+                f"sam3d={insertion_result.kept_point_count}->{inserted_indices.numel()} "
+                f"(culled {n_culled_sam3d}, tau={tau * 1000:.1f}mm), "
+                f"flagged_existing={n_flagged_existing}, "
                 f"instance_total={instance_count}, "
                 f"scale={insertion_result.chosen_scale:.4f}"
             )

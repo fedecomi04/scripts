@@ -958,6 +958,50 @@ class DynamicGSModel(SplatfactoModel):
             "near_proxy_count": int(near_proxy.sum()),
         }
 
+    def _get_object_mask_slab_indices(
+        self,
+        render_object_mask: Tensor,
+        rendered_depth: Tensor,
+        depth_tol_m: float = 0.01,
+    ) -> Tensor:
+        """Return all Gaussian indices whose projected center lands inside the object
+        mask AND whose projected depth is within ``depth_tol_m`` of the rendered
+        front-surface depth. Broader than ``_get_existing_object_subset`` (no top-k,
+        no shell thinning) — used to define the SAM3D cull set, not the CPD target.
+        """
+        centers_2d, radii = extract_projected_centers_and_radii(self.info, self.num_points)
+        mask = render_object_mask[..., 0] if render_object_mask.ndim == 3 else render_object_mask
+        depth_image = rendered_depth[..., 0] if rendered_depth.ndim == 3 else rendered_depth
+        height, width = mask.shape
+
+        projected_depths = self.info.get("depths")
+        if projected_depths is None:
+            return torch.zeros((0,), dtype=torch.long, device=self.means.device)
+        if projected_depths.ndim > 1:
+            projected_depths = projected_depths.reshape(-1)
+        projected_depths = projected_depths.float()
+
+        cx = torch.round(centers_2d[:, 0]).long()
+        cy = torch.round(centers_2d[:, 1]).long()
+        in_bounds = (
+            torch.isfinite(centers_2d).all(dim=-1)
+            & torch.isfinite(radii)
+            & torch.isfinite(projected_depths)
+            & (radii > 0)
+            & (cx >= 0) & (cx < width)
+            & (cy >= 0) & (cy < height)
+        )
+        idx = torch.nonzero(in_bounds, as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            return idx
+
+        in_mask = mask[cy[idx], cx[idx]] > 0.5
+        sampled = depth_image[cy[idx], cx[idx]]
+        near_surface = torch.isfinite(sampled) & (
+            (projected_depths[idx] - sampled).abs() <= float(depth_tol_m)
+        )
+        return idx[in_mask & near_surface]
+
     def _get_existing_object_subset(
         self,
         render_object_mask: Tensor,
