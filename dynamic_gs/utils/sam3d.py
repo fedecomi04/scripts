@@ -32,6 +32,7 @@ def get_sam3d_output_paths(
         "preview_path": image_dir / f"{output_stem}_preview.png",
         "run_info_path": output_dir / f"{output_stem}_run_info.txt",
         "glb_path": output_dir / f"{output_stem}_mesh.glb",
+        "mesh_ply_path": output_dir / f"{output_stem}_mesh.ply",
     }
 
 
@@ -137,6 +138,14 @@ def _write_runtime_config() -> Path:
     config.compile_model = False
     config.dtype = "float16"
     config.depth_model.device = "cpu"
+    # SAM3D mesh decoder: FoundationPose needs a triangle mesh, but the
+    # mesh decoder's 256^3 FlexiCubes grid (~740 MB) plus the rest of the
+    # SAM3D pipeline pushes peak GPU usage past 8 GiB. The user's fork
+    # already does aggressive CPU offload for the diffusion stack, but the
+    # mesh decoder's grid is locked on GPU at __init__. Until a separate
+    # mesh-only post-pass is implemented (or a larger GPU is available),
+    # decode gaussian only. The FP tracker will warn and skip when no
+    # mesh PLY is found in `phase0_manifest.json`.
     config.decode_formats = ["gaussian"]
     config.slat_decoder_mesh_config_path = None
     config.slat_decoder_mesh_ckpt_path = None
@@ -587,6 +596,7 @@ def run_sam3d_multi_object(
             pose_path = output_paths["pose_path"]
             preview_path = output_paths["preview_path"]
             run_info_path = output_paths["run_info_path"]
+            mesh_ply_path = output_paths["mesh_ply_path"]
 
             if int(mask.sum()) == 0:
                 print(f"[sam3d-multi] skipping mask {i} ({stem}): empty mask", file=sys.stderr)
@@ -655,6 +665,29 @@ def run_sam3d_multi_object(
 
             output["gs"].save_ply(str(ply_path))
 
+            # Export the SAM3D triangle mesh (FoundationPose input). The mesh
+            # decoder produces a `MeshExtractResult` with `.vertices` and
+            # `.faces` torch tensors in the same canonical mesh frame as the
+            # Gaussian splat above.
+            mesh_saved = False
+            mesh_list = output.get("mesh")
+            if mesh_list is not None and len(mesh_list) > 0:
+                mesh_result = mesh_list[0]
+                if getattr(mesh_result, "success", True):
+                    try:
+                        import trimesh
+                        verts = mesh_result.vertices.detach().cpu().numpy()
+                        faces = mesh_result.faces.detach().cpu().numpy()
+                        if verts.shape[0] > 0 and faces.shape[0] > 0:
+                            tm = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                            tm.export(str(mesh_ply_path))
+                            mesh_saved = True
+                    except Exception as exc:
+                        print(
+                            f"[sam3d-multi] mask {i} ({stem}): mesh export failed: {exc}",
+                            file=sys.stderr,
+                        )
+
             pose_data = {}
             for key in ("translation", "rotation", "scale"):
                 value = output.get(key)
@@ -675,6 +708,7 @@ def run_sam3d_multi_object(
                 f"Attempted sizes: {attempted_sizes}",
                 f"Saved gaussian splat: {ply_path}",
                 f"Saved pose sidecar: {pose_path}",
+                f"Saved triangle mesh: {mesh_ply_path if mesh_saved else 'NOT SAVED'}",
             ]
             run_info_path.write_text("\n".join(run_info) + "\n")
             del output
