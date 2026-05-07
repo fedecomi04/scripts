@@ -50,11 +50,13 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
 
     static_num_steps: int = 3000
     dynamic_steps_per_frame: int = 300
-    save_debug_images: bool = True
+    save_debug_images: bool = False
     """If False, skip the per-frame debug PNG saves (D0.1f / D0.9 /
-    DN.8). The saves are pure disk I/O and not part of the change
-    detection critical path; disabling them removes ~210ms from D0
-    and ~600ms from each dynamic frame."""
+    DN.8) and the CoTracker debug PNG + motion log (DN.3f). These are
+    pure disk I/O and not part of the tracking or change-detection
+    critical path; disabling them removes ~210ms from D0, ~600ms from
+    each recorded dynamic frame, and ~170ms from each live tracker
+    tick."""
 
     enable_dynamic_keyframe_filter: bool = True
     """ORB-SLAM-style greedy keyframe filter on the dynamic dataset
@@ -1069,6 +1071,25 @@ class DynamicGSPipeline(VanillaPipeline):
 
     # ---- CoTracker helpers ----
 
+    def _build_tracking_rgb(self, batch) -> "torch.Tensor":
+        """Live RGB for CoTracker, with the dataset mask composited onto the model background.
+
+        Pixels where ``batch["mask"]`` is 0 (gripper / out-of-camera) are replaced with the
+        Gazebo-blue background color so CoTracker cannot lock onto gripper texture or generate
+        spurious features at the mask boundary. Returned at full resolution (no training downscale).
+        """
+        rgb = self.model.get_live_rgb(batch, apply_training_downscale=False)
+        mask = batch.get("mask")
+        if mask is None:
+            return rgb
+        if mask.ndim == 2:
+            mask = mask[..., None]
+        mask = mask.float().to(rgb.device)
+        if mask.shape[:2] != rgb.shape[:2]:
+            return rgb
+        background = self.model._get_background_color().to(rgb.device).view(1, 1, -1)
+        return rgb * mask + background * (1.0 - mask)
+
     @staticmethod
     def _has_nonempty_mask(mask) -> bool:
         return mask is not None and bool(torch.any(mask > 0.5))
@@ -1152,16 +1173,34 @@ class DynamicGSPipeline(VanillaPipeline):
                 f"min={self._cotracker_motion.min_track_points})"
             )
             return
-        current_live_rgb = self.model.get_live_rgb(batch, apply_training_downscale=False)
+        # --- Sub-timing: DN.3a build masked live RGB (uint8->float, GPU upload, composite gripper-masked pixels onto model background) ---
+        t = time.time()
+        current_live_rgb = self._build_tracking_rgb(batch)
+        self._timing["DN.3a_get_live_rgb"].append(time.time() - t)
+        # --- Sub-timing: DN.3b-e estimate_and_advance — inner sub-timings come from motion_estimate.timings ---
+        t = time.time()
         motion_estimate = self._cotracker_motion.estimate_and_advance(
             current_rgb=current_live_rgb,
             current_depth=batch["depth_image"],
             current_camera=camera,
             current_mask=current_mask,
         )
+        self._timing["DN.3_estimate_total"].append(time.time() - t)
+        sub = motion_estimate.timings or {}
+        # The estimator emits one entry per sub-step it completed; missing
+        # keys (e.g. "predictor_forward" on a not-ready early return) are
+        # logged as 0.0 so the report column stays aligned.
+        self._timing["DN.3b_estimator_input_prep"].append(float(sub.get("input_prep", 0.0)))
+        self._timing["DN.3c_predictor_forward"].append(float(sub.get("predictor_forward", 0.0)))
+        self._timing["DN.3d_postprocess"].append(float(sub.get("postprocess", 0.0)))
+        self._timing["DN.3e_ransac_kabsch"].append(float(sub.get("ransac_kabsch", 0.0)))
+        # --- Sub-timing: DN.3f debug I/O (motion log text + tracked-points overlay PNG; gated by save_debug_images) ---
+        t = time.time()
         frame_name = self.datamanager.get_current_dynamic_frame_name()
-        self._write_cotracker_motion_log(frame_name, motion_estimate)
-        self._save_cotracker_debug(frame_name, motion_estimate)
+        if self.config.save_debug_images:
+            self._write_cotracker_motion_log(frame_name, motion_estimate)
+            self._save_cotracker_debug(frame_name, motion_estimate)
+        self._timing["DN.3f_debug_io"].append(time.time() - t)
         if not motion_estimate.success:
             CONSOLE.log(
                 f"[dynamic-gs] CoTracker rigid motion unavailable for {frame_name}: "
@@ -1173,9 +1212,12 @@ class DynamicGSPipeline(VanillaPipeline):
                 f"mask_fallback={motion_estimate.used_mask_fallback}"
             )
             return
+        # --- Sub-timing: DN.3g apply rigid transform (CUDA tensor op on flagged Gaussians: means rotation + translation, quaternion compose) ---
+        t = time.time()
         moved_count = self.model.apply_rigid_object_transform_from_reference(
             motion_estimate.rotation, motion_estimate.translation,
         )
+        self._timing["DN.3g_apply_transform"].append(time.time() - t)
         if moved_count == 0:
             CONSOLE.log(
                 f"[dynamic-gs] CoTracker estimated motion for {frame_name}, "
@@ -1208,6 +1250,8 @@ class DynamicGSPipeline(VanillaPipeline):
             checkpoint_path=self.model.config.cotracker_checkpoint_path,
             hub_repo=self.model.config.cotracker_hub_repo,
             hub_model=self.model.config.cotracker_hub_model,
+            predictor_resolution=self.model.config.cotracker_predictor_resolution,
+            predictor_iters=self.model.config.cotracker_predictor_iters,
         )
         seeded = self._cotracker_motion.initialize(
             rgb=rgb, depth=depth, camera=camera, mask=mask,
@@ -1492,15 +1536,12 @@ class DynamicGSPipeline(VanillaPipeline):
             self._apply_cotracker_motion(camera, batch)
         self._timing["DN.3_cotracker_motion"].append(time.time() - t0)
 
-        c2w_3x4 = camera.camera_to_worlds[0].detach().cpu()
-        accepted = (
-            self._dynamic_keyframe_filter is None
-            or self._dynamic_keyframe_filter.accept(c2w_3x4)
-        )
-        if not accepted:
-            self._global_frame_counter += 1
-            return
-
+        # Render after every tracker tick so the scene reflects the latest
+        # object pose, regardless of whether the keyframe filter / CDN gate
+        # ends up accepting this frame for the optim pool. RDN + the object
+        # mask are both consumed by the change-mask compute below; the
+        # change mask itself is only pushed onto the optim pool when the
+        # keyframe filter accepts and CDN clears the pixel threshold.
         t0 = time.time()
         rdn_outputs = self._render_from_camera(camera)
         self._timing["DN.5_render_rdn"].append(time.time() - t0)
@@ -1517,8 +1558,13 @@ class DynamicGSPipeline(VanillaPipeline):
         )
         self._timing["DN.7_change_mask_cdn"].append(time.time() - t0)
 
+        c2w_3x4 = camera.camera_to_worlds[0].detach().cpu()
+        accepted = (
+            self._dynamic_keyframe_filter is None
+            or self._dynamic_keyframe_filter.accept(c2w_3x4)
+        )
         cdn_px = int((cdn[..., 0] > 0.5).sum().item()) if cdn.ndim >= 3 else int((cdn > 0.5).sum().item())
-        if cdn_px < self.config.optim_pool_min_change_pixels:
+        if not accepted or cdn_px < self.config.optim_pool_min_change_pixels:
             self._global_frame_counter += 1
             return
 
@@ -1944,7 +1990,9 @@ class DynamicGSPipeline(VanillaPipeline):
 
         # --- TIMING: D0.6 CoTracker init (sample 2D points inside the rendered object mask, back-project to world via depth, store as reference) ---
         t0 = time.time()
-        live_rgb_fullres = self.model.get_live_rgb(batch, apply_training_downscale=False)
+        # Use the gripper-masked tracking RGB so the D0 reference frame stored
+        # by CoTracker matches what subsequent DN frames will look like.
+        live_rgb_fullres = self._build_tracking_rgb(batch)
         self.model.capture_reference_object_pose()
         # Use the rendered object Gaussian mask as the seed mask for
         # CoTracker — its 2D footprint defines which pixels we want to
@@ -2301,18 +2349,12 @@ class DynamicGSPipeline(VanillaPipeline):
                 f"accepted={is_accepted}"
             )
 
-        if not is_accepted:
-            # Rejected by the keyframe filter — no CDN compute, no pool push.
-            # FP already fired above so the object pose is current; the
-            # viewer will render the new pose on its next pull.
-            CONSOLE.log(
-                f"[dynamic-gs] frame {frame_idx} ({frame_name}): "
-                f"FP-tracked, keyframe-filter rejected"
-            )
-            self._global_frame_counter += 1
-            return
-
-        # Render RDN (full scene), object mask, then CDN.
+        # Render RDN + object mask + CDN on every tick, regardless of
+        # keyframe-filter acceptance, so the rendered scene reflects the
+        # latest object pose every time CoTracker moves it. The optim
+        # pool push below stays gated by is_accepted AND the CDN pixel
+        # threshold — so optimization cadence is unchanged, only the
+        # render cadence improves.
         t0 = time.time()
         rdn_outputs = self._render_from_camera(camera)
         self._timing["DN.5_render_rdn"].append(time.time() - t0)
@@ -2330,6 +2372,15 @@ class DynamicGSPipeline(VanillaPipeline):
         self._timing["DN.7_change_mask_cdn"].append(time.time() - t0)
 
         cdn_px = int((cdn[..., 0] > 0.5).sum().item()) if cdn.ndim >= 3 else int((cdn > 0.5).sum().item())
+
+        if not is_accepted:
+            CONSOLE.log(
+                f"[dynamic-gs] frame {frame_idx} ({frame_name}): "
+                f"CoTracker-tracked + rendered, keyframe-filter rejected"
+            )
+            self._global_frame_counter += 1
+            return
+
         if cdn_px < self.config.optim_pool_min_change_pixels:
             CONSOLE.log(
                 f"[dynamic-gs] frame {frame_idx} ({frame_name}): "
@@ -2588,6 +2639,14 @@ class DynamicGSPipeline(VanillaPipeline):
         ]
         dn_keys = [
             ("DN.3_cotracker_motion", "CoTracker pairwise advance + RANSAC-Kabsch (R, t) on the moved-object Gaussians"),
+            ("DN.3a_get_live_rgb", "  -> get_live_rgb (uint8->float, optional downscale, GPU upload, background composite)"),
+            ("DN.3_estimate_total", "  -> estimate_and_advance total (sum of 3b+3c+3d+3e plus minor overhead)"),
+            ("DN.3b_estimator_input_prep", "    -> input prep (RGB/depth/intrinsics/c2w extraction, CPU)"),
+            ("DN.3c_predictor_forward", "    -> predictor forward (CoTracker NN inference + .cpu() pull which forces CUDA sync)"),
+            ("DN.3d_postprocess", "    -> postprocess (image-bound filter, mask filter, bilinear depth sample, world back-projection — CPU/numpy)"),
+            ("DN.3e_ransac_kabsch", "    -> RANSAC-Kabsch (numpy loop, scales with ransac_iterations × correspondence count)"),
+            ("DN.3f_debug_io", "  -> debug I/O (motion log + tracked-points overlay PNG)"),
+            ("DN.3g_apply_transform", "  -> apply rigid transform to flagged Gaussians (CUDA means+quat update)"),
             ("DN.5_render_rdn", "Render RDN (render scene after rigid transform)"),
             ("DN.6_render_object_mask", "Render object mask (rasterize object_flags Gaussians from simulation)"),
             ("DN.7_change_mask_cdn", "Change mask CDN (MSSIM RDN vs DN, excluding gripper + projected object mask)"),

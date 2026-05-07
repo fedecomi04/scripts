@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 import cv2
@@ -35,10 +36,22 @@ class CoTrackerMotionEstimate:
     tracked_inlier_mask: Optional[np.ndarray] = None  # (K,) True only for RANSAC inliers
     previous_rgb: Optional[Tensor] = None             # previous frame image
     current_rgb: Optional[Tensor] = None              # current frame image
+    # Per-call sub-step timings in seconds. Keys: "input_prep",
+    # "predictor_forward", "postprocess", "ransac_kabsch". Empty when the
+    # estimator early-returned (not ready).
+    timings: dict = field(default_factory=dict)
 
 
 class CoTrackerMotionEstimator:
-    """Offline pairwise CoTracker motion estimation for a rigid dynamic object."""
+    """Streaming CoTracker motion estimation for a rigid dynamic object.
+
+    Uses ``cotracker3_online`` with a sliding window of ``2 * model.step``
+    consecutive frames (typically 8). The 3D RANSAC anchor stays at D0,
+    so the recovered (R, t) is still absolute — only the 2D tracker is
+    streaming. The predictor's internal RNN state propagates D0 query
+    identities forward across windows even after D0 itself slides out of
+    the buffer.
+    """
 
     def __init__(
         self,
@@ -50,6 +63,8 @@ class CoTrackerMotionEstimator:
         checkpoint_path: str = "",
         hub_repo: str = "facebookresearch/co-tracker",
         hub_model: str = "cotracker3_offline",
+        predictor_resolution: tuple[int, int] = (256, 256),
+        predictor_iters: int = 4,
     ) -> None:
         self.device = torch.device(device)
         self.query_point_count = max(int(query_point_count), 3)
@@ -59,14 +74,29 @@ class CoTrackerMotionEstimator:
         self.checkpoint_path = checkpoint_path.strip()
         self.hub_repo = hub_repo
         self.hub_model = hub_model
+        self.predictor_resolution = tuple(int(v) for v in predictor_resolution)
+        self.predictor_iters = max(int(predictor_iters), 1)
 
         self._predictor = None
+        self._predictor_step: int = 0  # populated after _get_predictor()
         self._previous_rgb: Optional[Tensor] = None
         self._previous_depth: Optional[np.ndarray] = None
         self._previous_intrinsics: Optional[np.ndarray] = None
         self._previous_camera_to_world: Optional[np.ndarray] = None
         self._reference_world_points: Optional[np.ndarray] = None
         self._current_points_xy: Optional[np.ndarray] = None
+        # Sliding-window streaming state (cotracker3_online).
+        self._frame_buffer: list[Tensor] = []
+        self._online_first_step: bool = True
+        # Cadence state: the cotracker3 demo runs inference every ``step``
+        # frames (overlap = step). Running every tick wastes 7/8 of the
+        # encoder cost re-encoding frames that haven't changed window-
+        # position. ``_tick_count`` is the count of accepted frames since
+        # initialize(); inference fires when ``tick_count % step == 0``
+        # (after the buffer has filled). Between inferences the cached
+        # estimate is reused so the object pose holds the latest result.
+        self._tick_count: int = 0
+        self._last_estimate: Optional[CoTrackerMotionEstimate] = None
         self.last_init_fast_point_count = 0
         self.last_init_sampled_count = 0
         self.last_init_depth_valid_count = 0
@@ -90,7 +120,19 @@ class CoTrackerMotionEstimator:
             return 0
         return int(len(self._current_points_xy))
 
+    @property
+    def online_window_size(self) -> int:
+        """Sliding-window size = ``2 * predictor.step`` for cotracker3_online (typically 8)."""
+        if self._predictor_step <= 0:
+            return 8
+        return max(2 * self._predictor_step, 4)
+
     def initialize(self, rgb: Tensor, depth: Tensor, camera: Cameras, mask: Tensor) -> int:
+        # Reset sliding-window state on every (re-)initialization.
+        self._frame_buffer = []
+        self._online_first_step = True
+        self._tick_count = 0
+        self._last_estimate = None
         self._previous_rgb = self._prepare_tracking_rgb(rgb)
         self._previous_depth = self._prepare_depth_image(depth)
         self._previous_intrinsics = self._extract_intrinsics(camera)
@@ -140,11 +182,15 @@ class CoTrackerMotionEstimator:
         identity = np.eye(3, dtype=np.float32)
         zero = np.zeros((3,), dtype=np.float32)
         track_count_before = self.current_track_count
+        timings: dict = {}
 
+        # --- Sub-timing: input prep (RGB/depth/intrinsics/c2w extraction, all CPU) ---
+        t = time.time()
         current_rgb_prepared = self._prepare_tracking_rgb(current_rgb)
         current_depth_prepared = self._prepare_depth_image(current_depth)
         current_intrinsics = self._extract_intrinsics(current_camera)
         current_camera_to_world = self._extract_camera_to_world(current_camera)
+        timings["input_prep"] = time.time() - t
         if current_depth_prepared.shape != current_rgb_prepared.shape[:2]:
             raise RuntimeError(
                 "CoTracker motion estimation requires RGB and depth at the same resolution, "
@@ -167,27 +213,140 @@ class CoTrackerMotionEstimator:
                 used_mask_fallback=False,
                 mean_residual=float("inf"),
                 median_residual=float("inf"),
+                timings=timings,
             )
 
+        # --- Sub-timing: predictor forward ---
+        # Two paths, auto-selected by predictor type:
+        #   - Offline (cotracker3_offline): 2-frame video [previous_rgb,
+        #     current_rgb], queries on frame 0. Each tick runs inference.
+        #     Per-tick cost is the encoder over 2 frames (~30-50 ms at
+        #     interp_shape=(256, 256)). Per-tick pose updates → real-time
+        #     tracking on consumer hardware.
+        #   - Online (cotracker3_online): 16-frame sliding-window streaming
+        #     with cadence skip — inference every ``step`` ticks, cached
+        #     reuse on intermediate ticks. Higher latency per pose update
+        #     (1/step of input rate) but throughput-friendly. Designed for
+        #     batched/async use.
+        # We auto-select via ``_predictor_step``: cotracker3_online has
+        # ``.step`` (typically 8); offline does not.
+        t = time.time()
         predictor = self._get_predictor()
         debug_prev_points = self._current_points_xy.copy()
         debug_prev_rgb = self._previous_rgb.clone()
-        query_points = torch.from_numpy(self._current_points_xy.astype(np.float32)).to(self.device)
-        query_frames = torch.zeros((query_points.shape[0], 1), dtype=query_points.dtype, device=self.device)
-        queries = torch.cat([query_frames, query_points], dim=-1).unsqueeze(0)
 
-        video = torch.stack([self._previous_rgb, current_rgb_prepared], dim=0).permute(0, 3, 1, 2).unsqueeze(0)
-        video = video.to(self.device, non_blocking=True)
+        if self._predictor_step <= 0:
+            # ----- Offline 2-frame path -----
+            query_points = torch.from_numpy(self._current_points_xy.astype(np.float32)).to(self.device)
+            query_frames = torch.zeros((query_points.shape[0], 1), dtype=query_points.dtype, device=self.device)
+            queries = torch.cat([query_frames, query_points], dim=-1).unsqueeze(0)
 
-        with torch.no_grad():
-            tracks, visibility = predictor(video, queries=queries)
+            video = torch.stack([self._previous_rgb, current_rgb_prepared], dim=0).permute(0, 3, 1, 2).unsqueeze(0)
+            video = video.to(self.device, non_blocking=True)
 
-        current_points_xy = tracks[0, 1].detach().cpu().numpy().astype(np.float32)
-        visibility_now = visibility[0, 1]
-        if visibility_now.ndim > 1:
-            visibility_now = visibility_now.squeeze(-1)
-        visibility_now = visibility_now.detach().cpu().numpy().astype(bool)
+            with torch.no_grad():
+                tracks, visibility = self._run_offline_forward(predictor, video, queries)
 
+            current_points_xy = tracks[0, 1].detach().cpu().numpy().astype(np.float32)
+            visibility_now = visibility[0, 1]
+            if visibility_now.ndim > 1:
+                visibility_now = visibility_now.squeeze(-1)
+            visibility_now = visibility_now.detach().cpu().numpy().astype(bool)
+            timings["predictor_forward"] = time.time() - t
+        else:
+            # ----- Online sliding-window path with cadence skip -----
+            window_size = self.online_window_size
+
+            if not self._frame_buffer:
+                self._frame_buffer.append(self._previous_rgb.clone())
+            self._frame_buffer.append(current_rgb_prepared.clone())
+            if len(self._frame_buffer) > window_size:
+                self._frame_buffer.pop(0)
+
+            if len(self._frame_buffer) < window_size:
+                timings["predictor_forward"] = time.time() - t
+                return CoTrackerMotionEstimate(
+                    success=False,
+                    ready=True,
+                    rotation=identity,
+                    translation=zero,
+                    correspondence_count=0,
+                    inlier_count=0,
+                    track_count_before=track_count_before,
+                    track_count_after=self.current_track_count,
+                    raw_visible_count=0,
+                    mask_visible_count=0,
+                    depth_valid_count=0,
+                    used_mask_fallback=False,
+                    mean_residual=float("inf"),
+                    median_residual=float("inf"),
+                    previous_points_xy=debug_prev_points,
+                    current_points_xy=None,
+                    tracked_inlier_mask=None,
+                    previous_rgb=debug_prev_rgb,
+                    current_rgb=current_rgb_prepared,
+                    timings=timings,
+                )
+
+            self._tick_count += 1
+            step_eff = max(self._predictor_step, 1)
+            should_run_inference = (
+                self._last_estimate is None
+                or (self._tick_count % step_eff) == 0
+            )
+            if not should_run_inference:
+                timings["predictor_forward"] = time.time() - t
+                from dataclasses import replace as _dc_replace
+                return _dc_replace(self._last_estimate, timings=timings)
+
+            video = torch.stack(self._frame_buffer, dim=0).permute(0, 3, 1, 2).unsqueeze(0)
+            video = video.to(self.device, non_blocking=True)
+
+            if self._online_first_step:
+                query_points = torch.from_numpy(self._current_points_xy.astype(np.float32)).to(self.device)
+                query_frames = torch.zeros((query_points.shape[0], 1), dtype=query_points.dtype, device=self.device)
+                queries = torch.cat([query_frames, query_points], dim=-1).unsqueeze(0)
+                with torch.no_grad():
+                    tracks, visibility = predictor(video, is_first_step=True, queries=queries)
+                self._online_first_step = False
+            else:
+                with torch.no_grad():
+                    tracks, visibility = predictor(video, is_first_step=False)
+
+            if tracks is None or visibility is None:
+                timings["predictor_forward"] = time.time() - t
+                return CoTrackerMotionEstimate(
+                    success=False,
+                    ready=True,
+                    rotation=identity,
+                    translation=zero,
+                    correspondence_count=0,
+                    inlier_count=0,
+                    track_count_before=track_count_before,
+                    track_count_after=self.current_track_count,
+                    raw_visible_count=0,
+                    mask_visible_count=0,
+                    depth_valid_count=0,
+                    used_mask_fallback=False,
+                    mean_residual=float("inf"),
+                    median_residual=float("inf"),
+                    previous_points_xy=debug_prev_points,
+                    current_points_xy=None,
+                    tracked_inlier_mask=None,
+                    previous_rgb=debug_prev_rgb,
+                    current_rgb=current_rgb_prepared,
+                    timings=timings,
+                )
+
+            current_points_xy = tracks[0, -1].detach().cpu().numpy().astype(np.float32)
+            visibility_now = visibility[0, -1]
+            if visibility_now.ndim > 1:
+                visibility_now = visibility_now.squeeze(-1)
+            visibility_now = visibility_now.detach().cpu().numpy().astype(bool)
+            timings["predictor_forward"] = time.time() - t
+
+        # --- Sub-timing: postprocess (image-bound filter, mask filter, bilinear depth sample, world back-projection — all CPU/numpy) ---
+        t = time.time()
         current_points_xy, visibility_now = self._filter_points_in_image(
             current_points_xy,
             visibility_now,
@@ -226,6 +385,7 @@ class CoTrackerMotionEstimator:
             current_intrinsics,
             current_camera_to_world,
         )
+        timings["postprocess"] = time.time() - t
 
         rotation = identity
         translation = zero
@@ -236,6 +396,8 @@ class CoTrackerMotionEstimator:
         track_count_after = int(correspondence_mask.sum())
         tracked_inlier_mask = np.zeros((len(current_points_xy),), dtype=bool)
 
+        # --- Sub-timing: RANSAC-Kabsch (numpy loop, scales with ransac_iterations × correspondence count) ---
+        t = time.time()
         if len(prev_world) >= self.min_track_points and len(curr_world) >= self.min_track_points:
             ransac_result = self._estimate_rigid_transform_ransac(
                 prev_world,
@@ -256,8 +418,9 @@ class CoTrackerMotionEstimator:
                 tracked_inlier_mask[tracked_indices[inlier_mask]] = True
                 if success:
                     track_count_after = inlier_count
+        timings["ransac_kabsch"] = time.time() - t
 
-        return CoTrackerMotionEstimate(
+        result = CoTrackerMotionEstimate(
             success=success,
             ready=True,
             rotation=rotation,
@@ -277,7 +440,14 @@ class CoTrackerMotionEstimator:
             tracked_inlier_mask=tracked_inlier_mask,
             previous_rgb=debug_prev_rgb,
             current_rgb=current_rgb_prepared,
+            timings=timings,
         )
+        # Cache only successful estimates for skip-tick reuse. A failed
+        # inference (success=False) shouldn't pin the object pose on stale
+        # data — let subsequent ticks try a fresh inference.
+        if success:
+            self._last_estimate = result
+        return result
 
     def _get_predictor(self):
         if self._predictor is not None:
@@ -303,8 +473,71 @@ class CoTrackerMotionEstimator:
 
         predictor = predictor.to(self.device)
         predictor.eval()
+        # cotracker3_online exposes ``.step`` (typically 4); the sliding window
+        # size is ``2 * step`` (typically 8). cotracker3_offline does NOT have
+        # ``.step`` and its forward() rejects ``is_first_step``. The fork in
+        # ``estimate_and_advance`` takes the offline 2-frame path when
+        # ``_predictor_step <= 0``, so absence of ``.step`` must map to 0.
+        self._predictor_step = int(getattr(predictor, "step", 0))
+        # Override the predictor's internal resize target. The predictor's
+        # forward pass calls ``F.interpolate(video, self.interp_shape)``
+        # before the CNN encoder, regardless of input resolution. Setting a
+        # smaller value here reduces encoder cost ~linearly with pixel
+        # count. (0, 0) means "keep the hub-loaded default". Output 2D
+        # coordinates are still scaled back to the input resolution by the
+        # predictor itself, so this override is transparent to downstream
+        # consumers.
+        if (
+            self.predictor_resolution
+            and self.predictor_resolution != (0, 0)
+            and hasattr(predictor, "interp_shape")
+        ):
+            predictor.interp_shape = tuple(self.predictor_resolution)
         self._predictor = predictor
         return predictor
+
+    def _run_offline_forward(self, predictor, video: Tensor, queries: Tensor):
+        """Inline replacement for ``predictor(video, queries=queries)`` on the
+        offline path. The hub wrapper hardcodes ``iters=6`` in its
+        ``_compute_sparse_tracks`` and pads in a 6x6 support grid; we
+        replicate the minimal needed pre/post (resize to ``interp_shape``,
+        scale queries, threshold visibility, overwrite query-frame
+        predictions, scale tracks back) but call the underlying model with
+        ``iters=self.predictor_iters`` and skip the support grid (its only
+        role is extra context tokens for the transformer; for short rigid
+        2-frame tracks the speed win outweighs the marginal stability gain).
+        """
+        B, T, C, H, W = video.shape
+        interp_h, interp_w = predictor.interp_shape
+        video = video.reshape(B * T, C, H, W)
+        video = F.interpolate(
+            video, (interp_h, interp_w), mode="bilinear", align_corners=True
+        )
+        video = video.reshape(B, T, 3, interp_h, interp_w)
+
+        queries = queries.clone()
+        queries[:, :, 1:] *= queries.new_tensor(
+            [(interp_w - 1) / max(W - 1, 1), (interp_h - 1) / max(H - 1, 1)]
+        )
+
+        tracks, visibilities, *_ = predictor.model.forward(
+            video=video, queries=queries, iters=self.predictor_iters
+        )
+        visibilities = visibilities > 0.9
+
+        # Mirror the wrapper's "overwrite query-frame predictions" loop:
+        # the predictor doesn't always reproduce the exact query coords on
+        # the query frame; downstream code expects them to match.
+        for i in range(queries.shape[0]):
+            queries_t = queries[i, : tracks.size(2), 0].to(torch.int64)
+            arange = torch.arange(0, len(queries_t), device=tracks.device)
+            tracks[i, queries_t, arange] = queries[i, : tracks.size(2), 1:]
+            visibilities[i, queries_t, arange] = True
+
+        tracks = tracks * tracks.new_tensor(
+            [(W - 1) / max(interp_w - 1, 1), (H - 1) / max(interp_h - 1, 1)]
+        )
+        return tracks, visibilities
 
 
 

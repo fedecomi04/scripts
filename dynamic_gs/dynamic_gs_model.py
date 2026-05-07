@@ -84,13 +84,31 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     # object. ``apply_rigid_object_transform_from_reference`` then moves
     # every Gaussian flagged as belonging to that object.
     enable_cotracker_rigid_motion: bool = True
-    cotracker_query_point_count: int = 256
+    cotracker_query_point_count: int = 64
     cotracker_min_track_points: int = 12
     cotracker_ransac_iterations: int = 128
     cotracker_ransac_inlier_threshold: float = 0.008
     cotracker_checkpoint_path: str = ""
     cotracker_hub_repo: str = "facebookresearch/co-tracker"
     cotracker_hub_model: str = "cotracker3_offline"
+    cotracker_predictor_resolution: tuple[int, int] = (192, 192)
+    """(height, width) override for the predictor's internal resize before its
+    CNN encoder runs. The hub-loaded model resizes every input to
+    ``model.model_resolution`` (typically ~384x512) regardless of camera
+    resolution, so the encoder cost is determined by this value alone.
+    The CoTracker3 paper benchmarks at (256, 256) — same as training. Set
+    (0, 0) to keep the hub default. Lower values reduce encoder cost
+    roughly linearly with pixel count, at the price of slightly less
+    precise sub-pixel tracking."""
+    cotracker_predictor_iters: int = 4
+    """Number of transformer refinement iterations per offline predictor
+    forward. The hub predictor wrapper hardcodes ``iters=6``; we bypass
+    it and call the underlying model with this value instead. Each iter
+    is a full transformer pass over the (point, frame) tokens, so cost
+    is roughly linear in iters. The CoTracker3 paper trains at iters=4;
+    6 is the wrapper's default for marginal accuracy gains. For 2-frame
+    pairwise tracking on a 5 Hz camera, iters=3-4 is typically enough
+    to converge."""
     enable_scene_optimization: bool = True
     scene_opt_refine_every: int = 100
     scene_opt_densify_grad_thresh: float = 0.0002

@@ -360,6 +360,74 @@ LR is zeroed (not disabled) for inactive groups. When transitioning to the dynam
 
 **Frame-0 register skip:** the FP `register()` call is the slowest path (multi-iteration global pose search). By seeding `pose_last` directly from the known scene pose, we skip ~5 seconds of D0 cost AND avoid needing a 2D segmentation mask for first-frame registration.
 
+### CoTracker 2D Tracker Detail (alternative branch)
+
+CoTracker is the alternative dynamic tracker, used in branches where
+FoundationPose is disabled (e.g. `keyframes_optim`). It tracks 2D
+keypoints frame-to-frame; world-frame `(R, t)` is recovered by
+back-projecting the tracked points through depth and running
+RANSAC-Kabsch against the D0 anchor. Same downstream interface as FP —
+only the source of `(R, t)` differs.
+
+**Model:** `cotracker3_offline` from `facebookresearch/co-tracker`
+(loaded via `torch.hub`). Wrapper class:
+[`CoTrackerMotionEstimator`](dynamic_gs/utils/cotracker_motion.py).
+
+**Mode:** Pairwise 2-frame inference. Each tick the estimator stacks
+`[previous_rgb, current_rgb]` into a `(1, 2, 3, H, W)` video and seeds
+it with the D0 query points; the underlying transformer outputs
+frame-1 coords + visibility. The 3D RANSAC anchor stays at D0, so the
+recovered `(R, t)` is still absolute world-frame even though the 2D
+tracker only sees a 2-frame sliding window. The online-predictor /
+sliding-window path also exists in the file (gated by
+`_predictor_step > 0`) but is not active when `cotracker3_offline` is
+the configured hub model — offline has no `.step` attribute, so
+`_predictor_step` falls back to 0 and the 2-frame fork is taken.
+
+**Custom forward bypass** ([`_run_offline_forward`](dynamic_gs/utils/cotracker_motion.py)):
+replaces the hub wrapper's `predictor(...)` call. The wrapper hardcodes
+`iters=6` in `_compute_sparse_tracks` and pads in a 6×6 = 36-point
+support grid that doubles the transformer's token count. The bypass
+calls `predictor.model.forward(...)` directly with our own `iters` and
+no support grid, replicating only the minimal pre/post the wrapper
+does (resize to `interp_shape`, scale queries, threshold visibility at
+0.9, overwrite query-frame predictions, scale tracks back to input
+resolution).
+
+**Tuned parameters** (in [`DynamicGSModelConfig`](dynamic_gs/dynamic_gs_model.py)):
+
+| Parameter | Value | Effect |
+|---|---|---|
+| `cotracker_hub_model` | `cotracker3_offline` | Per-tick pose updates (vs online's window-batched updates every `step` ticks) |
+| `cotracker_predictor_resolution` | `(192, 192)` | Internal encoder resize target (down from hub default `model.model_resolution=(384, 512)`) |
+| `cotracker_predictor_iters` | `4` | Transformer refinement passes per call (down from hub-hardcoded 6) |
+| `cotracker_query_point_count` | `64` | D0 mask-sampled query points (down from 256) |
+| `cotracker_min_track_points` | `12` | RANSAC abort threshold |
+| `cotracker_ransac_iterations` | `128` | 3-point RANSAC samples |
+| `cotracker_ransac_inlier_threshold` | `0.008` m | Inlier residual cap |
+| `save_debug_images` (pipeline) | `False` | Removes per-tick PNG/log writes (~160 ms) |
+
+**Per-tick cost (`DN.3_cotracker_motion`, debug off, ~5 Hz capture):**
+
+| Substep | Cost |
+|---|---|
+| `DN.3a` get_live_rgb (gripper-mask composite) | ~0.1 ms |
+| `DN.3b` input prep (CPU) | ~3 ms |
+| `DN.3c` predictor forward (NN + .cpu sync) | ~45 ms |
+| `DN.3d` postprocess (mask filter, depth sample, back-project) | ~0.3 ms |
+| `DN.3e` RANSAC-Kabsch | ~7 ms |
+| `DN.3f` debug I/O | 0 ms (gated by `save_debug_images`) |
+| `DN.3g` apply rigid transform | ~2 ms |
+| **Total** | **~56 ms ≈ 18 Hz** |
+
+**Headroom (untouched levers):** drop `predictor_iters` to 3 (~22 Hz)
+or 2 (~28 Hz); drop `predictor_resolution` to (160, 160) for marginal
+additional savings; reduce `query_point_count` to 48 — encoder cost
+doesn't change but RANSAC shrinks. Tradeoff is sub-pixel accuracy,
+observable as median residual rising in the timing report. Tune by
+watching `inlier_count` in the cotracker motion log: as long as it
+holds near 60+/64, the tracker is stable.
+
 ### Dynamic Tracking Roadmap (open work)
 
 The dynamic phase has two conceptually independent jobs and they should
