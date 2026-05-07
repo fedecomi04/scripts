@@ -102,9 +102,25 @@ class FoundationPoseTracker:
             debug_dir=str(debug_dir_path),
         )
         self._mesh = mesh
+        # Centered bbox + centering transform, computed exactly the same way
+        # FP's own ``run_demo.py`` does it. Drawing with a centered bbox and
+        # the corresponding centered pose puts the xyz axes (which always
+        # render at the local origin) at the geometric centre of the box,
+        # instead of wherever the mesh's raw vertex (0,0,0) happens to sit.
+        to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
+        self._to_origin: np.ndarray = np.asarray(to_origin, dtype=np.float64).reshape(4, 4)
+        self._to_origin_inv: np.ndarray = np.linalg.inv(self._to_origin)
+        self._mesh_bbox: np.ndarray = np.stack(
+            [-np.asarray(extents) / 2.0, np.asarray(extents) / 2.0], axis=0
+        ).astype(np.float64)
         self._mesh_to_world_init: np.ndarray = mesh_to_world.astype(np.float64)
         self._mesh_to_world_init_inv: np.ndarray = np.linalg.inv(self._mesh_to_world_init)
         self._initialized: bool = False
+        # Original-mesh-to-camera pose from the most recent track/init call,
+        # stashed so the pipeline can render an overlay (bbox + xyz axes)
+        # using the same pose that was just consumed by FP. ``None`` until
+        # the first init/track returns.
+        self._last_pose_in_camera: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------
     # FP-frame conversions
@@ -154,6 +170,12 @@ class FoundationPoseTracker:
 
         if int(refine_iterations) <= 0:
             self._initialized = True
+            # No refinement: the seed itself is the consumed pose. Recover
+            # original-mesh-to-camera so visualization uses the same frame
+            # as the bbox stored on the tracker.
+            self._last_pose_in_camera = (
+                pose_centered @ self._tf_to_centered_np()
+            ).astype(np.float64)
             R = np.eye(3, dtype=np.float32)
             t = np.zeros(3, dtype=np.float32)
             return R, t
@@ -162,6 +184,7 @@ class FoundationPoseTracker:
             rgb=rgb, depth=depth_np, K=K_np, iteration=int(refine_iterations)
         )
         self._initialized = True
+        self._last_pose_in_camera = np.asarray(pose_in_camera, dtype=np.float64).reshape(4, 4)
         return self._delta_world_from_pose_in_camera(pose_in_camera, camera_to_world)
 
     def fallback_register(
@@ -189,6 +212,7 @@ class FoundationPoseTracker:
         self._mesh_to_world_init = camera_to_world @ np.asarray(pose_in_camera, dtype=np.float64).reshape(4, 4)
         self._mesh_to_world_init_inv = np.linalg.inv(self._mesh_to_world_init)
         self._initialized = True
+        self._last_pose_in_camera = np.asarray(pose_in_camera, dtype=np.float64).reshape(4, 4)
         return self._delta_world_from_pose_in_camera(pose_in_camera, camera_to_world)
 
     def track_one(
@@ -209,7 +233,63 @@ class FoundationPoseTracker:
         pose_in_camera = self._est.track_one(
             rgb=rgb, depth=depth_np, K=K_np, iteration=int(iterations)
         )
+        self._last_pose_in_camera = np.asarray(pose_in_camera, dtype=np.float64).reshape(4, 4)
         return self._delta_world_from_pose_in_camera(pose_in_camera, camera_to_world)
+
+    def save_pose_visualization(
+        self,
+        rgb: np.ndarray,
+        K: np.ndarray,
+        output_path: str | Path,
+        axis_scale: float = 0.1,
+        thickness: int = 3,
+    ) -> bool:
+        """Render the current FP pose as a 3D bbox + xyz axes overlay.
+
+        Uses FP's own ``draw_posed_3d_box`` and ``draw_xyz_axis`` from
+        ``Utils.py`` so the overlay matches what ``run_demo.py`` produces.
+        ``rgb`` is the same uint8 RGB image that was just passed to
+        ``track_one`` / ``initialize_from_known_pose``; ``K`` is the same
+        OpenCV-convention 3x3 intrinsics. Writes a PNG to *output_path*
+        (parent dir created if missing). Returns True on success, False if
+        no pose has been recorded yet.
+        """
+        if self._last_pose_in_camera is None:
+            return False
+        _ensure_fp_on_path()
+        try:
+            import cv2  # type: ignore
+            from Utils import draw_posed_3d_box, draw_xyz_axis  # type: ignore
+        except Exception as exc:
+            logging.warning(f"[FP] save_pose_visualization: import failed ({exc})")
+            return False
+
+        K_np = np.asarray(K, dtype=np.float64).reshape(3, 3)
+        # Match FP's run_demo: draw with the centered-mesh-to-camera pose so
+        # the bbox (already in centered coords as ±extents/2) and the xyz
+        # axes (always at the local origin) share a frame.
+        center_pose = self._last_pose_in_camera @ self._to_origin_inv
+        img = np.ascontiguousarray(rgb).copy()
+        try:
+            img = draw_posed_3d_box(K_np, img=img, ob_in_cam=center_pose, bbox=self._mesh_bbox)
+            img = draw_xyz_axis(
+                img,
+                ob_in_cam=center_pose,
+                scale=float(axis_scale),
+                K=K_np,
+                thickness=int(thickness),
+                transparency=0,
+                is_input_rgb=True,
+            )
+        except Exception as exc:
+            logging.warning(f"[FP] save_pose_visualization: draw failed ({exc})")
+            return False
+
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(out), bgr)
+        return True
 
     # ------------------------------------------------------------------
     # Conversion helpers

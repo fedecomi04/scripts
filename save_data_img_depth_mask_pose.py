@@ -57,14 +57,19 @@ PACKAGE_MAP = {
     ),
 }
 
-SAVE_HZ = 10.0
-MAX_IMAGES = 200
+SAVE_HZ = 30.0
+# Minimum stamp delta required to save a new frame. Using exactly 1/SAVE_HZ
+# decimates an exactly-SAVE_HZ source to half-rate because sub-ms rounding in
+# the stamp delta puts dt just under 1/30. The 10% slack admits the on-rate
+# stream while still skipping every other frame from a 2x source.
+SAVE_MIN_PERIOD_SEC = 0.9 / SAVE_HZ
+MAX_IMAGES = 600
 SYNC_QUEUE_SIZE = 20
 SYNC_SLOP_SEC = 0.1
 IMAGE_NAME_PREFIX = "arm"
 
 INIT_CLOUD_NAME = "depth_camera_init_points.ply"
-MAX_INIT_CLOUD_POINTS = 300000
+MAX_INIT_CLOUD_POINTS = 600000
 BACKGROUND_COLOR_THRESHOLD = 10.0
 MASK_KEEP_ERODE_RADIUS_PX = 4
 MASK_MIN_KEEP_COMPONENT_AREA_PX = 64
@@ -882,7 +887,7 @@ class CaptureSession:
 
         if self.last_saved_stamp is not None:
             dt = (image_msg.header.stamp - self.last_saved_stamp).to_sec()
-            if dt < 1.0 / SAVE_HZ:
+            if dt < SAVE_MIN_PERIOD_SEC:
                 return
 
         self._warn_if_unexpected_image_frame(image_msg.header.frame_id)

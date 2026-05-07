@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Type
 
+import numpy as np
+import torch
 from torch.nn import Parameter
 
 from nerfstudio.data.datamanagers.base_datamanager import DataManager, DataManagerConfig
@@ -12,6 +14,7 @@ from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatama
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.data.datasets.base_dataset import InputDataset
 from nerfstudio.data.utils.data_utils import get_depth_image_from_path
+from nerfstudio.utils.rich_utils import CONSOLE
 
 
 class DynamicFrameDataset(InputDataset):
@@ -57,6 +60,18 @@ class DynamicGSDataManagerConfig(DataManagerConfig):
     data: Optional[Path] = None
     static_subdir: str = "static_scene"
     dynamic_subdir: str = "dynamic_scene"
+
+    enable_static_keyframe_filter: bool = True
+    """ORB-SLAM-style greedy keyframe filter applied to the static train
+    set once at startup. Frame i is accepted only if there is no already-
+    accepted keyframe j with both translation gap <= τ_t AND rotation gap
+    <= τ_r. Reduces redundant near-duplicate views before static training
+    starts."""
+    static_keyframe_translation_m: float = 0.02
+    """τ_t in meters. Poses are unscaled (auto_scale_poses=False), so this
+    is metric."""
+    static_keyframe_rotation_deg: float = 20.0
+    """τ_r in degrees, geodesic rotation distance on SO(3)."""
 
     inner: FullImageDatamanagerConfig = field(
         default_factory=lambda: FullImageDatamanagerConfig(
@@ -106,6 +121,13 @@ class DynamicGSDataManager(DataManager):
             raise FileNotFoundError(f"Missing dynamic scene folder: {dynamic_root}")
 
         self.static_manager = self._build_manager(static_root, use_depth_dataset=False)
+        self.static_total_frames = len(self.static_manager.train_dataset)
+        if config.enable_static_keyframe_filter:
+            self._filter_static_keyframes(
+                translation_thresh_m=config.static_keyframe_translation_m,
+                rotation_thresh_deg=config.static_keyframe_rotation_deg,
+            )
+        self.static_accepted_frames = len(self.static_manager.train_dataset)
         self.dynamic_manager = self._build_manager(dynamic_root, use_depth_dataset=True)
         self.current_dynamic_frame_idx = 0
 
@@ -130,6 +152,82 @@ class DynamicGSDataManager(DataManager):
             test_mode=self.test_mode,
             world_size=self.world_size,
             local_rank=self.local_rank,
+        )
+
+    def _filter_static_keyframes(
+        self,
+        *,
+        translation_thresh_m: float,
+        rotation_thresh_deg: float,
+    ) -> None:
+        """ORB-SLAM-style greedy keyframe filter on the static train set.
+
+        Accept frame 0 unconditionally. For each subsequent frame i,
+        reject iff there exists an already-accepted keyframe j with
+        ``||t_i - t_j|| <= τ_t`` AND ``angle(R_i, R_j) <= τ_r``;
+        otherwise accept it. The OR semantics ("far enough in T OR R")
+        match ORB-SLAM's keyframe insertion test.
+
+        Cost is ``O(K · N)`` doubles where K is the kept count — runs
+        once at startup, before any cached image / param tensor is
+        materialized, so the filter incurs no runtime overhead during
+        training.
+        """
+        ds = self.static_manager.train_dataset
+        n = len(ds)
+        if n <= 1 or translation_thresh_m <= 0.0 or rotation_thresh_deg <= 0.0:
+            return
+
+        c2w = ds.cameras.camera_to_worlds.detach().cpu().numpy().astype(np.float64)
+        if c2w.ndim != 3 or c2w.shape[1] != 3 or c2w.shape[2] != 4:
+            CONSOLE.log(
+                f"[dynamic-gs] static keyframe filter skipped: unexpected "
+                f"camera_to_worlds shape {tuple(c2w.shape)}"
+            )
+            return
+        R = c2w[:, :3, :3]
+        t = c2w[:, :3, 3]
+        rot_thresh_rad = float(np.deg2rad(rotation_thresh_deg))
+        trans_thresh = float(translation_thresh_m)
+
+        kept_idx: List[int] = [0]
+        kept_R: List[np.ndarray] = [R[0]]
+        kept_t: List[np.ndarray] = [t[0]]
+        for i in range(1, n):
+            K_t = np.stack(kept_t, axis=0)
+            K_R = np.stack(kept_R, axis=0)
+            dt = np.linalg.norm(t[i] - K_t, axis=1)
+            traces = np.einsum("ab,kab->k", R[i], K_R)
+            cos_theta = np.clip(0.5 * (traces - 1.0), -1.0, 1.0)
+            dr = np.arccos(cos_theta)
+            near = (dt <= trans_thresh) & (dr <= rot_thresh_rad)
+            if not near.any():
+                kept_idx.append(i)
+                kept_R.append(R[i])
+                kept_t.append(t[i])
+
+        if len(kept_idx) == n:
+            CONSOLE.log(
+                f"[dynamic-gs] static keyframe filter: kept {n}/{n} "
+                f"(τ_t={trans_thresh:.4f} m, τ_r={rotation_thresh_deg:.1f}°)"
+            )
+            return
+
+        keep_tensor = torch.tensor(kept_idx, dtype=torch.long)
+        outs = self.static_manager.train_dataparser_outputs
+        outs.image_filenames = [outs.image_filenames[i] for i in kept_idx]
+        if outs.mask_filenames is not None:
+            outs.mask_filenames = [outs.mask_filenames[i] for i in kept_idx]
+        outs.cameras = outs.cameras[keep_tensor]
+        ds.cameras = ds.cameras[keep_tensor]
+
+        if hasattr(self.static_manager, "train_unsampled_epoch_count"):
+            delattr(self.static_manager, "train_unsampled_epoch_count")
+        self.static_manager.train_unseen_cameras = self.static_manager.sample_train_cameras()
+
+        CONSOLE.log(
+            f"[dynamic-gs] static keyframe filter: kept {len(kept_idx)}/{n} "
+            f"(τ_t={trans_thresh:.4f} m, τ_r={rotation_thresh_deg:.1f}°)"
         )
 
     def set_phase(self, phase):

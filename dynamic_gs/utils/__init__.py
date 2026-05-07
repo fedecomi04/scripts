@@ -16,7 +16,9 @@ from .esam import (
     query_esam_mask_pair,
 )
 from .foundationpose_tracker import FoundationPoseTracker
+from .keyframe_filter import DynamicKeyframeFilter
 from .no_refine_strategy import NoRefineStrategy
+from .optim_pool import OptimFrame, OptimPool
 from .rigid_regularization import rigid_or_static_loss
 from .sam3_segmentation import load_sam3_masks, run_sam3_subprocess
 from .sam3d import (
@@ -45,6 +47,7 @@ __all__ = [
     "build_esam_ti",
     "combine_object_masks",
     "dilate_binary_mask",
+    "DynamicKeyframeFilter",
     "ESAM_NUM_PROMPT_POINTS",
     "ESAM_PROMPT_KEEP_RATIO",
     "extract_projected_centers_and_radii",
@@ -54,6 +57,8 @@ __all__ = [
     "load_sam3_masks",
     "masked_l1_depth_loss",
     "NoRefineStrategy",
+    "OptimFrame",
+    "OptimPool",
     "get_sam3d_output_paths",
     "load_sam3d_pose",
     "query_esam_mask",

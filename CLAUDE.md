@@ -103,15 +103,64 @@ c2w extraction inside `register_and_fuse_sam3d_object` then all see the
 optimized pose, which slightly improves reprojection alignment between
 the SAM3D object cloud and the static-depth registration target.
 
-**Phase 2 — Dynamic (from step `static_num_steps`, `dynamic_steps_per_frame`
-steps/frame):** Per-frame optimization of the dynamic sequence. The phase
-transition resets the `means` optimizer state and scheduler. `means`
-gradients are masked so object Gaussians are moved by rigid transforms,
-while non-object Gaussians can still be optimized by scene optimization.
+**Phase 2 — Dynamic (from step `static_num_steps`):** Decoupled
+tracking + optimization. The phase transition resets the `means`
+optimizer state and scheduler. `means` gradients are masked so object
+Gaussians are moved by rigid transforms, while non-object Gaussians can
+still be optimized by scene optimization.
 
-- **Frame 0 bootstrap (Path A — prefused):** `prepare_dynamic_update(skip_object_flags_write=True)` → select moved object from pre-fused candidates via ESAM overlap → set `object_flags = (object_instance_ids == selected_k).float()` + `_persistent_object_membership_ready = True` → rendered object mask → **pick the pre-built FoundationPose tracker for the selected instance** from `_fp_trackers_by_instance`, drop the rest, seed `est.pose_last` from the known scene pose (no construction cost here — Phase 0b paid it) → CD0. No SAM3D generation/insertion at D0; no `register()` call (skipped because the initial pose is already known from Phase 0b fusion). No SAM2 — the projected object Gaussians give the authoritative object mask.
-- **Frame 0 bootstrap (Path B — no prefusion):** `prepare_dynamic_update` (render RS + change mask + ESAM on render/live + Gaussian flagging) → SAM3D 3D generation → CPD-based fusion/insertion → render object mask → FoundationPose `register()` fallback on D0 live image/depth/mask (no manifest entry) → capture reference object pose → compute CD0
-- **Frame N tracking:** FoundationPose `track_one(rgb, depth, K, ...)` from the cached `pose_last` (FP refines its previous pose against the new RGB-D — i.e., **consecutive-frame tracking** internally; the convert-to-D0-reference is only the output convention) → convert mesh-to-camera 4×4 to world-frame absolute SE(3) from the D0 reference pose → apply via `apply_rigid_object_transform_from_reference` → render RDN → render object mask → compute CDN. **The CDN's object exclusion comes from the projected object-Gaussian mask alone** (no SAM2 propagation; FoundationPose handles per-frame pose, so the Gaussian projection is the authoritative "where the object is" signal).
+The dynamic phase splits into two **independent loops sharing one
+Gaussian scene**:
+
+* **Tracking loop** runs at a step-based cadence (`tracker_tick_every_steps=3`,
+  faking ~5 Hz given ~58 ms/step). Every tick: pull the next dataset
+  frame, run FoundationPose `track_one`, apply the rigid transform to
+  object Gaussians. **FP runs on every frame for pose continuity**, even
+  rejected ones. If the frame is in the keyframe-accepted set AND its
+  CDN clears `optim_pool_min_change_pixels`, the
+  `(camera, cdn_at_capture)` pair is pushed onto the `OptimPool`
+  (capacity 15, FIFO with drop-oldest on overflow).
+* **Optim loop** picks pool entries in round-robin and runs one training
+  step per pick. Per step:
+  1. `obj_mask_now = render_object_mask(frame.camera)` against the
+     **current** object pose (latest FP track).
+  2. `effective = frame.cdn × (1 − obj_mask_now)` — pixels currently
+     occluded by the (possibly far-moved) object are skipped from this
+     stored frame's loss, so scene Gaussians behind the object don't get
+     pushed toward the object's color.
+  3. `model._set_optim_mask(effective)`; pin datamanager to
+     `frame.frame_idx`; delegate to `super().get_train_loss_dict`. The
+     full-scene render inside super sets `model.info`; we then refresh
+     `scene_opt_active_mask` from `effective` before returning so
+     backward's hooks see the right per-Gaussian gate.
+  4. Update `epochs_used`, `last_loss`, and `initial_loss` (set on the
+     first iteration). Evict iff `epochs_used >= optim_pool_max_epochs`
+     OR `last_loss < initial_loss × optim_pool_loss_relative_threshold`.
+
+The two loops are bound only by step cadence — older pool frames keep
+getting optimized while the object visibly moves to the latest FP
+estimate, exactly matching the live-camera scenario.
+
+- **D0 bootstrap (Path A — prefused):** First tracker tick runs the
+  full D0 logic (`_prepare_frame_0`): select the moved object from
+  pre-fused candidates via ESAM overlap → set
+  `object_flags = (object_instance_ids == selected_k).float()` +
+  `_persistent_object_membership_ready = True` → rendered object mask
+  → **pick the pre-built FoundationPose tracker for the selected
+  instance** from `_fp_trackers_by_instance`, drop the rest, seed
+  `est.pose_last` from the known scene pose (no construction cost here
+  — Phase 0b paid it) → CD0. The CD0 + camera are pushed to the pool as
+  the first entry. No `register()` call. No SAM2.
+- **D0 bootstrap (Path B — no prefusion):** Same as before
+  (`prepare_dynamic_update` → SAM3D generation → CPD fusion → FP
+  `register()` fallback → CD0), then push to pool.
+- **DN tracking:** FoundationPose `track_one(rgb, depth, K, ...)` from
+  the cached `pose_last` (stateful per-frame refinement) →
+  `apply_rigid_object_transform_from_reference`. If the keyframe filter
+  accepts AND CDN clears the min-pixel gate, render RDN + object mask +
+  compute CDN, push `(camera, cdn)` to the pool. **The CDN's object
+  exclusion comes from the projected object-Gaussian mask alone** (no
+  SAM2 propagation).
 
 ### Phase Transition Details
 
@@ -186,6 +235,7 @@ DynamicGSDataManager    (dynamic_gs_datamanager.py)
 |--------|------|
 | `active_mask.py` | Change detection from RGB/depth deltas; MSSIM-based `build_change_mask`; morphological filtering; `keep_largest_component_with_min_area` combines the prior `remove_small_components` + `keep_largest_component` into a single scipy.label CPU round-trip |
 | `foundationpose_tracker.py` | `FoundationPoseTracker`: wraps NVIDIA FoundationPose (`third_party/FoundationPose/`); takes a triangle mesh + initial mesh-to-world; seeds `est.pose_last` from the known scene pose at D0 (skips `register()`); `track_one` per frame; converts mesh-to-camera output to world-frame absolute (R, t) for `apply_rigid_object_transform_from_reference` |
+| `keyframe_filter.py` | `DynamicKeyframeFilter`: stateful ORB-SLAM-style greedy keyframe filter shared between recorded (`bulk_filter` over a c2w stack) and live (`accept(c2w)` per arrival) modes. Same OR-rule and SO(3) geodesic math as `DynamicGSDataManager._filter_static_keyframes`, but designed so the live path drops in by replacing the bulk pre-filter with per-arrival `accept` calls. |
 | `sam3_segmentation.py` | SAM3 text-prompted segmentation: worker (`run_sam3_segmentation`) runs in `sam3_dynamic_gs` conda env; subprocess launcher (`run_sam3_subprocess`) uses `conda run`; mask filtering (area, border, IoU dedup) |
 | `sam3d.py` | SAM3D subprocess invocation: single-object (`run_sam3d_single_object_subprocess`, uses cropping), multi-object (`run_sam3d_multi_object_subprocess`, no cropping, one model load); output path management; pose sidecar save/resolve/validation |
 | `sam3d_fusion.py` | SAM3D rotation-aware object initialization: apply SAM3D quaternion in camera/world frame, then current bbox scale + centroid alignment + voxel downsampling + probreg CPD similarity; Gaussian insertion and deduplication via `register_and_fuse_sam3d_object` |
@@ -209,6 +259,22 @@ Pipeline-level config in `DynamicGSPipelineConfig`:
 | `static_num_steps` | 4000 | Number of static training steps before the dynamic phase |
 | `dynamic_steps_per_frame` | 50 | Optimization steps per dynamic frame |
 | `save_debug_images` | True | Gates per-frame debug PNG saves (D0.1f / D0.9 / DN.8). Set False to remove ~210ms from D0 and ~600ms from each dynamic frame; SAM3D Path B inputs (`render.png`, `render_object_mask_binary.png`) are still saved when needed |
+| `enable_dynamic_keyframe_filter` | True | ORB-SLAM-style greedy keyframe filter on the dynamic dataset, applied **before** any change-mask compute. Pre-filters all dynamic c2w poses at pipeline `__init__` via `DynamicKeyframeFilter.bulk_filter`, stores accepted dataset indices in `self._accepted_dynamic_frames`. The step→frame mapper `_dynamic_frame_for_step` indirects through this list, so rejected frames cost zero (no FP track, no change mask, no 50 optim steps) and `max_num_iterations` shrinks to `static_num_steps + K_accepted · dynamic_steps_per_frame`. The same filter instance survives for the future live-data path: replace the bulk pre-filter with per-arrival `self._dynamic_keyframe_filter.accept(c2w)` calls and append the dataset index to `_accepted_dynamic_frames` on True. |
+| `dynamic_keyframe_translation_m` | 0.01 | τ_t in metric meters (poses are unscaled, `auto_scale_poses=False`). |
+| `dynamic_keyframe_rotation_deg` | 20.0 | τ_r in degrees, geodesic SO(3) distance. |
+| `tracker_tick_every_steps` | 3 | Step-based cadence for the simulated 5 Hz incoming-frame stream. Every Nth optim step, advance `_next_frame_to_track` and run `_tracker_tick`. Decoupling is deterministic (not wall-clock) so optim doesn't idle when faster than the fake camera. The first dynamic step always fires a tick (D0 bootstrap). |
+| `optim_pool_capacity` | 15 | Max simultaneously-queued accepted frames in `OptimPool`. On overflow, the oldest entry is dropped (mirrors live behavior: optim falling behind tracking forgets the oldest backlog). |
+| `optim_pool_max_epochs` | 50 | Per-frame eviction cap. When `epochs_used >= max`, evict regardless of loss. |
+| `optim_pool_loss_relative_threshold` | 0.3 | Eviction threshold as a fraction of the frame's first-iteration loss. Once `last_loss < initial_loss × 0.3`, evict. Relative semantics avoid scene-dependent absolute tuning. |
+| `optim_pool_min_change_pixels` | 500 | Minimum CDN active-pixel count required to push a frame onto the pool. ~0.3 % of a 400×400 frame; below that, the change region is dominated by specular shimmer / sub-pixel JPEG noise. |
+
+Datamanager-level config in `DynamicGSDataManagerConfig` (consumed by `_filter_static_keyframes` at startup, before any image is cached):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `enable_static_keyframe_filter` | True | ORB-SLAM-style greedy keyframe filter on the static train set. Frame `i` is rejected iff some accepted keyframe `j` is within both τ_t in translation AND τ_r in rotation. Operates on `train_dataparser_outputs.image_filenames`/`mask_filenames`/`cameras` and `train_dataset.cameras`, then resets `train_unseen_cameras`. Runs once before `cached_train` is materialized, so it costs nothing at training time. The filtered count flows through `len(train_dataset)` to `num_train_data` and sizes the camera-optimizer pose-adjustment tensor. |
+| `static_keyframe_translation_m` | 0.01 | τ_t in metric meters. Valid because `auto_scale_poses=False` keeps c2w translations in metric units. |
+| `static_keyframe_rotation_deg` | 20.0 | τ_r in degrees, geodesic SO(3) distance via `arccos((trace(R_iᵀ R_j) − 1)/2)`. |
 
 Key model parameters in `DynamicGSModelConfig` (inherits from `SplatfactoModelConfig`):
 

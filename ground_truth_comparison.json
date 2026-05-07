@@ -1,0 +1,36 @@
+{
+  "dataset1": {
+    "name": "dynamic_gs_test_2026-03-28_19-49-45_w_background",
+    "path": "/home/mrc-cuhk/Documents/dynamic_gaussian_splat/data_teleoperation/datasets/dynamic_gs_test_2026-03-28_19-49-45_w_background",
+    "expected_objects": 3,
+    "objects_description": "red cube (left), red soda can (center), blue cube (right)",
+    "ground_truth_ply": {
+      "file": "dynamic_scene/initialization_artifacts/arm_05460_sam3d_fused_object_only.ply",
+      "num_points": 260030,
+      "centroid": [-0.6326, 0.2147, 0.5769],
+      "bbox_min": [-0.6562, 0.1812, 0.5153],
+      "bbox_max": [-0.5906, 0.2465, 0.6407],
+      "note": "This is the single-object D0 SAM3D result from the old pipeline (one object only)"
+    },
+    "static_frames": 136,
+    "dynamic_frames": 61,
+    "first_frame": "arm_05011.png"
+  },
+  "dataset2": {
+    "name": "dynamic_gs_test_2026-04-15_15-38-26",
+    "path": "/home/mrc-cuhk/Documents/dynamic_gaussian_splat/data_teleoperation/datasets/dynamic_gs_test_2026-04-15_15-38-26",
+    "expected_objects": 5,
+    "objects_description": "red cube, blue cube, red soda can, pink fidget spinner, dark banana",
+    "ground_truth_ply": {
+      "file": "dynamic_scene/initialization_artifacts/arm_00552_sam3d_fused_object_only.ply",
+      "num_points": 67750,
+      "centroid": [-0.7637, 0.2008, 0.5295],
+      "bbox_min": [-0.8813, 0.1114, 0.5001],
+      "bbox_max": [-0.6649, 0.2549, 0.5821],
+      "note": "This is the single-object D0 SAM3D result from the old pipeline (one object only)"
+    },
+    "static_frames": 80,
+    "dynamic_frames": 119,
+    "first_frame": "arm_00299.png"
+  }
+}

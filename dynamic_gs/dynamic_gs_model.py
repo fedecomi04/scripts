@@ -63,6 +63,8 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     depth_lambda: float = 0.4
     active_mask_dilate_radius: int = 0
     output_depth_during_training: bool = True
+    sh_degree_interval: int = 500
+    resolution_schedule: int = 200
 
     change_mask_depth_threshold: float = 0.02
     change_mask_rgb_threshold: float = 0.10
@@ -94,7 +96,7 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
 
     # SAM3 pre-static graspable object prefusion
     use_sam3_graspable_prefusion: bool = True
-    sam3_prompt_text: str = "the can on the table"
+    sam3_prompt_text: str = "the two objects on the table"
     sam3_conda_env_name: str = "sam3_dynamic_gs"
     sam3_candidate_min_area_ratio: float = 0.002
     sam3_candidate_max_area_ratio: float = 0.25
@@ -103,6 +105,16 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     sam3_confidence_threshold: float = 0.3
     sam3_min_score: float = 0.4
     sam3_reuse_cached: bool = True
+    use_raw_sam3d_mesh: bool = True
+    """Skip the Poisson rewrite of ``<stem>_sam3d_mesh.ply`` and feed the
+    SAM3D mesh-decoder output directly to FoundationPose. The mesh is
+    in canonical SAM3D space, so ``mesh_to_world = canonical_to_world_4x4``
+    from the same CPD fusion call. Use this to test whether the raw
+    SAM3D mesh is cleaner than Poisson-over-flagged-Gaussians for FP
+    tracking. NOTE: existing cached ``*_sam3d_mesh.ply`` files are
+    post-Poisson; to get the actual SAM3D decoder output back on disk
+    you must force a fresh SAM3D run (delete ``*_sam3d_raw_output.ply``
+    or pass ``sam3_reuse_cached=False`` once)."""
 
 
 class DynamicGSModel(SplatfactoModel):
@@ -165,6 +177,12 @@ class DynamicGSModel(SplatfactoModel):
                 dtype=torch.long,
                 device=self.object_instance_ids.device,
             )
+            self._buffers["inserted_flags"] = torch.zeros(
+                num_points,
+                1,
+                dtype=self.object_flags.dtype,
+                device=self.object_flags.device,
+            )
 
         if "object_flags" not in state_dict:
             state_dict["object_flags"] = torch.zeros_like(self.object_flags)
@@ -172,6 +190,8 @@ class DynamicGSModel(SplatfactoModel):
             state_dict["sam3d_init_target_flags"] = torch.zeros_like(self.sam3d_init_target_flags)
         if "object_instance_ids" not in state_dict:
             state_dict["object_instance_ids"] = torch.zeros_like(self.object_instance_ids)
+        if "inserted_flags" not in state_dict:
+            state_dict["inserted_flags"] = torch.zeros_like(self.inserted_flags)
 
         super().load_state_dict(state_dict, **kwargs)
 
@@ -213,6 +233,18 @@ class DynamicGSModel(SplatfactoModel):
         self.register_buffer(
             "object_instance_ids",
             torch.zeros(num_points, 1, dtype=torch.long, device=self.means.device),
+            persistent=True,
+        )
+        # 1.0 for Gaussians that were inserted by Phase 0b SAM3D fusion,
+        # 0.0 for the original SfM-seeded scene Gaussians. Used by
+        # ``get_outputs`` to render a "scene-only / non-inserted" view
+        # for D0 Path A change detection — the rendered image then has
+        # no false positives from imperfect inserted-object fusion, so
+        # the change mask cleanly highlights only what differs between
+        # the original static scene and the live D0 image.
+        self.register_buffer(
+            "inserted_flags",
+            torch.zeros(num_points, 1, dtype=self.means.dtype, device=self.means.device),
             persistent=True,
         )
         self.register_buffer(
@@ -624,12 +656,14 @@ class DynamicGSModel(SplatfactoModel):
         scene_opt_active = self.scene_opt_active_mask
         sam3d_init_target_flags = self.sam3d_init_target_flags
         object_instance_ids = self.object_instance_ids
+        inserted_flags = self.inserted_flags
         if (
             object_flags.shape[0] == num_points
             and current_active.shape[0] == num_points
             and scene_opt_active.shape[0] == num_points
             and sam3d_init_target_flags.shape[0] == num_points
             and object_instance_ids.shape[0] == num_points
+            and inserted_flags.shape[0] == num_points
         ):
             return
 
@@ -638,6 +672,7 @@ class DynamicGSModel(SplatfactoModel):
         new_scene_opt_active = torch.zeros(num_points, dtype=torch.bool, device=scene_opt_active.device)
         new_sam3d_init_target_flags = torch.zeros(num_points, 1, dtype=sam3d_init_target_flags.dtype, device=sam3d_init_target_flags.device)
         new_instance_ids = torch.zeros(num_points, 1, dtype=torch.long, device=object_instance_ids.device)
+        new_inserted_flags = torch.zeros(num_points, 1, dtype=inserted_flags.dtype, device=inserted_flags.device)
         keep = min(object_flags.shape[0], num_points)
         if keep > 0:
             new_object_flags[:keep] = object_flags[:keep]
@@ -645,11 +680,13 @@ class DynamicGSModel(SplatfactoModel):
             new_scene_opt_active[:keep] = scene_opt_active[:keep]
             new_sam3d_init_target_flags[:keep] = sam3d_init_target_flags[:keep]
             new_instance_ids[:keep] = object_instance_ids[:keep]
+            new_inserted_flags[:keep] = inserted_flags[:keep]
         self._buffers["object_flags"] = new_object_flags
         self._buffers["current_active_mask"] = new_current_active
         self._buffers["scene_opt_active_mask"] = new_scene_opt_active
         self._buffers["sam3d_init_target_flags"] = new_sam3d_init_target_flags
         self._buffers["object_instance_ids"] = new_instance_ids
+        self._buffers["inserted_flags"] = new_inserted_flags
 
     def _refresh_gaussian_optimizers(self, reset_means_optimizer: bool) -> None:
         if not hasattr(self, "optimizers"):
@@ -732,6 +769,7 @@ class DynamicGSModel(SplatfactoModel):
         self._buffers["object_flags"] = self.object_flags[keep]
         self._buffers["sam3d_init_target_flags"] = self.sam3d_init_target_flags[keep]
         self._buffers["object_instance_ids"] = self.object_instance_ids[keep]
+        self._buffers["inserted_flags"] = self.inserted_flags[keep]
         if self.current_active_mask.shape[0] == num_points:
             self._buffers["current_active_mask"] = self.current_active_mask[keep]
         if self.scene_opt_active_mask.shape[0] == num_points:
@@ -758,6 +796,10 @@ class DynamicGSModel(SplatfactoModel):
             self.object_flags[old_num_points:] = 1.0
         if instance_id > 0:
             self.object_instance_ids[old_num_points:] = instance_id
+        # Mark these new Gaussians as inserted (the original SfM Gaussians
+        # stay at 0). Used by ``get_outputs`` to render a "non-inserted"
+        # view for D0 Path A change detection.
+        self.inserted_flags[old_num_points:] = 1.0
         self._refresh_gaussian_optimizers(reset_means_optimizer=True)
         return torch.arange(old_num_points, self.num_points, device=self.means.device, dtype=torch.long)
 
@@ -1608,6 +1650,7 @@ class DynamicGSModel(SplatfactoModel):
                 "live_propagation_mask": live_object_mask if torch.any(live_object_mask > 0.5) else optim_mask,
                 "rendered_rgb": outputs["rgb"],
                 "rendered_depth": outputs["depth"],
+                "non_inserted_rgb": outputs["non_inserted_rgb"],
                 "change_mask": change_mask,
             }
         finally:
@@ -1687,7 +1730,7 @@ class DynamicGSModel(SplatfactoModel):
                 )
                 empty_outputs["flagged_rgb"] = empty_outputs["rgb"]
                 empty_outputs["non_flagged_rgb"] = empty_outputs["rgb"]
-                empty_outputs["sam3d_init_target_rgb"] = empty_outputs["rgb"]
+                empty_outputs["non_inserted_rgb"] = empty_outputs["rgb"]
                 return empty_outputs
         else:
             crop_ids = None
@@ -1700,7 +1743,7 @@ class DynamicGSModel(SplatfactoModel):
             scales_crop = self.scales[crop_ids]
             quats_crop = self.quats[crop_ids]
             object_flags_crop = self.object_flags[crop_ids].squeeze(-1) > 0.5
-            sam3d_init_target_flags_crop = self.sam3d_init_target_flags[crop_ids].squeeze(-1) > 0.5
+            inserted_flags_crop = self.inserted_flags[crop_ids].squeeze(-1) > 0.5
         else:
             opacities_crop = self.opacities
             means_crop = self.means
@@ -1709,7 +1752,7 @@ class DynamicGSModel(SplatfactoModel):
             scales_crop = self.scales
             quats_crop = self.quats
             object_flags_crop = self.object_flags.squeeze(-1) > 0.5
-            sam3d_init_target_flags_crop = self.sam3d_init_target_flags.squeeze(-1) > 0.5
+            inserted_flags_crop = self.inserted_flags.squeeze(-1) > 0.5
 
         colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
 
@@ -1785,7 +1828,10 @@ class DynamicGSModel(SplatfactoModel):
 
         flagged_rgb = render_subset_rgb(object_flags_crop)
         non_flagged_rgb = render_subset_rgb(~object_flags_crop)
-        sam3d_init_target_rgb = render_subset_rgb(sam3d_init_target_flags_crop)
+        # Render the scene with inserted (Phase 0b SAM3D) Gaussians removed
+        # — used by D0 Path A to compute a clean change mask that doesn't
+        # have false positives at imperfectly-fused inserted-object regions.
+        non_inserted_rgb = render_subset_rgb(~inserted_flags_crop)
 
         if self.config.use_bilateral_grid and self.training:
             if camera.metadata is not None and "cam_idx" in camera.metadata:
@@ -1809,7 +1855,7 @@ class DynamicGSModel(SplatfactoModel):
             "depth": depth_im,
             "flagged_rgb": flagged_rgb,
             "non_flagged_rgb": non_flagged_rgb,
-            "sam3d_init_target_rgb": sam3d_init_target_rgb,
+            "non_inserted_rgb": non_inserted_rgb,
             "accumulation": alpha.squeeze(0),
             "background": background,
         }
@@ -1868,10 +1914,19 @@ class DynamicGSModel(SplatfactoModel):
             return
 
         means2d = self.info.get("means2d") if self.info else None
-        if means2d is not None and means2d.grad is not None:
+        radii_info = self.info.get("radii") if self.info else None
+        # Skip accumulation when ``self.info`` is stale relative to the
+        # current Gaussian count. Stale info can happen on no-op steps
+        # (empty optim pool returning the zero-loss dummy without a fresh
+        # render) after a prior _refine_eligible() prune.
+        info_consistent = (
+            radii_info is not None
+            and radii_info.squeeze(0).shape[0] == self.num_points
+        )
+        if means2d is not None and means2d.grad is not None and info_consistent:
             with torch.no_grad():
                 grad_norms = means2d.grad.detach().squeeze(0).norm(dim=-1)
-                eligible = self._get_eligible_mask() & (self.info["radii"].squeeze(0) > 0)
+                eligible = self._get_eligible_mask() & (radii_info.squeeze(0) > 0)
                 if self._grad2d_accum is None:
                     self._grad2d_accum = torch.zeros(self.num_points, device=self.device)
                     self._grad2d_count = torch.zeros(self.num_points, device=self.device)
@@ -1927,6 +1982,7 @@ class DynamicGSModel(SplatfactoModel):
             self._buffers["scene_opt_active_mask"] = self.scene_opt_active_mask[keep_mask]
             self._buffers["sam3d_init_target_flags"] = self.sam3d_init_target_flags[keep_mask]
             self._buffers["object_instance_ids"] = self.object_instance_ids[keep_mask]
+            self._buffers["inserted_flags"] = self.inserted_flags[keep_mask]
             if self._grad2d_accum is not None:
                 self._grad2d_accum = self._grad2d_accum[keep_mask]
                 self._grad2d_count = self._grad2d_count[keep_mask]

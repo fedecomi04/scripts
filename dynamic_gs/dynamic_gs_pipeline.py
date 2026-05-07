@@ -20,7 +20,10 @@ from nerfstudio.utils.rich_utils import CONSOLE
 from .dynamic_gs_datamanager import DynamicGSDataManagerConfig
 from .dynamic_gs_model import DynamicGSModelConfig
 from .utils import (
+    DynamicKeyframeFilter,
     FoundationPoseTracker,
+    OptimFrame,
+    OptimPool,
     build_change_mask,
     dilate_binary_mask,
     extract_projected_centers_and_radii,
@@ -54,6 +57,77 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     DN.8). The saves are pure disk I/O and not part of the change
     detection critical path; disabling them removes ~210ms from D0
     and ~600ms from each dynamic frame."""
+
+    enable_dynamic_keyframe_filter: bool = True
+    """ORB-SLAM-style greedy keyframe filter on the dynamic dataset
+    applied BEFORE any change-mask compute. Frame i is rejected iff
+    some accepted keyframe j is within both τ_t in translation AND
+    τ_r in rotation. Rejected frames cost zero — the trainer's step
+    schedule indirects through ``_accepted_dynamic_frames``, so
+    ``max_num_iterations`` shrinks to ``static_num_steps + K_accepted ·
+    dynamic_steps_per_frame``. The same stateful filter is the API
+    for future live ingestion (call ``accept(c2w)`` per arrival)."""
+    dynamic_keyframe_translation_m: float = 0.01
+    """τ_t in metric meters (poses are unscaled, ``auto_scale_poses=False``)."""
+    dynamic_keyframe_rotation_deg: float = 20.0
+    """τ_r in degrees, geodesic SO(3) distance."""
+
+    tracker_tick_every_steps: int = 3
+    """Tracker cadence: a tracker tick (FP track + maybe push to optim
+    pool) fires every N optim steps. With ~58 ms/step, N=3 fakes a
+    ~5.7 Hz incoming-frame rate — close to the 5 Hz dataset capture
+    rate. Decoupling is step-based (deterministic) rather than
+    wall-clock-based, so optim doesn't idle when it's faster than the
+    fake camera. The first dynamic step always fires a tick (D0
+    bootstrap)."""
+    optim_pool_capacity: int = 15
+    """Max number of accepted frames simultaneously queued for
+    optimization. On overflow, the oldest entry is dropped (mirrors
+    live behavior: if optim falls behind tracking, the queue forgets
+    the oldest backlog rather than growing unboundedly)."""
+    optim_pool_max_epochs: int = 30
+    """Per-frame optimization budget. When ``epochs_used >= max``, the
+    frame is evicted from the pool regardless of loss."""
+    optim_pool_loss_relative_threshold: float = 0.3
+    """Eviction threshold expressed as a fraction of the frame's
+    *first-iteration* loss. Once ``last_loss < initial_loss * 0.3``,
+    the frame is evicted. Relative semantics avoid scene-dependent
+    absolute tuning."""
+    optim_pool_min_change_pixels: int = 500
+    """A captured CDN must have at least this many active pixels to be
+    pushed to the optim pool. Below this, the change region is
+    dominated by specular shimmer / sub-pixel JPEG noise and isn't
+    worth a 50-step optimization budget. ~0.3% of a 400×400 frame."""
+
+    enable_static_convergence_check: bool = True
+    """Enable the MS-SSIM-based early static→dynamic transition. Once
+    the rendered scene matches the GT for all static keyframes (change
+    pixels per image below threshold), the static phase exits early
+    even if ``static_num_steps`` is not yet reached."""
+    static_convergence_first_check_step: int = 700
+    """First step at which the convergence check is run. Sits 300
+    steps after full-resolution training kicks in (full res reached
+    at step ``resolution_schedule * num_downscales = 200 * 2 = 400``),
+    giving the scene some full-res training time before the first
+    metric is sampled."""
+    static_convergence_check_every: int = 500
+    """Cadence of subsequent convergence checks while in the static
+    phase."""
+    static_convergence_rgb_threshold: float = 0.1
+    """MS-SSIM dissimilarity threshold used **only by the static
+    convergence check**. Independent of the dynamic-phase
+    ``change_mask_rgb_threshold`` so the two concerns can be tuned
+    separately. Lower = more sensitive (more pixels flagged as
+    "different"), higher = stricter. At 0.1 a pixel counts as
+    different if MSSIM dissimilarity exceeds 10 % — this matches the
+    dynamic-phase default and keeps the static metric on the same
+    sensitivity scale."""
+    static_convergence_max_change_ratio: float = 0.01
+    """Average per-image change-pixel ratio below which the static
+    phase is considered converged. 0.01 = 1 %: as long as more than
+    1 % of valid pixels (the average accepted-keyframe, mask-aware)
+    are flagged different above ``static_convergence_rgb_threshold``,
+    training continues. Below 1 %, transition to the dynamic phase."""
 class DynamicGSPipeline(VanillaPipeline):
     config: DynamicGSPipelineConfig
 
@@ -86,7 +160,55 @@ class DynamicGSPipeline(VanillaPipeline):
             grad_scaler=grad_scaler,
         )
         self.total_dynamic_frames = self.datamanager.get_num_dynamic_frames()
-        self.total_dynamic_steps = self.total_dynamic_frames * self.config.dynamic_steps_per_frame
+
+        # Build the keyframe filter (kept around for the future live-data
+        # path: per-arrival ``accept(c2w)`` calls share this state with
+        # the recorded-mode bulk_filter we run below).
+        self._dynamic_keyframe_filter: Optional[DynamicKeyframeFilter] = None
+        if self.config.enable_dynamic_keyframe_filter:
+            self._dynamic_keyframe_filter = DynamicKeyframeFilter(
+                translation_thresh_m=self.config.dynamic_keyframe_translation_m,
+                rotation_thresh_deg=self.config.dynamic_keyframe_rotation_deg,
+            )
+
+        # Recorded mode: pre-filter the entire dynamic dataset upfront so
+        # ``_total_train_steps`` and ``_dynamic_frame_for_step`` see only
+        # the kept frames. Live mode (future) replaces this bulk pass with
+        # per-arrival calls to ``self._dynamic_keyframe_filter.accept(...)``
+        # that append to ``_accepted_dynamic_frames`` and trigger
+        # ``_prepare_dynamic_frame`` on True.
+        self._accepted_dynamic_frames: list[int] = list(range(self.total_dynamic_frames))
+        if self._dynamic_keyframe_filter is not None and self.total_dynamic_frames > 1:
+            dyn_c2w = (
+                self.datamanager.dynamic_manager.train_dataset.cameras.camera_to_worlds
+            )
+            self._accepted_dynamic_frames = self._dynamic_keyframe_filter.bulk_filter(dyn_c2w)
+            CONSOLE.log(
+                f"[dynamic-gs] dynamic keyframe filter: kept "
+                f"{len(self._accepted_dynamic_frames)}/{self.total_dynamic_frames} "
+                f"(τ_t={self.config.dynamic_keyframe_translation_m:.4f} m, "
+                f"τ_r={self.config.dynamic_keyframe_rotation_deg:.1f}°)"
+            )
+
+        self.total_dynamic_steps = (
+            len(self._accepted_dynamic_frames) * self.config.dynamic_steps_per_frame
+        )
+        # Fast-membership lookup: tracker tick checks frame_idx against this
+        # set to decide whether to compute CDN + push to the optim pool.
+        self._accepted_dynamic_frames_set: set[int] = set(self._accepted_dynamic_frames)
+
+        # Decoupled tracking/optimization state. ``_next_frame_to_track``
+        # iterates ALL dataset frames in order (FP track runs on every
+        # frame for pose continuity); the pool only collects accepted
+        # frames whose CDN passes the min-pixels gate.
+        self._optim_pool: OptimPool = OptimPool(capacity=self.config.optim_pool_capacity)
+        self._next_frame_to_track: int = 0
+        self._dynamic_step_counter: int = 0
+
+        # Step at which the static convergence check first reported
+        # "scene matches GT for all keyframes". When set, ``_phase_for_step``
+        # returns "dynamic" early.
+        self._static_converged_step: Optional[int] = None
 
         # Pre-load ESAM at pipeline init so the ~300ms one-time model load
         # AND the first-call CUDA kernel JIT for our input shape are paid
@@ -141,6 +263,9 @@ class DynamicGSPipeline(VanillaPipeline):
         self._fp_tracker = None
         self._fp_trackers_by_instance = {}
         self._global_frame_counter = 0
+        self._optim_pool = OptimPool(capacity=self.config.optim_pool_capacity)
+        self._next_frame_to_track = 0
+        self._dynamic_step_counter = 0
 
     def _run_sam3_and_sam3d_generation(self) -> Optional[dict]:
         """Pre-static: run SAM3 mask discovery + SAM3D 3D object generation.
@@ -641,66 +766,81 @@ class DynamicGSPipeline(VanillaPipeline):
                 (self.model.object_instance_ids.squeeze(-1) == instance_id).sum().item()
             )
 
-            # Fused-mesh reconstruction. Build the FoundationPose mesh from the
-            # union of post-cull SAM3D inserts (back/bottom) + flagged init
-            # Gaussians (front/sides/top) — the actual rendered object as it
-            # exists after fusion. Both subsets are read from `model.means` in
-            # world frame, so `mesh_to_world` is identity. Falls back to the
-            # SAM3D-only canonical mesh if the union is too sparse for Poisson.
+            # Mesh build for FoundationPose. Two modes selected by
+            # ``model.config.use_raw_sam3d_mesh``:
+            #   * False (default): Poisson over the flagged object Gaussian
+            #     centers (``object_instance_ids == instance_id``) — the
+            #     actual rendered object as it exists in the splat. Mesh
+            #     in world frame, so ``mesh_to_world = I``. Falls back to
+            #     Poisson on the SAM3D-only canonical cloud if too sparse.
+            #   * True: skip Poisson entirely and use the SAM3D mesh
+            #     decoder output at ``mesh_ply_path`` as-is. The mesh is
+            #     in canonical SAM3D space, so
+            #     ``mesh_to_world = canonical_to_world_4x4``.
             used_fused = False
             if mesh_ply_path is not None:
                 t_mesh = time.time()
-                fused_pts_list = []
-                if inserted_indices.numel() > 0:
-                    fused_pts_list.append(
-                        self.model.means[inserted_indices].detach().cpu().numpy().astype(np.float32)
-                    )
-                if match_indices.numel() > 0:
-                    fused_pts_list.append(
-                        self.model.means[match_indices].detach().cpu().numpy().astype(np.float32)
+
+                if self.model.config.use_raw_sam3d_mesh:
+                    # Trust the SAM3D mesh decoder output; do not overwrite.
+                    if Path(mesh_ply_path).exists():
+                        mesh_path_for_manifest = str(mesh_ply_path)
+                        CONSOLE.log(
+                            f"[phase-0] object {obj_idx}: raw SAM3D mesh-decoder output -> {mesh_ply_path}"
+                        )
+                    else:
+                        CONSOLE.log(
+                            f"[phase-0] object {obj_idx}: SAM3D mesh PLY missing — FP will be skipped"
+                        )
+                else:
+                    flagged_mask = self.model.object_instance_ids.squeeze(-1) == instance_id
+                    flagged_pts_np = (
+                        self.model.means[flagged_mask].detach().cpu().numpy().astype(np.float32)
                     )
 
-                mesh_ok = False
-                if fused_pts_list:
-                    fused_pts_np = np.concatenate(fused_pts_list, axis=0)
-                    try:
-                        mesh_ok = reconstruct_mesh_from_points(
-                            points=fused_pts_np,
-                            mesh_ply_path=Path(mesh_ply_path),
-                        )
-                        used_fused = mesh_ok
-                    except Exception as exc:
-                        CONSOLE.log(
-                            f"[phase-0] fused mesh reconstruction failed for object {obj_idx}: {exc}"
-                        )
+                    mesh_ok = False
+                    if flagged_pts_np.shape[0] > 0:
+                        try:
+                            mesh_ok = reconstruct_mesh_from_points(
+                                points=flagged_pts_np,
+                                mesh_ply_path=Path(mesh_ply_path),
+                            )
+                            used_fused = mesh_ok
+                        except Exception as exc:
+                            CONSOLE.log(
+                                f"[phase-0] flagged-Gaussian mesh reconstruction failed for object {obj_idx}: {exc}"
+                            )
 
-                if not mesh_ok:
-                    try:
-                        mesh_ok = reconstruct_mesh_from_gaussian_ply(
-                            gaussian_ply_path=Path(ply_path),
-                            mesh_ply_path=Path(mesh_ply_path),
-                        )
-                    except Exception as exc:
+                    if not mesh_ok:
+                        try:
+                            mesh_ok = reconstruct_mesh_from_gaussian_ply(
+                                gaussian_ply_path=Path(ply_path),
+                                mesh_ply_path=Path(mesh_ply_path),
+                            )
+                        except Exception as exc:
+                            CONSOLE.log(
+                                f"[phase-0] SAM3D-only mesh fallback failed for object {obj_idx}: {exc}"
+                            )
+                            mesh_ok = False
+
+                    if mesh_ok and Path(mesh_ply_path).exists():
+                        mesh_path_for_manifest = str(mesh_ply_path)
                         CONSOLE.log(
-                            f"[phase-0] SAM3D-only mesh fallback failed for object {obj_idx}: {exc}"
+                            f"[phase-0] object {obj_idx}: "
+                            f"{'flagged-Gaussian Poisson' if used_fused else 'SAM3D-only fallback'} mesh "
+                            f"({flagged_pts_np.shape[0]} flagged pts) -> {mesh_ply_path}"
                         )
-                        mesh_ok = False
+                    else:
+                        CONSOLE.log(
+                            f"[phase-0] object {obj_idx}: mesh reconstruction produced no triangles"
+                        )
 
                 self._timing[f"S0.3_mesh_recon_obj_{obj_idx}"].append(time.time() - t_mesh)
-                if mesh_ok and Path(mesh_ply_path).exists():
-                    mesh_path_for_manifest = str(mesh_ply_path)
-                    CONSOLE.log(
-                        f"[phase-0] object {obj_idx}: "
-                        f"{'fused' if used_fused else 'SAM3D-only fallback'} mesh -> {mesh_ply_path}"
-                    )
-                else:
-                    CONSOLE.log(
-                        f"[phase-0] object {obj_idx}: mesh reconstruction produced no triangles"
-                    )
 
-            # mesh_to_world: identity when the fused mesh was built (mesh
-            # already in world frame); canonical→world 4×4 from CPD when we
-            # fell back to the SAM3D-only mesh in canonical SAM3D frame.
+            # mesh_to_world: identity when flagged-Gaussian Poisson was
+            # built (mesh already in world frame); canonical→world 4×4 from
+            # CPD when we fell back to the SAM3D-only mesh in canonical
+            # SAM3D frame OR when ``use_raw_sam3d_mesh`` is True.
             if used_fused:
                 mesh_to_world = np.eye(4, dtype=np.float64)
             else:
@@ -842,12 +982,24 @@ class DynamicGSPipeline(VanillaPipeline):
 
         z = depth_np[ys, xs]
 
-        # Filter depth outliers from mask-boundary bleed: keep only pixels whose depth is
-        # within ±3×MAD of the median depth inside the mask.  MAD is robust to outliers.
+        # MAD-based depth outlier scrub on the back-projected target cloud.
+        # Mask-boundary pixels frequently hit the background/table behind
+        # the object (silhouette-edge depth bleed); without this scrub the
+        # contaminated target points pull CPD's similarity fit toward a
+        # smaller scale and a shifted centroid, inserting the SAM3D cloud
+        # "super small inside the true object". CPD's outlier robustness
+        # alone is insufficient because the bleed is structured along the
+        # silhouette, not random.
+        #
+        # Threshold is intentionally permissive (``5.0 × 1.4826 ≈ 7.4 MAD``
+        # vs. the original ``4.45 MAD``) so that objects with large legit
+        # depth extent (e.g. tall/thick objects) are not truncated at the
+        # back/bottom — only true silhouette-edge bleed (typically half a
+        # meter or more behind the object) is removed.
         if z.size >= 10:
             med = float(np.median(z))
             mad = float(np.median(np.abs(z - med))) + 1e-6
-            keep = np.abs(z - med) < 3.0 * 1.4826 * mad
+            keep = np.abs(z - med) < 5.0 * 1.4826 * mad
             if keep.sum() >= 3:
                 ys = ys[keep]
                 xs = xs[keep]
@@ -1095,6 +1247,13 @@ class DynamicGSPipeline(VanillaPipeline):
             return
 
         frame_name = self.datamanager.get_current_dynamic_frame_name()
+        try:
+            self._fp_tracker.save_pose_visualization(
+                rgb=rgb_np, K=K,
+                output_path=self._get_fp_pose_debug_dir() / f"{frame_name}.png",
+            )
+        except Exception as exc:
+            CONSOLE.log(f"[dynamic-gs] FP pose-vis save failed on {frame_name}: {exc}")
         self._write_fp_motion_log(frame_name, R, t)
         moved_count = self.model.apply_rigid_object_transform_from_reference(R, t)
         if moved_count == 0:
@@ -1227,6 +1386,15 @@ class DynamicGSPipeline(VanillaPipeline):
             self._fp_tracker = None
             return
 
+        frame_name = self.datamanager.get_current_dynamic_frame_name()
+        try:
+            self._fp_tracker.save_pose_visualization(
+                rgb=rgb_np, K=K,
+                output_path=self._get_fp_pose_debug_dir() / f"{frame_name}.png",
+            )
+        except Exception as exc:
+            CONSOLE.log(f"[dynamic-gs] FP pose-vis save failed on {frame_name}: {exc}")
+
         CONSOLE.log(
             f"[dynamic-gs] FP initialized from known scene pose for instance {instance_id} "
             f"(D0 ||t||={float(np.linalg.norm(t)):.4f}m)"
@@ -1327,6 +1495,16 @@ class DynamicGSPipeline(VanillaPipeline):
     def _get_debug_dir(self) -> Path:
         return Path(self.datamanager.config.data) / self.datamanager.config.dynamic_subdir / "debug"
 
+    def _get_fp_pose_debug_dir(self) -> Path:
+        """Directory for per-frame FoundationPose pose-overlay PNGs.
+
+        Lives under the dynamic dataset (not the standard ``debug/`` dir)
+        so that each image passed to FP is paired with a visual record of
+        the bbox + xyz-axes pose actually consumed that frame — useful
+        when FP drifts or fails midway through the dataset.
+        """
+        return Path(self.datamanager.config.data) / self.datamanager.config.dynamic_subdir / "foundation_pose_debug"
+
     @torch.no_grad()
     def _render_from_camera(self, camera):
         """Render from camera in training mode (to get training-resolution output)."""
@@ -1381,13 +1559,28 @@ class DynamicGSPipeline(VanillaPipeline):
         return self.config.static_num_steps + self.total_dynamic_steps
 
     def _phase_for_step(self, step: int) -> Literal["static", "dynamic"]:
-        if self.total_dynamic_frames == 0 or step < self.config.static_num_steps:
+        if self.total_dynamic_frames == 0 or not self._accepted_dynamic_frames:
+            return "static"
+        # Early-convergence transition: once the MSSIM-based check sees the
+        # scene match GT, we don't wait for ``static_num_steps``.
+        if self._static_converged_step is not None and step >= self._static_converged_step:
+            return "dynamic"
+        if step < self.config.static_num_steps:
             return "static"
         return "dynamic"
 
     def _dynamic_frame_for_step(self, step: int) -> int:
+        """Map a global step to the dataset frame index to optimize.
+
+        Indirects through ``_accepted_dynamic_frames`` so rejected
+        keyframes consume zero steps. The trainer's step counter sees
+        ``static_num_steps + K_accepted · dynamic_steps_per_frame``
+        steps total (set by ``_total_train_steps``).
+        """
         dynamic_step = max(step - self.config.static_num_steps, 0)
-        return min(dynamic_step // self.config.dynamic_steps_per_frame, self.total_dynamic_frames - 1)
+        accepted_idx = dynamic_step // self.config.dynamic_steps_per_frame
+        accepted_idx = min(accepted_idx, len(self._accepted_dynamic_frames) - 1)
+        return self._accepted_dynamic_frames[accepted_idx]
 
     # ---- Core: per-frame processing ----
 
@@ -1441,12 +1634,12 @@ class DynamicGSPipeline(VanillaPipeline):
         # --- TIMING: D0.1f Post-D0.1 debug image saves (~10 PNGs from prepare_dynamic_update; gated by save_debug_images) ---
         t0 = time.time()
         render_mask_plain_path = debug_dir / f"{frame_name}_render_object_mask_binary.png"
+        debug_dir.mkdir(parents=True, exist_ok=True)
         if self.config.save_debug_images:
             self._save_image(live_rgb, debug_dir / f"{frame_name}_live_input.png")
             self._save_depth_image(gt_depth, debug_dir / f"{frame_name}_live_depth.png")
             self._save_image(stats["rendered_rgb"], debug_dir / f"{frame_name}_render.png")
             self._save_depth_image(stats["rendered_depth"], debug_dir / f"{frame_name}_render_depth.png")
-            self._save_image_with_points(stats["change_mask"], None, debug_dir / f"{frame_name}_change_mask.png")
             self._save_image(stats["render_object_mask"], render_mask_plain_path)
             self._save_image_with_points(
                 stats["render_object_mask"],
@@ -1459,7 +1652,6 @@ class DynamicGSPipeline(VanillaPipeline):
                 stats.get("live_prompt_points"),
                 debug_dir / f"{frame_name}_live_object_mask.png",
             )
-            self._save_image_with_points(stats["optim_mask"], None, debug_dir / f"{frame_name}_optim_mask.png")
             self._save_image_with_points(
                 stats["render_propagation_mask"],
                 stats.get("render_prompt_points"),
@@ -1474,58 +1666,157 @@ class DynamicGSPipeline(VanillaPipeline):
                 self._save_image_with_points(gripper_mask.float(), None, debug_dir / f"{frame_name}_gripper_mask.png")
         self._timing["D0.1f_post_save"].append(time.time() - t0)
 
+        # --- TIMING: D0.8 Change mask CD0 (MSSIM comparison non-inserted scene render vs D0, excluding gripper) ---
+        # Build CD0 from ``non_inserted_rgb`` (scene rendered with all
+        # ``inserted_flags == 1`` Gaussians removed) vs the live D0 image
+        # with the gripper mask applied and no object-mask exclusion. Any
+        # pixel whose live colour differs from this "object-free" render
+        # is genuinely something the static scene didn't model — the
+        # moved object's NEW position AND any prefused-but-stationary
+        # objects' current positions. Computed once here and reused for
+        # both Path A's moved-object validation and the final
+        # ``_set_optim_mask`` / ``update_scene_opt_active_mask`` writes.
+        t0 = time.time()
+        cd0 = self._compute_change_mask(
+            stats["non_inserted_rgb"], stats["rendered_depth"],
+            gt_rgb, gt_depth,
+            gripper_mask,
+            object_mask=None,
+        )
+        self._timing["D0.8_change_mask_cd0"].append(time.time() - t0)
+
         # --- D0.2-D0.3: Path A (prefused) vs Path B (old SAM3D insertion) ---
         if has_prefused:
-            # Path A: select the moved object from pre-fused candidates
+            # Path A — robust moved-object pick, two stages:
+            #   1. PRIMARY: closest prefused object centroid in 2D to the
+            #      anchor point ``(W/2, 0.75 · H)`` (image is upper-left
+            #      origin, so ``0.75 H`` is 1/4 of the way up from the
+            #      bottom). The gripper-held object is consistently in the
+            #      lower-centre of the image in this teleop setup, so
+            #      anchoring there gives a 100 % robust pick that doesn't
+            #      depend on change-detection signal quality.
+            #   2. VALIDATE: confirm the picked candidate's projected
+            #      centers lie inside CD0 (built earlier from
+            #      ``non_inserted_rgb`` vs the live D0 image). Logs a
+            #      warning if not — picks the anchor-closest candidate
+            #      either way.
             t0 = time.time()
-            esam_mask = stats["optim_mask"]  # combined ESAM/change mask
-            if esam_mask.ndim == 3:
-                esam_mask_2d = esam_mask[..., 0]
-            else:
-                esam_mask_2d = esam_mask
-
-            # Project Gaussians with object_instance_ids > 0 to 2D
-            centers_2d, radii = extract_projected_centers_and_radii(self.model.info, self.model.num_points)
-            instance_ids = self.model.object_instance_ids.squeeze(-1)  # (N,)
+            centers_2d, radii = extract_projected_centers_and_radii(
+                self.model.info, self.model.num_points
+            )
+            instance_ids = self.model.object_instance_ids.squeeze(-1)
             prefused_mask = instance_ids > 0
-
-            # Find unique instance IDs and compute overlap
             unique_ids = torch.unique(instance_ids[prefused_mask])
-            best_overlap = -1
+
+            if cd0.ndim == 3:
+                cdn_2d = cd0[..., 0]
+            else:
+                cdn_2d = cd0
+            h, w = cdn_2d.shape[:2]
+
+            # --- Anchor-distance pick.
+            anchor_x = w * 0.5
+            anchor_y = h * 0.75   # 1/4 from the bottom in upper-left origin
             best_id = 0
-            h, w = esam_mask_2d.shape[:2]
+            best_distance = float("inf")
+            best_centroid = (0.0, 0.0)
+            best_overlap = 0
+            best_total = 0
+            best_ratio = 0.0
+            score_log = []
             for uid in unique_ids:
                 uid_val = uid.item()
                 uid_mask = (instance_ids == uid_val) & torch.isfinite(radii) & (radii > 0)
                 uid_centers = centers_2d[uid_mask]
-                # Count how many projected centers fall inside the ESAM mask
-                cx = torch.round(uid_centers[:, 0]).long()
-                cy = torch.round(uid_centers[:, 1]).long()
-                in_bounds = (cx >= 0) & (cx < w) & (cy >= 0) & (cy < h)
-                if not in_bounds.any():
+                if uid_centers.shape[0] == 0:
                     continue
-                in_mask = esam_mask_2d[cy[in_bounds], cx[in_bounds]] > 0.5
+                cx = uid_centers[:, 0]
+                cy = uid_centers[:, 1]
+                in_bounds_f = (cx >= 0) & (cx < w) & (cy >= 0) & (cy < h)
+                total_in_bounds = int(in_bounds_f.sum().item())
+                if total_in_bounds == 0:
+                    continue
+                centroid_x = float(cx[in_bounds_f].mean().item())
+                centroid_y = float(cy[in_bounds_f].mean().item())
+                dist = float(((centroid_x - anchor_x) ** 2 + (centroid_y - anchor_y) ** 2) ** 0.5)
+                # Validation overlap (purely informational at this stage).
+                cx_long = torch.round(cx[in_bounds_f]).long().clamp(0, w - 1)
+                cy_long = torch.round(cy[in_bounds_f]).long().clamp(0, h - 1)
+                in_mask = cdn_2d[cy_long, cx_long] > 0.5
                 overlap = int(in_mask.sum().item())
-                if overlap > best_overlap:
-                    best_overlap = overlap
+                ratio = overlap / float(total_in_bounds)
+                score_log.append(
+                    f"id={uid_val} centroid=({centroid_x:.1f},{centroid_y:.1f}) "
+                    f"dist={dist:.1f}px overlap={overlap}/{total_in_bounds} ratio={ratio:.3f}"
+                )
+                if dist < best_distance:
+                    best_distance = dist
                     best_id = uid_val
+                    best_centroid = (centroid_x, centroid_y)
+                    best_overlap = overlap
+                    best_total = total_in_bounds
+                    best_ratio = ratio
 
+            # Diagnostic overlay PNG: change mask + each candidate's
+            # projected centers + anchor point + winner outline.
+            try:
+                import matplotlib.pyplot as _plt
+                from matplotlib import cm as _cm
+                fig, ax = _plt.subplots(figsize=(8, 8))
+                ax.imshow(cdn_2d.detach().cpu().numpy(), cmap="gray", vmin=0, vmax=1)
+                cmap_obj = _cm.get_cmap("tab10")
+                for k, uid in enumerate(unique_ids):
+                    uid_val = uid.item()
+                    uid_mask = (instance_ids == uid_val) & torch.isfinite(radii) & (radii > 0)
+                    uid_centers = centers_2d[uid_mask].detach().cpu().numpy()
+                    if uid_centers.size == 0:
+                        continue
+                    col = cmap_obj(k % 10)
+                    is_winner = uid_val == best_id
+                    ax.scatter(
+                        uid_centers[:, 0], uid_centers[:, 1],
+                        s=4 if is_winner else 2,
+                        c=[col],
+                        alpha=0.9 if is_winner else 0.4,
+                        edgecolors="red" if is_winner else "none",
+                        linewidths=0.6 if is_winner else 0,
+                        label=f"id={uid_val}{' (picked)' if is_winner else ''}",
+                    )
+                ax.scatter([anchor_x], [anchor_y], s=80, marker="x", c="cyan", linewidths=2,
+                           label=f"anchor (W/2, 3H/4)")
+                ax.legend(loc="upper right", fontsize=8)
+                ax.set_title(f"D0 Path A selection — picked id={best_id} (dist={best_distance:.1f}px)")
+                ax.axis("off")
+                fig.savefig(
+                    debug_dir / f"{frame_name}_d0_selection_overlay.png",
+                    bbox_inches="tight", dpi=120,
+                )
+                _plt.close(fig)
+            except Exception as exc:
+                CONSOLE.log(f"[dynamic-gs] Path A: overlay plot skipped ({exc})")
+
+            VALIDATION_MIN_RATIO = 0.10
             if best_id > 0:
                 self.model.object_flags.copy_(
                     (self.model.object_instance_ids == best_id).float()
                 )
                 self.model._persistent_object_membership_ready = True
                 self._d0_selected_instance_id = int(best_id)
+                if best_ratio < VALIDATION_MIN_RATIO:
+                    CONSOLE.log(
+                        f"[dynamic-gs] Path A WARNING: anchor-closest pick id={best_id} "
+                        f"has only {best_ratio*100:.1f}% of its centers inside the change "
+                        f"mask (< {VALIDATION_MIN_RATIO*100:.0f}%); pick may be wrong"
+                    )
                 CONSOLE.log(
                     f"[dynamic-gs] Path A: selected pre-fused object instance_id={best_id} "
-                    f"(overlap={best_overlap} Gaussians, "
-                    f"total={int((instance_ids == best_id).sum().item())})"
+                    f"(centroid=({best_centroid[0]:.1f},{best_centroid[1]:.1f}), "
+                    f"dist={best_distance:.1f}px from anchor ({anchor_x:.1f},{anchor_y:.1f}); "
+                    f"validation overlap={best_overlap}/{best_total}={best_ratio*100:.1f}%; "
+                    f"all candidates: {'; '.join(score_log)})"
                 )
             else:
-                CONSOLE.log("[dynamic-gs] Path A: no pre-fused object overlaps ESAM mask; falling back to ESAM flags")
-                # Fall through — object_flags were not set by prepare_dynamic_update
-                # because skip_object_flags_write=True, but the ESAM active mask is still
-                # in current_active_mask. Copy it to object_flags as a last resort.
+                CONSOLE.log("[dynamic-gs] Path A: no pre-fused candidates; falling back to ESAM flags")
                 self.model.object_flags.copy_(self.model.current_active_mask.float()[:, None])
                 self._d0_selected_instance_id = 0
 
@@ -1602,28 +1893,20 @@ class DynamicGSPipeline(VanillaPipeline):
             CONSOLE.log("[dynamic-gs] FP init skipped: no pre-fused instance selected at D0")
         self._timing["D0.6_fp_init"].append(time.time() - t0)
 
-        # The change-mask exclusion is now driven by the rendered object mask
-        # alone (FoundationPose tracks the object pose, so the projection of
-        # the object Gaussians is the authoritative "where the object is" mask
-        # — no SAM2 propagation needed).
-        combined_obj_mask = rendered_obj_mask
         if self.config.save_debug_images:
             self._save_image_with_points(rendered_obj_mask, None, debug_dir / f"{frame_name}_rendered_object_mask.png")
 
-        # --- TIMING: D0.7 Render RS00 (re-render scene after SAM3D object insertion) ---
+        # --- TIMING: D0.7 Render RS00 (re-render scene after SAM3D object insertion; debug overlay only) ---
         t0 = time.time()
-        rs00_outputs = self._render_from_camera(camera)
+        if self.config.save_debug_images:
+            rs00_outputs = self._render_from_camera(camera)
+            rs00_rgb = rs00_outputs["rgb"]
+        else:
+            rs00_outputs = None
+            rs00_rgb = None
         self._timing["D0.7_render_rs00"].append(time.time() - t0)
-        rs00_rgb = rs00_outputs["rgb"]
 
-        # --- TIMING: D0.8 Change mask CD0 (MSSIM comparison RS00 vs D0, excluding gripper + object union mask) ---
-        t0 = time.time()
-        cd0 = self._compute_change_mask(
-            rs00_rgb, rs00_outputs["depth"], gt_rgb, gt_depth, gripper_mask, combined_obj_mask,
-        )
-        self._timing["D0.8_change_mask_cd0"].append(time.time() - t0)
-
-        # --- TIMING: D0.9 Debug images (save ~9 overlay PNGs to disk) ---
+        # --- TIMING: D0.9 Debug images (save overlay PNGs to disk) ---
         t0 = time.time()
         if self.config.save_debug_images:
             dbg = debug_dir
@@ -1739,7 +2022,132 @@ class DynamicGSPipeline(VanillaPipeline):
 
     # ---- Phase sync and training loop ----
 
+    def _maybe_check_static_convergence(self, step: int) -> None:
+        """Cadence gate around ``_compute_static_change_metric``.
+
+        First runs at ``static_convergence_first_check_step`` (aligned
+        with full-resolution training kicking in), then every
+        ``static_convergence_check_every`` steps. Once the
+        per-image change-pixel **ratio** drops below
+        ``static_convergence_max_change_ratio`` (default 2 %), we set
+        ``self._static_converged_step`` so the next ``_phase_for_step``
+        call returns ``"dynamic"`` and the trainer flips phases this step.
+        """
+        if not self.config.enable_static_convergence_check:
+            return
+        if self._static_converged_step is not None:
+            return
+        if step < self.config.static_convergence_first_check_step:
+            return
+        offset = step - self.config.static_convergence_first_check_step
+        if offset % self.config.static_convergence_check_every != 0:
+            return
+
+        t0 = time.time()
+        avg_ratio, avg_px = self._compute_static_change_metric()
+        elapsed = time.time() - t0
+        self._timing["S.convergence_check"].append(elapsed)
+        threshold_ratio = float(self.config.static_convergence_max_change_ratio)
+        CONSOLE.log(
+            f"[dynamic-gs] static convergence check @ step {step}: "
+            f"avg change ratio = {avg_ratio*100:.2f}% ({avg_px:.0f} px/image; "
+            f"threshold {threshold_ratio*100:.2f}%, "
+            f"MSSIM_thresh={self.config.static_convergence_rgb_threshold}), "
+            f"check took {elapsed:.2f}s"
+        )
+        if avg_ratio < threshold_ratio:
+            self._static_converged_step = step
+            CONSOLE.log(
+                f"[dynamic-gs] static phase converged at step {step} "
+                f"(early exit; configured static_num_steps was {self.config.static_num_steps})"
+            )
+
+    def _compute_static_change_metric(self) -> tuple[float, float]:
+        """Returns ``(avg_change_ratio, avg_change_px)`` over all static keyframes.
+
+        Renders each keyframe at full resolution (eval mode) and runs
+        the MSSIM ``build_change_mask`` recipe with a higher MSSIM
+        threshold (``static_convergence_rgb_threshold``) than the
+        dynamic phase, so only substantially-different pixels count.
+
+        The dataset's per-image mask (gripper / out-of-frame /
+        background) is passed as ``valid_mask`` to the change-mask
+        builder so masked-out pixels are excluded from the count, and
+        the ratio is computed over the **valid pixel count**, not the
+        full HxW — otherwise the metric is diluted by area the model
+        was never trained to render.
+        """
+        ds = self.datamanager.static_manager.train_dataset
+        cached = self.datamanager.static_manager.cached_train
+        n = len(ds)
+        if n == 0:
+            return 0.0, 0.0
+
+        device = self.model.device
+        bg = self.model._get_background_color()
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                total_px = 0
+                total_ratio = 0.0
+                for i in range(n):
+                    camera = ds.cameras[i : i + 1].to(device)
+                    if camera.metadata is None:
+                        camera.metadata = {}
+                    camera.metadata["cam_idx"] = i
+                    outputs = self.model.get_outputs(camera)
+                    pred_rgb = outputs["rgb"]
+                    batch = {k: v for k, v in cached[i].items()}
+                    if "image" in batch:
+                        batch["image"] = batch["image"].to(device)
+                    if "mask" in batch and batch["mask"] is not None:
+                        batch["mask"] = batch["mask"].to(device)
+                    gt_rgb = self.model.composite_with_background(
+                        self.model.get_gt_img(batch["image"]), bg
+                    )
+                    valid_mask = self.model._get_batch_mask(batch)
+                    cdn = build_change_mask(
+                        pred_depth=None,
+                        gt_depth=None,
+                        pred_rgb=pred_rgb,
+                        gt_rgb=gt_rgb,
+                        valid_mask=valid_mask,
+                        rgb_threshold=self.config.static_convergence_rgb_threshold,
+                        blur_kernel_size=self.model.config.change_mask_blur_kernel_size,
+                        blur_sigma=self.model.config.change_mask_blur_sigma,
+                    )
+                    if cdn.ndim >= 3:
+                        cdn_2d = cdn[..., 0]
+                    else:
+                        cdn_2d = cdn
+                    px_i = int((cdn_2d > 0.5).sum().item())
+                    if valid_mask is not None:
+                        vm_2d = valid_mask[..., 0] if valid_mask.ndim >= 3 else valid_mask
+                        valid_count = int((vm_2d > 0.5).sum().item())
+                    else:
+                        h, w = cdn_2d.shape[:2]
+                        valid_count = h * w
+                    total_px = total_px + px_i
+                    total_ratio += px_i / float(max(valid_count, 1))
+        finally:
+            if was_training:
+                self.model.train()
+
+        return total_ratio / float(n), total_px / float(n)
+
     def _sync_phase(self, step: int) -> None:
+        """Phase-transition only.
+
+        Frame stepping in the dynamic phase used to live here; with the
+        decoupled tracking/optimization design it now lives in
+        ``_tracker_tick`` (driven from ``_dynamic_get_train_loss_dict``).
+        """
+        # Run the convergence check BEFORE computing the phase, so a
+        # convergence trigger flips the phase in this same step.
+        if self.current_phase == "static":
+            self._maybe_check_static_convergence(step)
+
         phase = self._phase_for_step(step)
         phase_changed = phase != self.current_phase
 
@@ -1760,11 +2168,225 @@ class DynamicGSPipeline(VanillaPipeline):
             self.current_dynamic_frame_idx = None
             return
 
-        frame_idx = self._dynamic_frame_for_step(step)
-        if frame_idx != self.current_dynamic_frame_idx:
-            self.current_dynamic_frame_idx = frame_idx
-            self.datamanager.set_dynamic_frame_idx(frame_idx)
-            self._prepare_dynamic_frame()
+    # ---- Decoupled tracking + optimization ----
+
+    def _tracker_tick(self, frame_idx: int) -> None:
+        """One simulated camera frame: FP track always; pool push only if
+        the frame is in the keyframe-accepted set AND its CDN clears the
+        min-pixel gate.
+
+        FP runs on every frame (even rejected ones) so the object pose
+        stays continuous — rejected frames are near-duplicates with tiny
+        pose deltas, so the per-tick FP cost is dominated by the small
+        refinement.
+        """
+        self.datamanager.set_dynamic_frame_idx(frame_idx)
+        self.current_dynamic_frame_idx = frame_idx
+        camera, batch = self.datamanager.get_current_dynamic_train_batch()
+        frame_name = self.datamanager.get_dynamic_frame_name(frame_idx)
+
+        bg = self.model._get_background_color()
+        gt_rgb = self.model.composite_with_background(self.model.get_gt_img(batch["image"]), bg)
+        gt_depth = self.model._get_gt_depth(batch)
+        gripper_mask = self.model._get_batch_mask(batch)
+
+        is_first = self._global_frame_counter == 0
+        is_accepted = frame_idx in self._accepted_dynamic_frames_set
+
+        if is_first:
+            # D0 bootstrap (SAM3D fusion / FP setup / CD0). Reuses the
+            # existing `_prepare_frame_0` end-to-end and pushes the
+            # resulting CD0 + camera onto the pool.
+            live_rgb = self.model.get_live_rgb(batch, background=bg, apply_training_downscale=True)
+            init_debug_dir = self.datamanager.get_initialization_debug_dir()
+            init_artifact_dir = self.datamanager.get_initialization_artifact_dir()
+            self._prepare_frame_0(
+                camera, batch, live_rgb, gt_rgb, gt_depth, gripper_mask,
+                frame_name, init_debug_dir, init_artifact_dir,
+            )
+            cdn = self.model.change_mask_image.detach().clone()
+            self._optim_pool.push(OptimFrame(
+                frame_idx=frame_idx, camera=camera, cdn=cdn,
+            ))
+            self._global_frame_counter += 1
+            return
+
+        # FP track on every frame (object-pose continuity).
+        # Capture the object centroid before / after FP so we can verify
+        # in the log that the means actually shift on rejected frames.
+        t0 = time.time()
+        obj_mask_pre = self.model.object_flags.squeeze(-1) > 0.5
+        centroid_before = (
+            self.model.means[obj_mask_pre].detach().mean(dim=0)
+            if obj_mask_pre.any()
+            else None
+        )
+        if self._sam3d_inserted and self._fp_tracker is not None:
+            self._apply_fp_motion(camera, batch)
+        self._timing["DN.3_fp_track"].append(time.time() - t0)
+        centroid_after = (
+            self.model.means[obj_mask_pre].detach().mean(dim=0)
+            if obj_mask_pre.any()
+            else None
+        )
+        if centroid_before is not None and centroid_after is not None:
+            drift = float(torch.linalg.norm(centroid_after - centroid_before).item())
+            CONSOLE.log(
+                f"[fp-tick] dyn_step={self._dynamic_step_counter} "
+                f"frame={frame_idx} ({frame_name}) "
+                f"centroid_drift={drift*1000:.2f}mm "
+                f"accepted={is_accepted}"
+            )
+
+        if not is_accepted:
+            # Rejected by the keyframe filter — no CDN compute, no pool push.
+            # FP already fired above so the object pose is current; the
+            # viewer will render the new pose on its next pull.
+            CONSOLE.log(
+                f"[dynamic-gs] frame {frame_idx} ({frame_name}): "
+                f"FP-tracked, keyframe-filter rejected"
+            )
+            self._global_frame_counter += 1
+            return
+
+        # Render RDN (full scene), object mask, then CDN.
+        t0 = time.time()
+        rdn_outputs = self._render_from_camera(camera)
+        self._timing["DN.5_render_rdn"].append(time.time() - t0)
+        rdn_rgb = rdn_outputs["rgb"]
+        rdn_depth = rdn_outputs["depth"]
+
+        t0 = time.time()
+        rendered_obj_mask = self.model.render_object_mask(camera)
+        self._timing["DN.6_render_object_mask"].append(time.time() - t0)
+
+        t0 = time.time()
+        cdn = self._compute_change_mask(
+            rdn_rgb, rdn_depth, gt_rgb, gt_depth, gripper_mask, rendered_obj_mask,
+        )
+        self._timing["DN.7_change_mask_cdn"].append(time.time() - t0)
+
+        cdn_px = int((cdn[..., 0] > 0.5).sum().item()) if cdn.ndim >= 3 else int((cdn > 0.5).sum().item())
+        if cdn_px < self.config.optim_pool_min_change_pixels:
+            CONSOLE.log(
+                f"[dynamic-gs] frame {frame_idx} ({frame_name}): "
+                f"change px={cdn_px} < {self.config.optim_pool_min_change_pixels}, skipped"
+            )
+            self._global_frame_counter += 1
+            return
+
+        if self.config.save_debug_images:
+            dbg = self._get_debug_dir()
+            self._save_overlay(gt_rgb, cdn, dbg / f"{frame_name}_live_w_cdn.png")
+            self._save_overlay(rdn_rgb, cdn, dbg / f"{frame_name}_render_w_cdn.png")
+            self._save_image(cdn, dbg / f"{frame_name}_cdn.png")
+
+        self._optim_pool.push(OptimFrame(
+            frame_idx=frame_idx, camera=camera, cdn=cdn.detach().clone(),
+        ))
+        CONSOLE.log(
+            f"[dynamic-gs] frame {frame_idx} ({frame_name}): change px={cdn_px}, "
+            f"pool_size={len(self._optim_pool)}"
+        )
+        self._global_frame_counter += 1
+
+    def _zero_loss_dummy(self):
+        """Trivial loss tuple used when the pool is empty.
+
+        Returned shape matches ``VanillaPipeline.get_train_loss_dict``:
+        ``(model_outputs, loss_dict, metrics_dict)``. The loss is a
+        scalar tensor with ``requires_grad=True`` so the trainer's
+        ``loss.backward()`` is a no-op rather than an error.
+        """
+        device = self.model.device
+        zero = torch.zeros((), device=device, requires_grad=True)
+        return {}, {"main_loss": zero}, {}
+
+    def _dynamic_get_train_loss_dict(self, step: int):
+        """One trainer step in the dynamic phase.
+
+        1. Step-based tracker tick: every ``tracker_tick_every_steps``
+           we advance ``_next_frame_to_track`` and run ``_tracker_tick``
+           on it. The first dynamic step always ticks (to catch the D0
+           bootstrap).
+        2. Pool round-robin pick: pick the next pool entry, build the
+           per-step effective mask
+           ``cdn_at_capture · (1 − render_object_mask(camera_now))``,
+           install it, point the datamanager at the entry's frame, and
+           delegate to ``super().get_train_loss_dict`` for the loss.
+        3. Update pool entry bookkeeping (epoch counter, initial/last
+           loss). Evict if epoch budget exhausted OR loss dropped to
+           ``optim_pool_loss_relative_threshold`` of initial.
+        """
+        # 1. Tracker tick
+        cadence = max(1, int(self.config.tracker_tick_every_steps))
+        if (
+            self._dynamic_step_counter % cadence == 0
+            and self._next_frame_to_track < self.total_dynamic_frames
+        ):
+            self._tracker_tick(self._next_frame_to_track)
+            self._next_frame_to_track += 1
+        self._dynamic_step_counter += 1
+
+        # 2. Pool round-robin
+        if len(self._optim_pool) == 0:
+            return self._zero_loss_dummy()
+        frame = self._optim_pool.pick_round_robin()
+
+        # Per-step effective mask: capture-time CDN minus current object footprint.
+        obj_mask_now = self.model.render_object_mask(frame.camera)
+        if obj_mask_now.shape != frame.cdn.shape:
+            h, w = frame.cdn.shape[:2]
+            obj_mask_now = TF.interpolate(
+                obj_mask_now.permute(2, 0, 1).unsqueeze(0),
+                size=(h, w),
+                mode="nearest",
+            ).squeeze(0).permute(1, 2, 0)
+        effective = (frame.cdn * (1.0 - obj_mask_now)).detach()
+        self.model._set_optim_mask(effective)
+
+        # Pin datamanager so super().get_train_loss_dict pulls this frame.
+        self.datamanager.set_dynamic_frame_idx(frame.frame_idx)
+        self.current_dynamic_frame_idx = frame.frame_idx
+
+        # Render full scene + compute loss.
+        result = super().get_train_loss_dict(step)
+
+        # Refresh per-Gaussian gate using the just-set self.info from the
+        # full-scene render. Backward (called by the trainer after this
+        # function returns) reads scene_opt_active_mask via the registered
+        # gradient hooks.
+        self.model.update_scene_opt_active_mask(effective)
+
+        # 3. Pool bookkeeping + eviction
+        try:
+            loss_value = float(sum(v.detach() for v in result[1].values()).item())
+        except Exception:
+            loss_value = 0.0
+        if frame.initial_loss is None:
+            frame.initial_loss = loss_value
+        frame.last_loss = loss_value
+        frame.epochs_used += 1
+
+        evict = False
+        if frame.epochs_used >= self.config.optim_pool_max_epochs:
+            evict = True
+        elif (
+            frame.initial_loss is not None
+            and frame.initial_loss > 0
+            and frame.last_loss < frame.initial_loss * self.config.optim_pool_loss_relative_threshold
+        ):
+            evict = True
+        if evict:
+            self._optim_pool.evict(frame)
+            CONSOLE.log(
+                f"[dynamic-gs] evicted frame {frame.frame_idx} "
+                f"(epochs={frame.epochs_used}, "
+                f"loss={frame.last_loss:.4f}/{frame.initial_loss:.4f}, "
+                f"pool_size={len(self._optim_pool)})"
+            )
+
+        return result
 
     def get_training_callbacks(self, training_callback_attributes: TrainingCallbackAttributes):
         callbacks = super().get_training_callbacks(training_callback_attributes)
@@ -1777,7 +2399,10 @@ class DynamicGSPipeline(VanillaPipeline):
     def get_train_loss_dict(self, step: int):
         t0 = time.time()
         self._sync_phase(step)
-        result = super().get_train_loss_dict(step)
+        if self.current_phase == "dynamic":
+            result = self._dynamic_get_train_loss_dict(step)
+        else:
+            result = super().get_train_loss_dict(step)
         elapsed = time.time() - t0
         phase_key = "static_step" if self.current_phase == "static" else "dynamic_step"
         self._timing[phase_key].append(elapsed)
@@ -1895,6 +2520,12 @@ class DynamicGSPipeline(VanillaPipeline):
             f"dynamic_steps_per_frame={self.config.dynamic_steps_per_frame}, "
             f"total_dynamic_frames={self.total_dynamic_frames}"
         )
+        lines.append(
+            f"Keyframe filter: static kept "
+            f"{self.datamanager.static_accepted_frames}/{self.datamanager.static_total_frames}, "
+            f"dynamic kept "
+            f"{len(self._accepted_dynamic_frames)}/{self.total_dynamic_frames}"
+        )
         lines.append("")
 
         # --- Phase 0: split into 0a (pre-static generation) + 0b (post-static fusion) ---
@@ -1943,12 +2574,28 @@ class DynamicGSPipeline(VanillaPipeline):
         # --- Phase 1: Static ---
         s = self._timing["static_step"]
         static_total = sum(s) if s else 0.0
+        conv = self._timing.get("S.convergence_check", [])
+        conv_total = sum(conv) if conv else 0.0
+        # ``static_step`` is wall-clock around the whole get_train_loss_dict
+        # call, so it already includes the convergence-check spikes that run
+        # inside _sync_phase. Subtract for an honest "pure step" average.
+        pure_total = max(static_total - conv_total, 0.0)
+        pure_count = max(len(s) - len(conv), 1)
         lines.append("--- PHASE 1: STATIC TRAINING ---")
-        lines.append(f"Phase total: {static_total:.1f}s")
+        lines.append(f"Phase total: {static_total:.1f}s  (training: {pure_total:.1f}s, convergence checks: {conv_total:.1f}s)")
         lines.append("")
         if s:
-            avg_ms = static_total / len(s) * 1000
-            lines.append(f"  S.1  Full training step (avg over {len(s)} steps)  {avg_ms:>10.1f}ms  {100.0:>6.1f}%")
+            pure_avg_ms = pure_total / pure_count * 1000
+            lines.append(
+                f"  S.1  Pure training step (avg over {pure_count} steps, excl. convergence checks)  "
+                f"{pure_avg_ms:>10.1f}ms"
+            )
+        if conv:
+            avg_s = conv_total / len(conv)
+            lines.append(
+                f"  S.2  Static convergence check (avg over {len(conv)} calls)  "
+                f"{avg_s*1000:>10.1f}ms total {conv_total:.2f}s"
+            )
         lines.append("")
 
         # --- Phase 2: Dynamic initialization (Frame 0) ---
@@ -1987,7 +2634,10 @@ class DynamicGSPipeline(VanillaPipeline):
         dyn_train_total = sum(d) if d else 0.0
         dyn_phase_total = frame_prep_total + dyn_train_total
 
-        lines.append(f"--- PHASE 3: DYNAMIC LOOP (Frames 1-{self.total_dynamic_frames - 1}) ---")
+        lines.append(
+            f"--- PHASE 3: DYNAMIC LOOP "
+            f"(kept {len(self._accepted_dynamic_frames)}/{self.total_dynamic_frames} keyframes) ---"
+        )
         lines.append(f"Phase total: {dyn_phase_total:.1f}s")
         lines.append(f"  Frame prep total: {frame_prep_total:.1f}s")
         lines.append(f"  Training total: {dyn_train_total:.1f}s")
