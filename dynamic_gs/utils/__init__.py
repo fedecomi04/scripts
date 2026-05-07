@@ -15,7 +15,7 @@ from .esam import (
     query_esam_mask,
     query_esam_mask_pair,
 )
-from .foundationpose_tracker import FoundationPoseTracker
+from .cotracker_motion import CoTrackerMotionEstimate, CoTrackerMotionEstimator
 from .keyframe_filter import DynamicKeyframeFilter
 from .no_refine_strategy import NoRefineStrategy
 from .optim_pool import OptimFrame, OptimPool
@@ -47,11 +47,12 @@ __all__ = [
     "build_esam_ti",
     "combine_object_masks",
     "dilate_binary_mask",
+    "CoTrackerMotionEstimate",
+    "CoTrackerMotionEstimator",
     "DynamicKeyframeFilter",
     "ESAM_NUM_PROMPT_POINTS",
     "ESAM_PROMPT_KEEP_RATIO",
     "extract_projected_centers_and_radii",
-    "FoundationPoseTracker",
     "keep_largest_component",
     "keep_largest_component_with_min_area",
     "load_sam3_masks",

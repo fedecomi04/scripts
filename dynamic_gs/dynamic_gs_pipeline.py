@@ -20,8 +20,8 @@ from nerfstudio.utils.rich_utils import CONSOLE
 from .dynamic_gs_datamanager import DynamicGSDataManagerConfig
 from .dynamic_gs_model import DynamicGSModelConfig
 from .utils import (
+    CoTrackerMotionEstimator,
     DynamicKeyframeFilter,
-    FoundationPoseTracker,
     OptimFrame,
     OptimPool,
     build_change_mask,
@@ -29,8 +29,6 @@ from .utils import (
     extract_projected_centers_and_radii,
     load_sam3d_gaussian_ply,
     load_sam3d_rotation_wxyz,
-    reconstruct_mesh_from_gaussian_ply,
-    reconstruct_mesh_from_points,
     register_and_fuse_sam3d_object,
     save_point_cloud,
 )
@@ -146,11 +144,11 @@ class DynamicGSPipeline(VanillaPipeline):
         self.total_dynamic_frames = 0
         self.total_dynamic_steps = 0
         self._sam3d_inserted = False
-        self._fp_tracker = None
-        # Per-instance FP trackers built during Phase 0b — paid once at the
-        # static→dynamic boundary so D0 just picks one and discards the rest.
-        # Keyed by Phase-0b instance_id (1..K).
-        self._fp_trackers_by_instance: dict[int, FoundationPoseTracker] = {}
+        # CoTracker3 + RANSAC-Kabsch rigid-motion estimator. Stateful: holds
+        # the D0 reference RGB + depth + 3D back-projected points; each
+        # incoming frame's RGB-D advances the tracks pairwise and returns
+        # an absolute (R, t) in world frame from the D0 anchor.
+        self._cotracker_motion = None
         self._global_frame_counter = 0
         self._timing = defaultdict(list)
         self._timing_report_written = False
@@ -287,8 +285,7 @@ class DynamicGSPipeline(VanillaPipeline):
 
     def _reset_dynamic_segmentation_state(self) -> None:
         self._sam3d_inserted = False
-        self._fp_tracker = None
-        self._fp_trackers_by_instance = {}
+        self._cotracker_motion = None
         self._global_frame_counter = 0
         self._optim_pool = OptimPool(capacity=self.config.optim_pool_capacity)
         self._next_frame_to_track = 0
@@ -614,13 +611,6 @@ class DynamicGSPipeline(VanillaPipeline):
                 CONSOLE.log(f"[phase-0] skipping object {obj_idx}: {exc}")
                 continue
 
-            # Mesh reconstruction is deferred to AFTER the cull+flag step so
-            # we can build it from the world-frame union of post-cull SAM3D +
-            # flagged init Gaussians. See the "Fused-mesh reconstruction"
-            # block below.
-            mesh_path_for_manifest: Optional[str] = None
-            mesh_ply_path = sam3d_out.get("mesh_ply_path")
-
             obj_mask_np = np.array(Image.open(sam3_obj["mask_path"]).convert("L"))
             obj_mask_tensor = torch.from_numpy((obj_mask_np > 127).astype(np.float32))
             obj_mask_tensor = obj_mask_tensor[..., None].to(self.device)
@@ -793,122 +783,15 @@ class DynamicGSPipeline(VanillaPipeline):
                 (self.model.object_instance_ids.squeeze(-1) == instance_id).sum().item()
             )
 
-            # Mesh build for FoundationPose. Two modes selected by
-            # ``model.config.use_raw_sam3d_mesh``:
-            #   * False (default): Poisson over the flagged object Gaussian
-            #     centers (``object_instance_ids == instance_id``) — the
-            #     actual rendered object as it exists in the splat. Mesh
-            #     in world frame, so ``mesh_to_world = I``. Falls back to
-            #     Poisson on the SAM3D-only canonical cloud if too sparse.
-            #   * True: skip Poisson entirely and use the SAM3D mesh
-            #     decoder output at ``mesh_ply_path`` as-is. The mesh is
-            #     in canonical SAM3D space, so
-            #     ``mesh_to_world = canonical_to_world_4x4``.
-            used_fused = False
-            if mesh_ply_path is not None:
-                t_mesh = time.time()
-
-                if self.model.config.use_raw_sam3d_mesh:
-                    # Trust the SAM3D mesh decoder output; do not overwrite.
-                    if Path(mesh_ply_path).exists():
-                        mesh_path_for_manifest = str(mesh_ply_path)
-                        CONSOLE.log(
-                            f"[phase-0] object {obj_idx}: raw SAM3D mesh-decoder output -> {mesh_ply_path}"
-                        )
-                    else:
-                        CONSOLE.log(
-                            f"[phase-0] object {obj_idx}: SAM3D mesh PLY missing — FP will be skipped"
-                        )
-                else:
-                    flagged_mask = self.model.object_instance_ids.squeeze(-1) == instance_id
-                    flagged_pts_np = (
-                        self.model.means[flagged_mask].detach().cpu().numpy().astype(np.float32)
-                    )
-
-                    mesh_ok = False
-                    if flagged_pts_np.shape[0] > 0:
-                        try:
-                            mesh_ok = reconstruct_mesh_from_points(
-                                points=flagged_pts_np,
-                                mesh_ply_path=Path(mesh_ply_path),
-                            )
-                            used_fused = mesh_ok
-                        except Exception as exc:
-                            CONSOLE.log(
-                                f"[phase-0] flagged-Gaussian mesh reconstruction failed for object {obj_idx}: {exc}"
-                            )
-
-                    if not mesh_ok:
-                        try:
-                            mesh_ok = reconstruct_mesh_from_gaussian_ply(
-                                gaussian_ply_path=Path(ply_path),
-                                mesh_ply_path=Path(mesh_ply_path),
-                            )
-                        except Exception as exc:
-                            CONSOLE.log(
-                                f"[phase-0] SAM3D-only mesh fallback failed for object {obj_idx}: {exc}"
-                            )
-                            mesh_ok = False
-
-                    if mesh_ok and Path(mesh_ply_path).exists():
-                        mesh_path_for_manifest = str(mesh_ply_path)
-                        CONSOLE.log(
-                            f"[phase-0] object {obj_idx}: "
-                            f"{'flagged-Gaussian Poisson' if used_fused else 'SAM3D-only fallback'} mesh "
-                            f"({flagged_pts_np.shape[0]} flagged pts) -> {mesh_ply_path}"
-                        )
-                    else:
-                        CONSOLE.log(
-                            f"[phase-0] object {obj_idx}: mesh reconstruction produced no triangles"
-                        )
-
-                self._timing[f"S0.3_mesh_recon_obj_{obj_idx}"].append(time.time() - t_mesh)
-
-            # mesh_to_world: identity when flagged-Gaussian Poisson was
-            # built (mesh already in world frame); canonical→world 4×4 from
-            # CPD when we fell back to the SAM3D-only mesh in canonical
-            # SAM3D frame OR when ``use_raw_sam3d_mesh`` is True.
-            if used_fused:
-                mesh_to_world = np.eye(4, dtype=np.float64)
-            else:
-                mesh_to_world = np.asarray(
-                    insertion_result.canonical_to_world_4x4, dtype=np.float64
-                )
-
-            # Pre-build the FoundationPose tracker for this candidate now,
-            # while the static→dynamic boundary is "free time". This pays the
-            # ~4 s nvdiffrast + model-weights + first-call JIT cost up front,
-            # so D0 only needs to seed pose_last (~ms). The D0 path picks one
-            # of these and discards the rest.
-            if (
-                self.model.config.enable_fp_rigid_motion
-                and mesh_path_for_manifest is not None
-            ):
-                t_fp_construct = time.time()
-                tracker = self._construct_fp_tracker(
-                    mesh_path=mesh_path_for_manifest,
-                    mesh_to_world_4x4=mesh_to_world,
-                )
-                self._timing[f"S0.3_fp_construct_obj_{obj_idx}"].append(
-                    time.time() - t_fp_construct
-                )
-                if tracker is not None:
-                    self._fp_trackers_by_instance[instance_id] = tracker
-                    CONSOLE.log(
-                        f"[phase-0] object {obj_idx} (instance_id={instance_id}): "
-                        f"FP tracker built ({self._timing[f'S0.3_fp_construct_obj_{obj_idx}'][-1]:.2f}s)"
-                    )
-                else:
-                    CONSOLE.log(
-                        f"[phase-0] object {obj_idx} (instance_id={instance_id}): "
-                        "FP tracker construction failed; D0 will fall back"
-                    )
+            # CoTracker tracks 2D pixel points in the live RGB stream and
+            # back-projects via depth, so Phase 0b doesn't need a mesh or any
+            # per-instance pre-construction step. The tracker is initialized
+            # at D0 (``_initialize_cotracker``) once the moved object is
+            # known, against the live D0 RGB-D + the rendered object mask.
             manifest[instance_id] = {
                 "object_index": obj_idx,
                 "mask_path": str(sam3_obj["mask_path"]),
                 "ply_path": str(ply_path),
-                "mesh_path": mesh_path_for_manifest,
-                "mesh_to_world_4x4": mesh_to_world.reshape(4, 4).tolist(),
                 "score": sam3_obj.get("score", 0.0),
                 "existing_gaussians": int(existing_indices.numel()),
                 "sam3d_pre_cull_count": int(insertion_result.kept_point_count),
@@ -1184,248 +1067,164 @@ class DynamicGSPipeline(VanillaPipeline):
             mask.permute(2, 0, 1).unsqueeze(0), size=(target_h, target_w), mode="nearest",
         ).squeeze(0).permute(1, 2, 0)
 
-    # ---- FoundationPose helpers ----
+    # ---- CoTracker helpers ----
 
     @staticmethod
     def _has_nonempty_mask(mask) -> bool:
         return mask is not None and bool(torch.any(mask > 0.5))
 
-    @staticmethod
-    def _camera_to_world_cv(camera) -> np.ndarray:
-        """4×4 mesh->camera-friendly camera_to_world (x right, y down, z forward).
+    def _get_cotracker_debug_dir(self) -> Path:
+        return self._get_debug_dir() / "cotracker_debug"
 
-        Nerfstudio cameras use the OpenGL convention (y up, z backwards). FP / OpenCV
-        use y down, z forward. The world-frame coords are unchanged; only the
-        camera basis flips: ``cv_c2w = ns_c2w @ diag(1, -1, -1, 1)``.
-        """
-        ns_c2w = np.eye(4, dtype=np.float64)
-        ns_c2w[:3, :4] = camera.camera_to_worlds[0].detach().cpu().numpy().astype(np.float64)
-        flip = np.diag([1.0, -1.0, -1.0, 1.0])
-        return ns_c2w @ flip
-
-    @staticmethod
-    def _camera_K(camera, target_h: int, target_w: int) -> np.ndarray:
-        """Pinhole K (y-down image), scaled to ``target_h × target_w`` if needed."""
-        fx = float(camera.fx[0].item())
-        fy = float(camera.fy[0].item())
-        cx = float(camera.cx[0].item())
-        cy = float(camera.cy[0].item())
-        src_h = int(camera.height[0].item()) if hasattr(camera.height[0], "item") else int(camera.height[0])
-        src_w = int(camera.width[0].item()) if hasattr(camera.width[0], "item") else int(camera.width[0])
-        if (target_h, target_w) != (src_h, src_w):
-            sx = target_w / float(src_w)
-            sy = target_h / float(src_h)
-            fx *= sx
-            fy *= sy
-            cx *= sx
-            cy *= sy
-        K = np.eye(3, dtype=np.float64)
-        K[0, 0] = fx
-        K[1, 1] = fy
-        K[0, 2] = cx
-        K[1, 2] = cy
-        return K
-
-    @staticmethod
-    def _to_uint8_rgb(rgb_tensor: torch.Tensor) -> np.ndarray:
-        """Convert (H, W, 3) torch [0..1] float to (H, W, 3) numpy uint8."""
-        arr = rgb_tensor.detach().float().clamp(0.0, 1.0).mul(255.0).byte().cpu().numpy()
-        return np.ascontiguousarray(arr)
-
-    @staticmethod
-    def _to_float32_depth(depth_tensor: torch.Tensor) -> np.ndarray:
-        """Convert (H, W) or (H, W, 1) torch depth (meters) to (H, W) float32 numpy."""
-        arr = depth_tensor.detach().float().cpu().numpy()
-        if arr.ndim == 3 and arr.shape[-1] == 1:
-            arr = arr[..., 0]
-        return np.ascontiguousarray(arr.astype(np.float32))
-
-    def _write_fp_motion_log(self, frame_name: str, R: np.ndarray, t: np.ndarray) -> None:
+    def _write_cotracker_motion_log(self, frame_name: str, motion_estimate) -> None:
         debug_dir = self._get_debug_dir()
         debug_dir.mkdir(parents=True, exist_ok=True)
-        log_path = debug_dir / f"{frame_name}_fp_motion.txt"
+        log_path = debug_dir / f"{frame_name}_cotracker_motion.txt"
         log_lines = [
-            f"rotation: {R.reshape(9).tolist()}",
-            f"translation: {t.reshape(3).tolist()}",
+            f"success: {motion_estimate.success}",
+            f"ready: {motion_estimate.ready}",
+            f"correspondence_count: {motion_estimate.correspondence_count}",
+            f"inlier_count: {motion_estimate.inlier_count}",
+            f"track_count_before: {motion_estimate.track_count_before}",
+            f"track_count_after: {motion_estimate.track_count_after}",
+            f"raw_visible_count: {motion_estimate.raw_visible_count}",
+            f"mask_visible_count: {motion_estimate.mask_visible_count}",
+            f"depth_valid_count: {motion_estimate.depth_valid_count}",
+            f"used_mask_fallback: {motion_estimate.used_mask_fallback}",
+            f"mean_residual: {motion_estimate.mean_residual}",
+            f"median_residual: {motion_estimate.median_residual}",
+            f"rotation: {motion_estimate.rotation.tolist()}",
+            f"translation: {motion_estimate.translation.tolist()}",
         ]
         log_path.write_text("\n".join(log_lines) + "\n")
 
-    def _apply_fp_motion(self, camera, batch) -> None:
-        if self._fp_tracker is None:
+    def _save_cotracker_debug(self, frame_name: str, est) -> None:
+        """Side-by-side previous→current frame with tracked points + lines."""
+        if est.previous_points_xy is None or est.current_points_xy is None:
             return
-        live_rgb = self.model.get_live_rgb(batch, apply_training_downscale=False)
-        rgb_np = self._to_uint8_rgb(live_rgb)
-        depth_np = self._to_float32_depth(batch["depth_image"])
-        h, w = rgb_np.shape[:2]
-        K = self._camera_K(camera, h, w)
-        c2w = self._camera_to_world_cv(camera)
+        if est.previous_rgb is None or est.current_rgb is None:
+            return
+        prev_img = est.previous_rgb.detach().float().cpu().numpy()
+        curr_img = est.current_rgb.detach().float().cpu().numpy()
+        if prev_img.max() > 1.5:
+            prev_img = prev_img / 255.0
+        if curr_img.max() > 1.5:
+            curr_img = curr_img / 255.0
+        prev_img = prev_img.clip(0, 1)
+        curr_img = curr_img.clip(0, 1)
+        h, w = prev_img.shape[:2]
+        canvas = np.concatenate([prev_img, curr_img], axis=1)
+        canvas = (canvas * 255).astype(np.uint8).copy()
+        prev_pts = est.previous_points_xy
+        curr_pts = est.current_points_xy
+        inlier_mask = est.tracked_inlier_mask
+        n = min(len(prev_pts), len(curr_pts))
+        for i in range(n):
+            px, py = int(prev_pts[i, 0]), int(prev_pts[i, 1])
+            cx, cy = int(curr_pts[i, 0]) + w, int(curr_pts[i, 1])
+            is_inlier = bool(inlier_mask[i]) if inlier_mask is not None and i < len(inlier_mask) else False
+            point_color = [0, 255, 0] if is_inlier else [255, 0, 0]
+            line_color = [0, 180, 0] if is_inlier else [180, 0, 0]
+            steps = max(abs(cx - px), abs(cy - py), 1)
+            for t in range(steps + 1):
+                lx = int(px + (cx - px) * t / steps)
+                ly = int(py + (cy - py) * t / steps)
+                if 0 <= ly < h and 0 <= lx < 2 * w:
+                    canvas[ly, lx] = line_color
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    if 0 <= py + dy < h and 0 <= px + dx < w:
+                        canvas[py + dy, px + dx] = point_color
+                    if 0 <= cy + dy < h and 0 <= cx + dx < 2 * w:
+                        canvas[cy + dy, cx + dx] = point_color
+        dbg = self._get_cotracker_debug_dir()
+        dbg.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(canvas).save(dbg / f"{frame_name}_cotracker.png")
 
-        try:
-            R, t = self._fp_tracker.track_one(
-                rgb=rgb_np,
-                depth=depth_np,
-                K=K,
-                camera_to_world=c2w,
-                iterations=self.model.config.fp_track_refine_iter,
-            )
-        except Exception as exc:
+    def _apply_cotracker_motion(self, camera, batch, current_mask=None) -> None:
+        if self._cotracker_motion is None:
+            return
+        if not self._cotracker_motion.ready:
             frame_name = self.datamanager.get_current_dynamic_frame_name()
-            CONSOLE.log(f"[dynamic-gs] FP tracker failed on {frame_name}: {exc}")
-            return
-
-        frame_name = self.datamanager.get_current_dynamic_frame_name()
-        try:
-            self._fp_tracker.save_pose_visualization(
-                rgb=rgb_np, K=K,
-                output_path=self._get_fp_pose_debug_dir() / f"{frame_name}.png",
+            CONSOLE.log(
+                f"[dynamic-gs] CoTracker skipped for {frame_name}: tracker not ready "
+                f"({self._cotracker_motion.current_track_count} tracks, "
+                f"min={self._cotracker_motion.min_track_points})"
             )
-        except Exception as exc:
-            CONSOLE.log(f"[dynamic-gs] FP pose-vis save failed on {frame_name}: {exc}")
-        self._write_fp_motion_log(frame_name, R, t)
-        moved_count = self.model.apply_rigid_object_transform_from_reference(R, t)
+            return
+        current_live_rgb = self.model.get_live_rgb(batch, apply_training_downscale=False)
+        motion_estimate = self._cotracker_motion.estimate_and_advance(
+            current_rgb=current_live_rgb,
+            current_depth=batch["depth_image"],
+            current_camera=camera,
+            current_mask=current_mask,
+        )
+        frame_name = self.datamanager.get_current_dynamic_frame_name()
+        self._write_cotracker_motion_log(frame_name, motion_estimate)
+        self._save_cotracker_debug(frame_name, motion_estimate)
+        if not motion_estimate.success:
+            CONSOLE.log(
+                f"[dynamic-gs] CoTracker rigid motion unavailable for {frame_name}: "
+                f"raw={motion_estimate.raw_visible_count}, "
+                f"mask={motion_estimate.mask_visible_count}, "
+                f"depth={motion_estimate.depth_valid_count}, "
+                f"correspondences={motion_estimate.correspondence_count}, "
+                f"inliers={motion_estimate.inlier_count}, "
+                f"mask_fallback={motion_estimate.used_mask_fallback}"
+            )
+            return
+        moved_count = self.model.apply_rigid_object_transform_from_reference(
+            motion_estimate.rotation, motion_estimate.translation,
+        )
         if moved_count == 0:
             CONSOLE.log(
-                f"[dynamic-gs] FP estimated motion for {frame_name}, "
+                f"[dynamic-gs] CoTracker estimated motion for {frame_name}, "
                 "but no object Gaussians were moved. Check object_flags/reference pose consistency."
             )
         CONSOLE.log(
-            f"[dynamic-gs] FP rigid motion -> {frame_name}, moved={moved_count}, "
-            f"||t||={float(np.linalg.norm(t)):.4f}m"
+            f"[dynamic-gs] CoTracker rigid motion -> {frame_name}, moved={moved_count}, "
+            f"inliers={motion_estimate.inlier_count}/{motion_estimate.correspondence_count}, "
+            f"median residual={motion_estimate.median_residual:.5f}, "
+            f"mask_fallback={motion_estimate.used_mask_fallback}"
         )
 
-    def _construct_fp_tracker(
-        self, mesh_path: str, mesh_to_world_4x4
-    ) -> Optional[FoundationPoseTracker]:
-        """Build a FoundationPoseTracker from a mesh PLY + canonical→world 4×4.
+    def _initialize_cotracker(self, rgb, depth, camera, mask) -> None:
+        """Seed CoTracker with the D0 reference frame.
 
-        The transform is the FULL canonical→world similarity (bbox-scale +
-        centroid-align + post-CPD similarity composed). FP expects a pure
-        SE(3) ``pose_last``: we split the isotropic scale out of the rotation
-        block and apply it as the mesh prescale instead.
-
-        Returns ``None`` on any failure (caller logs and continues).
+        Samples ``query_point_count`` 2D pixel points inside the object mask,
+        back-projects via depth+intrinsics+c2w to get the world-frame
+        reference 3D positions, and stores ``rgb`` as the previous frame.
+        Subsequent ``estimate_and_advance`` calls track those points to the
+        new frame and run RANSAC-Kabsch to recover (R, t).
         """
-        if not self.model.config.enable_fp_rigid_motion:
-            return None
-        if not mesh_path or not Path(mesh_path).exists():
-            CONSOLE.log(
-                f"[dynamic-gs] FP construct: mesh_path missing/not-on-disk (got {mesh_path}); skipping"
-            )
-            return None
-
-        mesh_to_world_full = np.asarray(mesh_to_world_4x4, dtype=np.float64).reshape(4, 4)
-        col_norms = np.linalg.norm(mesh_to_world_full[:3, :3], axis=0)
-        iso_scale = float(col_norms.mean())
-        mesh_to_world_rigid = mesh_to_world_full.copy()
-        if iso_scale > 1e-9:
-            mesh_to_world_rigid[:3, :3] = mesh_to_world_full[:3, :3] / iso_scale
-
-        debug_dir = self._get_debug_dir() / "fp_debug"
-        try:
-            return FoundationPoseTracker(
-                mesh_path=mesh_path,
-                mesh_to_world=mesh_to_world_rigid,
-                mesh_unit_scale=iso_scale * self.model.config.fp_mesh_unit_scale,
-                debug_dir=debug_dir,
-            )
-        except Exception as exc:
-            CONSOLE.log(f"[dynamic-gs] FP construct failed: {exc}")
-            return None
-
-    def _initialize_fp_tracker(self, d0_rgb, d0_depth, camera, instance_id: int) -> None:
-        """Pick the pre-built tracker for the moved instance and seed pose_last.
-
-        FP construction is the slow part (~4 s: nvdiffrast context, model
-        weight load, first-call CUDA JIT). It's now done eagerly in Phase 0b
-        for every prefused candidate via ``_fp_trackers_by_instance``. At D0
-        we just pick the chosen tracker, drop the rest (their refs are freed
-        for GC), seed ``pose_last`` from the known scene pose, and optionally
-        refine on the actual D0 RGB-D.
-
-        Fallback: if the dict is empty (legacy datasets missing the manifest,
-        or Phase 0b construction failed), build the tracker on the spot using
-        ``phase0_manifest.json`` as before.
-        """
-        if not self.model.config.enable_fp_rigid_motion:
+        if not self.model.config.enable_cotracker_rigid_motion:
             return
-
-        # Drop trackers we don't need anymore so nvdiffrast contexts + model
-        # weights from non-selected instances are eligible for GC.
-        chosen = self._fp_trackers_by_instance.pop(instance_id, None)
-        for _other_id, _other_tracker in list(self._fp_trackers_by_instance.items()):
-            del _other_tracker
-        self._fp_trackers_by_instance.clear()
-
-        if chosen is None:
-            # Legacy / fallback path: read manifest and construct now.
-            artifact_dir = (
-                Path(self.datamanager.config.data)
-                / self.datamanager.config.dynamic_subdir
-                / "initialization_artifacts"
-            )
-            manifest_path = artifact_dir / "phase0_manifest.json"
-            if not manifest_path.exists():
-                CONSOLE.log(f"[dynamic-gs] FP init skipped: phase0_manifest.json not found at {manifest_path}")
-                return
-            try:
-                manifest = json.loads(manifest_path.read_text())
-            except Exception as exc:
-                CONSOLE.log(f"[dynamic-gs] FP init skipped: failed to read manifest: {exc}")
-                return
-            entry = manifest.get(str(instance_id))
-            if entry is None:
-                CONSOLE.log(f"[dynamic-gs] FP init skipped: no manifest entry for instance {instance_id}")
-                return
-            mesh_path = entry.get("mesh_path")
-            mesh_to_world = entry.get("mesh_to_world_4x4")
-            if mesh_to_world is None:
-                CONSOLE.log(
-                    f"[dynamic-gs] FP init: mesh_to_world_4x4 missing for instance {instance_id}; "
-                    "falling back to register()"
-                )
-                return
-            chosen = self._construct_fp_tracker(mesh_path, mesh_to_world)
-            if chosen is None:
-                self._fp_tracker = None
-                return
-            CONSOLE.log(
-                f"[dynamic-gs] FP construct (D0 fallback): tracker built for instance {instance_id}"
-            )
-
-        self._fp_tracker = chosen
-
-        rgb_np = self._to_uint8_rgb(d0_rgb)
-        depth_np = self._to_float32_depth(d0_depth)
-        h, w = rgb_np.shape[:2]
-        K = self._camera_K(camera, h, w)
-        c2w = self._camera_to_world_cv(camera)
-
-        try:
-            R, t = self._fp_tracker.initialize_from_known_pose(
-                rgb=rgb_np,
-                depth=depth_np,
-                K=K,
-                camera_to_world=c2w,
-                refine_iterations=self.model.config.fp_init_refine_iter,
-            )
-        except Exception as exc:
-            CONSOLE.log(f"[dynamic-gs] FP init refine failed: {exc}")
-            self._fp_tracker = None
-            return
-
-        frame_name = self.datamanager.get_current_dynamic_frame_name()
-        try:
-            self._fp_tracker.save_pose_visualization(
-                rgb=rgb_np, K=K,
-                output_path=self._get_fp_pose_debug_dir() / f"{frame_name}.png",
-            )
-        except Exception as exc:
-            CONSOLE.log(f"[dynamic-gs] FP pose-vis save failed on {frame_name}: {exc}")
-
+        self._cotracker_motion = CoTrackerMotionEstimator(
+            device=self.model.device,
+            query_point_count=self.model.config.cotracker_query_point_count,
+            min_track_points=self.model.config.cotracker_min_track_points,
+            ransac_iterations=self.model.config.cotracker_ransac_iterations,
+            ransac_inlier_threshold=self.model.config.cotracker_ransac_inlier_threshold,
+            checkpoint_path=self.model.config.cotracker_checkpoint_path,
+            hub_repo=self.model.config.cotracker_hub_repo,
+            hub_model=self.model.config.cotracker_hub_model,
+        )
+        seeded = self._cotracker_motion.initialize(
+            rgb=rgb, depth=depth, camera=camera, mask=mask,
+        )
         CONSOLE.log(
-            f"[dynamic-gs] FP initialized from known scene pose for instance {instance_id} "
-            f"(D0 ||t||={float(np.linalg.norm(t)):.4f}m)"
+            f"[dynamic-gs] CoTracker reference seed on D0 -> "
+            f"fast={self._cotracker_motion.last_init_fast_point_count}, "
+            f"sampled={self._cotracker_motion.last_init_sampled_count}, "
+            f"depth_valid={self._cotracker_motion.last_init_depth_valid_count}, "
+            f"dense_fallback={self._cotracker_motion.last_init_used_dense_fallback}, "
+            f"tracks={seeded}, ready={self._cotracker_motion.ready}"
         )
+        if seeded < self._cotracker_motion.min_track_points:
+            CONSOLE.log(
+                f"[dynamic-gs] CoTracker seeded too few D0 points: "
+                f"{seeded} < min_track_points={self._cotracker_motion.min_track_points}"
+            )
 
     # ---- Image helpers ----
 
@@ -1521,16 +1320,6 @@ class DynamicGSPipeline(VanillaPipeline):
 
     def _get_debug_dir(self) -> Path:
         return Path(self.datamanager.config.data) / self.datamanager.config.dynamic_subdir / "debug"
-
-    def _get_fp_pose_debug_dir(self) -> Path:
-        """Directory for per-frame FoundationPose pose-overlay PNGs.
-
-        Lives under the dynamic dataset (not the standard ``debug/`` dir)
-        so that each image passed to FP is paired with a visual record of
-        the bbox + xyz-axes pose actually consumed that frame — useful
-        when FP drifts or fails midway through the dataset.
-        """
-        return Path(self.datamanager.config.data) / self.datamanager.config.dynamic_subdir / "foundation_pose_debug"
 
     @torch.no_grad()
     def _render_from_camera(self, camera):
@@ -1697,11 +1486,11 @@ class DynamicGSPipeline(VanillaPipeline):
             self._global_frame_counter += 1
             return
 
-        # FP track on every live frame for object-pose continuity.
+        # CoTracker advances on every live frame for object-pose continuity.
         t0 = time.time()
-        if self._sam3d_inserted and self._fp_tracker is not None:
-            self._apply_fp_motion(camera, batch)
-        self._timing["DN.3_fp_track"].append(time.time() - t0)
+        if self._sam3d_inserted and self._cotracker_motion is not None:
+            self._apply_cotracker_motion(camera, batch)
+        self._timing["DN.3_cotracker_motion"].append(time.time() - t0)
 
         c2w_3x4 = camera.camera_to_worlds[0].detach().cpu()
         accepted = (
@@ -1864,7 +1653,7 @@ class DynamicGSPipeline(VanillaPipeline):
         self, camera, batch, live_rgb, gt_rgb, gt_depth, gripper_mask,
         frame_name, debug_dir, artifact_dir,
     ):
-        """Bootstrap: ESAM → SAM3D → rendered object mask → seed live tracker → FoundationPose → CD0."""
+        """Bootstrap: ESAM → SAM3D → rendered object mask → CoTracker D0 seed → CD0."""
         t_total = time.time()
 
         # Check if Phase 0 prefusion already inserted objects
@@ -2153,18 +1942,23 @@ class DynamicGSPipeline(VanillaPipeline):
         rendered_obj_mask = self.model.render_object_mask(camera)
         self._timing["D0.4_render_object_mask"].append(time.time() - t0)
 
-        # --- TIMING: D0.6 FoundationPose init (load mesh + scene-pose seed est.pose_last, refine on D0 obs) ---
+        # --- TIMING: D0.6 CoTracker init (sample 2D points inside the rendered object mask, back-project to world via depth, store as reference) ---
         t0 = time.time()
         live_rgb_fullres = self.model.get_live_rgb(batch, apply_training_downscale=False)
         self.model.capture_reference_object_pose()
-        instance_id_for_fp = getattr(self, "_d0_selected_instance_id", 0)
-        if instance_id_for_fp > 0:
-            self._initialize_fp_tracker(
-                live_rgb_fullres, batch["depth_image"], camera, instance_id=instance_id_for_fp
+        # Use the rendered object Gaussian mask as the seed mask for
+        # CoTracker — its 2D footprint defines which pixels we want to
+        # track. Falls back to the ESAM live-object mask if rendered is
+        # empty.
+        seed_mask = rendered_obj_mask if self._has_nonempty_mask(rendered_obj_mask) else None
+        instance_id_for_co = getattr(self, "_d0_selected_instance_id", 0)
+        if instance_id_for_co > 0 and seed_mask is not None:
+            self._initialize_cotracker(
+                live_rgb_fullres, batch["depth_image"], camera, mask=seed_mask,
             )
         else:
-            CONSOLE.log("[dynamic-gs] FP init skipped: no pre-fused instance selected at D0")
-        self._timing["D0.6_fp_init"].append(time.time() - t0)
+            CONSOLE.log("[dynamic-gs] CoTracker init skipped: no instance selected or seed mask empty")
+        self._timing["D0.6_cotracker_init"].append(time.time() - t0)
 
         if self.config.save_debug_images:
             self._save_image_with_points(rendered_obj_mask, None, debug_dir / f"{frame_name}_rendered_object_mask.png")
@@ -2212,27 +2006,23 @@ class DynamicGSPipeline(VanillaPipeline):
             f"sam3d_gen={self._timing['D0.2_sam3d_generation'][-1]:.2f}s, "
             f"sam3d_ins={self._timing['D0.3_sam3d_insertion'][-1]:.2f}s, "
             f"obj_mask={self._timing['D0.4_render_object_mask'][-1]:.2f}s, "
-            f"fp_init={self._timing['D0.6_fp_init'][-1]:.2f}s, "
+            f"cotracker_init={self._timing['D0.6_cotracker_init'][-1]:.2f}s, "
             f"render_rs00={self._timing['D0.7_render_rs00'][-1]:.2f}s, "
             f"change_mask={self._timing['D0.8_change_mask_cd0'][-1]:.2f}s, "
             f"debug_imgs={self._timing['D0.9_debug_images'][-1]:.2f}s"
         )
 
     def _prepare_frame_n(self, camera, batch, live_rgb, gt_rgb, gt_depth, gripper_mask, frame_name, debug_dir):
-        """Frame N>=1: FoundationPose track_one → absolute rigid transform → render → rendered obj mask → CDN.
-
-        FoundationPose tracks the object pose statefully (refines its cached
-        ``pose_last`` against the new RGB-D), so the projected object-Gaussian
-        mask after the transform is the authoritative "where the object is"
-        signal. We no longer need a SAM2 live-mask propagation chain.
+        """Frame N>=1: CoTracker pairwise advance → RANSAC-Kabsch (R, t) →
+        absolute rigid transform → render → rendered obj mask → CDN.
         """
         t_total = time.time()
 
-        # --- TIMING: DN.3 FoundationPose track_one (mesh-to-camera 6D pose, applied as world-frame absolute SE(3) from D0 reference) ---
-        if self._sam3d_inserted and self._fp_tracker is not None:
+        # --- TIMING: DN.3 CoTracker advance (pairwise track of D0-sampled object points; RANSAC-Kabsch for absolute world (R, t)) ---
+        if self._sam3d_inserted and self._cotracker_motion is not None:
             t0 = time.time()
-            self._apply_fp_motion(camera, batch)
-            self._timing["DN.3_fp_track"].append(time.time() - t0)
+            self._apply_cotracker_motion(camera, batch)
+            self._timing["DN.3_cotracker_motion"].append(time.time() - t0)
 
         # --- TIMING: DN.5 Render RDN (render full scene after rigid transform applied to object Gaussians) ---
         t0 = time.time()
@@ -2286,7 +2076,7 @@ class DynamicGSPipeline(VanillaPipeline):
         CONSOLE.log(
             f"[timing] frame {self.current_dynamic_frame_idx}: "
             f"total={self._timing['DN.9_total_frame_n'][-1]:.3f}s, "
-            f"fp_track={self._timing.get('DN.3_fp_track', [0])[-1]:.3f}s, "
+            f"cotracker={self._timing.get('DN.3_cotracker_motion', [0])[-1]:.3f}s, "
             f"render={self._timing['DN.5_render_rdn'][-1]:.3f}s, "
             f"obj_mask={self._timing['DN.6_render_object_mask'][-1]:.3f}s, "
             f"change={self._timing['DN.7_change_mask_cdn'][-1]:.3f}s, "
@@ -2494,9 +2284,9 @@ class DynamicGSPipeline(VanillaPipeline):
             if obj_mask_pre.any()
             else None
         )
-        if self._sam3d_inserted and self._fp_tracker is not None:
-            self._apply_fp_motion(camera, batch)
-        self._timing["DN.3_fp_track"].append(time.time() - t0)
+        if self._sam3d_inserted and self._cotracker_motion is not None:
+            self._apply_cotracker_motion(camera, batch)
+        self._timing["DN.3_cotracker_motion"].append(time.time() - t0)
         centroid_after = (
             self.model.means[obj_mask_pre].detach().mean(dim=0)
             if obj_mask_pre.any()
@@ -2791,13 +2581,13 @@ class DynamicGSPipeline(VanillaPipeline):
             ("D0.3e_persistent_membership", "  -> Persistent membership (sklearn KNN over all candidate Gaussians)"),
             ("D0.3f_save_fused_and_log", "  -> Save fused PLY + write fusion log"),
             ("D0.4_render_object_mask", "Render object mask (rasterize object_flags Gaussians from simulation)"),
-            ("D0.6_fp_init", "FoundationPose D0 seed (pick pre-built tracker from Phase 0b, drop the rest, seed pose_last; refine if fp_init_refine_iter>0)"),
+            ("D0.6_cotracker_init", "CoTracker D0 seed (sample 2D points inside the rendered object mask, back-project to world via depth)"),
             ("D0.7_render_rs00", "Render RS00 (re-render scene after SAM3D insertion)"),
             ("D0.8_change_mask_cd0", "Change mask CD0 (MSSIM RS00 vs D0, excluding gripper + object)"),
             ("D0.9_debug_images", "Debug images (save overlay PNGs to disk)"),
         ]
         dn_keys = [
-            ("DN.3_fp_track", "FoundationPose track_one (mesh-to-camera 6D, applied as world-frame absolute SE(3) from D0)"),
+            ("DN.3_cotracker_motion", "CoTracker pairwise advance + RANSAC-Kabsch (R, t) on the moved-object Gaussians"),
             ("DN.5_render_rdn", "Render RDN (render scene after rigid transform)"),
             ("DN.6_render_object_mask", "Render object mask (rasterize object_flags Gaussians from simulation)"),
             ("DN.7_change_mask_cdn", "Change mask CDN (MSSIM RDN vs DN, excluding gripper + projected object mask)"),
@@ -2846,14 +2636,6 @@ class DynamicGSPipeline(VanillaPipeline):
             for key in sorted(k for k in self._timing if k.startswith("S0.3_fusion_obj_")):
                 obj_idx = key.split("_")[-1]
                 s0_keys.append((key, f"Object {obj_idx} fusion (register + insert + propagate)"))
-            for key in sorted(k for k in self._timing if k.startswith("S0.3_mesh_recon_obj_")):
-                obj_idx = key.split("_")[-1]
-                s0_keys.append((key, f"Object {obj_idx} Poisson mesh reconstruction"))
-            for key in sorted(k for k in self._timing if k.startswith("S0.3_fp_construct_obj_")):
-                obj_idx = key.split("_")[-1]
-                s0_keys.append(
-                    (key, f"Object {obj_idx} FoundationPose tracker construction (eager, frees D0.6)")
-                )
             s0_keys.append(("S0.4b_fusion_total", "Phase 0b total (fusion, runs at static→dynamic boundary)"))
 
             lines.append("--- PHASE 0: SAM3D OBJECT INITIALIZATION (0a generation + 0b fusion) ---")

@@ -34,8 +34,13 @@ import argparse
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import Iterable
+
+# Local helper that rebuilds the static-only init PLY from depth + masks.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from regenerate_static_init_ply import regenerate as regenerate_static_init_ply
 
 
 DEFAULT_DATASET_ROOT = Path(
@@ -106,6 +111,8 @@ def _prepare_dataset(
     output_root: Path,
     last_static_frame: str,
     overwrite: bool,
+    regenerate_init_ply: bool = True,
+    init_ply_num_points: int = 500_000,
 ) -> tuple[int, int]:
     if output_root.exists():
         if not overwrite:
@@ -144,6 +151,17 @@ def _prepare_dataset(
 
     (output_root / "dynamic_scene" / "debug").mkdir(parents=True, exist_ok=True)
     (output_root / "dynamic_scene" / "render_masks_esam").mkdir(parents=True, exist_ok=True)
+
+    # The source ``depth_camera_init_points.ply`` was built using both
+    # static AND dynamic frames, so the moved object appears as a ghost
+    # trail in the seed cloud. Rebuild from the static-scene split only.
+    if regenerate_init_ply:
+        print(f"  -> regenerating static-only init PLY for {output_root.name}")
+        regenerate_static_init_ply(
+            root=output_root,
+            num_points=init_ply_num_points,
+            backup_existing=False,
+        )
 
     return len(static_frames), len(dynamic_frames)
 
@@ -192,12 +210,31 @@ def main() -> None:
         action="store_true",
         help="Replace existing output datasets with the same names.",
     )
+    parser.add_argument(
+        "--no-regenerate-init-ply",
+        action="store_true",
+        help=(
+            "Skip rebuilding the static-only init point cloud. By default, "
+            "after each split the script back-projects depth + mask of the "
+            "static-scene frames only and overwrites "
+            "``static_scene/depth_camera_init_points.ply`` so the seed cloud "
+            "is free of the dynamic-frame ghost trail."
+        ),
+    )
+    parser.add_argument(
+        "--init-ply-num-points",
+        type=int,
+        default=500_000,
+        help="Target point count for the regenerated init PLY.",
+    )
     args = parser.parse_args()
 
     for dataset_name, last_static_frame in args.pairs:
         source_root = args.raw_root / dataset_name
         output_root = args.output_root / f"{args.prefix}{dataset_name}"
         static_count, dynamic_count = _prepare_dataset(
+            regenerate_init_ply=not args.no_regenerate_init_ply,
+            init_ply_num_points=args.init_ply_num_points,
             source_root=source_root,
             output_root=output_root,
             last_static_frame=last_static_frame,

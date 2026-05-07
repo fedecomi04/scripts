@@ -115,48 +115,24 @@ def _save_ply(points: np.ndarray, colors: np.ndarray, out_path: Path) -> None:
     PlyData([el], text=False).write(str(out_path))
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--root",
-        type=Path,
-        required=True,
-        help="Dataset root containing static_scene/",
-    )
-    parser.add_argument("--num-points", type=int, default=500_000)
-    parser.add_argument(
-        "--bg-tolerance",
-        type=float,
-        default=DEFAULT_BG_TOLERANCE,
-        help="L2 RGB distance from the simulator bg color (217,235,255) to drop.",
-    )
-    parser.add_argument(
-        "--depth-unit-scale",
-        type=float,
-        default=1e-3,
-        help="Multiplier from raw uint16 depth to meters (default 1e-3).",
-    )
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--max-frame-id",
-        type=int,
-        default=None,
-        help=(
-            "Drop static frames whose numeric ID (parsed from the filename, "
-            "e.g. arm_14864.png -> 14864) exceeds this value. Use to exclude "
-            "trailing static-scene frames that were captured AFTER the object "
-            "moved (which produces ghost-trail duplicates in the seed cloud)."
-        ),
-    )
-    parser.add_argument(
-        "--min-frame-id",
-        type=int,
-        default=None,
-        help="Symmetric counterpart: drop frames with ID below this value.",
-    )
-    args = parser.parse_args()
+def regenerate(
+    root: Path,
+    num_points: int = 500_000,
+    bg_tolerance: float = DEFAULT_BG_TOLERANCE,
+    depth_unit_scale: float = 1e-3,
+    seed: int = 0,
+    max_frame_id: int | None = None,
+    min_frame_id: int | None = None,
+    backup_existing: bool = True,
+) -> Path:
+    """Rebuild ``<root>/static_scene/depth_camera_init_points.ply`` from depth
+    + masks of the static-scene frames only. Returns the output PLY path.
 
-    root = args.root.expanduser().resolve()
+    Used both as a standalone CLI (see ``main`` below) and from
+    ``prepare_pipeline_split_datasets.py`` so newly split datasets get a
+    static-only init cloud automatically.
+    """
+    root = Path(root).expanduser().resolve()
     static_root = root / "static_scene"
     transforms_path = static_root / "transforms.json"
     out_path = static_root / "depth_camera_init_points.ply"
@@ -170,7 +146,7 @@ def main() -> None:
     cx, cy = float(meta["cx"]), float(meta["cy"])
     frames = meta["frames"]
     raw_count = len(frames)
-    if args.max_frame_id is not None or args.min_frame_id is not None:
+    if max_frame_id is not None or min_frame_id is not None:
         kept_frames = []
         skipped = []
         for f in frames:
@@ -178,23 +154,23 @@ def main() -> None:
             if fid is None:
                 kept_frames.append(f)
                 continue
-            if args.max_frame_id is not None and fid > args.max_frame_id:
+            if max_frame_id is not None and fid > max_frame_id:
                 skipped.append(fid)
                 continue
-            if args.min_frame_id is not None and fid < args.min_frame_id:
+            if min_frame_id is not None and fid < min_frame_id:
                 skipped.append(fid)
                 continue
             kept_frames.append(f)
         frames = kept_frames
         print(
             f"Frame-id filter: kept {len(frames)}/{raw_count} "
-            f"(min={args.min_frame_id}, max={args.max_frame_id}); "
+            f"(min={min_frame_id}, max={max_frame_id}); "
             f"dropped {len(skipped)} ids: "
             f"{skipped[:3]}{'...' if len(skipped) > 6 else ''}{skipped[-3:] if len(skipped) > 3 else ''}"
         )
     print(f"Static frames: {len(frames)}; intrinsics fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}")
 
-    rng = np.random.default_rng(args.seed)
+    rng = np.random.default_rng(seed)
     all_pts_chunks: list[np.ndarray] = []
     all_col_chunks: list[np.ndarray] = []
     n_total_valid = 0
@@ -210,10 +186,10 @@ def main() -> None:
         if c2w.shape != (4, 4):
             raise ValueError(f"frame {fi} has bad transform_matrix shape {c2w.shape}")
 
-        depth_m = _load_depth_meters(depth_path, args.depth_unit_scale)
+        depth_m = _load_depth_meters(depth_path, depth_unit_scale)
         rgb = np.array(Image.open(rgb_path).convert("RGB"))
         keep_gripper = _load_mask(mask_path)
-        bg_mask = _bg_mask(rgb, args.bg_tolerance)
+        bg_mask = _bg_mask(rgb, bg_tolerance)
         depth_valid = depth_m > 0
 
         valid = keep_gripper & (~bg_mask) & depth_valid
@@ -244,7 +220,7 @@ def main() -> None:
         f"  total points   : {points.shape[0]:>12}\n"
     )
 
-    target = int(args.num_points)
+    target = int(num_points)
     if points.shape[0] > target:
         idx = rng.choice(points.shape[0], size=target, replace=False)
         points = points[idx]
@@ -253,11 +229,62 @@ def main() -> None:
     else:
         print(f"Total points {points.shape[0]} <= target {target}; keeping all.")
 
-    if out_path.exists() and not backup_path.exists():
+    if backup_existing and out_path.exists() and not backup_path.exists():
         shutil.copy2(out_path, backup_path)
         print(f"Backed up existing PLY -> {backup_path.name}")
     _save_ply(points, colors, out_path)
     print(f"Wrote {points.shape[0]} points -> {out_path}")
+    return out_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--root",
+        type=Path,
+        required=True,
+        help="Dataset root containing static_scene/",
+    )
+    parser.add_argument("--num-points", type=int, default=500_000)
+    parser.add_argument(
+        "--bg-tolerance",
+        type=float,
+        default=DEFAULT_BG_TOLERANCE,
+        help="L2 RGB distance from the simulator bg color (217,235,255) to drop.",
+    )
+    parser.add_argument(
+        "--depth-unit-scale",
+        type=float,
+        default=1e-3,
+        help="Multiplier from raw uint16 depth to meters (default 1e-3).",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--max-frame-id",
+        type=int,
+        default=None,
+        help=(
+            "Drop static frames whose numeric ID (parsed from the filename, "
+            "e.g. arm_14864.png -> 14864) exceeds this value."
+        ),
+    )
+    parser.add_argument(
+        "--min-frame-id",
+        type=int,
+        default=None,
+        help="Symmetric counterpart: drop frames with ID below this value.",
+    )
+    args = parser.parse_args()
+
+    regenerate(
+        root=args.root,
+        num_points=args.num_points,
+        bg_tolerance=args.bg_tolerance,
+        depth_unit_scale=args.depth_unit_scale,
+        seed=args.seed,
+        max_frame_id=args.max_frame_id,
+        min_frame_id=args.min_frame_id,
+    )
 
 
 if __name__ == "__main__":

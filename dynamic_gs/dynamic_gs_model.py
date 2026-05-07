@@ -78,15 +78,19 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     use_sam3d_object_init: bool = True
     reuse_sam3d_generated_ply: bool = True
     enable_dynamic_mean_optimization: bool = False
-    # FoundationPose 6D tracker (replaces the previous CoTracker3 + Kabsch-RANSAC path).
-    # Provides per-frame mesh-to-camera pose; pipeline converts to world-frame
-    # absolute (R, t) for ``apply_rigid_object_transform_from_reference``.
-    enable_fp_rigid_motion: bool = True
-    fp_refiner_run_name: str = "2023-10-28-18-33-37"
-    fp_scorer_run_name: str = "2024-01-11-20-02-45"
-    fp_init_refine_iter: int = 0
-    fp_track_refine_iter: int = 2
-    fp_mesh_unit_scale: float = 1.0
+    # CoTracker3 + Kabsch-RANSAC rigid-motion estimator. The pipeline tracks
+    # 2D pixel points sampled at D0 across each new frame, back-projects via
+    # depth, and runs RANSAC-Kabsch to recover a rigid (R, t) for the moved
+    # object. ``apply_rigid_object_transform_from_reference`` then moves
+    # every Gaussian flagged as belonging to that object.
+    enable_cotracker_rigid_motion: bool = True
+    cotracker_query_point_count: int = 256
+    cotracker_min_track_points: int = 12
+    cotracker_ransac_iterations: int = 128
+    cotracker_ransac_inlier_threshold: float = 0.008
+    cotracker_checkpoint_path: str = ""
+    cotracker_hub_repo: str = "facebookresearch/co-tracker"
+    cotracker_hub_model: str = "cotracker3_offline"
     enable_scene_optimization: bool = True
     scene_opt_refine_every: int = 100
     scene_opt_densify_grad_thresh: float = 0.0002
@@ -96,7 +100,7 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
 
     # SAM3 pre-static graspable object prefusion
     use_sam3_graspable_prefusion: bool = True
-    sam3_prompt_text: str = "the two objects on the table"
+    sam3_prompt_text: str = "the can of coke on the table"
     sam3_conda_env_name: str = "sam3_dynamic_gs"
     sam3_candidate_min_area_ratio: float = 0.002
     sam3_candidate_max_area_ratio: float = 0.25
@@ -105,16 +109,6 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     sam3_confidence_threshold: float = 0.3
     sam3_min_score: float = 0.4
     sam3_reuse_cached: bool = True
-    use_raw_sam3d_mesh: bool = True
-    """Skip the Poisson rewrite of ``<stem>_sam3d_mesh.ply`` and feed the
-    SAM3D mesh-decoder output directly to FoundationPose. The mesh is
-    in canonical SAM3D space, so ``mesh_to_world = canonical_to_world_4x4``
-    from the same CPD fusion call. Use this to test whether the raw
-    SAM3D mesh is cleaner than Poisson-over-flagged-Gaussians for FP
-    tracking. NOTE: existing cached ``*_sam3d_mesh.ply`` files are
-    post-Poisson; to get the actual SAM3D decoder output back on disk
-    you must force a fresh SAM3D run (delete ``*_sam3d_raw_output.ply``
-    or pass ``sam3_reuse_cached=False`` once)."""
 
 
 class DynamicGSModel(SplatfactoModel):
@@ -407,7 +401,7 @@ class DynamicGSModel(SplatfactoModel):
             if active.shape[0] != grad.shape[0] or not active.any():
                 return torch.zeros_like(grad)
             return grad * active.to(device=grad.device, dtype=grad.dtype).unsqueeze(-1)
-        if self.config.enable_fp_rigid_motion or not self.config.enable_dynamic_mean_optimization:
+        if self.config.enable_cotracker_rigid_motion or not self.config.enable_dynamic_mean_optimization:
             return torch.zeros_like(grad)
         mask = self.current_active_mask.to(device=grad.device, dtype=grad.dtype).unsqueeze(-1)
         return grad * mask
@@ -1453,9 +1447,10 @@ class DynamicGSModel(SplatfactoModel):
         """Generate the change mask and active Gaussian subset for one dynamic frame.
 
         Object segmentation is done with a single batched ESAM forward on
-        ``[render, live]`` (no SAM2 propagation — FoundationPose handles
-        per-frame object pose, so the projected object Gaussians give the
-        authoritative mask in the pipeline). When *external_object_mask* is
+        ``[render, live]``. The CoTracker tracks the moved object's pose
+        across frames; the projected object-Gaussian mask after applying
+        that pose is the authoritative mask in the pipeline. When
+        *external_object_mask* is
         provided, internal ESAM is skipped and that mask is used directly for
         both render and live, and the change-mask comparison additionally masks
         it out.
