@@ -128,6 +128,15 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     1 % of valid pixels (the average accepted-keyframe, mask-aware)
     are flagged different above ``static_convergence_rgb_threshold``,
     training continues. Below 1 %, transition to the dynamic phase."""
+
+    live: bool = False
+    """When True, run the interactive ROS-driven session before
+    nerfstudio constructs the datamanager: prompt the user, capture
+    SAM3 + SAM3D outputs, record static views to disk, build the
+    SfM init PLY, then proceed with the standard pipeline against
+    that just-recorded dataset. The dynamic phase reads frames live
+    from rospy instead of advancing through a recorded dataset.
+    Default False keeps recorded-mode behavior fully untouched."""
 class DynamicGSPipeline(VanillaPipeline):
     config: DynamicGSPipelineConfig
 
@@ -150,7 +159,25 @@ class DynamicGSPipeline(VanillaPipeline):
         # paths) produced pre-static. ``None`` means generation didn't run, ran with 0
         # objects, or was disabled — in which case the post-static fusion is a no-op.
         self._sam3d_generation_outputs: Optional[dict] = None
+        # Live-mode runtime state — None when ``config.live=False``.
+        self._live_subscriber = None
+        self._live_stop_requested: bool = False
+        self._live_last_processed_stamp: Optional[float] = None
         atexit.register(self._write_timing_report)
+
+        # Live-mode pre-training session: drives the interactive ROS
+        # capture (prompt → SAM3 → SAM3D → record static frames → build
+        # init PLY) and points the dataparser at the resulting
+        # LIVE_ROOT. Must run before ``super().__init__`` so the
+        # datamanager constructor sees the populated static_scene/.
+        if getattr(config, "live", False):
+            from .utils.live_session import run_live_capture_session
+            from .utils.live_ros_subscriber import LiveRosSubscriber
+            live_root = run_live_capture_session()
+            config.datamanager.data = live_root
+            self._live_subscriber = LiveRosSubscriber.get_singleton()
+            self._start_stdin_stop_watcher()
+
         super().__init__(
             config=config,
             device=device,
@@ -1553,12 +1580,234 @@ class DynamicGSPipeline(VanillaPipeline):
             change_mask = change_mask * valid_mask
         return change_mask
 
+    # ---- Live-mode helpers ----
+
+    def _start_stdin_stop_watcher(self) -> None:
+        """Daemon thread that flips ``_live_stop_requested`` on 'stop'.
+
+        Reads stdin line-by-line; non-'stop' lines are ignored. The
+        flag is checked at the top of ``_dynamic_get_train_loss_dict``,
+        which then short-circuits the dynamic loop and returns a
+        zero-loss dict so the trainer keeps stepping (viewer stays
+        responsive) without changing weights.
+        """
+        import threading
+        import sys
+
+        def _watch():
+            try:
+                for line in sys.stdin:
+                    if line.strip().lower() == "stop":
+                        self._live_stop_requested = True
+                        CONSOLE.log("[live] stop requested; freezing model and keeping viewer alive")
+                        return
+            except Exception:
+                return
+
+        threading.Thread(target=_watch, name="live_stdin_watcher", daemon=True).start()
+        # PROBLEM: stdin is shared with the user prompt earlier in
+        # live_session — by the time this watcher starts, the prompts
+        # have already returned and stdin is exclusively ours. If
+        # someone re-introduces interactive prompts mid-training, the
+        # watcher will eat their lines.
+
+    def _wrap_live_tuple_as_batch(self, frame) -> tuple[object, dict]:
+        """Build the (camera, batch) pair the rest of the pipeline expects.
+
+        Mirrors ``DynamicGSDataManager._get_dynamic_batch`` so that
+        every model method downstream — ``get_outputs``,
+        ``get_live_rgb``, ``_get_batch_mask``, ``_get_gt_depth``,
+        ``apply_rigid_object_transform_from_reference`` — sees a
+        familiar shape and is none the wiser.
+        """
+        from .utils.live_ros_subscriber import cameras_from_live_frame
+
+        device = self.model.device
+        camera = cameras_from_live_frame(
+            frame=frame,
+            intrinsics=self._live_subscriber.intrinsics,
+            device=device,
+            cam_idx=0,
+        )
+
+        rgb_rgb = np.ascontiguousarray(frame.rgb_bgr[..., ::-1])
+        image_t = torch.from_numpy(rgb_rgb).to(device)  # uint8 (H, W, 3)
+        depth_m = (frame.depth_mm.astype(np.float32) * 1e-3)
+        depth_t = torch.from_numpy(depth_m).to(device)
+        mask_bool = (frame.mask_keep > 0).astype(np.float32)
+        mask_t = torch.from_numpy(mask_bool).unsqueeze(-1).to(device)
+
+        batch = {
+            "image": image_t,
+            "image_idx": 0,
+            "mask": mask_t,
+            "depth_image": depth_t,
+        }
+        return camera, batch
+        # PROBLEM: `image_idx=0` re-uses the static frame 0 slot in the
+        # camera optimizer. If the trainer's optimizer has already
+        # updated slot 0 from static training, that pose adjustment
+        # bleeds into every live frame's render. We only call this in
+        # the dynamic phase where the camera optimizer is gated by
+        # phase, but the slot collision is worth a glance during a
+        # future cleanup.
+
+    def _tracker_tick_live(self) -> None:
+        """Live-mode replacement for ``_tracker_tick(frame_idx)``.
+
+        Pulls the most recent ROS tuple, dedupes against the last one
+        we processed, runs FP `track_one`, and — if the keyframe
+        filter accepts AND CDN clears the min-pixel gate — pushes a
+        capture-time CDN onto the optim pool.
+        """
+        sub = self._live_subscriber
+        if sub is None:
+            return
+        latest = sub.peek_latest()
+        if latest is None:
+            return
+        if (
+            self._live_last_processed_stamp is not None
+            and latest.stamp_sec == self._live_last_processed_stamp
+        ):
+            return
+        self._live_last_processed_stamp = latest.stamp_sec
+
+        camera, batch = self._wrap_live_tuple_as_batch(latest)
+        frame_name = f"live_{latest.seq:06d}"
+
+        bg = self.model._get_background_color()
+        gt_rgb = self.model.composite_with_background(self.model.get_gt_img(batch["image"]), bg)
+        gt_depth = self.model._get_gt_depth(batch)
+        gripper_mask = self.model._get_batch_mask(batch)
+
+        is_first = self._global_frame_counter == 0
+        if is_first:
+            live_rgb = self.model.get_live_rgb(batch, background=bg, apply_training_downscale=True)
+            init_debug_dir = self.datamanager.get_initialization_debug_dir()
+            init_artifact_dir = self.datamanager.get_initialization_artifact_dir()
+            self._prepare_frame_0(
+                camera, batch, live_rgb, gt_rgb, gt_depth, gripper_mask,
+                frame_name, init_debug_dir, init_artifact_dir,
+            )
+            cdn = self.model.change_mask_image.detach().clone()
+            self._optim_pool.push(OptimFrame(
+                frame_idx=0, camera=camera, cdn=cdn, live_batch=batch,
+            ))
+            self._global_frame_counter += 1
+            return
+
+        # FP track on every live frame for object-pose continuity.
+        t0 = time.time()
+        if self._sam3d_inserted and self._fp_tracker is not None:
+            self._apply_fp_motion(camera, batch)
+        self._timing["DN.3_fp_track"].append(time.time() - t0)
+
+        c2w_3x4 = camera.camera_to_worlds[0].detach().cpu()
+        accepted = (
+            self._dynamic_keyframe_filter is None
+            or self._dynamic_keyframe_filter.accept(c2w_3x4)
+        )
+        if not accepted:
+            self._global_frame_counter += 1
+            return
+
+        t0 = time.time()
+        rdn_outputs = self._render_from_camera(camera)
+        self._timing["DN.5_render_rdn"].append(time.time() - t0)
+        rdn_rgb = rdn_outputs["rgb"]
+        rdn_depth = rdn_outputs["depth"]
+
+        t0 = time.time()
+        rendered_obj_mask = self.model.render_object_mask(camera)
+        self._timing["DN.6_render_object_mask"].append(time.time() - t0)
+
+        t0 = time.time()
+        cdn = self._compute_change_mask(
+            rdn_rgb, rdn_depth, gt_rgb, gt_depth, gripper_mask, rendered_obj_mask,
+        )
+        self._timing["DN.7_change_mask_cdn"].append(time.time() - t0)
+
+        cdn_px = int((cdn[..., 0] > 0.5).sum().item()) if cdn.ndim >= 3 else int((cdn > 0.5).sum().item())
+        if cdn_px < self.config.optim_pool_min_change_pixels:
+            self._global_frame_counter += 1
+            return
+
+        self._optim_pool.push(OptimFrame(
+            frame_idx=0, camera=camera, cdn=cdn.detach().clone(),
+            live_batch=batch,
+        ))
+        CONSOLE.log(
+            f"[live] {frame_name}: change px={cdn_px}, pool_size={len(self._optim_pool)}"
+        )
+        self._global_frame_counter += 1
+        # PROBLEM: every accepted live frame holds its `camera` and
+        # `cdn` tensors on GPU until evicted from the pool. With
+        # capacity=15 and ~400×400×4B = ~640KB per CDN, that's tiny;
+        # the camera ray helpers are heavier but still small. If the
+        # operator drives the camera through hundreds of poses very
+        # quickly, the FIFO drop-oldest keeps memory bounded.
+
+    def _pick_closest_object_to_camera(self, camera) -> int:
+        """Choose the prefused instance whose 3D centroid is nearest the camera.
+
+        Live-mode replacement for the 2D anchor-distance pick at
+        ``(W/2, 0.75 H)``. Used at D0 because the recorded teleop heuristic
+        ("gripper-held object lives in the lower-centre of the image")
+        does not generalise — in live mode the operator approaches the
+        target from arbitrary viewpoints, so the closest object in
+        world space is a more reliable signal for "what's about to be
+        manipulated".
+        """
+        instance_ids = self.model.object_instance_ids.squeeze(-1)
+        prefused_mask = instance_ids > 0
+        if not bool(prefused_mask.any()):
+            return 0
+        unique_ids = torch.unique(instance_ids[prefused_mask])
+        if unique_ids.numel() == 0:
+            return 0
+        cam_pos = camera.camera_to_worlds[0, :3, 3].to(self.model.means.device)
+        best_id = 0
+        best_dist = float("inf")
+        for uid in unique_ids:
+            uid_val = int(uid.item())
+            mask = instance_ids == uid_val
+            if not bool(mask.any()):
+                continue
+            centroid = self.model.means[mask].detach().mean(dim=0)
+            dist = float(torch.linalg.norm(centroid - cam_pos).item())
+            if dist < best_dist:
+                best_dist = dist
+                best_id = uid_val
+        CONSOLE.log(f"[live] D0 closest-to-camera: instance_id={best_id} (dist={best_dist:.3f}m)")
+        return best_id
+        # PROBLEM: if two prefused objects sit at the same distance
+        # (within float noise), the iteration order picks one by
+        # `torch.unique` ordering rather than any user-meaningful
+        # criterion. The operator can re-position the camera and try
+        # again — this is a D0-only decision, not a per-frame one.
+
     # ---- Step/phase management ----
 
     def _total_train_steps(self) -> int:
         return self.config.static_num_steps + self.total_dynamic_steps
 
     def _phase_for_step(self, step: int) -> Literal["static", "dynamic"]:
+        # Live mode: dynamic_scene/ holds a single stub frame just to
+        # make the dataparser happy. The real gate is the MSSIM
+        # convergence check; without it the trainer would sit in the
+        # static phase until ``static_num_steps`` regardless of how
+        # many live views the operator captured.
+        if self.config.live:
+            if (
+                self._static_converged_step is not None
+                and step >= self._static_converged_step
+            ):
+                return "dynamic"
+            if step < self.config.static_num_steps:
+                return "static"
+            return "dynamic"
+
         if self.total_dynamic_frames == 0 or not self._accepted_dynamic_frames:
             return "static"
         # Early-convergence transition: once the MSSIM-based check sees the
@@ -1686,7 +1935,31 @@ class DynamicGSPipeline(VanillaPipeline):
         self._timing["D0.8_change_mask_cd0"].append(time.time() - t0)
 
         # --- D0.2-D0.3: Path A (prefused) vs Path B (old SAM3D insertion) ---
-        if has_prefused:
+        if has_prefused and self.config.live:
+            # Live mode: the recorded "anchor at lower-image-centre"
+            # heuristic doesn't apply — operator approaches the target
+            # from arbitrary viewpoints. Pick the prefused instance
+            # whose 3D centroid is closest to the camera position.
+            t0 = time.time()
+            best_id = self._pick_closest_object_to_camera(camera)
+            if best_id > 0:
+                self.model.object_flags.copy_(
+                    (self.model.object_instance_ids == best_id).float()
+                )
+                self.model._persistent_object_membership_ready = True
+                self._d0_selected_instance_id = int(best_id)
+                CONSOLE.log(
+                    f"[dynamic-gs] Path A (live): selected pre-fused object "
+                    f"instance_id={best_id} (closest 3D centroid to camera)"
+                )
+            else:
+                CONSOLE.log("[dynamic-gs] Path A (live): no pre-fused candidates; falling back to ESAM flags")
+                self.model.object_flags.copy_(self.model.current_active_mask.float()[:, None])
+                self._d0_selected_instance_id = 0
+            self._timing["D0.2_sam3d_generation"].append(0.0)
+            self._timing["D0.3_sam3d_insertion"].append(time.time() - t0)
+            self._sam3d_inserted = True
+        elif has_prefused:
             # Path A — robust moved-object pick, two stages:
             #   1. PRIMARY: closest prefused object centroid in 2D to the
             #      anchor point ``(W/2, 0.75 · H)`` (image is upper-left
@@ -2318,9 +2591,18 @@ class DynamicGSPipeline(VanillaPipeline):
            loss). Evict if epoch budget exhausted OR loss dropped to
            ``optim_pool_loss_relative_threshold`` of initial.
         """
+        # Live-mode `stop`: freeze weights, keep stepping no-ops so the
+        # viewer remains responsive.
+        if self.config.live and self._live_stop_requested:
+            self.model.eval()
+            return self._zero_loss_dummy()
+
         # 1. Tracker tick
         cadence = max(1, int(self.config.tracker_tick_every_steps))
-        if (
+        if self.config.live:
+            if self._dynamic_step_counter % cadence == 0:
+                self._tracker_tick_live()
+        elif (
             self._dynamic_step_counter % cadence == 0
             and self._next_frame_to_track < self.total_dynamic_frames
         ):
@@ -2345,12 +2627,21 @@ class DynamicGSPipeline(VanillaPipeline):
         effective = (frame.cdn * (1.0 - obj_mask_now)).detach()
         self.model._set_optim_mask(effective)
 
-        # Pin datamanager so super().get_train_loss_dict pulls this frame.
-        self.datamanager.set_dynamic_frame_idx(frame.frame_idx)
-        self.current_dynamic_frame_idx = frame.frame_idx
-
-        # Render full scene + compute loss.
-        result = super().get_train_loss_dict(step)
+        if frame.live_batch is None:
+            # Recorded mode: pin the datamanager to the entry's frame
+            # so super().get_train_loss_dict pulls disk-backed tensors.
+            self.datamanager.set_dynamic_frame_idx(frame.frame_idx)
+            self.current_dynamic_frame_idx = frame.frame_idx
+            result = super().get_train_loss_dict(step)
+        else:
+            # Live mode: skip the datamanager entirely. Build the loss
+            # directly against the OptimFrame's stored RGB/depth/mask so
+            # the model is supervised by the actual ROS frame at capture
+            # time, not whatever stub the dataparser is holding.
+            model_outputs = self.model(frame.camera)
+            metrics_dict = self.model.get_metrics_dict(model_outputs, frame.live_batch)
+            loss_dict = self.model.get_loss_dict(model_outputs, frame.live_batch, metrics_dict)
+            result = (model_outputs, loss_dict, metrics_dict)
 
         # Refresh per-Gaussian gate using the just-set self.info from the
         # full-scene render. Backward (called by the trainer after this
@@ -2392,7 +2683,14 @@ class DynamicGSPipeline(VanillaPipeline):
         callbacks = super().get_training_callbacks(training_callback_attributes)
         trainer = training_callback_attributes.trainer
         if trainer is not None:
-            trainer.config.max_num_iterations = self._total_train_steps()
+            if self.config.live:
+                # Live mode has no a-priori frame budget — the operator
+                # ends the session by typing 'stop' on stdin, after
+                # which we keep returning zero-loss results so the
+                # trainer keeps stepping (viewer stays alive).
+                trainer.config.max_num_iterations = 10**9
+            else:
+                trainer.config.max_num_iterations = self._total_train_steps()
         return callbacks
 
     @profiler.time_function

@@ -39,6 +39,12 @@ class OptimFrame:
     epochs_used: int = 0
     initial_loss: Optional[float] = None
     last_loss: Optional[float] = None
+    # Live-mode only: the (image, mask, depth_image) batch sourced from
+    # rospy at capture time. Recorded mode leaves this None and the
+    # pipeline pins the datamanager to ``frame_idx`` to fetch the same
+    # tensors from disk-backed cache. Used by `_dynamic_get_train_loss_dict`
+    # to build the loss directly without consulting the dataparser.
+    live_batch: Optional[dict] = None
 
 
 class OptimPool:
