@@ -155,6 +155,20 @@ class LiveRosSubscriber:
         self._record_frames_written: list[dict] = []
         self._record_stamps: list[rospy.Time] = []
 
+        # ORB-SLAM-style keyframe filter on the recording write path.
+        # τ_t and τ_r match `DynamicGSDataManagerConfig.static_keyframe_*`
+        # so the captured static frames have the same density the static
+        # keyframe filter would produce on a recorded dataset (no point
+        # writing 30 Hz of near-duplicate views to disk). First call
+        # after `reset()` is always accepted (anchor frame); subsequent
+        # frames must satisfy ||t-t_j|| > τ_t OR angle(R, R_j) > τ_r vs.
+        # *every* already-saved keyframe.
+        from .keyframe_filter import DynamicKeyframeFilter
+        self._record_keyframe_filter = DynamicKeyframeFilter(
+            translation_thresh_m=0.02,
+            rotation_thresh_deg=20.0,
+        )
+
         # Subscribers (kept on the instance so they aren't GC'd).
         self._joint_sub = rospy.Subscriber(
             GAZEBO_JOINT_STATES_TOPIC,
@@ -283,22 +297,50 @@ class LiveRosSubscriber:
             return
         if c2w is None:
             return
-        if self._mask_gen is None:
-            self._mask_gen = RobotMaskGenerator(
-                intrinsics=self.intrinsics,
-                joint_state_times_sec=self._joint_state_times_sec,
-                joint_state_positions=self._joint_state_positions,
-            )
-        try:
-            mask_keep = self._mask_gen._render_robot_exclusion_mask(
-                image_msg.header.stamp, MASK_RENDER_CAMERA_FRAME
-            )
-        except Exception as exc:
-            rospy.logwarn_throttle(2.0, f"[live] mask render failed: {exc}")
-            return
 
         rgb_bgr = ros_image_to_bgr(image_msg)
         depth_mm = ros_depth_to_uint16_mm(depth_msg)
+
+        # ORB-SLAM keyframe filter gate on the disk-write path. We test
+        # the filter BEFORE the URDF mask render so frames that are too
+        # close to an already-saved keyframe pay zero pyrender cost. The
+        # GPU is shared with SAM3 / Viser / CoTracker, so this matters.
+        # The filter is mutated only here (rospy callback thread) plus
+        # once in `start_recording` to seed it with the anchor.
+        should_write = False
+        if self._record_active:
+            with self._record_lock:
+                should_write = self._record_keyframe_filter.accept(c2w[:3, :4])
+
+        # URDF mask render is ~30-100 ms of pyrender EGL on the SAME GPU
+        # as gsplat / CoTracker / Viser / (sometimes SAM3). We pay it
+        # only when we are actually about to write the frame to disk.
+        # Outside the recording window — and on rejected keyframes
+        # within the recording window — we hand back an
+        # "everything-keep" mask. The rospy callback rate is then
+        # bounded only by camera publish rate.
+        if should_write:
+            if self._mask_gen is None:
+                self._mask_gen = RobotMaskGenerator(
+                    intrinsics=self.intrinsics,
+                    joint_state_times_sec=self._joint_state_times_sec,
+                    joint_state_positions=self._joint_state_positions,
+                )
+            try:
+                mask_keep = self._mask_gen._render_robot_exclusion_mask(
+                    image_msg.header.stamp, MASK_RENDER_CAMERA_FRAME
+                )
+            except Exception as exc:
+                rospy.logwarn_throttle(2.0, f"[live] mask render failed: {exc}")
+                return
+        else:
+            mask_keep = np.full(rgb_bgr.shape[:2], 255, dtype=np.uint8)
+            # PROBLEM: with mask_keep all-255 in the dynamic phase, the
+            # gripper/robot is no longer excluded from `_compute_change_mask`
+            # — fine in tracking-only mode (we skip change-mask compute
+            # entirely), but if you re-enable optimization later you must
+            # also re-enable mask rendering here, or the gripper will
+            # contaminate the change mask.
         with self._lock:
             self._frame_seq += 1
             seq = self._frame_seq
@@ -313,8 +355,9 @@ class LiveRosSubscriber:
             self._latest = frame
 
         # Disk write happens outside the latest-tuple lock so a slow disk
-        # never holds up `peek_latest`.
-        if self._record_active:
+        # never holds up `peek_latest`. Gated by the keyframe filter so
+        # we don't bloat the static dataset with near-duplicate views.
+        if should_write:
             self._write_frame_to_disk(frame, image_msg.header.stamp)
         # PROBLEM: pyrender / OpenGL contexts are single-thread-affine,
         # so the mask renderer only works on the thread that built it.
@@ -392,6 +435,15 @@ class LiveRosSubscriber:
             self._record_meta = meta
             self._record_frames_written = []
             self._record_stamps = []
+            # Reset the keyframe filter and seed it with the anchor's
+            # c2w. The first call to `accept` after `reset()` is always
+            # True, so this guarantees the anchor itself is the first
+            # accepted frame; every subsequent rospy-callback `accept`
+            # is tested against it. We must seed BEFORE flipping
+            # `_record_active=True` so the rospy thread can never beat
+            # us to the first accept call.
+            self._record_keyframe_filter.reset()
+            self._record_keyframe_filter.accept(anchor_frame.c2w_4x4[:3, :4])
             self._record_active = True
         self._write_frame_to_disk(anchor_frame, rospy.Time.from_sec(anchor_frame.stamp_sec))
         # PROBLEM: any frames that arrive between `anchor_frame` capture

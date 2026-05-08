@@ -64,7 +64,12 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     active_mask_dilate_radius: int = 0
     output_depth_during_training: bool = True
     sh_degree_interval: int = 500
-    resolution_schedule: int = 200
+    resolution_schedule: int = 100
+    """Per-downscale step budget. Full-resolution training kicks in at
+    ``resolution_schedule * num_downscales = 100 * 2 = 200`` steps.
+    Halved from the upstream Splatfacto default of 200 so the static
+    phase (1000-step budget) gets ~800 steps of full-res training
+    before convergence checks fire."""
 
     change_mask_depth_threshold: float = 0.02
     change_mask_rgb_threshold: float = 0.10

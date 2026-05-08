@@ -104,13 +104,14 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     the rendered scene matches the GT for all static keyframes (change
     pixels per image below threshold), the static phase exits early
     even if ``static_num_steps`` is not yet reached."""
-    static_convergence_first_check_step: int = 700
-    """First step at which the convergence check is run. Sits 300
+    static_convergence_first_check_step: int = 300
+    """First step at which the convergence check is run. Sits 100
     steps after full-resolution training kicks in (full res reached
-    at step ``resolution_schedule * num_downscales = 200 * 2 = 400``),
+    at step ``resolution_schedule * num_downscales = 100 * 2 = 200``),
     giving the scene some full-res training time before the first
-    metric is sampled."""
-    static_convergence_check_every: int = 500
+    metric is sampled. With the 1000-step static budget this leaves
+    room for ~7 checks before the hard cap."""
+    static_convergence_check_every: int = 400
     """Cadence of subsequent convergence checks while in the static
     phase."""
     static_convergence_rgb_threshold: float = 0.1
@@ -137,6 +138,15 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     that just-recorded dataset. The dynamic phase reads frames live
     from rospy instead of advancing through a recorded dataset.
     Default False keeps recorded-mode behavior fully untouched."""
+
+    disable_dynamic_optimization: bool = True
+    """When True, the dynamic phase runs **tracking only**: tracker
+    ticks fire and the rigid transform is applied to object
+    Gaussians, but the change-mask compute, optim-pool push, pool
+    round-robin pick, and per-step loss/backward are all skipped.
+    Use this to iterate on tracking robustness in real time without
+    the optim work taking GPU time. Object Gaussians still move
+    (driven by FP / CoTracker); scene Gaussians stay frozen."""
 class DynamicGSPipeline(VanillaPipeline):
     config: DynamicGSPipelineConfig
 
@@ -588,8 +598,17 @@ class DynamicGSPipeline(VanillaPipeline):
                 CONSOLE.log(f"[phase-0] warning: failed to load static depth ({exc}); falling back to SfM targets")
 
         manifest: dict = {}
+        n_objs = len(sam3_objects)
+        print(
+            f"\n==> [phase-0b] fusing {n_objs} SAM3D object(s) into the scene. "
+            f"Each object runs CPD registration (~1.8-58s/obj per CLAUDE.md) "
+            f"+ mesh build + FP tracker construct. Total can be several minutes; "
+            f"per-object progress lines follow.\n",
+            flush=True,
+        )
         for obj_idx, (sam3_obj, sam3d_out) in enumerate(zip(sam3_objects, sam3d_results)):
             instance_id = obj_idx + 1
+            print(f"==> [phase-0b] obj {obj_idx + 1}/{n_objs}: starting", flush=True)
             if not sam3d_out:
                 CONSOLE.log(f"[phase-0] skipping object {obj_idx}: SAM3D failed or empty")
                 continue
@@ -653,6 +672,13 @@ class DynamicGSPipeline(VanillaPipeline):
             # post-static optimized pose above, so read it directly.
             c2w_rotation = camera.camera_to_worlds[0, :3, :3].detach().cpu().numpy().astype(np.float32)
 
+            t_cpd = time.time()
+            print(
+                f"==> [phase-0b] obj {obj_idx + 1}/{n_objs}: running CPD registration "
+                f"(source={len(source_points)} pts, target={len(target_points_np)} pts) "
+                f"— this is the slow part",
+                flush=True,
+            )
             insertion_result = register_and_fuse_sam3d_object(
                 source_points=source_points,
                 source_colors=source_colors,
@@ -663,6 +689,11 @@ class DynamicGSPipeline(VanillaPipeline):
                 debug_dir=debug_dir,
                 artifact_dir=artifact_dir,
                 output_stem=f"static0_obj_{obj_idx:02d}_sam3d",
+            )
+            print(
+                f"==> [phase-0b] obj {obj_idx + 1}/{n_objs}: CPD done in {time.time() - t_cpd:.1f}s "
+                f"(kept {insertion_result.kept_point_count} pts)",
+                flush=True,
             )
 
             # Cull tunables — see comments in the cull block below for what
@@ -779,7 +810,12 @@ class DynamicGSPipeline(VanillaPipeline):
                         self.model.object_instance_ids[match_indices] = instance_id
                         n_flagged_existing = int(match_indices.numel())
 
-            self._timing[f"S0.3_fusion_obj_{obj_idx}"].append(time.time() - t_fusion)
+            obj_total = time.time() - t_fusion
+            self._timing[f"S0.3_fusion_obj_{obj_idx}"].append(obj_total)
+            print(
+                f"==> [phase-0b] obj {obj_idx + 1}/{n_objs}: done in {obj_total:.1f}s",
+                flush=True,
+            )
 
             instance_count = int(
                 (self.model.object_instance_ids.squeeze(-1) == instance_id).sum().item()
@@ -1223,12 +1259,17 @@ class DynamicGSPipeline(VanillaPipeline):
                 f"[dynamic-gs] CoTracker estimated motion for {frame_name}, "
                 "but no object Gaussians were moved. Check object_flags/reference pose consistency."
             )
-        CONSOLE.log(
-            f"[dynamic-gs] CoTracker rigid motion -> {frame_name}, moved={moved_count}, "
-            f"inliers={motion_estimate.inlier_count}/{motion_estimate.correspondence_count}, "
-            f"median residual={motion_estimate.median_residual:.5f}, "
-            f"mask_fallback={motion_estimate.used_mask_fallback}"
-        )
+        # Per-frame success log is muted in tracking-only mode — at
+        # 10+ Hz it floods the console and buries the [tracker-rate]
+        # line below. Failure logs above (skipped / unavailable) still
+        # fire because they're rare and diagnostic.
+        if not self.config.disable_dynamic_optimization:
+            CONSOLE.log(
+                f"[dynamic-gs] CoTracker rigid motion -> {frame_name}, moved={moved_count}, "
+                f"inliers={motion_estimate.inlier_count}/{motion_estimate.correspondence_count}, "
+                f"median residual={motion_estimate.median_residual:.5f}, "
+                f"mask_fallback={motion_estimate.used_mask_fallback}"
+            )
 
     def _initialize_cotracker(self, rgb, depth, camera, mask) -> None:
         """Seed CoTracker with the D0 reference frame.
@@ -1535,6 +1576,34 @@ class DynamicGSPipeline(VanillaPipeline):
         if self._sam3d_inserted and self._cotracker_motion is not None:
             self._apply_cotracker_motion(camera, batch)
         self._timing["DN.3_cotracker_motion"].append(time.time() - t0)
+
+        # Rolling tick-rate report. Plain `print` (not CONSOLE.log) so
+        # the line surfaces above nerfstudio's rich progress bar and
+        # writer logs. Independent of what Viser paints: this is the
+        # actual rate at which object Gaussians get moved.
+        now = time.time()
+        if not hasattr(self, "_live_tick_window_t0"):
+            self._live_tick_window_t0 = now
+            self._live_tick_window_count = 0
+        self._live_tick_window_count += 1
+        if (now - self._live_tick_window_t0) >= 2.0:
+            hz = self._live_tick_window_count / (now - self._live_tick_window_t0)
+            cotracker_ms = self._timing["DN.3_cotracker_motion"][-1] * 1000
+            print(
+                f"\n==> [tracker-rate] {hz:.1f} Hz over {now - self._live_tick_window_t0:.1f}s "
+                f"(CoTracker last={cotracker_ms:.0f}ms)\n",
+                flush=True,
+            )
+            self._live_tick_window_t0 = now
+            self._live_tick_window_count = 0
+
+        # Tracking-only mode: skip the RDN render, object mask, CDN
+        # compute, and pool push. The object Gaussians have already
+        # been moved by `_apply_cotracker_motion`; the viewer pulls
+        # the latest pose on its own render.
+        if self.config.disable_dynamic_optimization:
+            self._global_frame_counter += 1
+            return
 
         # Render after every tracker tick so the scene reflects the latest
         # object pose, regardless of whether the keyframe filter / CDN gate
@@ -2349,6 +2418,11 @@ class DynamicGSPipeline(VanillaPipeline):
                 f"accepted={is_accepted}"
             )
 
+        # Tracking-only mode: skip RDN render + CDN compute + pool push.
+        if self.config.disable_dynamic_optimization:
+            self._global_frame_counter += 1
+            return
+
         # Render RDN + object mask + CDN on every tick, regardless of
         # keyframe-filter acceptance, so the rendered scene reflects the
         # latest object pose every time CoTracker moves it. The optim
@@ -2451,6 +2525,12 @@ class DynamicGSPipeline(VanillaPipeline):
             self._next_frame_to_track += 1
         self._dynamic_step_counter += 1
 
+        # Tracking-only mode: skip pool pick + loss compute entirely.
+        # Tracker ticks above already ran and applied the rigid
+        # transform; weights stay frozen.
+        if self.config.disable_dynamic_optimization:
+            return self._zero_loss_dummy()
+
         # 2. Pool round-robin
         if len(self._optim_pool) == 0:
             return self._zero_loss_dummy()
@@ -2532,6 +2612,12 @@ class DynamicGSPipeline(VanillaPipeline):
                 trainer.config.max_num_iterations = 10**9
             else:
                 trainer.config.max_num_iterations = self._total_train_steps()
+            # Tracking-only mode: each "step" is a no-op for the
+            # writer (loss is identically 0). Bump the per-step log
+            # cadence way up so the LocalWriter stops painting Train
+            # Loss / GPU Memory lines over the [tracker-rate] print.
+            if self.config.disable_dynamic_optimization:
+                trainer.config.logging.steps_per_log = 10**9
         return callbacks
 
     @profiler.time_function

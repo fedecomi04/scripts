@@ -24,6 +24,7 @@ Returns LIVE_ROOT so the pipeline can point its dataparser at it.
 
 from __future__ import annotations
 
+import gc
 import json
 import shutil
 import threading
@@ -33,6 +34,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import torch
 from PIL import Image
 
 from .live_ros_subscriber import (
@@ -264,27 +266,67 @@ def run_live_capture_session() -> Path:
     )
     print(f"[live] SAM3 input frame captured (seq={anchor.seq})", flush=True)
 
-    print(f"[live] running SAM3 with prompt: {sam3_text!r} ...", flush=True)
-    sam3_objects = run_sam3_subprocess(
-        image_path=anchor_rgb_path,
-        text_prompt=sam3_text,
-        output_dir=debug_dir,
-        output_stem="static0",
-        sam3_conda_env=SAM3_CONDA_ENV,
-        min_area_ratio=SAM3_CANDIDATE_MIN_AREA_RATIO,
-        max_area_ratio=SAM3_CANDIDATE_MAX_AREA_RATIO,
-        dedup_iou=SAM3_CANDIDATE_DEDUP_IOU,
-        max_objects=SAM3_CANDIDATE_MAX_OBJECTS,
-        confidence_threshold=SAM3_CONFIDENCE_THRESHOLD,
-        min_score=SAM3_MIN_SCORE,
-    )
-    print(f"[live] SAM3: found {len(sam3_objects)} graspable masks", flush=True)
-    if not sam3_objects:
-        sub.stop_recording()
-        raise RuntimeError("SAM3 found 0 objects — adjust the prompt and retry")
+    # Free any CUDA reservation held by the parent (torch import,
+    # nerfstudio trainer setup, pyrender EGL warmup) so the SAM3
+    # subprocess's first cuBLAS call has clean VRAM.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    print("[live] kicking off SAM3D (background, ~100s for ~4 objects); "
-          "keep moving the camera to capture more static views", flush=True)
+    # Launch SAM3 in a background thread so the operator can press
+    # enter to stop recording at any time — even before SAM3 finishes.
+    # Recording (rospy callback thread) keeps writing keyframes to
+    # disk in parallel, gated by the ORB-SLAM filter so we don't
+    # bloat the dataset with near-duplicate views. GPU contention
+    # between SAM3 and the URDF mask renderer is accepted; URDF
+    # render slows down but doesn't fail under shared VRAM.
+    print(f"[live] recording started; SAM3 running in background (prompt: {sam3_text!r}). "
+          "press enter when you are done capturing static views.", flush=True)
+    sam3_slot = {"objects": None, "error": None, "finished": False}
+
+    def _run_sam3_worker():
+        try:
+            sam3_slot["objects"] = run_sam3_subprocess(
+                image_path=anchor_rgb_path,
+                text_prompt=sam3_text,
+                output_dir=debug_dir,
+                output_stem="static0",
+                sam3_conda_env=SAM3_CONDA_ENV,
+                min_area_ratio=SAM3_CANDIDATE_MIN_AREA_RATIO,
+                max_area_ratio=SAM3_CANDIDATE_MAX_AREA_RATIO,
+                dedup_iou=SAM3_CANDIDATE_DEDUP_IOU,
+                max_objects=SAM3_CANDIDATE_MAX_OBJECTS,
+                confidence_threshold=SAM3_CONFIDENCE_THRESHOLD,
+                min_score=SAM3_MIN_SCORE,
+            )
+        except Exception as exc:
+            sam3_slot["error"] = exc
+        finally:
+            sam3_slot["finished"] = True
+
+    sam3_thread = threading.Thread(target=_run_sam3_worker, name="sam3_subprocess", daemon=True)
+    sam3_thread.start()
+
+    _prompt_user("")  # Enter to stop recording.
+    sub.stop_recording()
+    n_static = sub.num_recorded_frames()
+    print(f"[live] recording stopped after {n_static} keyframes", flush=True)
+
+    if not sam3_slot["finished"]:
+        print("[live] waiting for SAM3 to finish...", flush=True)
+        sam3_thread.join()
+    if sam3_slot["error"] is not None:
+        raise sam3_slot["error"]
+    sam3_objects = sam3_slot["objects"] or []
+    if not sam3_objects:
+        raise RuntimeError("SAM3 found 0 objects — adjust the prompt and retry")
+    print(f"[live] SAM3: found {len(sam3_objects)} graspable masks", flush=True)
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print("[live] running SAM3D (background, ~100s for ~4 objects)", flush=True)
     sam3d_thread, sam3d_slot = _spawn_sam3d_in_thread(
         anchor_rgb_path=anchor_rgb_path,
         sam3_objects=sam3_objects,
@@ -294,20 +336,14 @@ def run_live_capture_session() -> Path:
         intrinsics_path=intrinsics_path,
     )
 
-    _prompt_user("press enter when you are done capturing static views: ")
-
-    if not sam3d_slot["finished"]:
-        print("[live] waiting for SAM3D to finish before starting static training "
-              "(SAM3D and training cannot share the GPU)...", flush=True)
-        last_log = time.time()
-        while not sam3d_slot["finished"]:
-            sam3d_thread.join(timeout=5.0)
-            if not sam3d_slot["finished"] and (time.time() - last_log) >= 5.0:
-                print("[live] still waiting for SAM3D...", flush=True)
-                last_log = time.time()
-    sam3d_thread.join()
+    # Static training cannot share the GPU with SAM3D, so we block here.
+    last_log = time.time()
+    while not sam3d_slot["finished"]:
+        sam3d_thread.join(timeout=5.0)
+        if not sam3d_slot["finished"] and (time.time() - last_log) >= 5.0:
+            print("[live] still waiting for SAM3D...", flush=True)
+            last_log = time.time()
     if sam3d_slot["error"] is not None:
-        sub.stop_recording()
         raise sam3d_slot["error"]
 
     sam3d_results = sam3d_slot["results"] or [{} for _ in sam3_objects]
@@ -316,9 +352,7 @@ def run_live_capture_session() -> Path:
         print(f"[live] SAM3D obj {i}: {'ok' if r else 'failed'}", flush=True)
     print(f"[live] SAM3D done: {n_ok}/{len(sam3_objects)} objects ready", flush=True)
 
-    sub.stop_recording()
-    n_static = sub.num_recorded_frames()
-    print(f"[live] recorded {n_static} static views; building init PLY...", flush=True)
+    print(f"[live] building init PLY from {n_static} static views...", flush=True)
     sub.build_static_init_pointcloud()
 
     _seed_dynamic_scene_stub(static_dir, dynamic_dir)
