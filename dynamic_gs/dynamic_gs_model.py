@@ -114,6 +114,67 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     6 is the wrapper's default for marginal accuracy gains. For 2-frame
     pairwise tracking on a 5 Hz camera, iters=3-4 is typically enough
     to converge."""
+
+    # 2D point tracker selection. The pipeline supports three backends
+    # with the same public surface (initialize / estimate_and_advance / ready):
+    #   * "cotracker" -- Meta CoTracker3 (offline 2-frame mode, hub-loaded)
+    #   * "tapir"     -- Google DeepMind online causal BootsTAPIR (PyTorch
+    #                    port, vendored under third_party/tapnet/)
+    #   * "klt"       -- Classical pyramidal Lucas-Kanade optical flow
+    #                    (cv2.calcOpticalFlowPyrLK), CPU-only, no model
+    #                    load. Resamples fresh FAST keypoints every frame
+    #                    rather than persisting a D0 anchor — the
+    #                    cumulative D0→curr transform is composed from
+    #                    per-frame δT, which drifts but works well for
+    #                    high-fps capture where inter-frame motion is
+    #                    small. Targets ≈5-10 ms / tick.
+    # The 3D RANSAC anchor stays at D0 for tapir/cotracker; klt
+    # back-projects pairwise (prev_world, curr_world) and composes.
+    # KLT is the default on this branch: it's CPU-only, ≈4 ms/tick on
+    # the user's RTX 4060 Ti host (vs ≈40 ms for TAPIR on the same
+    # dataset), and high-fps capture keeps inter-frame motion small
+    # enough that the cumulative-composition drift stays bounded.
+    dynamic_tracker: Literal["tapir", "cotracker", "klt"] = "klt"
+
+    tapir_query_point_count: int = 64
+    tapir_min_track_points: int = 12
+    tapir_ransac_iterations: int = 128
+    tapir_ransac_inlier_threshold: float = 0.008
+    tapir_checkpoint_path: str = ""
+    """Absolute path to ``causal_bootstapir_checkpoint.pt``. Empty falls
+    back to ``third_party/tapnet/checkpoints/causal_bootstapir_checkpoint.pt``."""
+    tapir_input_resolution: tuple[int, int] = (256, 256)
+    """(height, width) input size given to the TAPIR encoder. The
+    BootsTAPIR causal checkpoint is trained at 256x256; deviating from
+    this value will mostly hurt accuracy without much speed gain since
+    the encoder is already small."""
+    tapir_visibility_threshold: float = 0.5
+    """Visibility cutoff: a point is visible iff
+    ``(1 - sigmoid(occlusion)) * (1 - sigmoid(expected_dist)) > threshold``.
+    The TAPIR demo uses 0.5."""
+
+    # KLT (pyramidal Lucas-Kanade) tracker config. Active only when
+    # ``dynamic_tracker == "klt"``.
+    klt_query_point_count: int = 64
+    klt_min_track_points: int = 12
+    klt_ransac_iterations: int = 128
+    klt_ransac_inlier_threshold: float = 0.008
+    klt_pyramid_levels: int = 3
+    """``maxLevel`` passed to cv2.calcOpticalFlowPyrLK. 3 means a 4-level
+    pyramid (0..3); covers ~16x range of motion at the chosen winSize."""
+    klt_window_size: int = 15
+    """Square LK window side in pixels at the finest pyramid level."""
+    klt_lk_iterations: int = 20
+    """Max LK refinement iterations per pyramid level (TermCriteria_COUNT)."""
+    klt_lk_eps: float = 0.03
+    """LK convergence epsilon (TermCriteria_EPS)."""
+    klt_fast_threshold: int = 28
+    """FAST corner-detector threshold for per-frame keypoint resampling."""
+    klt_sample_inner_area_ratio: float = 0.8
+    """Erode the rendered object mask so its area is ~this fraction of
+    the original before sampling keypoints. Keeps points off the
+    silhouette where depth and color are unreliable."""
+
     enable_scene_optimization: bool = True
     scene_opt_refine_every: int = 100
     scene_opt_densify_grad_thresh: float = 0.0002

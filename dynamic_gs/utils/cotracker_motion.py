@@ -178,6 +178,7 @@ class CoTrackerMotionEstimator:
         current_depth: Tensor,
         current_camera: Cameras,
         current_mask: Tensor | None = None,
+        current_object_mask: Tensor | None = None,  # noqa: ARG002 — KLT-only; CoTracker ignores
     ) -> CoTrackerMotionEstimate:
         identity = np.eye(3, dtype=np.float32)
         zero = np.zeros((3,), dtype=np.float32)
