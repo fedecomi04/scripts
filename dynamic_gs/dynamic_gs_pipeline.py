@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -164,6 +165,17 @@ class DynamicGSPipeline(VanillaPipeline):
         self._global_frame_counter = 0
         self._timing = defaultdict(list)
         self._timing_report_written = False
+        # One-shot torch.profiler diagnosis of the dynamic training step.
+        # Toggled by DYNAMIC_GS_PROFILE=1. Captures `_torch_profile_active_dyn_steps`
+        # active iterations after `_torch_profile_warmup_dyn_steps` warmup, exports
+        # a Chrome trace + key_averages table to <data_root>/dynamic_step_profile.{json,txt},
+        # then becomes a no-op.
+        self._torch_profile_enabled = os.environ.get("DYNAMIC_GS_PROFILE", "0") == "1"
+        self._torch_profile_warmup_dyn_steps = 5
+        self._torch_profile_active_dyn_steps = 10
+        self._torch_profiler = None
+        self._torch_profile_started = False
+        self._torch_profile_done = False
         self._cpd_info: dict = {}
         # Holds the SAM3 + SAM3D generation outputs (mask metadata + per-object PLY/pose
         # paths) produced pre-static. ``None`` means generation didn't run, ran with 0
@@ -420,6 +432,27 @@ class DynamicGSPipeline(VanillaPipeline):
                     min_score=model_cfg.sam3_min_score,
                 )
             self._timing["S0.1_sam3_segmentation"].append(time.time() - t_sam3)
+            # In live mode, the actual SAM3 subprocess ran in
+            # ``live_session._run_sam3_worker`` before the pipeline was
+            # constructed. The block above only re-loads the cached
+            # results (~milliseconds), so the inline timer doesn't
+            # reflect the real subprocess wall-clock. Re-inject the
+            # measured duration from the live-session sidecar if it
+            # exists.
+            try:
+                live_timings_path = artifact_dir / "live_sam3_timings.json"
+                if live_timings_path.is_file():
+                    import json as _json
+                    live_timings = _json.loads(live_timings_path.read_text())
+                    if "S0.1_sam3_segmentation" in live_timings:
+                        # Replace the cached-check duration with the
+                        # real subprocess one. Single-entry list since
+                        # SAM3 only ever runs once per session.
+                        self._timing["S0.1_sam3_segmentation"] = [
+                            float(live_timings["S0.1_sam3_segmentation"]),
+                        ]
+            except Exception as _exc:
+                CONSOLE.log(f"[phase-0] could not read live SAM3 timing sidecar: {_exc}")
 
             if not sam3_objects:
                 CONSOLE.log("[phase-0] SAM3 found 0 objects; skipping Phase 0 prefusion")
@@ -1611,6 +1644,27 @@ class DynamicGSPipeline(VanillaPipeline):
         # below). Compare to LIVE.peek_latest + LIVE.wrap_batch + ... to
         # find the unaccounted gap.
         tick_t0 = time.time()
+        # --- LIVE.between_tick_gap: wall-clock time elapsed since the
+        # PREVIOUS tick_total recording finished. If this is large
+        # while tick_total is small, work happening OUTSIDE
+        # _tracker_tick_live (trainer's outer loop, optim step,
+        # callbacks, viewer render) is the bottleneck — not the tracker
+        # itself.
+        if hasattr(self, "_last_tick_end_t"):
+            self._timing["LIVE.between_tick_gap"].append(tick_t0 - self._last_tick_end_t)
+        # --- LIVE.frame_age: how stale was the most recent ROS frame
+        # at the moment we picked it up? If this is consistently
+        # similar to between_tick_gap, the supply (Gazebo camera plugin)
+        # is publishing at a comparable rate to our consumption — i.e.
+        # we're not starved by ROS. If frame_age << gap, we're
+        # consuming slower than ROS supplies (we're the bottleneck).
+        # If frame_age >> gap, ROS is publishing faster than we read —
+        # ideal scenario.
+        # --- LIVE.frame_dt_seq: stamp delta between this frame and the
+        # previously processed frame. If this is ~5 Hz (200ms) it tells
+        # us the camera plugin is rate-limited even if Gazebo physics
+        # runs faster. If it's ~30 Hz (33ms) the camera is fine and the
+        # consumer is the bottleneck.
         sub = self._live_subscriber
         if sub is None:
             return
@@ -1625,7 +1679,21 @@ class DynamicGSPipeline(VanillaPipeline):
             self._live_last_processed_stamp is not None
             and latest.stamp_sec == self._live_last_processed_stamp
         ):
+            # Dedup return — count it so we can see the dedup ratio.
+            self._timing.setdefault("LIVE.dedup_returns", []).append(0.0)
             return
+        # Frame is fresh. Record stamp-delta and wall-clock age before
+        # we update the last-processed stamp.
+        if self._live_last_processed_stamp is not None:
+            self._timing["LIVE.frame_dt_seq"].append(
+                latest.stamp_sec - self._live_last_processed_stamp
+            )
+        # Wall-clock age: how long ago did this frame land in the
+        # subscriber buffer? Compares ROS stamp to current wall clock.
+        # Note: assumes ROS stamps are wall clock (true with use_sim_time=False).
+        # If sim time is on, this is sim-time age, still useful for
+        # comparing against sim-time tick gap.
+        self._timing["LIVE.frame_age"].append(max(0.0, time.time() - latest.stamp_sec))
         self._live_last_processed_stamp = latest.stamp_sec
 
         # --- LIVE.wrap_batch: 3x pageable H2D copies (rgb 5MB, depth
@@ -1696,7 +1764,7 @@ class DynamicGSPipeline(VanillaPipeline):
         # been moved by `_apply_cotracker_motion`; the viewer pulls
         # the latest pose on its own render.
         if self.config.disable_dynamic_optimization:
-            self._timing["LIVE.tick_total"].append(time.time() - tick_t0)
+            self._timing["LIVE.tick_total"].append(time.time() - tick_t0); self._last_tick_end_t = time.time()
             self._global_frame_counter += 1
             return
 
@@ -1715,7 +1783,7 @@ class DynamicGSPipeline(VanillaPipeline):
         )
         self._timing["LIVE.keyframe_filter"].append(time.time() - t0)
         if not accepted:
-            self._timing["LIVE.tick_total"].append(time.time() - tick_t0)
+            self._timing["LIVE.tick_total"].append(time.time() - tick_t0); self._last_tick_end_t = time.time()
             self._global_frame_counter += 1
             return
 
@@ -1737,7 +1805,7 @@ class DynamicGSPipeline(VanillaPipeline):
 
         cdn_px = int((cdn[..., 0] > 0.5).sum().item()) if cdn.ndim >= 3 else int((cdn > 0.5).sum().item())
         if cdn_px < self.config.optim_pool_min_change_pixels:
-            self._timing["LIVE.tick_total"].append(time.time() - tick_t0)
+            self._timing["LIVE.tick_total"].append(time.time() - tick_t0); self._last_tick_end_t = time.time()
             self._global_frame_counter += 1
             return
 
@@ -1748,7 +1816,7 @@ class DynamicGSPipeline(VanillaPipeline):
         CONSOLE.log(
             f"[live] {frame_name}: change px={cdn_px}, pool_size={len(self._optim_pool)}"
         )
-        self._timing["LIVE.tick_total"].append(time.time() - tick_t0)
+        self._timing["LIVE.tick_total"].append(time.time() - tick_t0); self._last_tick_end_t = time.time()
         self._global_frame_counter += 1
         # PROBLEM: every accepted live frame holds its `camera` and
         # `cdn` tensors on GPU until evicted from the pool. With
@@ -2446,18 +2514,7 @@ class DynamicGSPipeline(VanillaPipeline):
                 # static scene is trained (back-side Gaussians never see
                 # static photometric optimization).
                 if self._sam3d_generation_outputs:
-                    try:
-                        self._fuse_sam3d_objects_into_scene(self._sam3d_generation_outputs)
-                    finally:
-                        # Live mode paused Gazebo physics at the second
-                        # Enter (live_session.run_live_capture_session) to
-                        # free CPU/GPU for static training + fusion. Resume
-                        # now — even if fusion raised, the operator wants
-                        # the simulator running again. The helper is
-                        # idempotent and a no-op when Gazebo isn't running.
-                        if self.config.live:
-                            from .utils.live_session import unpause_gazebo_physics
-                            unpause_gazebo_physics()
+                    self._fuse_sam3d_objects_into_scene(self._sam3d_generation_outputs)
             CONSOLE.log(f"[dynamic-gs] phase -> {phase} at step {step}")
 
         if phase == "static":
@@ -2736,14 +2793,87 @@ class DynamicGSPipeline(VanillaPipeline):
                 trainer.config.logging.steps_per_log = 10**9
         return callbacks
 
+    def _maybe_start_torch_profiler(self) -> None:
+        """Lazy-init torch.profiler.profile on the first dynamic step when enabled.
+
+        Captures one window of dynamic training steps (warmup + active), then
+        on_trace_ready fires once and exports a Chrome trace + a key_averages
+        table sorted by CUDA time. Subsequent ``step()`` calls become no-ops.
+        """
+        if self._torch_profile_started or self._torch_profile_done or not self._torch_profile_enabled:
+            return
+
+        try:
+            data_root = Path(self.datamanager.config.data)
+        except AttributeError:
+            data_root = Path(".")
+        trace_path = data_root / "dynamic_step_profile.json"
+        summary_path = data_root / "dynamic_step_profile.txt"
+
+        def _on_trace_ready(prof):
+            try:
+                prof.export_chrome_trace(str(trace_path))
+            except Exception as e:
+                CONSOLE.log(f"[profile] export_chrome_trace failed: {e}")
+            sort_key = "cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
+            try:
+                table = prof.key_averages().table(sort_by=sort_key, row_limit=40)
+            except Exception as e:
+                table = f"key_averages().table failed: {e}"
+            try:
+                summary_path.write_text(table)
+            except Exception:
+                pass
+            CONSOLE.log("[profile] === DYNAMIC STEP TORCH PROFILE (top 40 by CUDA time) ===")
+            CONSOLE.log(table)
+            CONSOLE.log(f"[profile] Chrome trace: {trace_path}")
+            CONSOLE.log(f"[profile] Op-table summary: {summary_path}")
+            self._torch_profile_done = True
+
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        try:
+            self._torch_profiler = torch.profiler.profile(
+                activities=activities,
+                schedule=torch.profiler.schedule(
+                    wait=0,
+                    warmup=self._torch_profile_warmup_dyn_steps,
+                    active=self._torch_profile_active_dyn_steps,
+                    repeat=1,
+                ),
+                on_trace_ready=_on_trace_ready,
+                record_shapes=False,
+                with_stack=False,
+                profile_memory=False,
+            )
+            self._torch_profiler.__enter__()
+            self._torch_profile_started = True
+            CONSOLE.log(
+                f"[profile] torch.profiler started: "
+                f"{self._torch_profile_warmup_dyn_steps} warmup + "
+                f"{self._torch_profile_active_dyn_steps} active dynamic steps"
+            )
+        except Exception as e:
+            CONSOLE.log(f"[profile] torch.profiler init failed: {e}")
+            self._torch_profile_enabled = False
+            self._torch_profiler = None
+
     @profiler.time_function
     def get_train_loss_dict(self, step: int):
         t0 = time.time()
         self._sync_phase(step)
         if self.current_phase == "dynamic":
+            self._maybe_start_torch_profiler()
             result = self._dynamic_get_train_loss_dict(step)
         else:
             result = super().get_train_loss_dict(step)
+        if self._torch_profiler is not None and self.current_phase == "dynamic":
+            try:
+                self._torch_profiler.step()
+            except Exception:
+                pass
         elapsed = time.time() - t0
         phase_key = "static_step" if self.current_phase == "static" else "dynamic_step"
         self._timing[phase_key].append(elapsed)
@@ -2871,6 +3001,9 @@ class DynamicGSPipeline(VanillaPipeline):
         ]
         live_keys = [
             ("LIVE.tick_total", "Whole-tick wall-clock (live mode only). Includes early-return ticks that didn't reach the renders."),
+            ("LIVE.between_tick_gap", "**Wall-clock between consecutive ticks** (= time spent OUTSIDE _tracker_tick_live: trainer outer loop, optim step, callbacks, viewer render). Large gap + small tick_total = bottleneck is here, not in the tracker."),
+            ("LIVE.frame_dt_seq", "Stamp delta between consecutive PROCESSED ROS frames. Reflects effective camera publishing rate as seen by the consumer."),
+            ("LIVE.frame_age", "Wall-clock age of the ROS frame at the moment we picked it up (now - frame.stamp)."),
             ("LIVE.peek_latest", "  -> ROS subscriber peek_latest (atomic read, should be sub-ms)"),
             ("LIVE.wrap_batch", "  -> _wrap_live_tuple_as_batch (3x pageable H2D copies: rgb~5MB + depth~3.6MB + mask~0.9MB + Cameras object)"),
             ("LIVE.gt_setup", "  -> gt_rgb composite + _get_gt_depth + _get_batch_mask (GPU ops on device-resident tensors)"),
@@ -3030,12 +3163,28 @@ class DynamicGSPipeline(VanillaPipeline):
             n_ticks = len(live_tick_vals)
             avg_tick_ms = sum(live_tick_vals) / n_ticks * 1000
             tick_hz = (1000.0 / avg_tick_ms) if avg_tick_ms > 0 else 0.0
+            # Effective end-to-end rate from inter-tick gap.
+            gap_vals = self._timing.get("LIVE.between_tick_gap", [])
+            if gap_vals:
+                avg_gap_ms = sum(gap_vals) / len(gap_vals) * 1000
+                cycle_ms = avg_tick_ms + avg_gap_ms
+                effective_hz = (1000.0 / cycle_ms) if cycle_ms > 0 else 0.0
+            else:
+                effective_hz = tick_hz
+            # Dedup ratio: dedup-returns vs. processed ticks.
+            dedup_count = len(self._timing.get("LIVE.dedup_returns", []))
+            total_calls = n_ticks + dedup_count
+            dedup_ratio = (dedup_count / total_calls) if total_calls > 0 else 0.0
             lines.append(
-                f"--- LIVE TICK BREAKDOWN (over {n_ticks} ticks; avg {avg_tick_ms:.1f}ms ≈ {tick_hz:.1f} Hz) ---"
+                f"--- LIVE TICK BREAKDOWN ({n_ticks} processed ticks + {dedup_count} dedup-returns; "
+                f"in-tick avg {avg_tick_ms:.1f}ms; **effective rate {effective_hz:.1f} Hz** with "
+                f"between-tick gap; dedup ratio {dedup_ratio*100:.0f}%) ---"
             )
             lines.append(
                 "  [Sub-step averages. LIVE.tick_total includes early-return ticks (filter rejects, "
-                "tracking-only short-circuit). Sub-keys are per-call; sum should ~match tick_total minus motion+renders.]"
+                "tracking-only short-circuit). LIVE.between_tick_gap is wall-clock spent OUTSIDE this "
+                "function (trainer outer loop, optim, viewer). If gap >> tick_total, the bottleneck "
+                "is outside the tracker.]"
             )
             for key, desc in live_keys:
                 vals = self._timing.get(key, [])

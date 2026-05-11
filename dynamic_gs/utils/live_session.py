@@ -24,6 +24,7 @@ Returns LIVE_ROOT so the pipeline can point its dataparser at it.
 
 from __future__ import annotations
 
+import atexit
 import gc
 import json
 import shutil
@@ -44,6 +45,71 @@ from .live_ros_subscriber import (
 )
 from .sam3_segmentation import run_sam3_subprocess
 from .sam3d import run_sam3d_multi_object_subprocess
+
+
+# Module-level flag so the unpause-on-exit guard only fires when we
+# actually paused. Set True by ``pause_gazebo_physics`` on success;
+# cleared by ``unpause_gazebo_physics``. The atexit hook reads this
+# to decide whether to attempt a final unpause.
+_GAZEBO_PHYSICS_PAUSED = False
+
+
+def pause_gazebo_physics() -> bool:
+    """Call ``/gazebo/pause_physics``. Returns True on success.
+
+    Used to free CPU/GPU contention from Gazebo for the duration of
+    the SAM3D subprocess + init PLY build (the slow stretch from the
+    second Enter through ``build_static_init_pointcloud``). Probreg
+    CPD and the PLY back-projection are CPU-heavy and compete with
+    gzserver's physics tick.
+
+    Safe to call when Gazebo isn't running — the wait_for_service
+    times out and we return False without raising.
+    """
+    global _GAZEBO_PHYSICS_PAUSED
+    try:
+        import rospy
+        from std_srvs.srv import Empty
+        rospy.wait_for_service("/gazebo/pause_physics", timeout=2.0)
+        rospy.ServiceProxy("/gazebo/pause_physics", Empty)()
+    except Exception as exc:
+        print(f"[live] could not pause Gazebo: {exc}", flush=True)
+        return False
+    _GAZEBO_PHYSICS_PAUSED = True
+    print("[live] Gazebo physics paused", flush=True)
+    return True
+
+
+def unpause_gazebo_physics() -> bool:
+    """Call ``/gazebo/unpause_physics``. Idempotent — safe to call
+    when not paused (Gazebo just resumes from running). Always clears
+    the in-process flag so the atexit hook doesn't double-unpause.
+    """
+    global _GAZEBO_PHYSICS_PAUSED
+    _GAZEBO_PHYSICS_PAUSED = False
+    try:
+        import rospy
+        from std_srvs.srv import Empty
+        rospy.wait_for_service("/gazebo/unpause_physics", timeout=2.0)
+        rospy.ServiceProxy("/gazebo/unpause_physics", Empty)()
+    except Exception as exc:
+        print(f"[live] could not unpause Gazebo: {exc}", flush=True)
+        return False
+    print("[live] Gazebo physics unpaused", flush=True)
+    return True
+
+
+def _atexit_unpause() -> None:
+    """Final safety net: if the process exits while Gazebo is still
+    paused — for example because SAM3D crashed or the user Ctrl+C'd
+    during PCD build — unpause so we don't leave the simulator frozen
+    for the next operator.
+    """
+    if _GAZEBO_PHYSICS_PAUSED:
+        unpause_gazebo_physics()
+
+
+atexit.register(_atexit_unpause)
 
 # Hardcoded SAM3 defaults (kept here, not in the model config, because
 # the live workflow expects to override them via the user prompt).
@@ -285,6 +351,13 @@ def run_live_capture_session() -> Path:
     sam3_slot = {"objects": None, "error": None, "finished": False}
 
     def _run_sam3_worker():
+        # Measured here (not in the pipeline) because in live mode the
+        # pipeline's ``_run_sam3_and_sam3d_generation`` only re-checks
+        # the cached SAM3 results and so its S0.1 timer reports ~0s.
+        # The duration captured here is written to a sidecar JSON below
+        # and re-injected into self._timing["S0.1_sam3_segmentation"]
+        # by the pipeline.
+        t_sam3 = time.time()
         try:
             sam3_slot["objects"] = run_sam3_subprocess(
                 image_path=anchor_rgb_path,
@@ -302,6 +375,7 @@ def run_live_capture_session() -> Path:
         except Exception as exc:
             sam3_slot["error"] = exc
         finally:
+            sam3_slot["duration"] = time.time() - t_sam3
             sam3_slot["finished"] = True
 
     sam3_thread = threading.Thread(target=_run_sam3_worker, name="sam3_subprocess", daemon=True)
@@ -312,48 +386,69 @@ def run_live_capture_session() -> Path:
     n_static = sub.num_recorded_frames()
     print(f"[live] recording stopped after {n_static} keyframes", flush=True)
 
-    if not sam3_slot["finished"]:
-        print("[live] waiting for SAM3 to finish...", flush=True)
-        sam3_thread.join()
-    if sam3_slot["error"] is not None:
-        raise sam3_slot["error"]
-    sam3_objects = sam3_slot["objects"] or []
-    if not sam3_objects:
-        raise RuntimeError("SAM3 found 0 objects — adjust the prompt and retry")
-    print(f"[live] SAM3: found {len(sam3_objects)} graspable masks", flush=True)
+    # Pause Gazebo physics from here through the end of the init-PLY
+    # build. The window covers SAM3-finish, SAM3D subprocess, and the
+    # depth-back-projection PLY assembly — all of which compete with
+    # gzserver for CPU/GPU. The atexit guard above unpauses if we die
+    # in this stretch; the try/finally below covers normal raises.
+    pause_gazebo_physics()
+    try:
+        if not sam3_slot["finished"]:
+            print("[live] waiting for SAM3 to finish...", flush=True)
+            sam3_thread.join()
+        if sam3_slot["error"] is not None:
+            raise sam3_slot["error"]
+        sam3_objects = sam3_slot["objects"] or []
+        if not sam3_objects:
+            raise RuntimeError("SAM3 found 0 objects — adjust the prompt and retry")
+        print(f"[live] SAM3: found {len(sam3_objects)} graspable masks "
+              f"({sam3_slot['duration']:.1f}s)", flush=True)
+        # Persist the measured SAM3 duration to a sidecar JSON. The
+        # pipeline reads this in ``_run_sam3_and_sam3d_generation`` and
+        # re-injects it into ``self._timing["S0.1_sam3_segmentation"]``
+        # so the timing report shows the real subprocess wall-clock,
+        # not the pipeline's near-zero cached-check.
+        live_timings_path = artifact_dir / "live_sam3_timings.json"
+        live_timings_path.write_text(json.dumps({
+            "S0.1_sam3_segmentation": float(sam3_slot["duration"]),
+        }, indent=2) + "\n")
 
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    print("[live] running SAM3D (background, ~100s for ~4 objects)", flush=True)
-    sam3d_thread, sam3d_slot = _spawn_sam3d_in_thread(
-        anchor_rgb_path=anchor_rgb_path,
-        sam3_objects=sam3_objects,
-        artifact_dir=artifact_dir,
-        debug_dir=debug_dir,
-        depth_path=depth_path,
-        intrinsics_path=intrinsics_path,
-    )
+        print("[live] running SAM3D (background, ~100s for ~4 objects)", flush=True)
+        sam3d_thread, sam3d_slot = _spawn_sam3d_in_thread(
+            anchor_rgb_path=anchor_rgb_path,
+            sam3_objects=sam3_objects,
+            artifact_dir=artifact_dir,
+            debug_dir=debug_dir,
+            depth_path=depth_path,
+            intrinsics_path=intrinsics_path,
+        )
 
-    # Static training cannot share the GPU with SAM3D, so we block here.
-    last_log = time.time()
-    while not sam3d_slot["finished"]:
-        sam3d_thread.join(timeout=5.0)
-        if not sam3d_slot["finished"] and (time.time() - last_log) >= 5.0:
-            print("[live] still waiting for SAM3D...", flush=True)
-            last_log = time.time()
-    if sam3d_slot["error"] is not None:
-        raise sam3d_slot["error"]
+        # Static training cannot share the GPU with SAM3D, so we block here.
+        last_log = time.time()
+        while not sam3d_slot["finished"]:
+            sam3d_thread.join(timeout=5.0)
+            if not sam3d_slot["finished"] and (time.time() - last_log) >= 5.0:
+                print("[live] still waiting for SAM3D...", flush=True)
+                last_log = time.time()
+        if sam3d_slot["error"] is not None:
+            raise sam3d_slot["error"]
 
-    sam3d_results = sam3d_slot["results"] or [{} for _ in sam3_objects]
-    n_ok = sum(1 for r in sam3d_results if r)
-    for i, r in enumerate(sam3d_results):
-        print(f"[live] SAM3D obj {i}: {'ok' if r else 'failed'}", flush=True)
-    print(f"[live] SAM3D done: {n_ok}/{len(sam3_objects)} objects ready", flush=True)
+        sam3d_results = sam3d_slot["results"] or [{} for _ in sam3_objects]
+        n_ok = sum(1 for r in sam3d_results if r)
+        for i, r in enumerate(sam3d_results):
+            print(f"[live] SAM3D obj {i}: {'ok' if r else 'failed'}", flush=True)
+        print(f"[live] SAM3D done: {n_ok}/{len(sam3_objects)} objects ready", flush=True)
 
-    print(f"[live] building init PLY from {n_static} static views...", flush=True)
-    sub.build_static_init_pointcloud()
+        print(f"[live] building init PLY from {n_static} static views...", flush=True)
+        sub.build_static_init_pointcloud()
+    finally:
+        # PCD build done (or aborted); resume the simulator before
+        # static training starts.
+        unpause_gazebo_physics()
 
     _seed_dynamic_scene_stub(static_dir, dynamic_dir)
 

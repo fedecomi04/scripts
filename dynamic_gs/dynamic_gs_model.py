@@ -134,7 +134,7 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     # the user's RTX 4060 Ti host (vs ≈40 ms for TAPIR on the same
     # dataset), and high-fps capture keeps inter-frame motion small
     # enough that the cumulative-composition drift stays bounded.
-    dynamic_tracker: Literal["tapir", "cotracker", "klt"] = "klt"
+    dynamic_tracker: Literal["tapir", "cotracker", "klt"] = "cotracker"
 
     tapir_query_point_count: int = 64
     tapir_min_track_points: int = 12
