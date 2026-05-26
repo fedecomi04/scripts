@@ -1939,21 +1939,20 @@ class DynamicGSPipeline(VanillaPipeline):
             cam_idx=0,
         )
 
-        # Pin the host buffers BEFORE the H2D copy so the GPU upload can
-        # truly run async with ``non_blocking=True``. Pageable memory
-        # (the default for ``torch.from_numpy``) forces the CUDA driver
-        # to first copy the page into a pinned staging buffer, which
-        # serialises the transfer with the launching thread and costs
-        # ~11 ms per tick on this rig. Pinning skips the staging step
-        # → ~3 ms per tick steady-state. Total live frame is rgb(uint8
-        # ~5 MB) + depth(float32 ~3.6 MB) + mask(float32 ~0.9 MB) ≈ 10 MB
-        # of pinned host memory per in-flight frame, trivially manageable.
+        # NOTE: a previous attempt called ``.pin_memory()`` per tensor
+        # to get async H2D. That regressed wrap_batch from 11 ms to
+        # 32 ms because ``Tensor.pin_memory()`` is itself a synchronous
+        # copy into a freshly-allocated pinned buffer (~20 ms total for
+        # rgb + depth + mask). Doing it right requires a long-lived
+        # pinned staging buffer that the shm reader writes directly
+        # into — left as future work. For now stick with the plain
+        # pageable upload.
         rgb_rgb = np.ascontiguousarray(frame.rgb_bgr[..., ::-1])
-        image_t = torch.from_numpy(rgb_rgb).pin_memory().to(device, non_blocking=True)
+        image_t = torch.from_numpy(rgb_rgb).to(device, non_blocking=True)
         # depth is already float32 metres from the publisher; no rescale.
-        depth_t = torch.from_numpy(frame.depth_m).pin_memory().to(device, non_blocking=True)
+        depth_t = torch.from_numpy(frame.depth_m).to(device, non_blocking=True)
         mask_bool = (frame.mask_keep > 0).astype(np.float32)
-        mask_t = torch.from_numpy(mask_bool).pin_memory().to(device, non_blocking=True).unsqueeze(-1)
+        mask_t = torch.from_numpy(mask_bool).to(device, non_blocking=True).unsqueeze(-1)
 
         batch = {
             "image": image_t,
