@@ -1669,6 +1669,10 @@ class DynamicGSPipeline(VanillaPipeline):
                 ransac_iterations=self.model.config.xfeat_ransac_iterations,
                 ransac_inlier_threshold=self.model.config.xfeat_ransac_inlier_threshold,
                 weights_path=self.model.config.xfeat_weights_path,
+                use_lighterglue=self.model.config.xfeat_use_lighterglue,
+                lighterglue_min_conf=self.model.config.xfeat_lighterglue_min_conf,
+                lighterglue_depth_confidence=self.model.config.xfeat_lighterglue_depth_confidence,
+                object_search_radius_px=self.model.config.xfeat_object_search_radius_px,
             )
             tracker_label = "XFeat"
         else:

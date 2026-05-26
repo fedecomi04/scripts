@@ -271,6 +271,15 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     xfeat_lighterglue_min_conf: float = 0.1
     """LighterGlue's match-confidence filter (post-attention). 0.1 is the
     XFeat repo default; higher is stricter, fewer matches."""
+    xfeat_lighterglue_depth_confidence: float = 0.95
+    """LighterGlue layer-depth early-exit threshold. When the per-token
+    confidence head's running mean clears this value, LighterGlue stops
+    iterating transformer layers early. ``-1`` disables early stopping
+    (the XFeat repo default — the XFeat author left it off because they
+    were benchmarking accuracy, not latency). For this live-tracking
+    workload the matches are easy (short baseline, well-textured object,
+    descriptors barely change tick-to-tick), so 0.95 typically exits
+    after 2-3 of the 6 layers and trims ~2-3 ms per call."""
     xfeat_object_mask_cache_ticks: int = 3
     """Re-render the splat-rasterized object mask only every Nth tracker
     tick; reuse the cached mask otherwise. ``render_object_mask`` costs

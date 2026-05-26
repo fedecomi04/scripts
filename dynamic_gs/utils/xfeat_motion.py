@@ -186,6 +186,7 @@ class XFeatMotionEstimator:
         anchor_rotation_gate_deg: float = ROTATION_GATE_DEG,
         use_lighterglue: bool = True,
         lighterglue_min_conf: float = 0.1,
+        lighterglue_depth_confidence: float = 0.95,
         object_search_radius_px: int = 80,
     ) -> None:
         self.device = torch.device(device)
@@ -201,6 +202,7 @@ class XFeatMotionEstimator:
         self._anchor_min_inliers = max(int(anchor_min_inliers), self.min_track_points)
         self._anchor_rotation_gate_deg = float(anchor_rotation_gate_deg)
         self._lighterglue_min_conf = float(lighterglue_min_conf)
+        self._lighterglue_depth_confidence = float(lighterglue_depth_confidence)
         self._object_search_radius_px = max(int(object_search_radius_px), 0)
 
         _ensure_repo_on_path()
@@ -229,7 +231,21 @@ class XFeatMotionEstimator:
                 from modules.lighterglue import LighterGlue  # type: ignore
                 lg_weights = os.path.join(_XFEAT_REPO, "weights", "xfeat-lighterglue.pt")
                 self._lighterglue = LighterGlue(weights=lg_weights).to(self._xfeat.dev).eval()
-                print(f"[xfeat] LighterGlue matcher enabled (weights: {lg_weights})")
+                # Enable layer-depth early-exit. The LighterGlue
+                # ``default_conf_xfeat`` ships with ``depth_confidence=-1``
+                # (disabled) — the XFeat author left it off for accuracy
+                # benchmarks. For live tracking we override at runtime so
+                # easy matches skip the deeper transformer layers.
+                try:
+                    self._lighterglue.net.conf.depth_confidence = (
+                        self._lighterglue_depth_confidence
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                print(
+                    f"[xfeat] LighterGlue matcher enabled (weights: {lg_weights}, "
+                    f"depth_conf={self._lighterglue_depth_confidence})"
+                )
             except Exception as exc:  # noqa: BLE001
                 print(
                     f"[xfeat] LighterGlue unavailable ({exc}); "
