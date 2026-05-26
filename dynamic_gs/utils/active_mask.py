@@ -128,6 +128,55 @@ def keep_largest_component_with_min_area(mask, min_area):
     return torch.from_numpy(keep_np).to(device=mask.device).float()[..., None]
 
 
+def select_top_n_components_filtered(
+    mask,
+    n: int = 3,
+    area_ratio: float = 0.3,
+    min_area: int = 1500,
+):
+    """Return up to ``n`` largest connected components of *mask* as a list of
+    per-component binary masks (``[H, W, 1]`` float).
+
+    Sorted by area descending. Components smaller than ``min_area`` pixels
+    are dropped regardless. After taking the top ``n``, additionally drop
+    any whose area is below ``area_ratio * largest_area`` (use
+    ``area_ratio=0.0`` to disable the dominance filter).
+    """
+
+    mask = _to_hw1(mask)
+    binary = mask[..., 0] > 0.5
+    if not torch.any(binary):
+        return []
+
+    labels_np, num = _scipy_label(binary.detach().cpu().numpy())
+    if num == 0:
+        return []
+
+    areas = np.bincount(labels_np.ravel(), minlength=num + 1)
+    areas[0] = 0  # background
+
+    # Sort by area descending, indices in labels_np start at 1.
+    order = np.argsort(-areas[1:]) + 1  # (num,) labels sorted by area desc
+    kept_labels: list[int] = []
+    largest_area = int(areas[order[0]]) if len(order) > 0 else 0
+    if largest_area < int(min_area):
+        return []
+    dominance_floor = max(int(min_area), int(round(float(area_ratio) * largest_area)))
+    for lbl in order[: int(n)]:
+        a = int(areas[lbl])
+        if a < dominance_floor:
+            break
+        kept_labels.append(int(lbl))
+
+    out = []
+    for lbl in kept_labels:
+        keep_np = labels_np == lbl
+        out.append(
+            torch.from_numpy(keep_np).to(device=mask.device).float()[..., None]
+        )
+    return out
+
+
 def combine_object_masks(render_mask, live_mask, valid_mask=None):
     """Build the optimization mask from rendered and live object masks."""
 

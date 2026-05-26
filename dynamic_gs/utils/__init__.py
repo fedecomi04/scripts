@@ -7,7 +7,9 @@ from .active_mask import (
     extract_projected_centers_and_radii,
     keep_largest_component,
     keep_largest_component_with_min_area,
+    select_top_n_components_filtered,
 )
+from .rgbd_decode import decode_component_to_gaussians
 from .depth_loss import masked_l1_depth_loss
 from .esam import (
     ESAM_NUM_PROMPT_POINTS,
@@ -48,8 +50,10 @@ __all__ = [
     "build_change_mask",
     "build_esam_ti",
     "combine_object_masks",
+    "decode_component_to_gaussians",
     "dilate_binary_mask",
     "CoTrackerMotionEstimate",
+    "select_top_n_components_filtered",
     "DynamicKeyframeFilter",
     "ESAM_NUM_PROMPT_POINTS",
     "ESAM_PROMPT_KEEP_RATIO",

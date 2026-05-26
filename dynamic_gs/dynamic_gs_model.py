@@ -897,6 +897,77 @@ class DynamicGSModel(SplatfactoModel):
         self._refresh_gaussian_optimizers(reset_means_optimizer=True)
         return n_deleted
 
+    @torch.no_grad()
+    def insert_inpaint_gaussians(
+        self,
+        xyz: Tensor,
+        features_dc: Tensor,
+        features_rest: Tensor,
+        opacities: Tensor,
+        scales: Tensor,
+        quats: Tensor,
+        instance_id: int = 999,
+    ) -> Tensor:
+        """Insert per-pixel feedforward-decoded Gaussians as frozen scene fill.
+
+        Accepts the raw tensors from the path's decoder (no defaulting of
+        opacity/scale/quat — those reflect the per-pixel pixel-footprint
+        and surface normal). Concatenates into the Splatfacto parameter
+        tensors and marks the new Gaussians with the frozen-insertion
+        invariant: ``object_flags=1``, ``object_instance_ids=instance_id``
+        (default 999 — not a tracked instance, so the rigid transform
+        skips them), ``inserted_flags=1``. Scene-opt gradient hooks zero
+        gradients for ``object_flags == 1``, so nothing optimizes them.
+        Returns the inserted index range.
+        """
+        if xyz.shape[0] == 0:
+            return torch.zeros((0,), dtype=torch.long, device=self.means.device)
+
+        device = self.means.device
+        dtype = self.means.dtype
+        n_new = xyz.shape[0]
+
+        # Coerce / validate shapes
+        new_means = xyz.to(device=device, dtype=dtype)
+        new_features_dc = features_dc.to(device=device, dtype=dtype)
+        new_features_rest = features_rest.to(device=device, dtype=dtype)
+        new_scales = scales.to(device=device, dtype=dtype)
+        new_quats = quats.to(device=device, dtype=dtype)
+        new_opacities = opacities.to(device=device, dtype=dtype)
+        if new_opacities.ndim == 1:
+            new_opacities = new_opacities.unsqueeze(-1)
+
+        # Match the SH layout the existing param tensors expect.
+        dim_sh_rest = self.features_rest.shape[1]
+        if new_features_rest.shape[1] != dim_sh_rest:
+            if new_features_rest.shape[1] == 0:
+                new_features_rest = torch.zeros((n_new, dim_sh_rest, 3), device=device, dtype=dtype)
+            else:
+                raise ValueError(
+                    f"features_rest dim mismatch: got {new_features_rest.shape[1]}, "
+                    f"expected {dim_sh_rest}"
+                )
+
+        old_num_points = self.num_points
+        new_tensors = {
+            "means": new_means,
+            "features_dc": new_features_dc,
+            "features_rest": new_features_rest,
+            "scales": new_scales,
+            "quats": new_quats,
+            "opacities": new_opacities,
+        }
+        for name in ["means", "features_dc", "features_rest", "scales", "quats", "opacities"]:
+            concatenated = torch.cat([self.gauss_params[name].detach(), new_tensors[name]], dim=0)
+            self.gauss_params[name] = torch.nn.Parameter(concatenated)
+
+        self._resize_dynamic_buffers(self.num_points)
+        self.object_flags[old_num_points:] = 1.0
+        self.object_instance_ids[old_num_points:] = int(instance_id)
+        self.inserted_flags[old_num_points:] = 1.0
+        self._refresh_gaussian_optimizers(reset_means_optimizer=True)
+        return torch.arange(old_num_points, self.num_points, device=device, dtype=torch.long)
+
     def insert_object_gaussians(
         self, new_xyz: Tensor, new_rgb: Tensor, object_flag: bool = True, instance_id: int = 0,
     ) -> Tensor:

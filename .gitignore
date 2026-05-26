@@ -5,3 +5,5 @@ __pycache__/
 .mypy_cache/
 outputs/
 third_party/sam-3d-objects/
+checkpoints/
+outputs/feedforward/

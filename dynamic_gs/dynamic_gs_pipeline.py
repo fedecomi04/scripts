@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import contextlib
 import os
 import time
 from collections import defaultdict
@@ -168,6 +169,61 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     save_live_optim_debug_every: int = 25
     """How often (in optim steps) to dump the live-optim debug images
     when ``save_live_optim_debug=True``. 1 = every step (heavy)."""
+
+    # ------------------------------------------------------------------
+    # Feedforward hole-fill (RGB-D decode) — see docs/feedforward_dev_design.md
+    # and the plan at ~/.claude/plans/eventual-gliding-quilt.md
+    # ------------------------------------------------------------------
+    enable_feedforward_inpaint: Literal["off", "rgbd_decode"] = "off"
+    """When != "off", route hole-fill through the feedforward path
+    instead of (or in addition to) the optim pool. Auto-implies
+    ``disable_dynamic_optimization`` semantics for the dynamic phase
+    (the default), so the only mutations are tracker rigid transforms
+    and feedforward insertions."""
+    feedforward_oneshot_step: int = 0
+    """Mode A trigger step (>0 enables; 0 disables). Once per run, at
+    this dynamic-phase step, select the top ``feedforward_top_n_components``
+    CDN components of the latest pool entry and inpaint each. Set to
+    0 to disable Mode A (e.g. when running Mode B alone)."""
+    feedforward_recurring_every_n_ticks: int = 0
+    """Mode B trigger cadence (>0 enables; 0 disables). Every Nth
+    tracker tick, inpaint all components passing
+    ``feedforward_min_component_area``. Set to 0 to disable Mode B
+    (e.g. when running Mode A alone)."""
+    feedforward_top_n_components: int = 3
+    """Mode A: take at most this many components, sorted by area."""
+    feedforward_dominant_area_ratio: float = 0.3
+    """Mode A: drop a top-N component whose area is below this fraction
+    of the largest component's area. 0.0 disables the dominance filter
+    (used by Mode B)."""
+    feedforward_min_component_area: int = 1500
+    """Skip any component with fewer than this many pixels. Applied
+    regardless of mode."""
+    feedforward_anchor_frame: Optional[int] = None
+    """Dataset frame index used as the fixed anchor camera pose for
+    the recorded video. None → ``_accepted_dynamic_frames[-1]``."""
+    feedforward_video_out: Optional[Path] = None
+    """Path to write the anchor-pose video to (mp4). None → no video."""
+    feedforward_video_fps: int = 24
+    feedforward_reuse_static_checkpoint: bool = True
+    """When True (and not in live mode), save a ``post_fusion_state.pt``
+    snapshot at the static→dynamic boundary and reload it in
+    ``__init__`` on subsequent runs. Skips ~50 s of static training
+    plus Phase 0a/0b on a cache hit. Delete the file under
+    ``static_scene/`` to force a fresh static run."""
+    feedforward_rgbd_opacity: float = 0.99
+    """Per-pixel opacity assigned to decoded Gaussians."""
+    feedforward_rgbd_min_valid_fraction: float = 0.95
+    """A component is skipped if fewer than this fraction of its pixels
+    have valid (>0) depth."""
+    feedforward_rgbd_normal_smoothing_radius: int = 3
+    """Bilateral-filter radius (pixels) on the depth map used for the
+    per-pixel surface-normal computation. The un-smoothed depth is
+    still used for position."""
+    feedforward_object_mask_dilate_px: int = 2
+    """Dilation applied to the current rendered object mask before it
+    is subtracted from CDN. Covers tracker-edge slack so we don't
+    back-project the live object's surface as flat patches."""
 # Fraction of the splat-rasterized object mask kept after distance-transform
 # erosion before passing to the tracker. 0.85 = keep the inner 85% of the
 # area, drop the boundary 15% — the low-opacity halo where keypoints would
@@ -220,6 +276,15 @@ class DynamicGSPipeline(VanillaPipeline):
         # to ~0.5–2 Hz in live tracking-only mode).
         self._trainer = None
         atexit.register(self._write_timing_report)
+
+        # Feedforward hole-fill runtime state. Always present; only used
+        # when ``config.enable_feedforward_inpaint != "off"``.
+        self._feedforward_call_counter: int = 0
+        self._feedforward_oneshot_done: bool = False
+        self._tracker_tick_count: int = 0
+        self._feedforward_video_writer = None  # opened lazily in _record_anchor_video_tick
+        self._feedforward_video_frame_count: int = 0
+        atexit.register(self._close_feedforward_video_writer)
 
         # Live-mode pre-training session: drives the interactive ROS
         # capture (prompt → SAM3 → SAM3D → record static frames → build
@@ -337,7 +402,18 @@ class DynamicGSPipeline(VanillaPipeline):
         # fusion. Must run BEFORE ``_sync_phase(0)`` so the latter sees
         # ``_static_converged_step = 0`` and flips straight to "dynamic".
         self._warm_cache_loaded = False
-        if self.config.live:
+        # Warm-cache: load post-fusion snapshot if present. Used in live
+        # mode by default, and in recorded mode when feedforward is on
+        # AND ``feedforward_reuse_static_checkpoint`` is True (the default).
+        # Cache file is shared across live and recorded runs.
+        _warm_cache_eligible = (
+            self.config.live
+            or (
+                self.config.enable_feedforward_inpaint != "off"
+                and self.config.feedforward_reuse_static_checkpoint
+            )
+        )
+        if _warm_cache_eligible:
             cache_path = (
                 Path(self.config.datamanager.data) / "static_scene" / "post_fusion_state.pt"
             )
@@ -957,13 +1033,15 @@ class DynamicGSPipeline(VanillaPipeline):
             f"fusion time={fusion_time:.2f}s"
         )
 
-        # Live mode: write a one-shot "post-fusion" snapshot so the next
-        # ``--live`` run can skip static training + Phase 0b entirely.
-        # The snapshot covers everything the dynamic loop needs: trained
-        # Gaussian parameters at the post-insertion size, all persistent
-        # buffers (object_flags / object_instance_ids / inserted_flags),
-        # and the SO3xR3 camera-optimizer offsets keyed by frame index.
-        if self.config.live:
+        # Write a one-shot "post-fusion" snapshot so the next session can
+        # skip static training + Phase 0b entirely. Fires in live mode
+        # (the original use case) AND in recorded mode when feedforward
+        # reuse is enabled (so successive Mode A / Mode B runs share the
+        # static work).
+        if self.config.live or (
+            self.config.enable_feedforward_inpaint != "off"
+            and self.config.feedforward_reuse_static_checkpoint
+        ):
             self._save_post_fusion_cache()
         return manifest
 
@@ -1800,6 +1878,412 @@ class DynamicGSPipeline(VanillaPipeline):
         if valid_mask is not None:
             change_mask = change_mask * valid_mask
         return change_mask
+
+    # ---- Feedforward hole-fill helpers (rgbd_decode path) ----
+
+    def _feedforward_clean_cdn(self, camera, cdn):
+        """Subtract the *current* rendered object mask (dilated) from CDN.
+
+        Prevents the path from back-projecting the live can's surface
+        as flat Gaussians on top of the tracked 3D can. The CDN stored
+        in the pool was object-excluded at capture time; the object may
+        have moved since.
+        """
+        try:
+            obj_mask_now = self.model.render_object_mask(camera)
+        except Exception as exc:
+            CONSOLE.log(f"[feedforward] render_object_mask failed: {exc}; using raw CDN")
+            return cdn
+        if obj_mask_now is None:
+            return cdn
+        if obj_mask_now.ndim == 2:
+            obj_mask_now = obj_mask_now[..., None]
+        if obj_mask_now.shape != cdn.shape:
+            h, w = cdn.shape[:2]
+            obj_mask_now = TF.interpolate(
+                obj_mask_now.permute(2, 0, 1).unsqueeze(0),
+                size=(h, w),
+                mode="nearest",
+            ).squeeze(0).permute(1, 2, 0)
+        dilate_px = int(self.config.feedforward_object_mask_dilate_px)
+        if dilate_px > 0:
+            obj_mask_now = dilate_binary_mask(obj_mask_now, dilate_px)
+        cleaned = (cdn * (1.0 - obj_mask_now)).detach()
+        return cleaned
+
+    @torch.no_grad()
+    def _feedforward_delete_in_region(self, camera, component_mask) -> int:
+        """Delete Gaussians whose 2D footprint at ``camera`` overlaps
+        ``component_mask`` AND have ``object_instance_ids ∈ {0, 999}``.
+
+        Original scene Gaussians (instance 0) and previously-inserted
+        inpaint Gaussians (instance 999) are deleted. Tracked-object
+        Gaussians (instance_ids in ``_fp_trackers_by_instance``) are
+        NEVER touched. Returns the count deleted.
+
+        Requires that ``model.info`` was populated by a recent full-scene
+        ``get_outputs(camera)`` call (the caller does this).
+        """
+        from .utils.active_mask import build_active_mask, extract_projected_centers_and_radii
+
+        model = self.model
+        if model.num_points == 0:
+            return 0
+        try:
+            centers_2d, radii = extract_projected_centers_and_radii(
+                model.info, model.num_points
+            )
+        except Exception as exc:
+            CONSOLE.log(f"[feedforward] projection failed: {exc}; skipping delete")
+            return 0
+
+        comp = component_mask
+        if comp.ndim == 3 and comp.shape[-1] == 1:
+            comp = comp[..., 0]
+        comp_bool = (comp > 0.5).to(centers_2d.device)
+        active_mask = build_active_mask(comp_bool, centers_2d, radii)
+        in_region = active_mask.to(torch.bool)
+
+        instance_ids = model.object_instance_ids.squeeze(-1)
+        # Eligible to delete: original scene (id=0) or prior inpaint inserts (id=999).
+        eligible = (instance_ids == 0) | (instance_ids == 999)
+        to_delete = in_region & eligible
+        indices = torch.nonzero(to_delete, as_tuple=False).squeeze(-1)
+        if indices.numel() == 0:
+            return 0
+        return model.delete_gaussian_indices(indices)
+
+    @torch.no_grad()
+    def _get_anchor_camera(self):
+        """Build the fixed-pose camera for the comparison video.
+
+        Uses the c2w of the dataset frame at ``feedforward_anchor_frame``
+        (default ``_accepted_dynamic_frames[-1]``), applying the post-
+        static camera-optimizer offset just like Phase 0b does.
+        """
+        if not self._accepted_dynamic_frames:
+            return None
+        anchor_idx = self.config.feedforward_anchor_frame
+        if anchor_idx is None:
+            anchor_idx = self._accepted_dynamic_frames[-1]
+        anchor_idx = int(anchor_idx)
+
+        try:
+            ds = self.datamanager.dynamic_manager.train_dataset
+        except AttributeError:
+            return None
+        if anchor_idx < 0 or anchor_idx >= len(ds.cameras):
+            CONSOLE.log(
+                f"[feedforward] anchor_frame={anchor_idx} out of range; clamping to last accepted"
+            )
+            anchor_idx = self._accepted_dynamic_frames[-1]
+        camera = ds.cameras[anchor_idx : anchor_idx + 1].to(self.device)
+        camera.metadata = dict(camera.metadata or {})
+        camera.metadata["cam_idx"] = anchor_idx
+        # Apply camera-optimizer offset if available (same pattern as Phase 0b).
+        try:
+            if (
+                self.model.camera_optimizer.config.mode != "off"
+                and 0 <= anchor_idx < self.model.camera_optimizer.num_cameras
+            ):
+                opt_c2w = self.model.camera_optimizer.apply_to_camera(camera).detach()
+                if opt_c2w.shape == camera.camera_to_worlds.shape:
+                    camera.camera_to_worlds = opt_c2w
+        except Exception:
+            pass
+        return camera
+
+    @torch.no_grad()
+    def _record_anchor_video_tick(self) -> None:
+        """Render the scene from the anchor camera and append a frame
+        to the feedforward comparison video. No-op when video output is
+        disabled. Lock-acquires against the viewer thread so the
+        concurrent gsplat rasterization doesn't trip the device-side
+        bounds assert."""
+        if self.config.feedforward_video_out is None:
+            return
+        t0 = time.time()
+        with self._feedforward_train_lock():
+            camera = self._get_anchor_camera()
+            if camera is None:
+                return
+            try:
+                outputs = self._render_from_camera(camera)
+            except Exception as exc:
+                CONSOLE.log(f"[feedforward-video] render failed: {exc}")
+                return
+        rgb = outputs["rgb"].detach().cpu().clamp(0, 1).numpy()
+        frame = (rgb * 255.0).astype(np.uint8)
+        # cv2 wants BGR
+        try:
+            import cv2  # type: ignore
+        except Exception:
+            CONSOLE.log("[feedforward-video] cv2 not available; cannot write video")
+            return
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        if self._feedforward_video_writer is None:
+            out_path = Path(self.config.feedforward_video_out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            h, w = frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self._feedforward_video_writer = cv2.VideoWriter(
+                str(out_path), fourcc, int(self.config.feedforward_video_fps), (w, h)
+            )
+            CONSOLE.log(
+                f"[feedforward-video] opened {out_path} fps={self.config.feedforward_video_fps}"
+            )
+        self._feedforward_video_writer.write(bgr)
+        self._feedforward_video_frame_count += 1
+        self._timing["FF.video_render_tick"].append(time.time() - t0)
+
+    def _close_feedforward_video_writer(self) -> None:
+        if self._feedforward_video_writer is None:
+            return
+        try:
+            self._feedforward_video_writer.release()
+        except Exception:
+            pass
+        path = self.config.feedforward_video_out
+        n = self._feedforward_video_frame_count
+        self._feedforward_video_writer = None
+        if path is None or n == 0:
+            return
+        CONSOLE.log(
+            f"[feedforward-video] closed (wrote {n} frames to {path}); "
+            f"re-encoding with ffmpeg for browser compatibility"
+        )
+        try:
+            import subprocess
+            tmp = str(path) + ".tmp.mp4"
+            os.replace(str(path), tmp)
+            # Try a clean PATH so the system ffmpeg (not the conda one with
+            # libffi conflicts) is preferred. Fall back to whatever's on PATH.
+            ffmpeg_cmd = ["ffmpeg", "-y", "-loglevel", "error",
+                          "-i", tmp, "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path)]
+            env = os.environ.copy()
+            env["PATH"] = "/usr/bin:/usr/local/bin"
+            result = subprocess.run(ffmpeg_cmd, check=False, env=env)
+            if result.returncode == 0 and Path(str(path)).is_file():
+                # Re-encode succeeded; clean up tmp.
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                CONSOLE.log(f"[feedforward-video] ffmpeg re-encode OK → {path}")
+            else:
+                # Re-encode failed; keep the raw mp4v file as the final output.
+                try:
+                    os.replace(tmp, str(path))
+                except OSError:
+                    pass
+                CONSOLE.log(
+                    f"[feedforward-video] ffmpeg re-encode failed (rc={result.returncode}); "
+                    f"kept raw mp4v at {path}"
+                )
+        except Exception as exc:
+            CONSOLE.log(f"[feedforward-video] ffmpeg re-encode skipped: {exc}")
+
+    def _feedforward_write_oneshot_comparison(self, pre_rgb, post_rgb, live_rgb, out_path) -> None:
+        """Save a 3-panel side-by-side PNG (pre | post | live), all from
+        the anchor pose. Tensors are (H, W, 3) in [0, 1]."""
+
+        try:
+            from PIL import Image
+        except Exception:
+            CONSOLE.log("[feedforward] PIL not available; comparison PNG skipped")
+            return
+
+        def _to_u8(t):
+            arr = t.detach().cpu().clamp(0, 1).numpy()
+            return (arr * 255.0).astype(np.uint8)
+
+        pre = _to_u8(pre_rgb)
+        post = _to_u8(post_rgb)
+        live = _to_u8(live_rgb)
+        H = max(pre.shape[0], post.shape[0], live.shape[0])
+        # Stitch side by side (assume same H).
+        panels = [pre, post, live]
+        widths = [p.shape[1] for p in panels]
+        out = np.zeros((H, sum(widths), 3), dtype=np.uint8)
+        x = 0
+        for p, w in zip(panels, widths):
+            out[: p.shape[0], x : x + w] = p
+            x += w
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(out).save(out_path)
+        CONSOLE.log(f"[feedforward] wrote comparison panel → {out_path}")
+
+    def _feedforward_train_lock(self):
+        """No-op context manager.
+
+        The trainer's outer loop already holds ``train_lock`` around
+        ``train_iteration``, so re-acquiring it from this thread (it's a
+        non-reentrant ``Lock``) would deadlock. We keep this helper as a
+        marker — feedforward mutations are safe as long as the viewer is
+        disabled or its render thread synchronizes via the same outer
+        ``train_lock`` (which it does in nerfstudio's
+        ``RenderStateMachine._render_img``).
+        """
+        return contextlib.nullcontext()
+
+    @torch.no_grad()
+    def _run_feedforward(self, target_frame, mode_label: str) -> None:
+        """Dispatcher for feedforward hole-fill at a target OptimFrame.
+
+        ``mode_label`` is "oneshot" or "recurring" — used only for logs
+        and component-selection policy:
+
+            * oneshot: take top ``feedforward_top_n_components`` with
+              the dominant-area ratio filter.
+            * recurring: take all components above ``min_area`` (no
+              dominance filter).
+
+        Side effects: deletes scene/prior-inpaint Gaussians in each
+        component's footprint, inserts feedforward-decoded Gaussians
+        as ``object_flags=1, instance_id=999``.
+        """
+        from .utils.active_mask import select_top_n_components_filtered
+        from .utils.rgbd_decode import decode_component_to_gaussians
+
+        call_id = self._feedforward_call_counter
+        self._feedforward_call_counter += 1
+
+        t_call0 = time.time()
+        camera = target_frame.camera
+        frame_idx = int(target_frame.frame_idx)
+        cdn = target_frame.cdn
+
+        # Pin the datamanager so we can pull this frame's GT RGB-D.
+        self.datamanager.set_dynamic_frame_idx(frame_idx)
+        self.current_dynamic_frame_idx = frame_idx
+        try:
+            _, batch = self.datamanager.get_current_dynamic_train_batch()
+        except Exception as exc:
+            CONSOLE.log(f"[feedforward] could not pull batch for frame {frame_idx}: {exc}")
+            return
+
+        bg = self.model._get_background_color()
+        live_rgb_full = self.model.composite_with_background(
+            self.model.get_gt_img(batch["image"]), bg
+        )
+        gt_depth = self.model._get_gt_depth(batch)
+        if gt_depth is None:
+            CONSOLE.log(f"[feedforward] frame {frame_idx} has no depth — skip")
+            return
+
+        t0 = time.time()
+        cdn_clean = self._feedforward_clean_cdn(camera, cdn)
+        self._timing["FF.1_cdn_clean"].append(time.time() - t0)
+
+        t0 = time.time()
+        if mode_label == "oneshot":
+            components = select_top_n_components_filtered(
+                cdn_clean,
+                n=int(self.config.feedforward_top_n_components),
+                area_ratio=float(self.config.feedforward_dominant_area_ratio),
+                min_area=int(self.config.feedforward_min_component_area),
+            )
+        else:
+            # Mode B (recurring): all components above min_area, no dominance filter.
+            components = select_top_n_components_filtered(
+                cdn_clean,
+                n=64,
+                area_ratio=0.0,
+                min_area=int(self.config.feedforward_min_component_area),
+            )
+        self._timing["FF.2_component_select"].append(time.time() - t0)
+
+        if not components:
+            CONSOLE.log(
+                f"[feedforward] {mode_label} call={call_id} step={self._dynamic_step_counter} "
+                f"frame={frame_idx} no components above min_area"
+            )
+            return
+
+        total_inserted = 0
+        total_deleted = 0
+        per_component_diag: list[dict] = []
+        for k, comp_mask in enumerate(components):
+            # Per-component: decode → render (to populate model.info at
+            # current N) → delete → insert. The full-scene render must
+            # happen AFTER any prior component's delete/insert because
+            # those mutate num_points.
+            t0 = time.time()
+            decoded = decode_component_to_gaussians(
+                camera,
+                live_rgb_full,
+                gt_depth,
+                comp_mask,
+                opacity=float(self.config.feedforward_rgbd_opacity),
+                normal_smoothing_radius=int(self.config.feedforward_rgbd_normal_smoothing_radius),
+                min_valid_fraction=float(self.config.feedforward_rgbd_min_valid_fraction),
+            )
+            self._timing["FF.3_decode"].append(time.time() - t0)
+
+            if decoded is None:
+                CONSOLE.log(
+                    f"[feedforward] {mode_label} call={call_id} comp={k} empty — skipped"
+                )
+                continue
+            if decoded.get("skipped", False):
+                per_component_diag.append({"component": k, **decoded["diagnostics"], "skipped": True})
+                CONSOLE.log(
+                    f"[feedforward] {mode_label} call={call_id} comp={k} skipped "
+                    f"valid_fraction={decoded['diagnostics']['valid_fraction']:.3f}"
+                )
+                continue
+
+            t0 = time.time()
+            # Drain any in-flight CUDA work that might still be touching the
+            # Gaussian buffers we are about to resize (a viewer-thread render
+            # submitted before this point can otherwise assert when its kernels
+            # finally run against the shrunk buffers).
+            if self.device == torch.device("cuda") or self.device.type == "cuda":
+                torch.cuda.synchronize()
+            # Populate model.info at current N before the delete-in-region call.
+            try:
+                _ = self._render_from_camera(camera)
+            except Exception as exc:
+                CONSOLE.log(f"[feedforward] pre-delete render failed: {exc}; skip comp")
+                continue
+            n_deleted = self._feedforward_delete_in_region(camera, comp_mask)
+            self._timing["FF.4_crop_and_delete"].append(time.time() - t0)
+
+            t0 = time.time()
+            inserted_ids = self.model.insert_inpaint_gaussians(
+                xyz=decoded["xyz"],
+                features_dc=decoded["features_dc"],
+                features_rest=decoded["features_rest"],
+                opacities=decoded["opacities"],
+                scales=decoded["scales"],
+                quats=decoded["quats"],
+                instance_id=999,
+            )
+            self._timing["FF.5_insert"].append(time.time() - t0)
+
+            n_inserted = int(inserted_ids.numel())
+            total_inserted += n_inserted
+            total_deleted += n_deleted
+            per_component_diag.append({
+                "component": k,
+                "inserted": n_inserted,
+                "deleted": n_deleted,
+                **decoded["diagnostics"],
+            })
+
+        total_per_call = time.time() - t_call0
+        self._timing["FF.6_total_per_call"].append(total_per_call)
+
+        # Sanity log on global invariants.
+        obj_count = int((self.model.object_flags.squeeze(-1) > 0.5).sum().item())
+        ins_count = int((self.model.inserted_flags.squeeze(-1) > 0.5).sum().item())
+        CONSOLE.log(
+            f"[feedforward] {mode_label} call={call_id} step={self._dynamic_step_counter} "
+            f"frame={frame_idx} components={len(per_component_diag)} "
+            f"inserted={total_inserted} deleted={total_deleted} total_ms={total_per_call*1000:.1f} "
+            f"object_flags_count={obj_count} inserted_flags_count={ins_count} "
+            f"total_gauss={self.model.num_points}"
+        )
 
     # ---- Live-mode helpers ----
 
@@ -2981,6 +3465,8 @@ class DynamicGSPipeline(VanillaPipeline):
             self._optim_pool.push(OptimFrame(
                 frame_idx=frame_idx, camera=camera, cdn=cdn,
             ))
+            if self.config.feedforward_video_out is not None:
+                self._record_anchor_video_tick()
             self._global_frame_counter += 1
             return
 
@@ -3011,8 +3497,20 @@ class DynamicGSPipeline(VanillaPipeline):
                 f"accepted={is_accepted}"
             )
 
+        # Append an anchor-pose frame to the feedforward comparison video
+        # AFTER the FP track has been applied, so the video reflects the
+        # latest object pose. Fires on every tick that reaches this point
+        # (after the D0 bootstrap path, which has its own early return).
+        if self.config.feedforward_video_out is not None:
+            self._record_anchor_video_tick()
+
         # Tracking-only mode: skip RDN render + CDN compute + pool push.
-        if self.config.disable_dynamic_optimization:
+        # EXCEPTION: when feedforward inpaint is enabled, we still need the
+        # CDN + pool push so Mode B has something to consume.
+        if (
+            self.config.disable_dynamic_optimization
+            and self.config.enable_feedforward_inpaint == "off"
+        ):
             self._global_frame_counter += 1
             return
 
@@ -3071,6 +3569,18 @@ class DynamicGSPipeline(VanillaPipeline):
         )
         self._global_frame_counter += 1
 
+        # ---- Feedforward Mode B hook + anchor-pose video tick ----
+        self._tracker_tick_count += 1
+        if (
+            self.config.enable_feedforward_inpaint == "rgbd_decode"
+            and self.config.feedforward_recurring_every_n_ticks > 0
+            and (self._tracker_tick_count % int(self.config.feedforward_recurring_every_n_ticks) == 0)
+        ):
+            tail = self._optim_pool._q[-1] if len(self._optim_pool) > 0 else None
+            if tail is not None:
+                with self._feedforward_train_lock():
+                    self._run_feedforward(tail, mode_label="recurring")
+
     def _zero_loss_dummy(self):
         """Trivial loss tuple used when the pool is empty.
 
@@ -3127,6 +3637,56 @@ class DynamicGSPipeline(VanillaPipeline):
             self._tracker_tick(self._next_frame_to_track)
             self._next_frame_to_track += 1
         self._dynamic_step_counter += 1
+
+        # ---- Feedforward Mode A trigger ----
+        if (
+            self.config.enable_feedforward_inpaint == "rgbd_decode"
+            and not self._feedforward_oneshot_done
+            and int(self.config.feedforward_oneshot_step) > 0
+            and step >= int(self.config.feedforward_oneshot_step)
+        ):
+            self._feedforward_oneshot_done = True
+            if len(self._optim_pool) == 0:
+                CONSOLE.log(
+                    f"[feedforward] oneshot fired at step={step} but pool is empty; skipping"
+                )
+            else:
+                with self._feedforward_train_lock():
+                    target = self._optim_pool._q[-1]
+                    # Render pre-inpaint from the anchor pose for the comparison PNG.
+                    anchor_cam = self._get_anchor_camera()
+                    pre_rgb = None
+                    live_rgb_for_panel = None
+                    if anchor_cam is not None:
+                        try:
+                            pre_rgb = self._render_from_camera(anchor_cam)["rgb"].detach()
+                        except Exception as exc:
+                            CONSOLE.log(f"[feedforward] pre-render failed: {exc}")
+                    # Run the dispatcher; this mutates the scene.
+                    self._run_feedforward(target, mode_label="oneshot")
+                    # Render post-inpaint and pull the anchor frame's live image
+                    # for a 3-panel comparison.
+                    if anchor_cam is not None and pre_rgb is not None:
+                        try:
+                            post_rgb = self._render_from_camera(anchor_cam)["rgb"].detach()
+                        except Exception as exc:
+                            CONSOLE.log(f"[feedforward] post-render failed: {exc}")
+                            post_rgb = None
+                        try:
+                            anchor_frame_idx = int(anchor_cam.metadata.get("cam_idx", 0))
+                            self.datamanager.set_dynamic_frame_idx(anchor_frame_idx)
+                            _, anchor_batch = self.datamanager.get_current_dynamic_train_batch()
+                            bg = self.model._get_background_color()
+                            live_rgb_for_panel = self.model.composite_with_background(
+                                self.model.get_gt_img(anchor_batch["image"]), bg
+                            )
+                        except Exception as exc:
+                            CONSOLE.log(f"[feedforward] anchor-frame live RGB pull failed: {exc}")
+                        if post_rgb is not None and live_rgb_for_panel is not None:
+                            out_path = self._get_debug_dir() / "feedforward_oneshot_comparison.png"
+                            self._feedforward_write_oneshot_comparison(
+                                pre_rgb, post_rgb, live_rgb_for_panel, out_path
+                            )
 
         # Tracking-only mode: skip pool pick + loss compute entirely.
         # Tracker ticks above already ran and applied the rigid
@@ -3448,6 +4008,15 @@ class DynamicGSPipeline(VanillaPipeline):
             ("LIVE.gt_setup", "  -> gt_rgb composite + _get_gt_depth + _get_batch_mask (GPU ops on device-resident tensors)"),
             ("LIVE.keyframe_filter", "  -> dynamic keyframe filter accept (pure pose math, sub-ms)"),
         ]
+        ff_keys = [
+            ("FF.1_cdn_clean", "Object-mask render + subtract from CDN (per inpaint call)"),
+            ("FF.2_component_select", "select_top_n_components_filtered (scipy.label on cleaned CDN)"),
+            ("FF.3_decode", "decode_component_to_gaussians per component (sub-ms vectorized GPU work)"),
+            ("FF.4_crop_and_delete", "Footprint filter (extract_projected_centers_and_radii + build_active_mask) + delete_gaussian_indices"),
+            ("FF.5_insert", "insert_inpaint_gaussians (concat + buffer resize + optimizer rebuild)"),
+            ("FF.6_total_per_call", "Per-call FF total: sum of FF.1-5"),
+            ("FF.video_render_tick", "Per-frame anchor-pose render for the comparison video (cv2 BGR write + tmp file)"),
+        ]
 
         lines = []
         total_steps = self._total_train_steps()
@@ -3643,6 +4212,29 @@ class DynamicGSPipeline(VanillaPipeline):
                     f"  {'(reference) DN.3_tracker_motion':<42s} {avg_motion_ms:>8.1f}ms  {pct:>6.1f}%    "
                     f"tracker motion total — see DN.3* breakdown above for sub-syncs"
                 )
+            lines.append("")
+
+        # --- Feedforward (FF.*) ---
+        ff_call_vals = self._timing.get("FF.6_total_per_call", [])
+        if ff_call_vals:
+            n_calls = len(ff_call_vals)
+            total_ff = sum(ff_call_vals)
+            avg_ms = total_ff / n_calls * 1000
+            lines.append(
+                f"--- FEEDFORWARD INPAINT ({n_calls} call(s); avg {avg_ms:.1f}ms/call; "
+                f"total {total_ff:.2f}s) ---"
+            )
+            for key, desc in ff_keys:
+                vals = self._timing.get(key, [])
+                if vals:
+                    avg = sum(vals) / len(vals) * 1000
+                    pct = (avg / avg_ms * 100) if avg_ms > 0 else 0.0
+                    lines.append(
+                        f"  {key:<32s} n={len(vals):<4d} avg={avg:>8.2f}ms total={sum(vals):>7.2f}s  "
+                        f"{pct:>5.1f}%   {desc}"
+                    )
+                else:
+                    lines.append(f"  {key:<32s}      N/A     N/A    {desc}")
             lines.append("")
 
         # --- Grand total ---

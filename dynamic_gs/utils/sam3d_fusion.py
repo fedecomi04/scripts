@@ -562,7 +562,7 @@ def _run_probreg_similarity_refinement(
             maxiter=_MAXITER,
             tol=_TOL,
             w=0.5,
-            use_color=True,
+            use_color=False,
             callbacks=[_iter_cb],
         )
     except Exception:
