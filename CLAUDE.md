@@ -16,6 +16,86 @@ Do a whole cleanup of the dynamic-gs pipeline (model, pipeline, datamanager, con
 
 ## Notes
 
+### Tracker purge — XFeat only (2026-05-26)
+
+The 5-tracker dispatch (cotracker / tapir / tapnext / klt / xfeat) is gone. XFeat is now the only supported tracker. Surviving runtime files:
+
+- `dynamic_gs/utils/xfeat_motion.py` — the tracker
+- `dynamic_gs/utils/tracker_common.py` — shared `MotionEstimate` dataclass + Kabsch/RANSAC helpers (extracted from the old `cotracker_motion.py` because XFeat depended on those static methods)
+- `dynamic_gs/utils/_purged/` — `cotracker_motion.py`, `tapir_motion.py`, `tapnext_motion.py`, `klt_motion.py`, `live_ros_subscriber.py`. Kept for reference, never imported by the runtime, their imports are intentionally broken.
+- `dynamic_gs/utils/sam2.py` — deleted entirely.
+
+Pipeline + model config changes:
+- Model: 50+ legacy fields removed (`cotracker_*`, `tapir_*`, `tapnext_*`, `klt_*`, `dynamic_tracker` Literal). Only `xfeat_*` fields remain.
+- Pipeline: `_TRACKER_LABELS`, `tracker_kind`/`dynamic_tracker` reads, and the 5-branch `_initialize_motion_estimator` dispatch all collapsed to single XFeat constructor.
+- `utils/__init__.py` keeps `CoTrackerMotionEstimate` as an alias for `tracker_common.MotionEstimate` (a couple of debug-viz call sites import the old name).
+- `enable_cotracker_rigid_motion: bool = True` kept as the master tracker switch despite the legacy name (config-compat).
+
+To revive a purged tracker: port its `CoTrackerMotionEstimator._foo` static-method calls to `tracker_common.foo`, move the file back to `dynamic_gs/utils/`, re-add the dispatch branch in `_initialize_motion_estimator`. See [_purged/__init__.py](dynamic_gs/utils/_purged/__init__.py) for the recipe.
+
+### Per-tick object mask removal — XFeat (2026-05-26)
+
+`render_object_mask + erode + dilate + pre-mask` was firing every tick for XFeat (~4 ms/tick) and produced **zero measurable quality benefit**. Removed entirely; XFeat now extracts on the full natural frame and uses **only `gripper_keep`** for post-match filtering.
+
+Net effect at 800×800, `xfeat_top_k=300`:
+- `DN.3j_object_mask_render`: 4ms → 0ms
+- `DN.3_tracker_motion`: 34 → 21 ms (-38%)
+- Effective rate: 12 Hz → 17.7 Hz
+- Inliers under motion: 100-160 with min ~19-30 (well above `min_track_points=12`)
+
+Anchor pool quality holds — new anchors filter on `gripper_keep` only (instead of `gripper_keep ∩ object_mask`), but LighterGlue's attention rejects background pairs and RANSAC catches anything that slips through. KLT path (still in `_purged/`) **does** need the mask structurally because it samples FAST keypoints from inside it.
+
+### XFeat config sweet spots — known shake / RANSAC failure modes (2026-05-26)
+
+These three settings together produced a stable tracker (17-30 Hz, inliers/correspondences ≈ 1.0). Deviations caused regressions that took hours to diagnose:
+
+- **`xfeat_top_k=300`** — DO NOT drop below 200. At `top_k=100` the post-depth-filter survivor set varies tick-to-tick → different ~30-50 point Kabsch subsets → visible object shake on stationary scenes. The "tick_total went UP" symptom (28→31ms) is a secondary clue — fewer keypoints didn't even help speed because XFeat extract is image-bound, not K-bound.
+- **`xfeat_lighterglue_depth_confidence=-1.0`** — DISABLED. Enabling early-exit (e.g. 0.95) picks a different transformer layer each tick → different match set → noisy Kabsch → shake. Same root cause as the `top_k=100` shake: match-set variance.
+- **`xfeat_ransac_iterations=32`** — was 128, no quality loss at 32 with `~64-100` candidate correspondences. Saved ~4ms.
+
+Inlier diagnostic now in `[tracker-rate]`: `inliers=X/Y avg (min Z, n=N/F)`. Watch `min` — if it consistently drops below 15 under fast motion, the mask removal would need to be revisited for anchor creation.
+
+### train_lock disable was a mistake — DO NOT redo (2026-05-26)
+
+Attempted to disable Nerfstudio's `train_lock` in `NoSaveTrainer.setup` to let renders and tracker ticks run concurrently. Worked in isolation (`LIVE.between_tick_gap` 27 → 2 ms) but caused **GPU contention** between the splat renderer and XFeat/LighterGlue kernels:
+
+| | Baseline (lock on) | Lock off + render every tick | Lock off + render every 3rd tick |
+|---|---|---|---|
+| outside-tick | 27 ms | 2 ms | 4 ms |
+| tracker_motion | 28 ms | 77 ms | 25 ms |
+| effective rate | 17 Hz | 10 Hz | 30 Hz |
+
+Net throughput unchanged at every-tick-render — the lock was hiding render cost behind serialization, not wasting cycles. Only worked at N=3 throttle but visual rate dropped to ~10 Hz and the user perceived it as "not updating." Reverted everything. The achievable lock-disable win requires bypassing server-side rendering entirely (supervisor's "push transforms directly to Viser via `GaussianSplatHandle.position`/`.wxyz`" — browser does WebGL splat) — that's a 1-2 day rewrite not yet attempted.
+
+Files to NOT re-touch unless attempting the full Viser-direct rewrite:
+- `NoSaveTrainer.setup` — currently clean (no override of `train_lock` or `_update_viewer_state`)
+- Pipeline `live_render_kick_every_n_ticks` config exists with default N=1 (inert) for future experiments
+
+### Killing ns-train safely — `kill <bash_pid>` is wrong (2026-05-26)
+
+`nohup ns-train ... > log 2>&1 &` returns the **bash wrapper PID**, not the Python process. `kill $BASHPID` kills only the wrapper; the Python process keeps running, holding GPU memory and CUDA streams. Three of these zombies stacked up during this session and caused a 2× tracker slowdown ([tracker-rate] dropped from ~18 Hz to ~10 Hz) before I noticed.
+
+Correct sequence:
+```bash
+PYPID=$(ps -ef | grep "ns-train.*dynamic-gs" | grep -v grep | awk '{print $2}')
+kill -9 $PYPID
+pkill -9 -f "live_ros_publisher"
+# Then ALWAYS verify:
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
+```
+
+If `nvidia-smi` shows any leftover python pids holding VRAM, kill those by PID directly. Any unexplained tracker slowdown should immediately trigger a zombie check.
+
+### Live mode timing-gap decomposition (2026-05-26)
+
+Added per-step instrumentation to localise `LIVE.between_tick_gap`:
+
+- `GAP.trainer_outer_loop` — wall-clock between `train_iteration` return and next entry. Captures Nerfstudio's `AFTER_TRAIN_ITERATION` callbacks, writer scalars, `_update_viewer_state`, eval check, `write_out_storage`. Typically **~24-27 ms** in live tracking-only mode and is the dominant chunk.
+- `GAP.pipeline_prelude` — `train_iteration` entry → `_tracker_tick_live` start (= `_sync_phase` + pipeline dispatch). Typically <0.1 ms.
+- `GAP.pipeline_postlude` — `_tracker_tick_live` exit → `get_train_loss_dict` return (= zero-loss dummy + timing-summary check). Typically <0.2 ms.
+
+If `between_tick_gap` is large, ~100 % of it lives in `GAP.trainer_outer_loop`. The pipeline-side contributes essentially zero overhead in tracking-only mode. To shrink the gap further would require overriding `Trainer.train()` (the whole outer loop) — not just `train_iteration`.
+
 ### Live tracker 30 Hz fix (2026-05-26)
 
 Root cause: gazebo RTF=0.32 (sim ran at 32 % real-time) → camera produced ~10 wall-clock fps; `rostopic hz` reported "30 Hz" using sim time and misled the diagnosis for hours.

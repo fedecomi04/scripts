@@ -21,7 +21,6 @@ from nerfstudio.utils.rich_utils import CONSOLE
 from .dynamic_gs_datamanager import DynamicGSDataManagerConfig
 from .dynamic_gs_model import DynamicGSModelConfig
 from .utils import (
-    CoTrackerMotionEstimator,
     DynamicKeyframeFilter,
     OptimFrame,
     OptimPool,
@@ -1444,63 +1443,27 @@ class DynamicGSPipeline(VanillaPipeline):
         dbg.mkdir(parents=True, exist_ok=True)
         Image.fromarray(canvas).save(dbg / f"{frame_name}_tracker.png")
 
-    _TRACKER_LABELS = {"tapir": "TAPIR", "tapnext": "TAPNext", "cotracker": "CoTracker", "klt": "KLT", "xfeat": "XFeat"}
-
     def _apply_motion_estimator(self, camera, batch, current_mask=None) -> None:
         if self._motion_estimator is None:
             return
-        tracker_kind = getattr(self.model.config, "dynamic_tracker", "cotracker")
-        tracker_label = self._TRACKER_LABELS.get(tracker_kind, "Tracker")
-        if not self._motion_estimator.ready:
-            # KLT and XFeat both become "ready" only after their first
-            # call has cached a previous frame, so we must still call
-            # estimate_and_advance on the not-ready first tick.
-            if tracker_kind not in ("klt", "xfeat"):
-                frame_name = self.datamanager.get_current_dynamic_frame_name()
-                CONSOLE.log(
-                    f"[dynamic-gs] {tracker_label} skipped for {frame_name}: tracker not ready "
-                    f"({self._motion_estimator.current_track_count} tracks, "
-                    f"min={self._motion_estimator.min_track_points})"
-                )
-                return
+        tracker_label = "XFeat"
+        # XFeat becomes "ready" only after its first call has cached a
+        # previous frame, so we MUST still call estimate_and_advance on
+        # the not-ready first tick rather than returning early.
         # --- Sub-timing: DN.3a build live RGB ---
-        # Neural trackers (TAPIR/TAPNext/CoTracker) want the FULL natural
-        # frame — they were trained on natural images, and any pre-mask
-        # destroys the texture they rely on. Painting the gripper region
-        # with a flat background colour (the legacy ``_build_tracking_rgb``
-        # path) made tracks collapse to constant-pixel hot-spots wherever
-        # any residual texture survived. The mask is still applied as a
-        # POST-FILTER on the tracked 2D points so matches that land on the
-        # gripper get dropped before RANSAC. KLT/XFeat keep the legacy
-        # composite because they're tuned against the gripper-blue
-        # background and would otherwise lock onto gripper corners.
+        # XFeat is tuned against the gripper-blue composite (it would
+        # otherwise lock onto gripper corners). Use ``_build_tracking_rgb``,
+        # NOT ``get_live_rgb``.
         t = time.time()
-        if tracker_kind in ("klt", "xfeat"):
-            current_live_rgb = self._build_tracking_rgb(batch)
-        else:
-            current_live_rgb = self.model.get_live_rgb(batch, apply_training_downscale=False)
+        current_live_rgb = self._build_tracking_rgb(batch)
         self._timing["DN.3a_get_live_rgb"].append(time.time() - t)
-        # KLT samples FAST keypoints inside the object mask, so it must
-        # render the mask per tick. XFeat extracts globally and relies
-        # only on gripper_keep for filtering — no per-tick object mask
-        # needed. TAPIR / CoTracker ignore the kwarg.
-        # --- Sub-timing: DN.3j object mask render + erode (KLT only) ---
+        # XFeat extracts globally and relies only on gripper_keep for
+        # post-match filtering — no per-tick object mask render.
+        # current_object_mask stays None; the DN.3j slot stays at 0 ms.
         t_mask = time.time()
         current_object_mask = None
-        if tracker_kind == "klt":
-            with torch.no_grad():
-                current_object_mask = self.model.render_object_mask(camera).detach()
-                current_object_mask = self._erode_mask_to_inner_fraction(
-                    current_object_mask, _TRACKER_MASK_INNER_FRACTION,
-                )
-            if current_mask is None:
-                current_mask = self.model._get_batch_mask(batch)
-        elif tracker_kind == "xfeat":
-            # XFeat path: ensure gripper_keep is available for the
-            # post-match filter inside the estimator, but skip the
-            # object-mask render entirely.
-            if current_mask is None:
-                current_mask = self.model._get_batch_mask(batch)
+        if current_mask is None:
+            current_mask = self.model._get_batch_mask(batch)
         self._timing["DN.3j_object_mask_render"].append(time.time() - t_mask)
         # --- Sub-timing: DN.3b-e estimate_and_advance — inner sub-timings come from motion_estimate.timings ---
         t = time.time()
@@ -1615,85 +1578,25 @@ class DynamicGSPipeline(VanillaPipeline):
         """
         if not self.model.config.enable_cotracker_rigid_motion:
             return
-        tracker_kind = getattr(self.model.config, "dynamic_tracker", "cotracker")
-        if tracker_kind == "tapnext":
-            from .utils.tapnext_motion import TapnextMotionEstimator
-            self._motion_estimator = TapnextMotionEstimator(
-                device=self.model.device,
-                query_point_count=self.model.config.tapnext_query_point_count,
-                min_track_points=self.model.config.tapnext_min_track_points,
-                ransac_iterations=self.model.config.tapnext_ransac_iterations,
-                ransac_inlier_threshold=self.model.config.tapnext_ransac_inlier_threshold,
-                checkpoint_path=self.model.config.tapnext_checkpoint_path,
-                input_resolution=self.model.config.tapnext_input_resolution,
-                visibility_threshold=self.model.config.tapnext_visibility_threshold,
-            )
-            tracker_label = "TAPNext"
-        elif tracker_kind == "tapir":
-            from .utils.tapir_motion import TapirMotionEstimator
-            self._motion_estimator = TapirMotionEstimator(
-                device=self.model.device,
-                query_point_count=self.model.config.tapir_query_point_count,
-                min_track_points=self.model.config.tapir_min_track_points,
-                ransac_iterations=self.model.config.tapir_ransac_iterations,
-                ransac_inlier_threshold=self.model.config.tapir_ransac_inlier_threshold,
-                checkpoint_path=self.model.config.tapir_checkpoint_path,
-                input_resolution=self.model.config.tapir_input_resolution,
-                visibility_threshold=self.model.config.tapir_visibility_threshold,
-            )
-            tracker_label = "TAPIR"
-        elif tracker_kind == "klt":
-            from .utils.klt_motion import KltMotionEstimator
-            self._motion_estimator = KltMotionEstimator(
-                device=self.model.device,
-                query_point_count=self.model.config.klt_query_point_count,
-                min_track_points=self.model.config.klt_min_track_points,
-                ransac_iterations=self.model.config.klt_ransac_iterations,
-                ransac_inlier_threshold=self.model.config.klt_ransac_inlier_threshold,
-                pyramid_levels=self.model.config.klt_pyramid_levels,
-                window_size=self.model.config.klt_window_size,
-                lk_iterations=self.model.config.klt_lk_iterations,
-                lk_eps=self.model.config.klt_lk_eps,
-                fast_threshold=self.model.config.klt_fast_threshold,
-                sample_inner_area_ratio=self.model.config.klt_sample_inner_area_ratio,
-            )
-            tracker_label = "KLT"
-        elif tracker_kind == "xfeat":
-            # XFeat replaces the FAST/Shi-Tomasi-based feature
-            # extraction that KLT uses: the CNN detects AND describes in
-            # one forward pass, then MNN over the descriptors gives
-            # frame-to-frame matches directly. There is no separate
-            # corner-detector or descriptor step to load.
-            from .utils.xfeat_motion import XFeatMotionEstimator
-            self._motion_estimator = XFeatMotionEstimator(
-                device=self.model.device,
-                top_k=self.model.config.xfeat_top_k,
-                detection_threshold=self.model.config.xfeat_detection_threshold,
-                min_cossim=self.model.config.xfeat_min_cossim,
-                min_track_points=self.model.config.xfeat_min_track_points,
-                ransac_iterations=self.model.config.xfeat_ransac_iterations,
-                ransac_inlier_threshold=self.model.config.xfeat_ransac_inlier_threshold,
-                weights_path=self.model.config.xfeat_weights_path,
-                use_lighterglue=self.model.config.xfeat_use_lighterglue,
-                lighterglue_min_conf=self.model.config.xfeat_lighterglue_min_conf,
-                lighterglue_depth_confidence=self.model.config.xfeat_lighterglue_depth_confidence,
-                object_search_radius_px=self.model.config.xfeat_object_search_radius_px,
-            )
-            tracker_label = "XFeat"
-        else:
-            self._motion_estimator = CoTrackerMotionEstimator(
-                device=self.model.device,
-                query_point_count=self.model.config.cotracker_query_point_count,
-                min_track_points=self.model.config.cotracker_min_track_points,
-                ransac_iterations=self.model.config.cotracker_ransac_iterations,
-                ransac_inlier_threshold=self.model.config.cotracker_ransac_inlier_threshold,
-                checkpoint_path=self.model.config.cotracker_checkpoint_path,
-                hub_repo=self.model.config.cotracker_hub_repo,
-                hub_model=self.model.config.cotracker_hub_model,
-                predictor_resolution=self.model.config.cotracker_predictor_resolution,
-                predictor_iters=self.model.config.cotracker_predictor_iters,
-            )
-            tracker_label = "CoTracker"
+        # XFeat is the only supported tracker after the 2026-05-26
+        # cleanup. See dynamic_gs/utils/_purged/ for the legacy KLT /
+        # CoTracker / TAPIR / TAPNext implementations.
+        from .utils.xfeat_motion import XFeatMotionEstimator
+        self._motion_estimator = XFeatMotionEstimator(
+            device=self.model.device,
+            top_k=self.model.config.xfeat_top_k,
+            detection_threshold=self.model.config.xfeat_detection_threshold,
+            min_cossim=self.model.config.xfeat_min_cossim,
+            min_track_points=self.model.config.xfeat_min_track_points,
+            ransac_iterations=self.model.config.xfeat_ransac_iterations,
+            ransac_inlier_threshold=self.model.config.xfeat_ransac_inlier_threshold,
+            weights_path=self.model.config.xfeat_weights_path,
+            use_lighterglue=self.model.config.xfeat_use_lighterglue,
+            lighterglue_min_conf=self.model.config.xfeat_lighterglue_min_conf,
+            lighterglue_depth_confidence=self.model.config.xfeat_lighterglue_depth_confidence,
+            object_search_radius_px=self.model.config.xfeat_object_search_radius_px,
+        )
+        tracker_label = "XFeat"
         seeded = self._motion_estimator.initialize(
             rgb=rgb, depth=depth, camera=camera, mask=mask,
         )
@@ -2174,13 +2077,7 @@ class DynamicGSPipeline(VanillaPipeline):
             gaps = self._timing.get("LIVE.between_tick_gap", [])
             gap_ms = (sum(gaps[-fresh:]) / fresh * 1000.0) if (gaps and fresh) else 0.0
             tracker_ms = self._timing["DN.3_tracker_motion"][-1] * 1000
-            tracker_label = {
-                "tapir": "TAPIR",
-                "tapnext": "TAPNext",
-                "cotracker": "CoTracker",
-                "klt": "KLT",
-                "xfeat": "XFeat",
-            }.get(getattr(self.model.config, "dynamic_tracker", "cotracker"), "CoTracker")
+            tracker_label = "XFeat"
             # Per-window mean over last `fresh` ticks for the inner DN.3 sub-timers
             # so we can see WHERE the tick budget is going. Computed inline so we
             # don't have to kill the run to read timing_report.txt.
@@ -2199,21 +2096,13 @@ class DynamicGSPipeline(VanillaPipeline):
             g = _last_mean_ms("DN.3g_apply_transform", n)
             tot = _last_mean_ms("DN.3_tracker_motion", n)
             est = _last_mean_ms("DN.3_estimate_total", n)
-            tracker_kind_now = getattr(self.model.config, "dynamic_tracker", "cotracker")
-            if tracker_kind_now == "xfeat":
-                xf = _last_mean_ms("DN.3c_xfeat_extract", n)
-                lg = _last_mean_ms("DN.3i_lighterglue_match", n)
-                breakdown = (
-                    f"rgb_prep={a:.1f} input_prep={b:.1f} "
-                    f"xfeat={xf:.1f} match={lg:.1f} ransac={e:.1f} apply={g:.1f} "
-                    f"estimate_total={est:.1f}  total={tot:.1f}ms"
-                )
-            else:
-                breakdown = (
-                    f"rgb_prep={a:.1f} input_prep={b:.1f} "
-                    f"net+match={c:.1f} postproc={d:.1f} ransac={e:.1f} apply={g:.1f} "
-                    f"estimate_total={est:.1f}  total={tot:.1f}ms"
-                )
+            xf = _last_mean_ms("DN.3c_xfeat_extract", n)
+            lg = _last_mean_ms("DN.3i_lighterglue_match", n)
+            breakdown = (
+                f"rgb_prep={a:.1f} input_prep={b:.1f} "
+                f"xfeat={xf:.1f} match={lg:.1f} ransac={e:.1f} apply={g:.1f} "
+                f"estimate_total={est:.1f}  total={tot:.1f}ms"
+            )
             # Per-window inlier/correspondence stats from the last `fresh`
             # successful Kabsch fits. Both lists are appended only when
             # the apply path runs (i.e. RANSAC succeeded), so the mean
@@ -2737,15 +2626,11 @@ class DynamicGSPipeline(VanillaPipeline):
 
         # --- TIMING: D0.6 CoTracker init (sample 2D points inside the rendered object mask, back-project to world via depth, store as reference) ---
         t0 = time.time()
-        # Match the per-tick path in ``_apply_motion_estimator``: KLT/XFeat
-        # see the gripper-blue-composited image, neural trackers see the raw
-        # natural image. The D0 reference must look exactly like the DN
-        # input or the descriptor / appearance distribution diverges.
-        _d0_tracker_kind = getattr(self.model.config, "dynamic_tracker", "cotracker")
-        if _d0_tracker_kind in ("klt", "xfeat"):
-            live_rgb_fullres = self._build_tracking_rgb(batch)
-        else:
-            live_rgb_fullres = self.model.get_live_rgb(batch, apply_training_downscale=False)
+        # Match the per-tick path in ``_apply_motion_estimator``: XFeat
+        # sees the gripper-blue-composited image. The D0 reference must
+        # look exactly like the DN input or the descriptor distribution
+        # diverges.
+        live_rgb_fullres = self._build_tracking_rgb(batch)
         self.model.capture_reference_object_pose()
         # Erode the splat-rasterized mask to its inner 85% so D0 keypoints
         # don't land on the low-opacity halo at the object's edge (those
@@ -2769,8 +2654,7 @@ class DynamicGSPipeline(VanillaPipeline):
         if not self._has_nonempty_mask(seed_mask):
             seed_mask = None
         instance_id_for_co = getattr(self, "_d0_selected_instance_id", 0)
-        _tracker_kind = getattr(self.model.config, "dynamic_tracker", "cotracker")
-        _tracker_label = self._TRACKER_LABELS.get(_tracker_kind, "Tracker")
+        _tracker_label = "XFeat"
         if instance_id_for_co > 0 and seed_mask is not None:
             self._initialize_motion_estimator(
                 live_rgb_fullres, batch["depth_image"], camera, mask=seed_mask,
@@ -3494,14 +3378,7 @@ class DynamicGSPipeline(VanillaPipeline):
 
         from datetime import datetime
 
-        tracker_kind = getattr(self.model.config, "dynamic_tracker", "cotracker")
-        tracker_label = {
-            "tapir": "TAPIR",
-            "tapnext": "TAPNext",
-            "cotracker": "CoTracker",
-            "klt": "KLT",
-            "xfeat": "XFeat",
-        }.get(tracker_kind, "CoTracker")
+        tracker_label = "XFeat"
         # --- Descriptions for each timer key (chronological within phase) ---
         d0_keys = [
             ("D0.1_initial_change_detection", "Initial change detection (total)"),

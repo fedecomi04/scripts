@@ -60,7 +60,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .cotracker_motion import CoTrackerMotionEstimate, CoTrackerMotionEstimator
+from . import tracker_common as _tc
+from .tracker_common import MotionEstimate as CoTrackerMotionEstimate
 
 if TYPE_CHECKING:
     from nerfstudio.cameras.cameras import Cameras
@@ -329,9 +330,9 @@ class XFeatMotionEstimator:
         self._anchors = []
 
         rgb_t = self._prepare_rgb_gpu(rgb)
-        depth_np = CoTrackerMotionEstimator._prepare_depth_image(depth)
-        intrinsics = CoTrackerMotionEstimator._extract_intrinsics(camera)
-        camera_to_world = CoTrackerMotionEstimator._extract_camera_to_world(camera)
+        depth_np = _tc.prepare_depth_image(depth)
+        intrinsics = _tc.extract_intrinsics(camera)
+        camera_to_world = _tc.extract_camera_to_world(camera)
         if depth_np.shape != tuple(rgb_t.shape[:2]):
             raise RuntimeError(
                 "XFeat initialization requires RGB and depth at the same resolution, "
@@ -358,7 +359,7 @@ class XFeatMotionEstimator:
             self.last_init_used_dense_fallback = False
             return 0
 
-        depth_values, depth_valid = CoTrackerMotionEstimator._sample_depth_bilinear(
+        depth_values, depth_valid = _tc.sample_depth_bilinear(
             depth_np, keypoints,
         )
 
@@ -419,9 +420,9 @@ class XFeatMotionEstimator:
         # bilinear depth sample + RANSAC-Kabsch is pure numpy.
         t = time.time()
         current_rgb_prepared = self._prepare_rgb_gpu(current_rgb)
-        current_depth_prepared = CoTrackerMotionEstimator._prepare_depth_image(current_depth)
-        current_intrinsics = CoTrackerMotionEstimator._extract_intrinsics(current_camera)
-        current_camera_to_world = CoTrackerMotionEstimator._extract_camera_to_world(current_camera)
+        current_depth_prepared = _tc.prepare_depth_image(current_depth)
+        current_intrinsics = _tc.extract_intrinsics(current_camera)
+        current_camera_to_world = _tc.extract_camera_to_world(current_camera)
         timings["input_prep"] = time.time() - t
 
         if current_depth_prepared.shape != tuple(current_rgb_prepared.shape[:2]):
@@ -504,10 +505,10 @@ class XFeatMotionEstimator:
         # garbage 3D, masked out below). One pass — cheaper than doing it
         # twice if the 2nd-nearest anchor fallback fires.
         t = time.time()
-        curr_depth_values, curr_depth_valid = CoTrackerMotionEstimator._sample_depth_bilinear(
+        curr_depth_values, curr_depth_valid = _tc.sample_depth_bilinear(
             current_depth_prepared, curr_keypoints,
         )
-        curr_world_all = CoTrackerMotionEstimator._backproject_to_world(
+        curr_world_all = _tc.backproject_to_world(
             curr_keypoints, curr_depth_values, current_intrinsics, current_camera_to_world,
         )
 
@@ -645,7 +646,7 @@ class XFeatMotionEstimator:
                 )
                 if anchor_kp.shape[0] >= self.min_track_points:
                     anchor_depth_values, anchor_depth_valid = (
-                        CoTrackerMotionEstimator._sample_depth_bilinear(
+                        _tc.sample_depth_bilinear(
                             current_depth_prepared, anchor_kp,
                         )
                     )
@@ -837,7 +838,7 @@ class XFeatMotionEstimator:
         depth_valid_t = torch.as_tensor(depth_valid, device=descriptors.device)
         kept_desc = descriptors[depth_valid_t]
         kept_kp_gpu = keypoints_gpu[depth_valid_t.to(keypoints_gpu.device)]
-        world_3d = CoTrackerMotionEstimator._backproject_to_world(
+        world_3d = _tc.backproject_to_world(
             kept_kp, kept_depth, intrinsics, camera_to_world,
         )
         rgb_stored: Optional[Tensor] = None
@@ -1033,12 +1034,8 @@ class XFeatMotionEstimator:
         anchor_world_pts = anchor.world_3d[anchor_idx[depth_compatible]]
         curr_world_pts = curr_world_all[curr_idx[depth_compatible]]
 
-        ransac_helper = CoTrackerMotionEstimator.__new__(CoTrackerMotionEstimator)
-        ransac_helper.min_track_points = self.min_track_points
-        ransac_helper.ransac_iterations = self.ransac_iterations
-        ransac_helper.ransac_inlier_threshold = self.ransac_inlier_threshold
         ransac_t = time.time()
-        ransac_result = ransac_helper._estimate_rigid_transform_ransac(
+        ransac_result = _tc.estimate_rigid_transform_ransac(
             anchor_world_pts, curr_world_pts,
             threshold=self.ransac_inlier_threshold,
             iterations=self.ransac_iterations,
@@ -1076,7 +1073,7 @@ class XFeatMotionEstimator:
         returns a contiguous HWC float tensor on the XFeat device, range
         normalised to 0..255 without a host sync.
 
-        The critical difference from CoTrackerMotionEstimator._prepare_tracking_rgb
+        The critical difference from _tc.prepare_tracking_rgb
         is: NO ``.cpu()`` and NO ``.max().item()`` call. The legacy helper's
         15 ms cost was 99 % CUDA-sync wait, not transfer.
         """
@@ -1135,7 +1132,7 @@ class XFeatMotionEstimator:
         if mask is None:
             return None
         if isinstance(mask, Tensor):
-            resized = CoTrackerMotionEstimator._resize_mask(mask, output_shape)
+            resized = _tc.resize_mask(mask, output_shape)
             return resized.detach().float().cpu().numpy() > 0.5
         arr = np.asarray(mask)
         if arr.ndim == 3 and arr.shape[-1] == 1:

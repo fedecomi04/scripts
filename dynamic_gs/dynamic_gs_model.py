@@ -84,143 +84,25 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     use_sam3d_object_init: bool = True
     reuse_sam3d_generated_ply: bool = True
     enable_dynamic_mean_optimization: bool = False
-    # CoTracker3 + Kabsch-RANSAC rigid-motion estimator. The pipeline tracks
-    # 2D pixel points sampled at D0 across each new frame, back-projects via
-    # depth, and runs RANSAC-Kabsch to recover a rigid (R, t) for the moved
-    # object. ``apply_rigid_object_transform_from_reference`` then moves
-    # every Gaussian flagged as belonging to that object.
+    # 2D point tracker = XFeat sparse + LighterGlue + Kabsch-RANSAC.
+    # The pipeline samples 2D points at D0, back-projects via depth,
+    # then per tick: extract+match against an anchor (or any of a small
+    # pool), back-project the matched 2D points in the live frame, run
+    # RANSAC-Kabsch to recover (R, t) for the moved object. The legacy
+    # CoTracker / TAPIR / TAPNext / KLT backends were purged on
+    # 2026-05-26; their files survive under ``dynamic_gs/utils/_purged/``.
     enable_cotracker_rigid_motion: bool = True
-    cotracker_query_point_count: int = 64
-    cotracker_min_track_points: int = 12
-    cotracker_ransac_iterations: int = 128
-    cotracker_ransac_inlier_threshold: float = 0.008
-    cotracker_checkpoint_path: str = ""
-    cotracker_hub_repo: str = "facebookresearch/co-tracker"
-    cotracker_hub_model: str = "cotracker3_offline"
-    cotracker_predictor_resolution: tuple[int, int] = (192, 192)
-    """(height, width) override for the predictor's internal resize before its
-    CNN encoder runs. The hub-loaded model resizes every input to
-    ``model.model_resolution`` (typically ~384x512) regardless of camera
-    resolution, so the encoder cost is determined by this value alone.
-    The CoTracker3 paper benchmarks at (256, 256) — same as training. Set
-    (0, 0) to keep the hub default. Lower values reduce encoder cost
-    roughly linearly with pixel count, at the price of slightly less
-    precise sub-pixel tracking."""
-    cotracker_predictor_iters: int = 4
-    """Number of transformer refinement iterations per offline predictor
-    forward. The hub predictor wrapper hardcodes ``iters=6``; we bypass
-    it and call the underlying model with this value instead. Each iter
-    is a full transformer pass over the (point, frame) tokens, so cost
-    is roughly linear in iters. The CoTracker3 paper trains at iters=4;
-    6 is the wrapper's default for marginal accuracy gains. For 2-frame
-    pairwise tracking on a 5 Hz camera, iters=3-4 is typically enough
-    to converge."""
+    """Master switch for the tracker. Kept as ``enable_cotracker_*`` for
+    config-compatibility with older saved configs; despite the legacy
+    name it now gates XFeat."""
 
-    # 2D point tracker selection. The pipeline supports five backends
-    # with the same public surface (initialize / estimate_and_advance / ready):
-    #   * "cotracker" -- Meta CoTracker3 (offline 2-frame mode, hub-loaded)
-    #   * "tapir"     -- Google DeepMind online causal BootsTAPIR (PyTorch
-    #                    port, vendored under third_party/tapnet/tapnet/torch/)
-    #   * "tapnext"   -- Google DeepMind TAPNext / BootsTAPNext (TRecViT-B/8,
-    #                    PyTorch port, vendored under third_party/tapnet/
-    #                    tapnet/tapnext/). Frames tracking as next-token
-    #                    prediction; single feed-forward per frame, no
-    #                    iterations/support grid. There is no official
-    #                    "TAPNext-S" variant — only TRecViT-B is released.
-    #                    Default checkpoint: bootstapnext_ckpt.npz (JAX),
-    #                    converted at load. Also supports tapnextpp_ckpt.pt
-    #                    (native PyTorch, fine-tuned for long-term tracking).
-    #   * "klt"       -- Classical pyramidal Lucas-Kanade optical flow
-    #                    (cv2.calcOpticalFlowPyrLK), CPU-only, no model
-    #                    load. Resamples fresh FAST keypoints every frame
-    #                    rather than persisting a D0 anchor — the
-    #                    cumulative D0→curr transform is composed from
-    #                    per-frame δT, which drifts but works well for
-    #                    high-fps capture where inter-frame motion is
-    #                    small. Targets ≈5-10 ms / tick.
-    #   * "xfeat"     -- XFeat (CVPR 2024) sparse-matching tracker.
-    # The 3D RANSAC anchor stays at D0 for tapir/tapnext/cotracker; klt
-    # back-projects pairwise (prev_world, curr_world) and composes.
-    # TAPIR is the default on this branch as of 2026-05-14: switched
-    # from cotracker after sm_120 migration, since TAPIR's stateful
-    # causal model has no support grid / fewer transformer iters per
-    # call and benches faster than cotracker on native cu128.
-    dynamic_tracker: Literal["tapir", "tapnext", "cotracker", "klt", "xfeat"] = "xfeat"
-
-    tapir_query_point_count: int = 64
-    tapir_min_track_points: int = 12
-    tapir_ransac_iterations: int = 128
-    tapir_ransac_inlier_threshold: float = 0.025
-    """RANSAC inlier residual cap, metres. Sized for depth-measurement
-    noise (gazebo openni_kinect: ~5-10 mm at typical distances), not for
-    2D keypoint precision — TAPIR's sub-pixel tracks are themselves
-    accurate, but per-point 3D backprojection inherits the depth noise
-    on both ends → pair-residual ~10-15 mm. A tighter threshold (e.g.
-    0.008) makes RANSAC reject visually-correct matches as outliers."""
-    tapir_checkpoint_path: str = ""
-    """Absolute path to ``causal_bootstapir_checkpoint.pt``. Empty falls
-    back to ``third_party/tapnet/checkpoints/causal_bootstapir_checkpoint.pt``."""
-    tapir_input_resolution: tuple[int, int] = (256, 256)
-    """(height, width) input size given to the TAPIR encoder. The
-    BootsTAPIR causal checkpoint is trained at 256x256; deviating from
-    this value will mostly hurt accuracy without much speed gain since
-    the encoder is already small."""
-    tapir_visibility_threshold: float = 0.5
-    """Visibility cutoff: a point is visible iff
-    ``(1 - sigmoid(occlusion)) * (1 - sigmoid(expected_dist)) > threshold``.
-    The TAPIR demo uses 0.5."""
-
-    # TAPNext (TRecViT-B/8, online next-token-prediction) tracker config.
-    # Active only when ``dynamic_tracker == "tapnext"``. The model holds
-    # one ``TAPNextTrackingState`` instance with the LRU caches of all 12
-    # TRecViT blocks, so per-frame inference is a single ``model(...)``
-    # call. Same RANSAC pipeline downstream as TAPIR.
-    tapnext_query_point_count: int = 32
-    tapnext_min_track_points: int = 12
-    tapnext_ransac_iterations: int = 32
-    tapnext_ransac_inlier_threshold: float = 0.025
-    """RANSAC inlier residual cap, metres. Same depth-noise rationale as
-    TAPIR — sub-pixel 2D tracks back-project to mm-precision so the
-    dominant pair-residual is depth noise (~5-10 mm on simulated
-    openni_kinect)."""
-    tapnext_checkpoint_path: str = ""
-    """Absolute path to either ``bootstapnext_ckpt.npz`` (JAX, auto-
-    converted at load via ``restore_model_from_jax_checkpoint``) or
-    ``tapnextpp_ckpt.pt`` (native PyTorch TAPNext++). Empty falls back to
-    ``third_party/tapnet/checkpoints/bootstapnext_ckpt.npz``."""
-    tapnext_input_resolution: tuple[int, int] = (256, 256)
-    """(height, width) input size given to the TAPNext encoder. The
-    released TRecViT-B/8 checkpoints are trained at 256x256; deviating
-    from this requires retraining the spatial position embedding."""
-    tapnext_visibility_threshold: float = 0.0
-    """Visibility cutoff on the raw visible-head logit (threshold=0 is
-    equivalent to ``sigmoid(logit) > 0.5``, matching torch_tapnext_demo)."""
-
-    # KLT (pyramidal Lucas-Kanade) tracker config. Active only when
-    # ``dynamic_tracker == "klt"``.
-    klt_query_point_count: int = 64
-    klt_min_track_points: int = 12
-    klt_ransac_iterations: int = 128
-    klt_ransac_inlier_threshold: float = 0.008
-    klt_pyramid_levels: int = 3
-    """``maxLevel`` passed to cv2.calcOpticalFlowPyrLK. 3 means a 4-level
-    pyramid (0..3); covers ~16x range of motion at the chosen winSize."""
-    klt_window_size: int = 15
-    """Square LK window side in pixels at the finest pyramid level."""
-    klt_lk_iterations: int = 20
-    """Max LK refinement iterations per pyramid level (TermCriteria_COUNT)."""
-    klt_lk_eps: float = 0.03
-    """LK convergence epsilon (TermCriteria_EPS)."""
-    klt_fast_threshold: int = 28
-    """FAST corner-detector threshold for per-frame keypoint resampling."""
-    klt_sample_inner_area_ratio: float = 0.8
-    """Erode the rendered object mask so its area is ~this fraction of
-    the original before sampling keypoints. Keeps points off the
-    silhouette where depth and color are unreliable."""
-
-    # XFeat (CVPR 2024) sparse-matching tracker config. Active only when
-    # ``dynamic_tracker == "xfeat"``. XFeat is a CNN that detects AND
-    # describes keypoints in one forward pass; matching is MNN over the
+    # XFeat (CVPR 2024) sparse-matching tracker config. XFeat is a CNN
+    # that detects AND describes keypoints in one forward pass; matching
+    # is via LighterGlue (XFeat-author-trained slim LightGlue) over the
+    # L2-normalised 64-D descriptors. Bench on RTX 5070 Ti (native
+    # cu128): sparse 1280x720 ~7 ms end-to-end (extract A + extract B +
+    # match). Semi-dense (XFeat*) at the same res takes ~12 ms - to try
+    # it, swap match_xfeat for match_xfeat_star in xfeat_motion.py.
     # L2-normalised 64-D descriptors. Bench on RTX 5070 Ti (native
     # cu128): sparse 1280x720 ~7 ms end-to-end (extract A + extract B +
     # match). Semi-dense (XFeat*) at the same res takes ~12 ms - to try

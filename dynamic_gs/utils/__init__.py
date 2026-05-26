@@ -16,7 +16,7 @@ from .esam import (
     query_esam_mask,
     query_esam_mask_pair,
 )
-from .cotracker_motion import CoTrackerMotionEstimate, CoTrackerMotionEstimator
+from .tracker_common import MotionEstimate as CoTrackerMotionEstimate
 from .keyframe_filter import DynamicKeyframeFilter
 from .no_refine_strategy import NoRefineStrategy
 from .optim_pool import OptimFrame, OptimPool
@@ -50,7 +50,6 @@ __all__ = [
     "combine_object_masks",
     "dilate_binary_mask",
     "CoTrackerMotionEstimate",
-    "CoTrackerMotionEstimator",
     "DynamicKeyframeFilter",
     "ESAM_NUM_PROMPT_POINTS",
     "ESAM_PROMPT_KEEP_RATIO",
