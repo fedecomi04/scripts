@@ -225,10 +225,15 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     # cu128): sparse 1280x720 ~7 ms end-to-end (extract A + extract B +
     # match). Semi-dense (XFeat*) at the same res takes ~12 ms - to try
     # it, swap match_xfeat for match_xfeat_star in xfeat_motion.py.
-    xfeat_top_k: int = 4096
+    xfeat_top_k: int = 300
     """Max keypoints per frame. The XFeat top-k is applied AFTER NMS so
-    in practice you get fewer keypoints than this on small/textureless
-    images - the value is only a cap."""
+    in practice you get fewer keypoints on small/textureless images —
+    the value is only a cap. 300 is sized for the worst case where the
+    visible-object region is heavily occluded (~10% visible); the cap
+    has to be tight because LighterGlue's transformer cost scales
+    ~linearly with keypoint count. Raise if matches consistently
+    saturate against the cap with the object fully visible; lower if
+    LighterGlue match time is still the dominant per-tick cost."""
     xfeat_detection_threshold: float = 0.05
     """XFeat detector logit threshold. Lower = more keypoints, more
     noise in low-texture regions."""
@@ -238,7 +243,13 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     cost of total match count."""
     xfeat_min_track_points: int = 12
     """RANSAC abort threshold (matches & inliers)."""
-    xfeat_ransac_iterations: int = 128
+    xfeat_ransac_iterations: int = 32
+    """RANSAC iteration count. With LighterGlue's attention-filtered
+    matches almost every 3-point random sample lands close to the true
+    transform, so the inlier set found at 32 iters matches what 128 finds
+    — but 32 saves ~7 ms per tick. Bump back toward 128 only if you see
+    persistent zero-inlier failures with healthy correspondence counts
+    in the diagnostic log."""
     xfeat_ransac_inlier_threshold: float = 0.025
     """RANSAC inlier residual cap, metres. 0.025 (25 mm) is sized for the
     sparse + LighterGlue path against Gazebo openni_kinect depth: even with
@@ -260,6 +271,15 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     xfeat_lighterglue_min_conf: float = 0.1
     """LighterGlue's match-confidence filter (post-attention). 0.1 is the
     XFeat repo default; higher is stricter, fewer matches."""
+    xfeat_object_mask_cache_ticks: int = 3
+    """Re-render the splat-rasterized object mask only every Nth tracker
+    tick; reuse the cached mask otherwise. ``render_object_mask`` costs
+    ~5 ms (gsplat rasterize over object Gaussians + ~1 ms ``.item()``
+    syncs + 1-2 ms CPU erosion). Caching 3 ticks saves ~3 ms/tick
+    averaged. Safe up to N≈5 because the post-match keep_region dilates
+    by ``xfeat_object_search_radius_px`` (default 80 px), so even a
+    stale mask still encloses the true object location for the few-tick
+    window. Set to 1 to disable the cache (re-render every tick)."""
     xfeat_object_search_radius_px: int = 80
     """Dilation radius (pixels) applied to the rendered object mask before
     using it as the per-frame post-match filter on the current frame. The

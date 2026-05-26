@@ -1474,19 +1474,39 @@ class DynamicGSPipeline(VanillaPipeline):
         # XFeat extracts globally then filters MATCHES inside the same
         # region; both need the rendered object mask + gripper mask.
         # TAPIR / CoTracker ignore the kwarg.
+        # --- Sub-timing: DN.3j object mask render + erode (XFeat/KLT only) ---
+        t_mask = time.time()
         current_object_mask = None
         if tracker_kind in ("klt", "xfeat"):
-            with torch.no_grad():
-                # Splat-rasterized mask, then eroded to keep only the inner
-                # 85% of the area. The outer 15% is the low-opacity halo
-                # where keypoints would land on background pixels just
-                # outside the object's actual silhouette.
-                current_object_mask = self.model.render_object_mask(camera).detach()
-                current_object_mask = self._erode_mask_to_inner_fraction(
-                    current_object_mask, _TRACKER_MASK_INNER_FRACTION,
-                )
+            # Cache the object mask for ``xfeat_object_mask_cache_ticks``
+            # consecutive ticks (XFeat only — KLT samples keypoints from
+            # this mask and the staleness would shift sampled locations,
+            # so KLT always re-renders). The downstream keep_region
+            # dilates by ``xfeat_object_search_radius_px`` (default 80 px),
+            # giving plenty of slack for a few ticks of object drift.
+            self._object_mask_tick_count = getattr(self, "_object_mask_tick_count", 0) + 1
+            cache_ticks = (
+                int(getattr(self.model.config, "xfeat_object_mask_cache_ticks", 1))
+                if tracker_kind == "xfeat" else 1
+            )
+            cached = getattr(self, "_cached_object_mask", None)
+            stale = (cached is None) or (self._object_mask_tick_count % max(cache_ticks, 1) == 1)
+            if stale:
+                with torch.no_grad():
+                    # Splat-rasterized mask, then eroded to keep only the inner
+                    # 85% of the area. The outer 15% is the low-opacity halo
+                    # where keypoints would land on background pixels just
+                    # outside the object's actual silhouette.
+                    current_object_mask = self.model.render_object_mask(camera).detach()
+                    current_object_mask = self._erode_mask_to_inner_fraction(
+                        current_object_mask, _TRACKER_MASK_INNER_FRACTION,
+                    )
+                self._cached_object_mask = current_object_mask
+            else:
+                current_object_mask = cached
             if current_mask is None:
                 current_mask = self.model._get_batch_mask(batch)
+        self._timing["DN.3j_object_mask_render"].append(time.time() - t_mask)
         # --- Sub-timing: DN.3b-e estimate_and_advance — inner sub-timings come from motion_estimate.timings ---
         t = time.time()
         motion_estimate = self._motion_estimator.estimate_and_advance(
@@ -1503,9 +1523,21 @@ class DynamicGSPipeline(VanillaPipeline):
         # logged as 0.0 so the report column stays aligned.
         self._timing["DN.3b_estimator_input_prep"].append(float(sub.get("input_prep", 0.0)))
         # ``predictor_forward`` is the TAPIR/CoTracker key; ``klt_forward``
-        # is the KLT key. Both flow into the same DN.3c slot in the report.
+        # is the KLT key; ``xfeat_extract`` is the XFeat sparse-extract
+        # leg. All flow into the same DN.3c slot so the generic "NN
+        # forward" column stays populated across backends.
         self._timing["DN.3c_predictor_forward"].append(
-            float(sub.get("predictor_forward", sub.get("klt_forward", 0.0)))
+            float(sub.get("predictor_forward",
+                          sub.get("xfeat_extract",
+                                  sub.get("klt_forward", 0.0))))
+        )
+        # XFeat-only: pure sparse-extract time (no matching, no RANSAC).
+        # Other backends leave this at 0.
+        self._timing["DN.3c_xfeat_extract"].append(float(sub.get("xfeat_extract", 0.0)))
+        # XFeat-only: LighterGlue matcher forward pass (or MNN fallback
+        # when LighterGlue isn't loaded).
+        self._timing["DN.3i_lighterglue_match"].append(
+            float(sub.get("lighterglue_match", 0.0))
         )
         self._timing["DN.3d_postprocess"].append(float(sub.get("postprocess", 0.0)))
         self._timing["DN.3e_ransac_kabsch"].append(float(sub.get("ransac_kabsch", 0.0)))
@@ -1907,12 +1939,21 @@ class DynamicGSPipeline(VanillaPipeline):
             cam_idx=0,
         )
 
+        # Pin the host buffers BEFORE the H2D copy so the GPU upload can
+        # truly run async with ``non_blocking=True``. Pageable memory
+        # (the default for ``torch.from_numpy``) forces the CUDA driver
+        # to first copy the page into a pinned staging buffer, which
+        # serialises the transfer with the launching thread and costs
+        # ~11 ms per tick on this rig. Pinning skips the staging step
+        # → ~3 ms per tick steady-state. Total live frame is rgb(uint8
+        # ~5 MB) + depth(float32 ~3.6 MB) + mask(float32 ~0.9 MB) ≈ 10 MB
+        # of pinned host memory per in-flight frame, trivially manageable.
         rgb_rgb = np.ascontiguousarray(frame.rgb_bgr[..., ::-1])
-        image_t = torch.from_numpy(rgb_rgb).to(device)  # uint8 (H, W, 3)
+        image_t = torch.from_numpy(rgb_rgb).pin_memory().to(device, non_blocking=True)
         # depth is already float32 metres from the publisher; no rescale.
-        depth_t = torch.from_numpy(frame.depth_m).to(device)
+        depth_t = torch.from_numpy(frame.depth_m).pin_memory().to(device, non_blocking=True)
         mask_bool = (frame.mask_keep > 0).astype(np.float32)
-        mask_t = torch.from_numpy(mask_bool).unsqueeze(-1).to(device)
+        mask_t = torch.from_numpy(mask_bool).pin_memory().to(device, non_blocking=True).unsqueeze(-1)
 
         batch = {
             "image": image_t,
@@ -2132,12 +2173,27 @@ class DynamicGSPipeline(VanillaPipeline):
             e = _last_mean_ms("DN.3e_ransac_kabsch", n)
             g = _last_mean_ms("DN.3g_apply_transform", n)
             tot = _last_mean_ms("DN.3_tracker_motion", n)
+            est = _last_mean_ms("DN.3_estimate_total", n)
+            tracker_kind_now = getattr(self.model.config, "dynamic_tracker", "cotracker")
+            if tracker_kind_now == "xfeat":
+                xf = _last_mean_ms("DN.3c_xfeat_extract", n)
+                lg = _last_mean_ms("DN.3i_lighterglue_match", n)
+                breakdown = (
+                    f"rgb_prep={a:.1f} input_prep={b:.1f} "
+                    f"xfeat={xf:.1f} match={lg:.1f} ransac={e:.1f} apply={g:.1f} "
+                    f"estimate_total={est:.1f}  total={tot:.1f}ms"
+                )
+            else:
+                breakdown = (
+                    f"rgb_prep={a:.1f} input_prep={b:.1f} "
+                    f"net+match={c:.1f} postproc={d:.1f} ransac={e:.1f} apply={g:.1f} "
+                    f"estimate_total={est:.1f}  total={tot:.1f}ms"
+                )
             print(
                 f"\n==> [tracker-rate] {hz:.1f} Hz over {elapsed:.1f}s "
                 f"({tracker_label} last={tracker_ms:.0f}ms | "
                 f"dedup {dedup_ratio*100:.0f}% | outside-tick {gap_ms:.0f}ms)"
-                f"\n    breakdown(mean/tick over {n}): rgb_prep={a:.1f} input_prep={b:.1f} "
-                f"net+match={c:.1f} postproc={d:.1f} ransac={e:.1f} apply={g:.1f}  total={tot:.1f}ms\n",
+                f"\n    breakdown(mean/tick over {n}): {breakdown}\n",
                 flush=True,
             )
             self._live_tick_window_t0 = now
@@ -3086,12 +3142,16 @@ class DynamicGSPipeline(VanillaPipeline):
         """Trivial loss tuple used when the pool is empty.
 
         Returned shape matches ``VanillaPipeline.get_train_loss_dict``:
-        ``(model_outputs, loss_dict, metrics_dict)``. The loss is a
-        scalar tensor with ``requires_grad=True`` so the trainer's
-        ``loss.backward()`` is a no-op rather than an error.
+        ``(model_outputs, loss_dict, metrics_dict)``. CPU zero with
+        ``requires_grad=True`` so the rare callers that DO go through
+        the stock backward path (e.g. ``optim_pool`` empty while
+        ``disable_dynamic_optimization=False``) still see a tensor whose
+        ``.backward()`` is a valid no-op. In tracking-only mode
+        (``disable_dynamic_optimization=True``) the ``NoSaveTrainer``
+        short-circuit means ``backward`` is never called on this
+        anyway.
         """
-        device = self.model.device
-        zero = torch.zeros((), device=device, requires_grad=True)
+        zero = torch.zeros((), device="cpu", requires_grad=True)
         return {}, {"main_loss": zero}, {}
 
     def _dynamic_get_train_loss_dict(self, step: int):
@@ -3425,17 +3485,20 @@ class DynamicGSPipeline(VanillaPipeline):
         dn_keys = [
             ("DN.3_tracker_motion", f"{tracker_label} 2D-track advance + RANSAC-Kabsch (R, t) on the moved-object Gaussians"),
             ("DN.3a_get_live_rgb", "  -> get_live_rgb (uint8->float, optional downscale, GPU upload, background composite)"),
+            ("DN.3j_object_mask_render", "  -> render_object_mask + erode (XFeat/KLT only; cached every xfeat_object_mask_cache_ticks for XFeat)"),
             ("DN.3_estimate_total", "  -> estimate_and_advance total (sum of 3b+3c+3d+3e plus minor overhead)"),
             ("DN.3b_estimator_input_prep", "    -> input prep total (rgb/depth/intrinsics/c2w extraction, includes CUDA syncs)"),
             ("DN.3b1_prep_rgb_cpu", f"      -> rgb .cpu() + .item() ({tracker_label}-only; CUDA sync)"),
             ("DN.3b2_prep_depth_cpu", f"      -> depth .cpu().numpy() ({tracker_label}-only; CUDA sync)"),
             ("DN.3b3_prep_intrinsics", f"      -> intrinsics .cpu().numpy() ({tracker_label}-only; CUDA sync)"),
             ("DN.3b4_prep_c2w", f"      -> camera_to_world .cpu().numpy() ({tracker_label}-only; CUDA sync)"),
-            ("DN.3c_predictor_forward", f"    -> predictor forward total ({tracker_label} NN inference + .cpu() pull)"),
+            ("DN.3c_predictor_forward", f"    -> predictor forward total ({tracker_label} NN inference + .cpu() pull; XFeat reports its sparse-extract leg here)"),
+            ("DN.3c_xfeat_extract", "      -> XFeat extract (XFeat-only; sparse detectAndCompute forward + keypoint .cpu() pull)"),
             ("DN.3c1_preprocess_frame", f"      -> preprocess frame to model ({tracker_label}-only; .item() sync + interpolate)"),
             ("DN.3c2_feature_grids", f"      -> feature_grids ({tracker_label}-only; encoder forward)"),
             ("DN.3c3_estimate_traj", f"      -> estimate_trajectories ({tracker_label}-only; transformer forward)"),
             ("DN.3c4_tracks_to_cpu", f"      -> tracks/visibles .cpu().numpy() ({tracker_label}-only; final CUDA sync)"),
+            ("DN.3i_lighterglue_match", "    -> LighterGlue match (XFeat-only; LightGlue transformer forward over 64-D descriptors; falls back to MNN time if LighterGlue unavailable)"),
             ("DN.3d_postprocess", "    -> postprocess (image-bound filter, mask filter, bilinear depth sample, world back-projection — CPU/numpy)"),
             ("DN.3e_ransac_kabsch", "    -> RANSAC-Kabsch (numpy loop, scales with ransac_iterations × correspondence count)"),
             ("DN.3h_resample", "    -> KLT keypoint resample (FAST inside eroded object ∩ gripper-keep; KLT-only)"),
