@@ -400,3 +400,41 @@ def build_active_mask(mask, centers_2d, radii):
     overlap = rect_sum(x0, y0, x1, y1) > 0
     finite = torch.isfinite(x) & torch.isfinite(y) & torch.isfinite(r)
     return overlap & finite & (r > 0)
+
+
+def build_active_mask_center_only(mask, centers_2d, dilate_px: int = 0):
+    """Mark a Gaussian active iff its projected 2D center falls inside ``mask``.
+
+    Unlike ``build_active_mask`` (footprint-overlap via integral image), this
+    samples ``mask`` at the integer pixel under each Gaussian center, so a
+    Gaussian whose rendered footprint extends into the mask but whose actual
+    3D centre projects outside is excluded.
+
+    ``dilate_px`` morphologically dilates ``mask`` before sampling, so the
+    rule becomes "centre inside the mask OR within ``dilate_px`` of its
+    border". 0 = strict centre test.
+    """
+
+    if mask.ndim == 3:
+        mask = mask[..., 0]
+    bool_mask = mask > 0.5
+
+    if dilate_px > 0:
+        k = 2 * int(dilate_px) + 1
+        dil = torch.nn.functional.max_pool2d(
+            bool_mask.float().unsqueeze(0).unsqueeze(0),
+            kernel_size=k, stride=1, padding=int(dilate_px),
+        )
+        bool_mask = (dil.squeeze(0).squeeze(0) > 0.5)
+
+    height, width = bool_mask.shape
+    x = centers_2d[:, 0]
+    y = centers_2d[:, 1]
+    finite = torch.isfinite(x) & torch.isfinite(y)
+    xi = torch.where(finite, x.round().long(), torch.zeros_like(x, dtype=torch.long))
+    yi = torch.where(finite, y.round().long(), torch.zeros_like(y, dtype=torch.long))
+    in_bounds = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
+    xi = xi.clamp(0, width - 1)
+    yi = yi.clamp(0, height - 1)
+    inside = bool_mask[yi, xi]
+    return inside & finite & in_bounds

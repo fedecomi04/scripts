@@ -27,6 +27,7 @@ from __future__ import annotations
 import atexit
 import gc
 import json
+import os
 import shutil
 import threading
 import time
@@ -38,65 +39,95 @@ import numpy as np
 import torch
 from PIL import Image
 
-from .live_ros_subscriber import (
+from .live_shm_reader import (
     LIVE_ROOT,
     LiveFrame,
-    LiveRosSubscriber,
+    LiveShmSubscriber,
 )
 from .sam3_segmentation import run_sam3_subprocess
-from .sam3d import run_sam3d_multi_object_subprocess
+from .sam3d import run_sam3d_multi_object_subprocess, sam3d_pose_has_rotation
+
+INIT_CLOUD_NAME = "depth_camera_init_points.ply"
 
 
-# Module-level flag so the unpause-on-exit guard only fires when we
-# actually paused. Set True by ``pause_gazebo_physics`` on success;
-# cleared by ``unpause_gazebo_physics``. The atexit hook reads this
-# to decide whether to attempt a final unpause.
+def _has_complete_recording_cache(live_root: Path) -> bool:
+    """Return True iff a previous live session left behind enough on disk
+    to skip the recording + SAM3 + SAM3D workflow on this run.
+
+    Checks the four marker files the pipeline downstream will read:
+    static_scene/transforms.json (camera frames), static_scene/<PLY>
+    (SfM init seed), dynamic_scene/initialization_debug/static0_sam3_results.json
+    (SAM3 cache), and at least one valid SAM3D PLY+pose pair under
+    dynamic_scene/initialization_artifacts/. If any are missing we
+    fall back to the full interactive flow.
+    """
+    static = live_root / "static_scene"
+    dyn = live_root / "dynamic_scene"
+    debug = dyn / "initialization_debug"
+    artifact = dyn / "initialization_artifacts"
+    if not (static / "transforms.json").exists():
+        return False
+    if not (static / INIT_CLOUD_NAME).exists():
+        return False
+    if not (dyn / "transforms.json").exists():
+        return False
+    if not (debug / "static0_sam3_results.json").exists():
+        return False
+    for ply in sorted(artifact.glob("static0_obj_*_sam3d_raw_output.ply")):
+        pose = ply.with_name(ply.name.replace("_raw_output.ply", "_pose.json"))
+        if pose.exists() and sam3d_pose_has_rotation(pose):
+            return True
+    return False
+    # PROBLEM: this looks at file existence, not file content integrity.
+    # If a previous run was killed mid-write (e.g. SAM3 wrote the JSON
+    # but SAM3D crashed before the PLY landed) we recover automatically
+    # because we only return True when at least one valid pose+PLY pair
+    # is found. But the matching SAM3 mask count vs SAM3D PLY count
+    # is NOT verified — a stale partial cache could pass this check
+    # and trip up Phase 0b fusion. Delete LIVE_ROOT to force a fresh
+    # capture.
+
+
+# Module-level flag + sub reference so the unpause-on-exit guard only
+# fires when we actually paused. Set True by ``pause_gazebo_physics``;
+# cleared by ``unpause_gazebo_physics``. The atexit hook reads this to
+# decide whether to attempt a final unpause.
+#
+# The publisher subprocess (in the ROS env) owns the actual rospy
+# ServiceProxy calls; we route through it via the LiveShmSubscriber
+# control pipe. That keeps the dynamic_gs env free of rospy.
 _GAZEBO_PHYSICS_PAUSED = False
+_PAUSE_SUB: Optional["LiveShmSubscriber"] = None
 
 
-def pause_gazebo_physics() -> bool:
-    """Call ``/gazebo/pause_physics``. Returns True on success.
+def pause_gazebo_physics(sub: "LiveShmSubscriber") -> bool:
+    """Pause Gazebo via the publisher subprocess.
 
     Used to free CPU/GPU contention from Gazebo for the duration of
-    the SAM3D subprocess + init PLY build (the slow stretch from the
-    second Enter through ``build_static_init_pointcloud``). Probreg
-    CPD and the PLY back-projection are CPU-heavy and compete with
-    gzserver's physics tick.
-
-    Safe to call when Gazebo isn't running — the wait_for_service
-    times out and we return False without raising.
+    the SAM3D subprocess + init PLY build. Safe to call when Gazebo
+    isn't running — returns False without raising.
     """
-    global _GAZEBO_PHYSICS_PAUSED
-    try:
-        import rospy
-        from std_srvs.srv import Empty
-        rospy.wait_for_service("/gazebo/pause_physics", timeout=2.0)
-        rospy.ServiceProxy("/gazebo/pause_physics", Empty)()
-    except Exception as exc:
-        print(f"[live] could not pause Gazebo: {exc}", flush=True)
-        return False
-    _GAZEBO_PHYSICS_PAUSED = True
-    print("[live] Gazebo physics paused", flush=True)
-    return True
+    global _GAZEBO_PHYSICS_PAUSED, _PAUSE_SUB
+    ok = bool(sub.pause_gazebo_physics())
+    if ok:
+        _GAZEBO_PHYSICS_PAUSED = True
+        _PAUSE_SUB = sub
+        print("[live] Gazebo physics paused", flush=True)
+    else:
+        print("[live] could not pause Gazebo", flush=True)
+    return ok
 
 
-def unpause_gazebo_physics() -> bool:
-    """Call ``/gazebo/unpause_physics``. Idempotent — safe to call
-    when not paused (Gazebo just resumes from running). Always clears
-    the in-process flag so the atexit hook doesn't double-unpause.
-    """
+def unpause_gazebo_physics(sub: "LiveShmSubscriber") -> bool:
+    """Unpause Gazebo. Idempotent."""
     global _GAZEBO_PHYSICS_PAUSED
     _GAZEBO_PHYSICS_PAUSED = False
-    try:
-        import rospy
-        from std_srvs.srv import Empty
-        rospy.wait_for_service("/gazebo/unpause_physics", timeout=2.0)
-        rospy.ServiceProxy("/gazebo/unpause_physics", Empty)()
-    except Exception as exc:
-        print(f"[live] could not unpause Gazebo: {exc}", flush=True)
-        return False
-    print("[live] Gazebo physics unpaused", flush=True)
-    return True
+    ok = bool(sub.unpause_gazebo_physics())
+    if ok:
+        print("[live] Gazebo physics unpaused", flush=True)
+    else:
+        print("[live] could not unpause Gazebo", flush=True)
+    return ok
 
 
 def _atexit_unpause() -> None:
@@ -105,8 +136,11 @@ def _atexit_unpause() -> None:
     during PCD build — unpause so we don't leave the simulator frozen
     for the next operator.
     """
-    if _GAZEBO_PHYSICS_PAUSED:
-        unpause_gazebo_physics()
+    if _GAZEBO_PHYSICS_PAUSED and _PAUSE_SUB is not None:
+        try:
+            _PAUSE_SUB.unpause_gazebo_physics()
+        except Exception:
+            pass
 
 
 atexit.register(_atexit_unpause)
@@ -160,7 +194,8 @@ def _save_anchor_intrinsics_and_depth(anchor: LiveFrame, intrinsics, artifact_di
     full-image (no-crop) inference with a metric pointmap.
     """
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    depth_m = (anchor.depth_mm.astype(np.float32) * 1e-3)
+    # Publisher already converted depth to float32 metres; just save it.
+    depth_m = anchor.depth_m.astype(np.float32)
     depth_path = artifact_dir / "static0_full_depth_meters.tiff"
     Image.fromarray(depth_m).save(depth_path)
     intrinsics_path = artifact_dir / "static0_full_intrinsics.json"
@@ -191,10 +226,22 @@ def _prompt_user(prompt_text: str) -> str:
     Used twice: once for the SAM3 text prompt and once for the second
     Enter that ends static-view capture. Kept dead simple — no thread,
     no signal handling.
+
+    Headless mode: if stdin is not a TTY (e.g. ns-train launched via
+    nohup / detached), input() raises EOFError immediately. Rather than
+    returning "" right away (which would collapse the static-capture
+    window to ~0 frames), sleep AUTONOMOUS_PROMPT_HOLDOFF_S so the ROS
+    publisher has time to accumulate keyframes. This lets the
+    autonomous TAPIR test run end-to-end without an operator.
     """
     try:
         return input(prompt_text)
     except EOFError:
+        holdoff = float(os.environ.get("AUTONOMOUS_PROMPT_HOLDOFF_S", "15"))
+        if holdoff > 0:
+            print(f"[live] (non-interactive: holding off {holdoff:.0f}s for headless capture)",
+                  flush=True)
+            time.sleep(holdoff)
         return ""
     # PROBLEM: blocks the main thread. ROS callbacks still run on
     # rospy's threadpool, but anything else on the main thread (e.g. a
@@ -299,18 +346,53 @@ def run_live_capture_session() -> Path:
     Returns LIVE_ROOT (which now contains a populated static_scene/,
     a stub dynamic_scene/, the SAM3+SAM3D cache, and the SfM init
     PLY).
+
+    Warm path: if LIVE_ROOT already holds a complete recording +
+    SAM3 + SAM3D cache from a previous session, the interactive
+    capture is skipped entirely. The ROS publisher still spawns
+    (we need live frames for the dynamic loop), but no prompts,
+    no recording, no SAM3, no SAM3D — the pipeline downstream will
+    reuse the on-disk artifacts via `sam3_reuse_cached=True`.
     """
-    _wipe_live_root()
     static_dir = LIVE_ROOT / "static_scene"
     dynamic_dir = LIVE_ROOT / "dynamic_scene"
     debug_dir = dynamic_dir / "initialization_debug"
     artifact_dir = dynamic_dir / "initialization_artifacts"
+
+    if _has_complete_recording_cache(LIVE_ROOT):
+        post_fusion_cache = LIVE_ROOT / "static_scene" / "post_fusion_state.pt"
+        tier = "Tier 2 (post-fusion state)" if post_fusion_cache.is_file() else "Tier 1 (SAM3+SAM3D only)"
+        print(
+            f"\n==> [live] reusing cached recording + SAM3 + SAM3D from {LIVE_ROOT}\n"
+            f"    cache level: {tier} — delete this folder to force a fresh recording.",
+            flush=True,
+        )
+        sub = LiveShmSubscriber(wipe_live_root=False)
+        sub.wait_for_first_frame(timeout_s=90.0)
+        if post_fusion_cache.is_file():
+            print("[live] ROS publisher ready; jumping straight to dynamic phase "
+                  "(static + Phase 0b will be loaded from snapshot)", flush=True)
+        else:
+            print("[live] ROS publisher ready; jumping straight to static training "
+                  "(no post-fusion snapshot — Phase 0b will run after static)", flush=True)
+        return LIVE_ROOT
+
+    # Publisher subprocess wipes LIVE_ROOT and recreates the
+    # static_scene/ + dynamic_scene/ skeletons. We then mkdir the
+    # debug/artifact subdirs that the SAM3/SAM3D workers write to.
+    print(
+        "[live] launching ROS publisher subprocess (radiance_ros_4060), "
+        "waiting for first synced (rgb, depth, pose) tuple...",
+        flush=True,
+    )
+    # Subscriber spawns the publisher in the ROS env and blocks until
+    # the publisher reports "ready" on stdout. The publisher itself
+    # waits for /camera_info before signalling ready, so by the time
+    # this returns we have intrinsics.
+    sub = LiveShmSubscriber(wipe_live_root=True)
     debug_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir.mkdir(parents=True, exist_ok=True)
-
-    print("[live] starting ROS subscriber, waiting for first synced (rgb, depth, pose) tuple...", flush=True)
-    sub = LiveRosSubscriber.get_singleton()
-    sub.wait_for_first_frame(timeout_s=30.0)
+    sub.wait_for_first_frame(timeout_s=90.0)
     print("ready!", flush=True)
 
     user_prompt = _prompt_user(
@@ -391,7 +473,7 @@ def run_live_capture_session() -> Path:
     # depth-back-projection PLY assembly — all of which compete with
     # gzserver for CPU/GPU. The atexit guard above unpauses if we die
     # in this stretch; the try/finally below covers normal raises.
-    pause_gazebo_physics()
+    pause_gazebo_physics(sub)
     try:
         if not sam3_slot["finished"]:
             print("[live] waiting for SAM3 to finish...", flush=True)
@@ -448,7 +530,7 @@ def run_live_capture_session() -> Path:
     finally:
         # PCD build done (or aborted); resume the simulator before
         # static training starts.
-        unpause_gazebo_physics()
+        unpause_gazebo_physics(sub)
 
     _seed_dynamic_scene_stub(static_dir, dynamic_dir)
 

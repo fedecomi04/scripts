@@ -29,7 +29,12 @@ from typing import Any, Optional
 import torch
 
 
-@dataclass
+# eq=False: keep identity-based __eq__/__hash__. The auto-generated
+# dataclass __eq__ would compare every field, including the tensor
+# fields (cdn/camera/live_batch) — and `OptimPool.evict` relies on
+# `list.index`, which would then hit `bool(tensor == tensor)` and raise
+# "Boolean value of Tensor with more than one value is ambiguous".
+@dataclass(eq=False)
 class OptimFrame:
     """One frame queued for optimization, snapshotted at tracker-tick time."""
 

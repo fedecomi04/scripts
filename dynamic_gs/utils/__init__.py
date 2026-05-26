@@ -1,5 +1,6 @@
 from .active_mask import (
     build_active_mask,
+    build_active_mask_center_only,
     build_change_mask,
     combine_object_masks,
     dilate_binary_mask,
@@ -43,6 +44,7 @@ from .sam3d_fusion import (
 
 __all__ = [
     "build_active_mask",
+    "build_active_mask_center_only",
     "build_change_mask",
     "build_esam_ti",
     "combine_object_masks",

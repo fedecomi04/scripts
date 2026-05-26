@@ -36,6 +36,11 @@ class CoTrackerMotionEstimate:
     tracked_inlier_mask: Optional[np.ndarray] = None  # (K,) True only for RANSAC inliers
     previous_rgb: Optional[Tensor] = None             # previous frame image
     current_rgb: Optional[Tensor] = None              # current frame image
+    # Object mask region active at each frame (for the side-by-side debug
+    # visualizer to draw a red boundary on both halves). Either tensor or
+    # numpy, (H, W) or (H, W, 1); the visualizer normalizes.
+    previous_mask: Optional[object] = None
+    current_mask: Optional[object] = None
     # Per-call sub-step timings in seconds. Keys: "input_prep",
     # "predictor_forward", "postprocess", "ransac_kabsch". Empty when the
     # estimator early-returned (not ready).
@@ -133,7 +138,11 @@ class CoTrackerMotionEstimator:
         self._online_first_step = True
         self._tick_count = 0
         self._last_estimate = None
-        self._previous_rgb = self._prepare_tracking_rgb(rgb)
+        # ``_previous_rgb`` is stored as a GPU float tensor in the ``[0, 255]``
+        # range CoTracker expects, so per-tick ``torch.stack`` doesn't trigger
+        # an H2D copy. ``_sample_mask_points`` below does its own ``.cpu()``
+        # round-trip internally — fine, that runs once at init.
+        self._previous_rgb = self._prepare_tracking_rgb_gpu(rgb, self.device) * 255.0
         self._previous_depth = self._prepare_depth_image(depth)
         self._previous_intrinsics = self._extract_intrinsics(camera)
         self._previous_camera_to_world = self._extract_camera_to_world(camera)
@@ -185,9 +194,14 @@ class CoTrackerMotionEstimator:
         track_count_before = self.current_track_count
         timings: dict = {}
 
-        # --- Sub-timing: input prep (RGB/depth/intrinsics/c2w extraction, all CPU) ---
+        # --- Sub-timing: input prep ---
+        # GPU-native rgb prep: ``get_live_rgb`` already produced a float
+        # tensor on GPU in [0, 1]; we scale to CoTracker's expected
+        # [0, 255] range on the device. No CPU round-trip; the legacy
+        # ``_prepare_tracking_rgb`` would have wasted ~15 ms per tick
+        # syncing GPU→CPU just to scale.
         t = time.time()
-        current_rgb_prepared = self._prepare_tracking_rgb(current_rgb)
+        current_rgb_prepared = self._prepare_tracking_rgb_gpu(current_rgb, self.device) * 255.0
         current_depth_prepared = self._prepare_depth_image(current_depth)
         current_intrinsics = self._extract_intrinsics(current_camera)
         current_camera_to_world = self._extract_camera_to_world(current_camera)
@@ -242,8 +256,10 @@ class CoTrackerMotionEstimator:
             query_frames = torch.zeros((query_points.shape[0], 1), dtype=query_points.dtype, device=self.device)
             queries = torch.cat([query_frames, query_points], dim=-1).unsqueeze(0)
 
-            video = torch.stack([self._previous_rgb, current_rgb_prepared], dim=0).permute(0, 3, 1, 2).unsqueeze(0)
-            video = video.to(self.device, non_blocking=True)
+            # Both tensors are already GPU-resident in [0, 255]; no H2D.
+            video = torch.stack(
+                [self._previous_rgb, current_rgb_prepared], dim=0,
+            ).permute(0, 3, 1, 2).unsqueeze(0)
 
             with torch.no_grad():
                 tracks, visibility = self._run_offline_forward(predictor, video, queries)
@@ -556,6 +572,29 @@ class CoTrackerMotionEstimator:
         return image.clamp(0.0, 255.0)
 
     @staticmethod
+    def _prepare_tracking_rgb_gpu(image: Tensor, device: torch.device) -> Tensor:
+        """GPU-native counterpart of ``_prepare_tracking_rgb``.
+
+        Returns an HWC float tensor on ``device`` in the ``[0, 1]`` range,
+        WITHOUT any host sync. Pipeline contract: input is the
+        ``get_live_rgb`` output (float on GPU, ``[0, 1]``, HWC). The legacy
+        ``_prepare_tracking_rgb`` returns CPU float ``[0, 255]`` after a
+        forced ``.cpu()`` + ``.max().item()`` (~15 ms wasted per tick on a
+        warm GPU). Each NN tracker's preprocess re-normalises to whatever
+        the model expects ([0, 255] for CoTracker, [-1, 1] for TAPIR /
+        TAPNext).
+        """
+        if image.ndim == 4 and image.shape[0] == 1:
+            image = image[0]
+        if image.ndim != 3:
+            raise ValueError(
+                f"Expected HxWxC image tensor for tracking, got shape {tuple(image.shape)}"
+            )
+        if image.shape[-1] > 3:
+            image = image[..., :3]
+        return image.detach().to(device, dtype=torch.float32, non_blocking=True)
+
+    @staticmethod
     def _prepare_depth_image(depth: Tensor) -> np.ndarray:
         if depth.ndim == 3 and depth.shape[-1] == 1:
             depth = depth[..., 0]
@@ -828,10 +867,32 @@ class CoTrackerMotionEstimator:
                 best_inlier_count = inlier_count
                 best_mean_residual = mean_residual
 
-        if best_inlier_mask is None or best_inlier_count < min_inliers:
+        if best_inlier_mask is None:
+            # No iteration produced even 3 inliers — there's nothing to
+            # report. Caller will see None and emit the "raw=N, inliers=0,
+            # resid=inf" diagnostic.
             return None
 
-        # The applied rigid transform is refit using only the final inlier set.
+        # Diagnostic on failure: when the best trial had inliers but fewer
+        # than the success threshold, still return the trial's pose + the
+        # residual distribution over ALL pairs (not just the inlier subset)
+        # so the caller's failure log can report whether the threshold was
+        # just too tight (e.g. all residuals at 12 mm vs 8 mm threshold) or
+        # the matches are genuinely garbage (residuals in the metres).
+        residuals_all = np.linalg.norm(
+            source_points @ best_rotation.T + best_translation[None, :] - target_points,
+            axis=1,
+        )
+        if best_inlier_count < min_inliers:
+            return {
+                "rotation": best_rotation.astype(np.float32),
+                "translation": best_translation.astype(np.float32),
+                "inlier_mask": best_inlier_mask,
+                "mean_residual": float(np.mean(residuals_all)),
+                "median_residual": float(np.median(residuals_all)),
+            }
+
+        # Success path: refit on the inlier set and recompute residuals.
         refined_transform = self._estimate_rigid_transform(
             source_points[best_inlier_mask],
             target_points[best_inlier_mask],
@@ -842,7 +903,15 @@ class CoTrackerMotionEstimator:
         residuals = np.linalg.norm(source_points @ rotation.T + translation[None, :] - target_points, axis=1)
         inlier_mask = np.isfinite(residuals) & (residuals <= threshold)
         if int(inlier_mask.sum()) < min_inliers:
-            return None
+            # Refit lost too many inliers — fall back to the trial pose
+            # but still report residuals so the caller can diagnose.
+            return {
+                "rotation": best_rotation.astype(np.float32),
+                "translation": best_translation.astype(np.float32),
+                "inlier_mask": best_inlier_mask,
+                "mean_residual": float(np.mean(residuals_all)),
+                "median_residual": float(np.median(residuals_all)),
+            }
 
         return {
             "rotation": rotation.astype(np.float32),

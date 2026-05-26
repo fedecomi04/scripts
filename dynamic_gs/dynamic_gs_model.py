@@ -26,6 +26,7 @@ from .utils import (
     NoRefineStrategy,
     Sam3DInsertionResult,
     build_active_mask,
+    build_active_mask_center_only,
     build_change_mask,
     build_esam_ti,
     combine_object_masks,
@@ -115,11 +116,20 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     pairwise tracking on a 5 Hz camera, iters=3-4 is typically enough
     to converge."""
 
-    # 2D point tracker selection. The pipeline supports three backends
+    # 2D point tracker selection. The pipeline supports five backends
     # with the same public surface (initialize / estimate_and_advance / ready):
     #   * "cotracker" -- Meta CoTracker3 (offline 2-frame mode, hub-loaded)
     #   * "tapir"     -- Google DeepMind online causal BootsTAPIR (PyTorch
-    #                    port, vendored under third_party/tapnet/)
+    #                    port, vendored under third_party/tapnet/tapnet/torch/)
+    #   * "tapnext"   -- Google DeepMind TAPNext / BootsTAPNext (TRecViT-B/8,
+    #                    PyTorch port, vendored under third_party/tapnet/
+    #                    tapnet/tapnext/). Frames tracking as next-token
+    #                    prediction; single feed-forward per frame, no
+    #                    iterations/support grid. There is no official
+    #                    "TAPNext-S" variant — only TRecViT-B is released.
+    #                    Default checkpoint: bootstapnext_ckpt.npz (JAX),
+    #                    converted at load. Also supports tapnextpp_ckpt.pt
+    #                    (native PyTorch, fine-tuned for long-term tracking).
     #   * "klt"       -- Classical pyramidal Lucas-Kanade optical flow
     #                    (cv2.calcOpticalFlowPyrLK), CPU-only, no model
     #                    load. Resamples fresh FAST keypoints every frame
@@ -128,18 +138,25 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     #                    per-frame δT, which drifts but works well for
     #                    high-fps capture where inter-frame motion is
     #                    small. Targets ≈5-10 ms / tick.
-    # The 3D RANSAC anchor stays at D0 for tapir/cotracker; klt
+    #   * "xfeat"     -- XFeat (CVPR 2024) sparse-matching tracker.
+    # The 3D RANSAC anchor stays at D0 for tapir/tapnext/cotracker; klt
     # back-projects pairwise (prev_world, curr_world) and composes.
-    # KLT is the default on this branch: it's CPU-only, ≈4 ms/tick on
-    # the user's RTX 4060 Ti host (vs ≈40 ms for TAPIR on the same
-    # dataset), and high-fps capture keeps inter-frame motion small
-    # enough that the cumulative-composition drift stays bounded.
-    dynamic_tracker: Literal["tapir", "cotracker", "klt"] = "cotracker"
+    # TAPIR is the default on this branch as of 2026-05-14: switched
+    # from cotracker after sm_120 migration, since TAPIR's stateful
+    # causal model has no support grid / fewer transformer iters per
+    # call and benches faster than cotracker on native cu128.
+    dynamic_tracker: Literal["tapir", "tapnext", "cotracker", "klt", "xfeat"] = "xfeat"
 
     tapir_query_point_count: int = 64
     tapir_min_track_points: int = 12
     tapir_ransac_iterations: int = 128
-    tapir_ransac_inlier_threshold: float = 0.008
+    tapir_ransac_inlier_threshold: float = 0.025
+    """RANSAC inlier residual cap, metres. Sized for depth-measurement
+    noise (gazebo openni_kinect: ~5-10 mm at typical distances), not for
+    2D keypoint precision — TAPIR's sub-pixel tracks are themselves
+    accurate, but per-point 3D backprojection inherits the depth noise
+    on both ends → pair-residual ~10-15 mm. A tighter threshold (e.g.
+    0.008) makes RANSAC reject visually-correct matches as outliers."""
     tapir_checkpoint_path: str = ""
     """Absolute path to ``causal_bootstapir_checkpoint.pt``. Empty falls
     back to ``third_party/tapnet/checkpoints/causal_bootstapir_checkpoint.pt``."""
@@ -152,6 +169,32 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     """Visibility cutoff: a point is visible iff
     ``(1 - sigmoid(occlusion)) * (1 - sigmoid(expected_dist)) > threshold``.
     The TAPIR demo uses 0.5."""
+
+    # TAPNext (TRecViT-B/8, online next-token-prediction) tracker config.
+    # Active only when ``dynamic_tracker == "tapnext"``. The model holds
+    # one ``TAPNextTrackingState`` instance with the LRU caches of all 12
+    # TRecViT blocks, so per-frame inference is a single ``model(...)``
+    # call. Same RANSAC pipeline downstream as TAPIR.
+    tapnext_query_point_count: int = 64
+    tapnext_min_track_points: int = 12
+    tapnext_ransac_iterations: int = 128
+    tapnext_ransac_inlier_threshold: float = 0.025
+    """RANSAC inlier residual cap, metres. Same depth-noise rationale as
+    TAPIR — sub-pixel 2D tracks back-project to mm-precision so the
+    dominant pair-residual is depth noise (~5-10 mm on simulated
+    openni_kinect)."""
+    tapnext_checkpoint_path: str = ""
+    """Absolute path to either ``bootstapnext_ckpt.npz`` (JAX, auto-
+    converted at load via ``restore_model_from_jax_checkpoint``) or
+    ``tapnextpp_ckpt.pt`` (native PyTorch TAPNext++). Empty falls back to
+    ``third_party/tapnet/checkpoints/bootstapnext_ckpt.npz``."""
+    tapnext_input_resolution: tuple[int, int] = (256, 256)
+    """(height, width) input size given to the TAPNext encoder. The
+    released TRecViT-B/8 checkpoints are trained at 256x256; deviating
+    from this requires retraining the spatial position embedding."""
+    tapnext_visibility_threshold: float = 0.0
+    """Visibility cutoff on the raw visible-head logit (threshold=0 is
+    equivalent to ``sigmoid(logit) > 0.5``, matching torch_tapnext_demo)."""
 
     # KLT (pyramidal Lucas-Kanade) tracker config. Active only when
     # ``dynamic_tracker == "klt"``.
@@ -175,10 +218,79 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     the original before sampling keypoints. Keeps points off the
     silhouette where depth and color are unreliable."""
 
+    # XFeat (CVPR 2024) sparse-matching tracker config. Active only when
+    # ``dynamic_tracker == "xfeat"``. XFeat is a CNN that detects AND
+    # describes keypoints in one forward pass; matching is MNN over the
+    # L2-normalised 64-D descriptors. Bench on RTX 5070 Ti (native
+    # cu128): sparse 1280x720 ~7 ms end-to-end (extract A + extract B +
+    # match). Semi-dense (XFeat*) at the same res takes ~12 ms - to try
+    # it, swap match_xfeat for match_xfeat_star in xfeat_motion.py.
+    xfeat_top_k: int = 4096
+    """Max keypoints per frame. The XFeat top-k is applied AFTER NMS so
+    in practice you get fewer keypoints than this on small/textureless
+    images - the value is only a cap."""
+    xfeat_detection_threshold: float = 0.05
+    """XFeat detector logit threshold. Lower = more keypoints, more
+    noise in low-texture regions."""
+    xfeat_min_cossim: float = -1.0
+    """Cosine-similarity floor for MNN matches. -1 disables (keeps every
+    mutual pair). Raise toward 0.5 to drop ambiguous matches at the
+    cost of total match count."""
+    xfeat_min_track_points: int = 12
+    """RANSAC abort threshold (matches & inliers)."""
+    xfeat_ransac_iterations: int = 128
+    xfeat_ransac_inlier_threshold: float = 0.025
+    """RANSAC inlier residual cap, metres. 0.025 (25 mm) is sized for the
+    sparse + LighterGlue path against Gazebo openni_kinect depth: even with
+    sub-pixel XFeat keypoints, the simulated depth sensor's modeled noise
+    + bilinear depth interpolation push pair-residuals to ~10-20 mm, so
+    8 mm was too tight (0 inliers with visually-correct matches). Drop to
+    0.015 only if you confirm via the median-residual log that residuals
+    are consistently sub-15-mm."""
+    xfeat_weights_path: str = ""
+    """Absolute path to xfeat.pt. Empty falls back to
+    third_party/xfeat/weights/xfeat.pt."""
+    xfeat_use_lighterglue: bool = True
+    """Use LighterGlue (XFeat-author-trained slim LightGlue) instead of MNN
+    over the descriptors. LighterGlue's attention rejects ambiguous
+    background-to-background matches that MNN would happily keep, which is
+    the entire point of switching: a single anchor matched against a
+    current frame by raw descriptor MNN drowns the object's motion in
+    background pairs that vote for the identity transform."""
+    xfeat_lighterglue_min_conf: float = 0.1
+    """LighterGlue's match-confidence filter (post-attention). 0.1 is the
+    XFeat repo default; higher is stricter, fewer matches."""
+    xfeat_object_search_radius_px: int = 80
+    """Dilation radius (pixels) applied to the rendered object mask before
+    using it as the per-frame post-match filter on the current frame. The
+    rendered mask shows where the object IS in the model's current pose
+    estimate, but the true object lags by one tick of motion, so we dilate
+    to give XFeat+LighterGlue a search radius around the model's
+    prediction. 80 px ≈ 2-3× the typical 30-50 px coke-can silhouette
+    diameter at 1280×720 — tolerates per-tick translations up to ~80 px.
+    Lower to ~40 if matches get noisy; raise toward 150 for very fast
+    motion. Set to 0 to skip the object filter entirely (matches are then
+    only gripper-keep filtered)."""
+
     enable_scene_optimization: bool = True
+    # When False, _refine_eligible (densify + prune + optimizer.state.clear)
+    # never runs, even after enough opt steps. Useful in live mode where
+    # any optimizer-state reset visibly perturbs the whole scene.
+    enable_dynamic_refine: bool = False
     scene_opt_refine_every: int = 100
     scene_opt_densify_grad_thresh: float = 0.0002
     scene_opt_cull_alpha_thresh: float = 0.1
+    # Center-only gating: a Gaussian is "in the change region" iff its
+    # projected 2D center falls inside CDN (optionally dilated by
+    # scene_opt_mask_dilate_px). Replaces the previous footprint-overlap
+    # test (build_active_mask), which was too permissive — Gaussians with
+    # large rendered radii intersected CDN even when their actual 3D
+    # position was far from the change.
+    scene_opt_use_center_only: bool = True
+    # Pixels of morphological dilation applied to CDN before the center
+    # test. ~20 px on 800x800 ≈ "centre is in the mask OR within ~20 px
+    # of its border".
+    scene_opt_mask_dilate_px: int = 20
     esam_prompt_keep_ratio: float = ESAM_PROMPT_KEEP_RATIO
     object_mask_dilate_px: int = 1
 
@@ -403,6 +515,17 @@ class DynamicGSModel(SplatfactoModel):
 
     def step_cb(self, optimizers, step):
         super().step_cb(optimizers, step)
+        # Live warm-cache: when --live loaded a post-fusion snapshot, the
+        # trainer restarts at step 0 but the cached Gaussians correspond
+        # to a model that has already advanced through static training.
+        # Splatfacto's resolution + SH-degree schedules read `self.step`,
+        # so without this offset the first dynamic step renders at 4×
+        # downscale and the live-RGB / render comparison mismatches in
+        # build_change_mask. Pipeline sets `_step_offset = static_num_steps`
+        # in _load_post_fusion_cache; default 0 keeps cold-path behavior.
+        offset = getattr(self, "_step_offset", 0)
+        if offset:
+            self.step = step + offset
         self._optimizers_wrapper = optimizers
         if not self._base_lrs:
             self._base_lrs = {
@@ -542,7 +665,13 @@ class DynamicGSModel(SplatfactoModel):
         mask_2d = change_mask
         if mask_2d.ndim == 3 and mask_2d.shape[-1] == 1:
             mask_2d = mask_2d[..., 0]
-        in_change = build_active_mask(mask_2d, centers_2d, radii)
+        if self.config.scene_opt_use_center_only:
+            in_change = build_active_mask_center_only(
+                mask_2d, centers_2d,
+                dilate_px=int(self.config.scene_opt_mask_dilate_px),
+            )
+        else:
+            in_change = build_active_mask(mask_2d, centers_2d, radii)
         not_object = ~(self.object_flags.squeeze(-1) > 0.5)
         active = in_change & not_object
         if self.scene_opt_active_mask.shape != active.shape:
@@ -1986,7 +2115,11 @@ class DynamicGSModel(SplatfactoModel):
         return loss_dict
 
     def step_post_backward(self, step):
-        assert step == self.step
+        # `self.step` may be offset by `_step_offset` in --live warm-cache
+        # mode so the resolution + SH schedules report full-res / final-SH
+        # from the trainer's step 0. The trainer's raw step (unshifted) is
+        # what gets passed in here, so compare against the shifted value.
+        assert step == self.step - getattr(self, "_step_offset", 0)
         if self.phase != "dynamic" or not self.config.enable_scene_optimization:
             return
         if not self._dynamic_ready:
@@ -2013,7 +2146,10 @@ class DynamicGSModel(SplatfactoModel):
                 self._grad2d_count[eligible] += 1.0
 
         self._opt_step += 1
-        if self._opt_step % self.config.scene_opt_refine_every == 0:
+        if (
+            self.config.enable_dynamic_refine
+            and self._opt_step % self.config.scene_opt_refine_every == 0
+        ):
             self._refine_eligible()
 
     @torch.no_grad()

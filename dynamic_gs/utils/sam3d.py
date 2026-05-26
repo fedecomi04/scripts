@@ -18,6 +18,27 @@ SAM3D_REPO_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "sam-3d-
 SAM3D_CONFIG_PATH = SAM3D_REPO_ROOT / "checkpoints" / "hf" / "pipeline.yaml"
 SAM3D_RUNTIME_CONFIG_PATH = SAM3D_REPO_ROOT / "checkpoints" / "hf" / "pipeline_runtime_small.yaml"
 
+# SAM3D's deps (sam_3d_objects + pytorch3d source-built for cu128 + spconv-cu118)
+# now live in the sam3_dynamic_gs env (python 3.12 + torch 2.11+cu128, native
+# sm_120). The rest of SAM3D — diffusion-style SLAT generator + decoders —
+# runs native sm_120; only spconv's sparse-conv kernels PTX-translate from
+# sm_86 since the spconv-cu118 wheel was built before Blackwell.
+SAM3D_CONDA_ENV = os.environ.get("DYNAMIC_GS_SAM3D_ENV", "sam3_dynamic_gs")
+_CONDA_ROOT = Path("/home/mrc-cuhk/miniconda3")
+_SAM3D_ENV_PYTHON = _CONDA_ROOT / "envs" / SAM3D_CONDA_ENV / "bin" / "python"
+
+
+def _resolve_sam3d_python() -> str:
+    """Pick the python interpreter that has sam_3d_objects installed.
+
+    If the SAM3D-env python exists, use it (cross-env subprocess). Else
+    fall back to ``sys.executable`` so a SAM3D-in-dynamic_gs install
+    later still works without code changes.
+    """
+    if _SAM3D_ENV_PYTHON.exists():
+        return str(_SAM3D_ENV_PYTHON)
+    return sys.executable
+
 
 def get_sam3d_output_paths(
     output_dir: Path,
@@ -755,7 +776,7 @@ def run_sam3d_multi_object_subprocess(
     }
 
     command = [
-        sys.executable,
+        _resolve_sam3d_python(),
         str(Path(__file__).resolve()),
         "--render-image", str(render_image_path),
         "--output-dir", str(output_dir),
@@ -825,7 +846,7 @@ def run_sam3d_single_object_subprocess(
     image_dir.mkdir(parents=True, exist_ok=True)
 
     command = [
-        sys.executable,
+        _resolve_sam3d_python(),
         str(Path(__file__).resolve()),
         "--render-image",
         str(render_image_path),

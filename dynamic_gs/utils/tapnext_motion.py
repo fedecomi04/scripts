@@ -1,19 +1,37 @@
-"""Online TAPIR (BootsTAPIR causal, PyTorch port) motion estimator.
+"""Online TAPNext (BootsTAPNext / TAPNext++ PyTorch port) motion estimator.
 
-Drop-in replacement for ``CoTrackerMotionEstimator`` that uses Google
-DeepMind's online causal TAPIR. The 3D RANSAC anchor is still pinned at
-D0 (back-projected through the depth at frame 0) so the recovered
-``(R, t)`` is absolute world-frame; only the 2D tracker changes.
+Drop-in replacement for :class:`TapirMotionEstimator` that uses Google
+DeepMind's TAPNext — a TRecViT-B/8 next-token-prediction tracker. The 3D
+RANSAC anchor is still pinned at D0 (back-projected through the depth at
+frame 0) so the recovered ``(R, t)`` is absolute world-frame; only the
+2D tracker changes.
 
-Why TAPIR over CoTracker:
-  * Pure-PyTorch online API (no Jax/Haiku/CUDA-toolchain dance).
-  * Per-frame stateful: a single feed-forward call refines ``causal_state``
-    in place — no iterations, no support grid, no sliding window.
-  * Native model resolution is 256x256; the encoder is small.
+Note on the "-S" naming
+-----------------------
+There is no officially released ``TAPNext-S`` variant. DeepMind ships two
+TAPNext checkpoints, both TRecViT-B/8 at 256x256:
 
-Vendored files live at ``third_party/tapnet/`` (torch model + transforms
-helper only — the full repo is not cloned). Checkpoint at
-``third_party/tapnet/checkpoints/causal_bootstapir_checkpoint.pt``.
+* ``bootstapnext_ckpt.npz`` (JAX) — the BootsTAPNext model reported in
+  the paper. Loaded via :func:`restore_model_from_jax_checkpoint`.
+* ``tapnextpp_ckpt.pt`` (PyTorch) — TAPNext++ fine-tuned for long-term
+  tracking, occlusion, and re-detection. Native PyTorch state-dict.
+
+Either checkpoint can be selected via the ``checkpoint_path`` argument;
+``.npz`` is auto-detected and converted from JAX.
+
+Why TAPNext over TAPIR
+----------------------
+* Single feed-forward, no separate ``get_feature_grids`` /
+  ``estimate_trajectories`` split. The TRecViT recurrent block holds
+  state per layer, so online inference is one ``model(...)`` call.
+* No support grid, no transformer-refinement iterations.
+* Robust to occlusions via the visible-head logit (no
+  ``expected_dist`` factor needed).
+
+Vendored files live at
+``third_party/tapnet/tapnet/tapnext/{tapnext_torch,tapnext_torch_utils,
+tapnext_lru_modules,pscan}.py``. Default checkpoint at
+``third_party/tapnet/checkpoints/bootstapnext_ckpt.npz``.
 """
 
 from __future__ import annotations
@@ -23,7 +41,6 @@ import sys
 import time
 from typing import TYPE_CHECKING, Optional
 
-import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -40,7 +57,7 @@ _DEFAULT_CHECKPOINT = os.path.join(
     "third_party",
     "tapnet",
     "checkpoints",
-    "causal_bootstapir_checkpoint.pt",
+    "bootstapnext_ckpt.npz",
 )
 _TAPNET_VENDOR_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -54,19 +71,19 @@ def _ensure_tapnet_on_path() -> None:
         sys.path.insert(0, _TAPNET_VENDOR_ROOT)
 
 
-class TapirMotionEstimator:
-    """Online causal TAPIR motion estimator.
+class TapnextMotionEstimator:
+    """Online TAPNext motion estimator.
 
-    Same public surface as :class:`CoTrackerMotionEstimator`:
+    Same public surface as :class:`CoTrackerMotionEstimator` /
+    :class:`TapirMotionEstimator`:
       * ``initialize(rgb, depth, camera, mask) -> int``
       * ``estimate_and_advance(rgb, depth, camera, mask) -> CoTrackerMotionEstimate``
       * ``ready``, ``current_track_count`` properties.
 
-    Differences in behavior:
-      * No cadence skip — TAPIR's online forward is per-frame.
-      * ``predictor_iters`` / ``predictor_resolution`` knobs are TAPIR-
-        specific; resolution is fixed to 256x256 (model architecture
-        constraint), iters is single-pass.
+    The TAPNext torch model takes the full set of query points up front
+    and returns a stateful ``TAPNextTrackingState``. Subsequent online
+    forwards feed one frame at a time with that state; queries are
+    cached on the state object.
     """
 
     def __init__(
@@ -78,9 +95,7 @@ class TapirMotionEstimator:
         ransac_inlier_threshold: float,
         checkpoint_path: str = "",
         input_resolution: tuple[int, int] = (256, 256),
-        visibility_threshold: float = 0.5,
-        pyramid_level: int = 1,
-        use_causal_conv: bool = True,
+        visibility_threshold: float = 0.0,
     ) -> None:
         self.device = torch.device(device)
         self.query_point_count = max(int(query_point_count), 3)
@@ -89,13 +104,13 @@ class TapirMotionEstimator:
         self.ransac_inlier_threshold = float(ransac_inlier_threshold)
         self.checkpoint_path = checkpoint_path.strip() or _DEFAULT_CHECKPOINT
         self.input_resolution = tuple(int(v) for v in input_resolution)
+        # TAPNext's visible-head returns a logit; visible iff
+        # ``logit > visibility_threshold`` (default 0 = sigmoid > 0.5,
+        # matching ``torch_tapnext_demo.ipynb``).
         self.visibility_threshold = float(visibility_threshold)
-        self.pyramid_level = int(pyramid_level)
-        self.use_causal_conv = bool(use_causal_conv)
 
         self._model = None
-        self._query_features = None
-        self._causal_state = None
+        self._tracking_state = None  # tapnext_torch.TAPNextTrackingState
         self._original_size: Optional[tuple[int, int]] = None  # (H, W) of input frames
 
         self._previous_rgb: Optional[Tensor] = None
@@ -119,8 +134,7 @@ class TapirMotionEstimator:
             and self._previous_camera_to_world is not None
             and self._reference_world_points is not None
             and self._current_points_xy is not None
-            and self._query_features is not None
-            and self._causal_state is not None
+            and self._tracking_state is not None
             and len(self._current_points_xy) >= self.min_track_points
         )
 
@@ -134,20 +148,35 @@ class TapirMotionEstimator:
         if self._model is not None:
             return self._model
         _ensure_tapnet_on_path()
-        from tapnet.torch import tapir_model  # type: ignore
+        from tapnet.tapnext import tapnext_torch  # type: ignore
 
         if not os.path.isfile(self.checkpoint_path):
             raise FileNotFoundError(
-                f"TAPIR checkpoint not found at {self.checkpoint_path}. Download "
-                f"https://storage.googleapis.com/dm-tapnet/bootstap/causal_bootstapir_checkpoint.pt"
+                f"TAPNext checkpoint not found at {self.checkpoint_path}. Download "
+                f"https://storage.googleapis.com/dm-tapnet/tapnext/bootstapnext_ckpt.npz "
+                f"(JAX) or https://storage.googleapis.com/dm-tapnet/tapnextpp/tapnextpp_ckpt.pt "
+                f"(PyTorch TAPNext++)."
             )
 
-        model = tapir_model.TAPIR(
-            pyramid_level=self.pyramid_level,
-            use_casual_conv=self.use_causal_conv,
-        )
-        state_dict = torch.load(self.checkpoint_path, map_location="cpu")
-        model.load_state_dict(state_dict)
+        model = tapnext_torch.TAPNext(image_size=self.input_resolution)
+        model = model.to(self.device)
+
+        ext = os.path.splitext(self.checkpoint_path)[1].lower()
+        if ext == ".npz":
+            from tapnet.tapnext import tapnext_torch_utils  # type: ignore
+            tapnext_torch_utils.restore_model_from_jax_checkpoint(
+                model, self.checkpoint_path,
+            )
+        elif ext in (".pt", ".pth"):
+            state_dict = torch.load(self.checkpoint_path, map_location="cpu")
+            if isinstance(state_dict, dict) and "state_dict" in state_dict:
+                state_dict = state_dict["state_dict"]
+            model.load_state_dict(state_dict)
+        else:
+            raise ValueError(
+                f"Unrecognised TAPNext checkpoint extension '{ext}' for "
+                f"{self.checkpoint_path}; expected .npz or .pt"
+            )
         model = model.to(self.device).eval()
         for p in model.parameters():
             p.requires_grad_(False)
@@ -157,10 +186,11 @@ class TapirMotionEstimator:
     def _preprocess_frame_to_model_input(self, rgb_hw3_uint8_like: Tensor) -> Tensor:
         """Resize to ``input_resolution``, normalise to [-1, 1], shape [1, 1, h, w, 3].
 
-        Pipeline contract: input is ``get_live_rgb`` output — float on GPU in
-        ``[0, 1]``, shape ``(H, W, 3)``. We deliberately do NOT call
+        Pipeline contract: input is ``get_live_rgb`` output — float on GPU,
+        range ``[0, 1]``, shape ``(H, W, 3)``. We deliberately do NOT call
         ``.max().item()`` to auto-detect range: that triggers a CUDA sync
-        every tick. Everything stays GPU-resident, no CPU round-trip.
+        every tick (~3-5 ms wasted). Everything stays on the model's device
+        end-to-end, no CPU round-trip.
         """
         rgb = rgb_hw3_uint8_like
         if rgb.ndim == 4 and rgb.shape[0] == 1:
@@ -168,10 +198,11 @@ class TapirMotionEstimator:
         if rgb.shape[-1] > 3:
             rgb = rgb[..., :3]
         rgb = rgb.detach().to(self.device, dtype=torch.float32, non_blocking=True)
+        # Permute and resize on the device.
         rgb = rgb.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
         rgb = F.interpolate(rgb, size=self.input_resolution, mode="bilinear", align_corners=True)
         rgb = rgb.permute(0, 2, 3, 1)  # [1, h, w, 3]
-        # get_live_rgb produces [0, 1] floats; map to [-1, 1].
+        # ``get_live_rgb`` already gave us [0, 1] floats; map to [-1, 1].
         rgb = rgb * 2.0 - 1.0
         return rgb.unsqueeze(1)  # [1, 1, h, w, 3]
 
@@ -203,7 +234,7 @@ class TapirMotionEstimator:
         camera_to_world = CoTrackerMotionEstimator._extract_camera_to_world(camera)
         if previous_depth.shape != previous_rgb.shape[:2]:
             raise RuntimeError(
-                "TAPIR initialization requires RGB and depth at the same resolution, "
+                "TAPNext initialization requires RGB and depth at the same resolution, "
                 f"got rgb={tuple(previous_rgb.shape[:2])} depth={tuple(previous_depth.shape)}."
             )
         self._previous_rgb = previous_rgb
@@ -238,12 +269,13 @@ class TapirMotionEstimator:
             self._current_points_xy, ref_depth, intrinsics, camera_to_world,
         )
 
-        # --- Initialise the TAPIR online state from frame 0 + query points. ---
+        # --- Initialise the TAPNext online state from frame 0 + query points. ---
         model = self._get_model()
         frame0 = self._preprocess_frame_to_model_input(previous_rgb)  # [1,1,h,w,3]
         query_xy_model = self._xy_input_to_model(self._current_points_xy)  # (N, 2) at 256
         N = query_xy_model.shape[0]
-        # TAPIR expects (t, y, x) integer-ish coords (the demo uses int32).
+        # TAPNext query_points format: [t, y, x] in pixel coords at the
+        # model's image_size (raster order — same as TAPVid).
         query_points_np = np.zeros((N, 3), dtype=np.float32)
         query_points_np[:, 0] = 0.0
         query_points_np[:, 1] = query_xy_model[:, 1]  # y
@@ -251,20 +283,10 @@ class TapirMotionEstimator:
         query_points = torch.from_numpy(query_points_np).to(self.device).unsqueeze(0)  # [1, N, 3]
 
         with torch.no_grad():
-            feature_grids = model.get_feature_grids(frame0, is_training=False)
-            self._query_features = model.get_query_features(
-                frame0,
-                is_training=False,
-                query_points=query_points,
-                feature_grids=feature_grids,
+            tracks, _, visible_logits, state = model(
+                video=frame0, query_points=query_points,
             )
-            causal_state = model.construct_initial_causal_state(
-                N, len(self._query_features.resolutions) - 1,
-            )
-            for i in range(len(causal_state)):
-                for k, v in causal_state[i].items():
-                    causal_state[i][k] = v.to(self.device)
-            self._causal_state = causal_state
+            self._tracking_state = state
         return int(N)
 
     def estimate_and_advance(
@@ -273,16 +295,13 @@ class TapirMotionEstimator:
         current_depth: Tensor,
         current_camera: Cameras,
         current_mask: Tensor | None = None,
-        current_object_mask: Tensor | None = None,  # noqa: ARG002 — KLT-only; TAPIR ignores
+        current_object_mask: Tensor | None = None,  # noqa: ARG002 — KLT/XFeat only; TAPNext ignores
     ) -> CoTrackerMotionEstimate:
         identity = np.eye(3, dtype=np.float32)
         zero = np.zeros((3,), dtype=np.float32)
         track_count_before = self.current_track_count
         timings: dict = {}
 
-        # Per-step CUDA-sync diagnostics. Each ``.cpu()`` / ``.numpy()`` /
-        # ``.item()`` below stalls on the full GPU queue, so under
-        # contention each line is a separate observable cost.
         t_all = time.time()
         t = time.time()
         # GPU-native rgb prep — no .cpu() round-trip, no .max().item() sync.
@@ -317,45 +336,31 @@ class TapirMotionEstimator:
         debug_prev_points = self._current_points_xy.copy()
         debug_prev_rgb = self._previous_rgb.clone()
 
-        # --- TAPIR online forward (per-frame, single pass) ---
+        # --- TAPNext online forward (per-frame, single pass) ---
         t_fwd = time.time()
         model = self._get_model()
         t = time.time()
-        # `_preprocess_frame_to_model_input` does .max().item() + interpolate
-        # + .to(device); the .item() is a CUDA sync.
         frame_t = self._preprocess_frame_to_model_input(current_rgb_prepared)
         timings["preprocess_frame"] = time.time() - t
         with torch.no_grad():
             t = time.time()
-            feature_grids = model.get_feature_grids(frame_t, is_training=False)
-            timings["feature_grids"] = time.time() - t
-            t = time.time()
-            trajectories = model.estimate_trajectories(
-                frame_t.shape[-3:-1],
-                is_training=False,
-                feature_grids=feature_grids,
-                query_features=self._query_features,
-                query_points_in_video=None,
-                query_chunk_size=64,
-                causal_context=self._causal_state,
-                get_causal_context=True,
+            tracks, _, visible_logits, state = model(
+                video=frame_t, state=self._tracking_state,
             )
             timings["estimate_traj"] = time.time() - t
-            self._causal_state = trajectories["causal_context"]
-            # TAPIR returns tracks as [B, N, T, 2] and occlusion/expected_dist
-            # as [B, N, T] (NOT [B, T, N, ...]).
-            tracks = trajectories["tracks"][-1]            # [1, N, T=1, 2]
-            occlusion = trajectories["occlusion"][-1]      # [1, N, T=1]
-            expected_dist = trajectories["expected_dist"][-1]
-            # TAPIR demo: visible iff (1 - sigmoid(occ)) * (1 - sigmoid(dist)) > 0.5
-            visibles = (1.0 - torch.sigmoid(occlusion)) * (1.0 - torch.sigmoid(expected_dist)) > self.visibility_threshold
+            self._tracking_state = state
+            # tracks: [B=1, T=1, Q, 2] with last dim = (y, x) at model resolution.
+            # visible_logits: [B=1, T=1, Q, 1]. Visible iff logit > threshold.
+            visibles = visible_logits[..., 0] > self.visibility_threshold
 
-        # Final GPU→CPU sync: stalls on every kernel queued above.
+        # Final GPU→CPU sync.
         t = time.time()
-        tracks_np_model = tracks[0, :, 0].detach().cpu().numpy().astype(np.float32)  # (N, 2) at 256
-        visibility_now = visibles[0, :, 0].detach().cpu().numpy().astype(bool)        # (N,)
+        tracks_yx_model = tracks[0, 0].detach().cpu().numpy().astype(np.float32)  # (Q, 2) [y, x]
+        visibility_now = visibles[0, 0].detach().cpu().numpy().astype(bool)        # (Q,)
         timings["tracks_to_cpu"] = time.time() - t
-        current_points_xy = self._xy_model_to_input(tracks_np_model)
+        # Convert (y, x) -> (x, y) at model resolution, then to input resolution.
+        tracks_xy_model = tracks_yx_model[:, ::-1].copy()
+        current_points_xy = self._xy_model_to_input(tracks_xy_model)
         timings["predictor_forward"] = time.time() - t_fwd
 
         # --- Postprocess (image-bound + mask filter + depth back-projection) ---
@@ -407,8 +412,6 @@ class TapirMotionEstimator:
 
         t = time.time()
         if len(prev_world) >= self.min_track_points and len(curr_world) >= self.min_track_points:
-            # Reuse the cotracker estimator's RANSAC implementation by binding
-            # to a transient instance with the same hyperparameters.
             ransac_helper = CoTrackerMotionEstimator.__new__(CoTrackerMotionEstimator)
             ransac_helper.min_track_points = self.min_track_points
             ransac_helper.ransac_iterations = self.ransac_iterations

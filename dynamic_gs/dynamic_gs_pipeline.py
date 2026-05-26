@@ -74,19 +74,21 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     """τ_r in degrees, geodesic SO(3) distance."""
 
     tracker_tick_every_steps: int = 3
-    """Tracker cadence: a tracker tick (FP track + maybe push to optim
-    pool) fires every N optim steps. With ~58 ms/step, N=3 fakes a
-    ~5.7 Hz incoming-frame rate — close to the 5 Hz dataset capture
-    rate. Decoupling is step-based (deterministic) rather than
-    wall-clock-based, so optim doesn't idle when it's faster than the
-    fake camera. The first dynamic step always fires a tick (D0
-    bootstrap)."""
+    """Tracker cadence for **recorded mode only**: a tracker tick
+    (FP track + maybe push to optim pool) fires every N optim steps.
+    With ~58 ms/step, N=3 fakes a ~5.7 Hz incoming-frame rate — close
+    to the 5 Hz dataset capture rate. Decoupling is step-based
+    (deterministic) rather than wall-clock-based, so optim doesn't idle
+    when it's faster than the fake camera. The first dynamic step
+    always fires a tick (D0 bootstrap). **Live mode ignores this and
+    ticks every step** — the ROS supply is the real rate limiter, and
+    the dedup-return makes over-polling free."""
     optim_pool_capacity: int = 15
     """Max number of accepted frames simultaneously queued for
     optimization. On overflow, the oldest entry is dropped (mirrors
     live behavior: if optim falls behind tracking, the queue forgets
     the oldest backlog rather than growing unboundedly)."""
-    optim_pool_max_epochs: int = 30
+    optim_pool_max_epochs: int = 10
     """Per-frame optimization budget. When ``epochs_used >= max``, the
     frame is evicted from the pool regardless of loss."""
     optim_pool_loss_relative_threshold: float = 0.3
@@ -148,6 +150,22 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     Use this to iterate on tracking robustness in real time without
     the optim work taking GPU time. Object Gaussians still move
     (driven by FP / CoTracker); scene Gaussians stay frozen."""
+
+    save_live_optim_debug: bool = True
+    """When True, save the rendered image, live GT, and the effective
+    loss mask (with overlay) for each live optim step into
+    ``<data_root>/dynamic_scene/debug/live_optim/``. Throttled by
+    ``save_live_optim_debug_every`` to avoid filling disk."""
+    save_live_optim_debug_every: int = 25
+    """How often (in optim steps) to dump the live-optim debug images
+    when ``save_live_optim_debug=True``. 1 = every step (heavy)."""
+# Fraction of the splat-rasterized object mask kept after distance-transform
+# erosion before passing to the tracker. 0.85 = keep the inner 85% of the
+# area, drop the boundary 15% — the low-opacity halo where keypoints would
+# land on background pixels just outside the object's actual silhouette.
+_TRACKER_MASK_INNER_FRACTION: float = 0.85
+
+
 class DynamicGSPipeline(VanillaPipeline):
     config: DynamicGSPipelineConfig
 
@@ -161,7 +179,7 @@ class DynamicGSPipeline(VanillaPipeline):
         # the D0 reference RGB + depth + 3D back-projected points; each
         # incoming frame's RGB-D advances the tracks pairwise and returns
         # an absolute (R, t) in world frame from the D0 anchor.
-        self._cotracker_motion = None
+        self._motion_estimator = None
         self._global_frame_counter = 0
         self._timing = defaultdict(list)
         self._timing_report_written = False
@@ -185,6 +203,13 @@ class DynamicGSPipeline(VanillaPipeline):
         self._live_subscriber = None
         self._live_stop_requested: bool = False
         self._live_last_processed_stamp: Optional[float] = None
+        # Back-ref to the nerfstudio Trainer, populated in
+        # get_training_callbacks. Lets _tracker_tick_live reach
+        # trainer.viewer_state to force a re-render right after the
+        # rigid transform is applied, bypassing update_scene's
+        # step-count throttle (which otherwise rate-limits the viewer
+        # to ~0.5–2 Hz in live tracking-only mode).
+        self._trainer = None
         atexit.register(self._write_timing_report)
 
         # Live-mode pre-training session: drives the interactive ROS
@@ -194,10 +219,12 @@ class DynamicGSPipeline(VanillaPipeline):
         # datamanager constructor sees the populated static_scene/.
         if getattr(config, "live", False):
             from .utils.live_session import run_live_capture_session
-            from .utils.live_ros_subscriber import LiveRosSubscriber
+            from .utils.live_shm_reader import LiveShmSubscriber
             live_root = run_live_capture_session()
             config.datamanager.data = live_root
-            self._live_subscriber = LiveRosSubscriber.get_singleton()
+            # The session already constructed the subscriber + spawned
+            # the publisher subprocess. Just pull the singleton.
+            self._live_subscriber = LiveShmSubscriber.get_singleton()
             self._start_stdin_stop_watcher()
 
         super().__init__(
@@ -296,6 +323,18 @@ class DynamicGSPipeline(VanillaPipeline):
         except Exception as exc:
             CONSOLE.log(f"[dynamic-gs] ESAM warm-up skipped: {exc}")
 
+        # Live warm-cache: if a post-fusion snapshot exists from a previous
+        # session, load it and short-circuit static training + Phase 0b
+        # fusion. Must run BEFORE ``_sync_phase(0)`` so the latter sees
+        # ``_static_converged_step = 0`` and flips straight to "dynamic".
+        self._warm_cache_loaded = False
+        if self.config.live:
+            cache_path = (
+                Path(self.config.datamanager.data) / "static_scene" / "post_fusion_state.pt"
+            )
+            if cache_path.is_file():
+                self._warm_cache_loaded = self._load_post_fusion_cache(cache_path)
+
         self._sync_phase(0)
 
         # Pre-static: run SAM3 segmentation + SAM3D 3D object generation now, so
@@ -304,12 +343,16 @@ class DynamicGSPipeline(VanillaPipeline):
         # deferred to the static→dynamic transition in ``_sync_phase`` so that
         # SAM3D's back-side Gaussians don't get opacity-eroded by static
         # photometric optimization.
-        if self.model.config.use_sam3_graspable_prefusion and self.model.config.sam3_prompt_text:
+        if (
+            not self._warm_cache_loaded
+            and self.model.config.use_sam3_graspable_prefusion
+            and self.model.config.sam3_prompt_text
+        ):
             self._sam3d_generation_outputs = self._run_sam3_and_sam3d_generation()
 
     def _reset_dynamic_segmentation_state(self) -> None:
         self._sam3d_inserted = False
-        self._cotracker_motion = None
+        self._motion_estimator = None
         self._global_frame_counter = 0
         self._optim_pool = OptimPool(capacity=self.config.optim_pool_capacity)
         self._next_frame_to_track = 0
@@ -857,7 +900,7 @@ class DynamicGSPipeline(VanillaPipeline):
             # CoTracker tracks 2D pixel points in the live RGB stream and
             # back-projects via depth, so Phase 0b doesn't need a mesh or any
             # per-instance pre-construction step. The tracker is initialized
-            # at D0 (``_initialize_cotracker``) once the moved object is
+            # at D0 (``_initialize_motion_estimator``) once the moved object is
             # known, against the live D0 RGB-D + the rendered object mask.
             manifest[instance_id] = {
                 "object_index": obj_idx,
@@ -904,7 +947,137 @@ class DynamicGSPipeline(VanillaPipeline):
             f"{num_prefused} Gaussians with instance IDs, "
             f"fusion time={fusion_time:.2f}s"
         )
+
+        # Live mode: write a one-shot "post-fusion" snapshot so the next
+        # ``--live`` run can skip static training + Phase 0b entirely.
+        # The snapshot covers everything the dynamic loop needs: trained
+        # Gaussian parameters at the post-insertion size, all persistent
+        # buffers (object_flags / object_instance_ids / inserted_flags),
+        # and the SO3xR3 camera-optimizer offsets keyed by frame index.
+        if self.config.live:
+            self._save_post_fusion_cache()
         return manifest
+
+    def _save_post_fusion_cache(self) -> None:
+        """Snapshot the post-fusion model so a future warm restart can
+        jump straight to the dynamic phase. Only called from
+        ``_fuse_sam3d_objects_into_scene`` in live mode.
+
+        Writes ``<LIVE_ROOT>/static_scene/post_fusion_state.pt`` with the
+        full ``model.state_dict()`` plus ``num_points``. The next session
+        re-builds the model from the SfM seed PLY (small N), then
+        ``_load_post_fusion_cache`` resizes the gauss_params to the saved
+        N and copies the trained tensors in.
+        """
+        try:
+            live_root = Path(self.config.datamanager.data)
+            cache_path = live_root / "static_scene" / "post_fusion_state.pt"
+            torch.save(
+                {
+                    "model_state_dict": self.model.state_dict(),
+                    "num_points": int(self.model.num_points),
+                },
+                cache_path,
+            )
+            CONSOLE.log(
+                f"[live-warm-cache] saved post-fusion state to "
+                f"{cache_path.name} (N={int(self.model.num_points)} Gaussians)"
+            )
+        except Exception as exc:
+            CONSOLE.log(f"[live-warm-cache] could not save snapshot: {exc}")
+        # PROBLEM: the snapshot is not config-tagged. If sh_degree,
+        # background color, or the camera-optimizer mode changes between
+        # save and load, the loaded tensors won't match the rebuilt model
+        # and load_state_dict will raise. Delete the .pt to recover.
+
+    def _load_post_fusion_cache(self, cache_path: Path) -> bool:
+        """Restore a post-fusion model snapshot from disk.
+
+        The cold-start model was built by ``super().__init__`` from the
+        SfM seed PLY (small N). The snapshot has N_post Gaussians (post
+        Phase-0b insertions), so each ``gauss_params`` Parameter has to
+        be re-allocated at N_post before ``load_state_dict`` can copy
+        values in. The model's own ``load_state_dict`` override handles
+        the persistent buffers (object_flags, object_instance_ids, ...).
+
+        Side effects on success:
+          * sets ``_static_converged_step = 0`` so the next ``_sync_phase``
+            flips current_phase straight to "dynamic"
+          * sets ``_sam3d_inserted = True`` so D0 takes Path A (prefused)
+          * leaves ``_sam3d_generation_outputs = None`` so the
+            static→dynamic transition does not re-run ``_fuse_sam3d_objects_into_scene``
+
+        Returns True on success, False on any failure (caller falls back
+        to the standard static+fusion path).
+        """
+        try:
+            blob = torch.load(cache_path, map_location=self.device)
+            state_dict = blob["model_state_dict"]
+            target_n = int(blob["num_points"])
+        except Exception as exc:
+            CONSOLE.log(f"[live-warm-cache] could not read {cache_path.name}: {exc}")
+            return False
+
+        device = self.model.means.device
+        try:
+            # Reallocate each gauss_params Parameter at the saved size.
+            # Mirrors the resize pattern in ``insert_object_gaussians``.
+            for name in ("means", "features_dc", "features_rest", "opacities", "scales", "quats"):
+                sd_key = f"gauss_params.{name}"
+                if sd_key not in state_dict:
+                    CONSOLE.log(f"[live-warm-cache] missing {sd_key}; falling back to static+fusion")
+                    return False
+                old_param = self.model.gauss_params[name]
+                new_tensor = state_dict[sd_key].to(device=device, dtype=old_param.dtype)
+                self.model.gauss_params[name] = torch.nn.Parameter(
+                    new_tensor.clone(),
+                    requires_grad=old_param.requires_grad,
+                )
+
+            # The model's load_state_dict override sees ``object_flags.shape[0]
+            # != target_n`` and rebuilds the persistent buffers at target_n
+            # before copying. strict=False so any new/old keys (e.g. viewer
+            # GUI handles) don't crash the load.
+            self.model.load_state_dict(state_dict, strict=False)
+
+            # The means-grad hook was bound to the old Parameter object; re-bind
+            # to the freshly-allocated one so dynamic-phase gradient masking
+            # fires correctly on object Gaussians.
+            self.model.gauss_params["means"].register_hook(self.model._mask_means_grad)
+        except Exception as exc:
+            CONSOLE.log(f"[live-warm-cache] state_dict load failed: {exc}")
+            return False
+
+        # Tell the dynamic-loop bookkeeping that fusion has already happened.
+        # D0 will go down Path A: pick the closest pre-fused instance to the
+        # camera, set object_flags from object_instance_ids, init the CoTracker.
+        self._sam3d_inserted = True
+        self._sam3d_generation_outputs = None
+        self._static_converged_step = 0
+
+        # Advance the model's notional step so splatfacto's resolution +
+        # SH-degree schedules immediately report full-res / final-SH.
+        # step_cb in DynamicGSModel honors `_step_offset`. Without this,
+        # the first dynamic render is 4× downscaled (200×200) and
+        # build_change_mask raises a tensor-size mismatch against the
+        # live RGB (800×800).
+        self.model._step_offset = int(self.config.static_num_steps)
+
+        CONSOLE.log(
+            f"[live-warm-cache] loaded {cache_path.name} "
+            f"(N={target_n} Gaussians); skipping static + Phase 0b."
+        )
+        print(
+            f"\n==> [live] warm cache hit: jumping straight to dynamic phase "
+            f"(N={target_n} Gaussians). Static training + Phase 0b skipped.\n",
+            flush=True,
+        )
+        return True
+        # PROBLEM: this assumes the saved camera-optimizer offsets still
+        # correspond to the current transforms.json frame ordering. The
+        # Tier 1 cache guarantees same LIVE_ROOT (so same transforms),
+        # but if you manually edit transforms.json between runs, the
+        # per-frame SO3xR3 offsets will load against the wrong indices.
 
     def _backproject_mask_to_world(
         self,
@@ -1163,13 +1336,43 @@ class DynamicGSPipeline(VanillaPipeline):
     def _has_nonempty_mask(mask) -> bool:
         return mask is not None and bool(torch.any(mask > 0.5))
 
-    def _get_cotracker_debug_dir(self) -> Path:
-        return self._get_debug_dir() / "cotracker_debug"
+    @staticmethod
+    def _erode_mask_to_inner_fraction(mask: "torch.Tensor", fraction: float) -> "torch.Tensor":
+        """Erode a binary mask to keep only the inner ``fraction`` of its area.
 
-    def _write_cotracker_motion_log(self, frame_name: str, motion_estimate) -> None:
+        Uses cv2's L2 distance transform: each foreground pixel gets its
+        Euclidean distance to the nearest background pixel. Pixels closest
+        to the boundary are dropped first. The threshold is picked as the
+        ``(1 - fraction)`` percentile of those distances, so the kept set
+        is exactly ``fraction`` of the original area (modulo discretization).
+
+        ``mask`` is (H, W, 1) or (H, W) float/bool on any device. Returns
+        the same shape/dtype/device. ``fraction >= 1`` returns the input
+        unchanged. Empty mask returns the input unchanged.
+        """
+        import cv2 as _cv2
+        if mask is None or fraction >= 1.0:
+            return mask
+        squeeze_back = mask.ndim == 3
+        mask_2d = mask.squeeze(-1) if squeeze_back else mask
+        mask_np = (mask_2d.detach().cpu().numpy() > 0.5).astype(np.uint8)
+        total = int(mask_np.sum())
+        if total == 0:
+            return mask
+        dist = _cv2.distanceTransform(mask_np, _cv2.DIST_L2, 3)
+        nonzero = dist[mask_np > 0]
+        thresh = float(np.percentile(nonzero, (1.0 - fraction) * 100.0))
+        eroded = (dist > thresh).astype(np.float32)
+        eroded_t = torch.from_numpy(eroded).to(mask.device, dtype=mask.dtype)
+        return eroded_t.unsqueeze(-1) if squeeze_back else eroded_t
+
+    def _get_motion_debug_dir(self) -> Path:
+        return self._get_debug_dir() / "tracker_debug"
+
+    def _write_motion_log(self, frame_name: str, motion_estimate) -> None:
         debug_dir = self._get_debug_dir()
         debug_dir.mkdir(parents=True, exist_ok=True)
-        log_path = debug_dir / f"{frame_name}_cotracker_motion.txt"
+        log_path = debug_dir / f"{frame_name}_motion.txt"
         log_lines = [
             f"success: {motion_estimate.success}",
             f"ready: {motion_estimate.ready}",
@@ -1188,7 +1391,7 @@ class DynamicGSPipeline(VanillaPipeline):
         ]
         log_path.write_text("\n".join(log_lines) + "\n")
 
-    def _save_cotracker_debug(self, frame_name: str, est) -> None:
+    def _save_motion_debug(self, frame_name: str, est) -> None:
         """Side-by-side previous→current frame with tracked points + lines."""
         if est.previous_points_xy is None or est.current_points_xy is None:
             return
@@ -1227,49 +1430,66 @@ class DynamicGSPipeline(VanillaPipeline):
                         canvas[py + dy, px + dx] = point_color
                     if 0 <= cy + dy < h and 0 <= cx + dx < 2 * w:
                         canvas[cy + dy, cx + dx] = point_color
-        dbg = self._get_cotracker_debug_dir()
+        dbg = self._get_motion_debug_dir()
         dbg.mkdir(parents=True, exist_ok=True)
-        Image.fromarray(canvas).save(dbg / f"{frame_name}_cotracker.png")
+        Image.fromarray(canvas).save(dbg / f"{frame_name}_tracker.png")
 
-    def _apply_cotracker_motion(self, camera, batch, current_mask=None) -> None:
-        if self._cotracker_motion is None:
+    _TRACKER_LABELS = {"tapir": "TAPIR", "tapnext": "TAPNext", "cotracker": "CoTracker", "klt": "KLT", "xfeat": "XFeat"}
+
+    def _apply_motion_estimator(self, camera, batch, current_mask=None) -> None:
+        if self._motion_estimator is None:
             return
-        if not self._cotracker_motion.ready:
-            # KLT only becomes "ready" after its first call (when a previous
-            # frame is cached). Skipping the call entirely on the first
-            # tick would prevent that cache from ever being populated, so
-            # special-case KLT here: fall through and let
-            # estimate_and_advance handle the not-ready early return,
-            # which still resamples points for the next call.
-            tracker_kind = getattr(self.model.config, "dynamic_tracker", "cotracker")
-            if tracker_kind != "klt":
+        tracker_kind = getattr(self.model.config, "dynamic_tracker", "cotracker")
+        tracker_label = self._TRACKER_LABELS.get(tracker_kind, "Tracker")
+        if not self._motion_estimator.ready:
+            # KLT and XFeat both become "ready" only after their first
+            # call has cached a previous frame, so we must still call
+            # estimate_and_advance on the not-ready first tick.
+            if tracker_kind not in ("klt", "xfeat"):
                 frame_name = self.datamanager.get_current_dynamic_frame_name()
                 CONSOLE.log(
-                    f"[dynamic-gs] CoTracker skipped for {frame_name}: tracker not ready "
-                    f"({self._cotracker_motion.current_track_count} tracks, "
-                    f"min={self._cotracker_motion.min_track_points})"
+                    f"[dynamic-gs] {tracker_label} skipped for {frame_name}: tracker not ready "
+                    f"({self._motion_estimator.current_track_count} tracks, "
+                    f"min={self._motion_estimator.min_track_points})"
                 )
                 return
-        # --- Sub-timing: DN.3a build masked live RGB (uint8->float, GPU upload, composite gripper-masked pixels onto model background) ---
+        # --- Sub-timing: DN.3a build live RGB ---
+        # Neural trackers (TAPIR/TAPNext/CoTracker) want the FULL natural
+        # frame — they were trained on natural images, and any pre-mask
+        # destroys the texture they rely on. Painting the gripper region
+        # with a flat background colour (the legacy ``_build_tracking_rgb``
+        # path) made tracks collapse to constant-pixel hot-spots wherever
+        # any residual texture survived. The mask is still applied as a
+        # POST-FILTER on the tracked 2D points so matches that land on the
+        # gripper get dropped before RANSAC. KLT/XFeat keep the legacy
+        # composite because they're tuned against the gripper-blue
+        # background and would otherwise lock onto gripper corners.
         t = time.time()
-        current_live_rgb = self._build_tracking_rgb(batch)
+        if tracker_kind in ("klt", "xfeat"):
+            current_live_rgb = self._build_tracking_rgb(batch)
+        else:
+            current_live_rgb = self.model.get_live_rgb(batch, apply_training_downscale=False)
         self._timing["DN.3a_get_live_rgb"].append(time.time() - t)
-        # KLT needs a per-frame rendered object mask to constrain its
-        # FAST resample region (eroded object mask ∩ gripper-keep). The
-        # render is ~3 ms and only paid for KLT — TAPIR / CoTracker
-        # ignore the kwarg.
-        tracker_kind = getattr(self.model.config, "dynamic_tracker", "cotracker")
+        # KLT samples FAST keypoints inside (eroded object ∩ gripper-keep).
+        # XFeat extracts globally then filters MATCHES inside the same
+        # region; both need the rendered object mask + gripper mask.
+        # TAPIR / CoTracker ignore the kwarg.
         current_object_mask = None
-        if tracker_kind == "klt":
+        if tracker_kind in ("klt", "xfeat"):
             with torch.no_grad():
+                # Splat-rasterized mask, then eroded to keep only the inner
+                # 85% of the area. The outer 15% is the low-opacity halo
+                # where keypoints would land on background pixels just
+                # outside the object's actual silhouette.
                 current_object_mask = self.model.render_object_mask(camera).detach()
-            # Also feed the gripper-keep mask through current_mask if the
-            # caller didn't already (live-tick path passes None).
+                current_object_mask = self._erode_mask_to_inner_fraction(
+                    current_object_mask, _TRACKER_MASK_INNER_FRACTION,
+                )
             if current_mask is None:
                 current_mask = self.model._get_batch_mask(batch)
         # --- Sub-timing: DN.3b-e estimate_and_advance — inner sub-timings come from motion_estimate.timings ---
         t = time.time()
-        motion_estimate = self._cotracker_motion.estimate_and_advance(
+        motion_estimate = self._motion_estimator.estimate_and_advance(
             current_rgb=current_live_rgb,
             current_depth=batch["depth_image"],
             current_camera=camera,
@@ -1307,18 +1527,21 @@ class DynamicGSPipeline(VanillaPipeline):
         t = time.time()
         frame_name = self.datamanager.get_current_dynamic_frame_name()
         if self.config.save_debug_images:
-            self._write_cotracker_motion_log(frame_name, motion_estimate)
-            self._save_cotracker_debug(frame_name, motion_estimate)
+            self._write_motion_log(frame_name, motion_estimate)
+            self._save_motion_debug(frame_name, motion_estimate)
         self._timing["DN.3f_debug_io"].append(time.time() - t)
         if not motion_estimate.success:
+            mean_res_mm = motion_estimate.mean_residual * 1000.0 if motion_estimate.mean_residual != float("inf") else float("inf")
+            med_res_mm = motion_estimate.median_residual * 1000.0 if motion_estimate.median_residual != float("inf") else float("inf")
             CONSOLE.log(
-                f"[dynamic-gs] CoTracker rigid motion unavailable for {frame_name}: "
+                f"[dynamic-gs] {tracker_label} rigid motion unavailable for {frame_name}: "
                 f"raw={motion_estimate.raw_visible_count}, "
                 f"mask={motion_estimate.mask_visible_count}, "
                 f"depth={motion_estimate.depth_valid_count}, "
                 f"correspondences={motion_estimate.correspondence_count}, "
                 f"inliers={motion_estimate.inlier_count}, "
-                f"mask_fallback={motion_estimate.used_mask_fallback}"
+                f"mask_fallback={motion_estimate.used_mask_fallback}, "
+                f"resid_mm(mean/med)={mean_res_mm:.1f}/{med_res_mm:.1f}"
             )
             return
         # --- Sub-timing: DN.3g apply rigid transform (CUDA tensor op on flagged Gaussians: means rotation + translation, quaternion compose) ---
@@ -1329,7 +1552,7 @@ class DynamicGSPipeline(VanillaPipeline):
         self._timing["DN.3g_apply_transform"].append(time.time() - t)
         if moved_count == 0:
             CONSOLE.log(
-                f"[dynamic-gs] CoTracker estimated motion for {frame_name}, "
+                f"[dynamic-gs] {tracker_label} estimated motion for {frame_name}, "
                 "but no object Gaussians were moved. Check object_flags/reference pose consistency."
             )
         # Per-frame success log is muted in tracking-only mode — at
@@ -1338,13 +1561,13 @@ class DynamicGSPipeline(VanillaPipeline):
         # fire because they're rare and diagnostic.
         if not self.config.disable_dynamic_optimization:
             CONSOLE.log(
-                f"[dynamic-gs] CoTracker rigid motion -> {frame_name}, moved={moved_count}, "
+                f"[dynamic-gs] {tracker_label} rigid motion -> {frame_name}, moved={moved_count}, "
                 f"inliers={motion_estimate.inlier_count}/{motion_estimate.correspondence_count}, "
                 f"median residual={motion_estimate.median_residual:.5f}, "
                 f"mask_fallback={motion_estimate.used_mask_fallback}"
             )
 
-    def _initialize_cotracker(self, rgb, depth, camera, mask) -> None:
+    def _initialize_motion_estimator(self, rgb, depth, camera, mask) -> None:
         """Seed CoTracker with the D0 reference frame.
 
         Samples ``query_point_count`` 2D pixel points inside the object mask,
@@ -1356,9 +1579,22 @@ class DynamicGSPipeline(VanillaPipeline):
         if not self.model.config.enable_cotracker_rigid_motion:
             return
         tracker_kind = getattr(self.model.config, "dynamic_tracker", "cotracker")
-        if tracker_kind == "tapir":
+        if tracker_kind == "tapnext":
+            from .utils.tapnext_motion import TapnextMotionEstimator
+            self._motion_estimator = TapnextMotionEstimator(
+                device=self.model.device,
+                query_point_count=self.model.config.tapnext_query_point_count,
+                min_track_points=self.model.config.tapnext_min_track_points,
+                ransac_iterations=self.model.config.tapnext_ransac_iterations,
+                ransac_inlier_threshold=self.model.config.tapnext_ransac_inlier_threshold,
+                checkpoint_path=self.model.config.tapnext_checkpoint_path,
+                input_resolution=self.model.config.tapnext_input_resolution,
+                visibility_threshold=self.model.config.tapnext_visibility_threshold,
+            )
+            tracker_label = "TAPNext"
+        elif tracker_kind == "tapir":
             from .utils.tapir_motion import TapirMotionEstimator
-            self._cotracker_motion = TapirMotionEstimator(
+            self._motion_estimator = TapirMotionEstimator(
                 device=self.model.device,
                 query_point_count=self.model.config.tapir_query_point_count,
                 min_track_points=self.model.config.tapir_min_track_points,
@@ -1371,7 +1607,7 @@ class DynamicGSPipeline(VanillaPipeline):
             tracker_label = "TAPIR"
         elif tracker_kind == "klt":
             from .utils.klt_motion import KltMotionEstimator
-            self._cotracker_motion = KltMotionEstimator(
+            self._motion_estimator = KltMotionEstimator(
                 device=self.model.device,
                 query_point_count=self.model.config.klt_query_point_count,
                 min_track_points=self.model.config.klt_min_track_points,
@@ -1385,8 +1621,26 @@ class DynamicGSPipeline(VanillaPipeline):
                 sample_inner_area_ratio=self.model.config.klt_sample_inner_area_ratio,
             )
             tracker_label = "KLT"
+        elif tracker_kind == "xfeat":
+            # XFeat replaces the FAST/Shi-Tomasi-based feature
+            # extraction that KLT uses: the CNN detects AND describes in
+            # one forward pass, then MNN over the descriptors gives
+            # frame-to-frame matches directly. There is no separate
+            # corner-detector or descriptor step to load.
+            from .utils.xfeat_motion import XFeatMotionEstimator
+            self._motion_estimator = XFeatMotionEstimator(
+                device=self.model.device,
+                top_k=self.model.config.xfeat_top_k,
+                detection_threshold=self.model.config.xfeat_detection_threshold,
+                min_cossim=self.model.config.xfeat_min_cossim,
+                min_track_points=self.model.config.xfeat_min_track_points,
+                ransac_iterations=self.model.config.xfeat_ransac_iterations,
+                ransac_inlier_threshold=self.model.config.xfeat_ransac_inlier_threshold,
+                weights_path=self.model.config.xfeat_weights_path,
+            )
+            tracker_label = "XFeat"
         else:
-            self._cotracker_motion = CoTrackerMotionEstimator(
+            self._motion_estimator = CoTrackerMotionEstimator(
                 device=self.model.device,
                 query_point_count=self.model.config.cotracker_query_point_count,
                 min_track_points=self.model.config.cotracker_min_track_points,
@@ -1399,24 +1653,68 @@ class DynamicGSPipeline(VanillaPipeline):
                 predictor_iters=self.model.config.cotracker_predictor_iters,
             )
             tracker_label = "CoTracker"
-        seeded = self._cotracker_motion.initialize(
+        seeded = self._motion_estimator.initialize(
             rgb=rgb, depth=depth, camera=camera, mask=mask,
         )
         CONSOLE.log(
             f"[dynamic-gs] {tracker_label} reference seed on D0 -> "
-            f"fast={self._cotracker_motion.last_init_fast_point_count}, "
-            f"sampled={self._cotracker_motion.last_init_sampled_count}, "
-            f"depth_valid={self._cotracker_motion.last_init_depth_valid_count}, "
-            f"dense_fallback={self._cotracker_motion.last_init_used_dense_fallback}, "
-            f"tracks={seeded}, ready={self._cotracker_motion.ready}"
+            f"fast={self._motion_estimator.last_init_fast_point_count}, "
+            f"sampled={self._motion_estimator.last_init_sampled_count}, "
+            f"depth_valid={self._motion_estimator.last_init_depth_valid_count}, "
+            f"dense_fallback={self._motion_estimator.last_init_used_dense_fallback}, "
+            f"tracks={seeded}, ready={self._motion_estimator.ready}"
         )
-        if seeded < self._cotracker_motion.min_track_points:
+        if seeded < self._motion_estimator.min_track_points:
             CONSOLE.log(
                 f"[dynamic-gs] {tracker_label} seeded too few D0 points: "
-                f"{seeded} < min_track_points={self._cotracker_motion.min_track_points}"
+                f"{seeded} < min_track_points={self._motion_estimator.min_track_points}"
             )
 
     # ---- Image helpers ----
+
+    def _maybe_save_live_optim_debug(self, step: int, frame, model_outputs, effective_mask) -> None:
+        """Dump two PNGs per live optim step, paired by name so they
+        sort side-by-side in a file browser:
+
+        - ``stepNNNNNNN_1_render_w_mask.png`` — rendered RGB with the
+          effective loss mask (CDN ∩ not-current-object ∩ not-gripper)
+          overlaid in red. This is "what the optimizer sees as the
+          prediction, restricted to the pixels that actually
+          contribute to the loss."
+        - ``stepNNNNNNN_2_live.png`` — the live ROS image being
+          compared against (the ground truth for the loss).
+
+        Throttled by ``save_live_optim_debug_every``. Best-effort: any
+        I/O failure is swallowed so a flaky disk can't kill training.
+        """
+        if not self.config.save_live_optim_debug:
+            return
+        every = max(1, int(self.config.save_live_optim_debug_every))
+        if (step % every) != 0:
+            return
+        try:
+            try:
+                data_root = Path(self.datamanager.config.data)
+            except AttributeError:
+                data_root = Path(".")
+            out_dir = data_root / "dynamic_scene" / "debug" / "live_optim"
+            tag = f"step{step:07d}"
+
+            render_rgb = model_outputs["rgb"]
+            live_batch = frame.live_batch
+            live_rgb = live_batch.get("image") if isinstance(live_batch, dict) else None
+            if isinstance(live_rgb, torch.Tensor):
+                live_rgb_t = live_rgb.detach().float()
+                if live_rgb_t.max() > 1.5:
+                    live_rgb_t = live_rgb_t / 255.0
+            else:
+                live_rgb_t = None
+
+            self._save_overlay(render_rgb, effective_mask, out_dir / f"{tag}_1_render_w_mask.png")
+            if live_rgb_t is not None:
+                self._save_image(live_rgb_t, out_dir / f"{tag}_2_live.png")
+        except Exception as exc:
+            CONSOLE.log(f"[live-debug] save failed at step {step}: {exc}")
 
     @staticmethod
     def _save_image(image, path):
@@ -1599,7 +1897,7 @@ class DynamicGSPipeline(VanillaPipeline):
         ``apply_rigid_object_transform_from_reference`` — sees a
         familiar shape and is none the wiser.
         """
-        from .utils.live_ros_subscriber import cameras_from_live_frame
+        from .utils.live_shm_reader import cameras_from_live_frame
 
         device = self.model.device
         camera = cameras_from_live_frame(
@@ -1611,8 +1909,8 @@ class DynamicGSPipeline(VanillaPipeline):
 
         rgb_rgb = np.ascontiguousarray(frame.rgb_bgr[..., ::-1])
         image_t = torch.from_numpy(rgb_rgb).to(device)  # uint8 (H, W, 3)
-        depth_m = (frame.depth_mm.astype(np.float32) * 1e-3)
-        depth_t = torch.from_numpy(depth_m).to(device)
+        # depth is already float32 metres from the publisher; no rescale.
+        depth_t = torch.from_numpy(frame.depth_m).to(device)
         mask_bool = (frame.mask_keep > 0).astype(np.float32)
         mask_t = torch.from_numpy(mask_bool).unsqueeze(-1).to(device)
 
@@ -1630,6 +1928,49 @@ class DynamicGSPipeline(VanillaPipeline):
         # the dynamic phase where the camera optimizer is gated by
         # phase, but the slot collision is worth a glance during a
         # future cleanup.
+
+    def _force_viewer_rerender(self) -> None:
+        """Trigger an immediate re-render on every connected viser
+        client. Used right after the tracker mutates object Gaussian
+        means so the visual update rate tracks the tracker rate
+        instead of being throttled by ``update_scene``'s step-count
+        gate. Best-effort: silently no-ops if the viewer isn't ready
+        or the import fails."""
+        trainer = self._trainer
+        if trainer is None:
+            return
+        viewer = getattr(trainer, "viewer_state", None)
+        if viewer is None or not getattr(viewer, "ready", False):
+            return
+        statemachines = getattr(viewer, "render_statemachines", None)
+        if not statemachines:
+            return
+        try:
+            from nerfstudio.viewer.render_state_machine import RenderAction
+        except Exception:
+            return
+        for client_id, sm in list(statemachines.items()):
+            try:
+                camera_state = viewer.get_camera_state(sm.client)
+            except Exception:
+                continue
+            if camera_state is None:
+                continue
+            # Bypass `sm.action()`'s state-machine filters and
+            # directly push a high-res render. `action()` ignores
+            # "step" while state is "low_move" (set by viser camera
+            # on_update events from the browser), which would cap us
+            # at the tiny low-state resolution forever. Setting
+            # `state = "low_static"` lets the next transition
+            # ("low_static" + "step" → "high") promote us cleanly,
+            # so `_render_img` uses `max_res` instead of the
+            # vis_rays_per_sec / target_fps fallback (~60 px).
+            try:
+                sm.state = "low_static"
+                sm.next_action = RenderAction("step", camera_state)
+                sm.render_trigger.set()
+            except Exception:
+                continue
 
     def _tracker_tick_live(self) -> None:
         """Live-mode replacement for ``_tracker_tick(frame_idx)``.
@@ -1679,8 +2020,10 @@ class DynamicGSPipeline(VanillaPipeline):
             self._live_last_processed_stamp is not None
             and latest.stamp_sec == self._live_last_processed_stamp
         ):
-            # Dedup return — count it so we can see the dedup ratio.
+            # Dedup return — count it (global + per-window) so the
+            # [tracker-rate] line can show the dedup ratio.
             self._timing.setdefault("LIVE.dedup_returns", []).append(0.0)
+            self._live_dedup_window_count = getattr(self, "_live_dedup_window_count", 0) + 1
             return
         # Frame is fresh. Record stamp-delta and wall-clock age before
         # we update the last-processed stamp.
@@ -1730,9 +2073,13 @@ class DynamicGSPipeline(VanillaPipeline):
 
         # CoTracker advances on every live frame for object-pose continuity.
         t0 = time.time()
-        if self._sam3d_inserted and self._cotracker_motion is not None:
-            self._apply_cotracker_motion(camera, batch)
-        self._timing["DN.3_cotracker_motion"].append(time.time() - t0)
+        if self._sam3d_inserted and self._motion_estimator is not None:
+            self._apply_motion_estimator(camera, batch)
+            # Object means just changed — force a viewer re-render
+            # immediately. Otherwise update_scene's render_freq
+            # step-count throttle caps visual update to ~0.5-2 Hz.
+            self._force_viewer_rerender()
+        self._timing["DN.3_tracker_motion"].append(time.time() - t0)
 
         # Rolling tick-rate report. Plain `print` (not CONSOLE.log) so
         # the line surfaces above nerfstudio's rich progress bar and
@@ -1742,26 +2089,64 @@ class DynamicGSPipeline(VanillaPipeline):
         if not hasattr(self, "_live_tick_window_t0"):
             self._live_tick_window_t0 = now
             self._live_tick_window_count = 0
+        if not hasattr(self, "_live_dedup_window_count"):
+            self._live_dedup_window_count = 0
         self._live_tick_window_count += 1
         if (now - self._live_tick_window_t0) >= 2.0:
-            hz = self._live_tick_window_count / (now - self._live_tick_window_t0)
-            tracker_ms = self._timing["DN.3_cotracker_motion"][-1] * 1000
+            elapsed = now - self._live_tick_window_t0
+            fresh = self._live_tick_window_count
+            dedup = self._live_dedup_window_count
+            hz = fresh / elapsed
+            # dedup ratio: fraction of tick CALLS that found no new ROS
+            # frame. ~0% => loop-bound (tick-rate == trainer-loop-rate,
+            # bottleneck is outside the tick). High => supply-bound
+            # (publisher/synchronizer isn't delivering fresh frames).
+            dedup_ratio = dedup / max(1, fresh + dedup)
+            # outside-tick: mean wall-clock spent OUTSIDE _tracker_tick_live
+            # over this window (trainer no-op step + callbacks + viewer
+            # render). Large => the trainer loop / viewer is the gate.
+            gaps = self._timing.get("LIVE.between_tick_gap", [])
+            gap_ms = (sum(gaps[-fresh:]) / fresh * 1000.0) if (gaps and fresh) else 0.0
+            tracker_ms = self._timing["DN.3_tracker_motion"][-1] * 1000
             tracker_label = {
                 "tapir": "TAPIR",
+                "tapnext": "TAPNext",
                 "cotracker": "CoTracker",
                 "klt": "KLT",
+                "xfeat": "XFeat",
             }.get(getattr(self.model.config, "dynamic_tracker", "cotracker"), "CoTracker")
+            # Per-window mean over last `fresh` ticks for the inner DN.3 sub-timers
+            # so we can see WHERE the tick budget is going. Computed inline so we
+            # don't have to kill the run to read timing_report.txt.
+            def _last_mean_ms(key, n):
+                vals = self._timing.get(key, [])
+                if not vals or n <= 0:
+                    return 0.0
+                vals = vals[-n:]
+                return sum(vals) / len(vals) * 1000.0
+            n = max(1, fresh)
+            a = _last_mean_ms("DN.3a_get_live_rgb", n)
+            b = _last_mean_ms("DN.3b_estimator_input_prep", n)
+            c = _last_mean_ms("DN.3c_predictor_forward", n)
+            d = _last_mean_ms("DN.3d_postprocess", n)
+            e = _last_mean_ms("DN.3e_ransac_kabsch", n)
+            g = _last_mean_ms("DN.3g_apply_transform", n)
+            tot = _last_mean_ms("DN.3_tracker_motion", n)
             print(
-                f"\n==> [tracker-rate] {hz:.1f} Hz over {now - self._live_tick_window_t0:.1f}s "
-                f"({tracker_label} last={tracker_ms:.0f}ms)\n",
+                f"\n==> [tracker-rate] {hz:.1f} Hz over {elapsed:.1f}s "
+                f"({tracker_label} last={tracker_ms:.0f}ms | "
+                f"dedup {dedup_ratio*100:.0f}% | outside-tick {gap_ms:.0f}ms)"
+                f"\n    breakdown(mean/tick over {n}): rgb_prep={a:.1f} input_prep={b:.1f} "
+                f"net+match={c:.1f} postproc={d:.1f} ransac={e:.1f} apply={g:.1f}  total={tot:.1f}ms\n",
                 flush=True,
             )
             self._live_tick_window_t0 = now
             self._live_tick_window_count = 0
+            self._live_dedup_window_count = 0
 
         # Tracking-only mode: skip the RDN render, object mask, CDN
         # compute, and pool push. The object Gaussians have already
-        # been moved by `_apply_cotracker_motion`; the viewer pulls
+        # been moved by `_apply_motion_estimator`; the viewer pulls
         # the latest pose on its own render.
         if self.config.disable_dynamic_optimization:
             self._timing["LIVE.tick_total"].append(time.time() - tick_t0); self._last_tick_end_t = time.time()
@@ -1805,6 +2190,21 @@ class DynamicGSPipeline(VanillaPipeline):
 
         cdn_px = int((cdn[..., 0] > 0.5).sum().item()) if cdn.ndim >= 3 else int((cdn > 0.5).sum().item())
         if cdn_px < self.config.optim_pool_min_change_pixels:
+            self._timing["LIVE.tick_total"].append(time.time() - tick_t0); self._last_tick_end_t = time.time()
+            self._global_frame_counter += 1
+            return
+
+        # Verify the gripper mask attached to this frame's batch is
+        # the real URDF-rendered one (not the publisher's all-1
+        # placeholder). A real mask has some zero pixels where the
+        # robot is in view; an all-1 mask would let the gripper
+        # region leak into CDN and pull the loss toward the robot.
+        mask_t = batch.get("mask") if isinstance(batch, dict) else None
+        if mask_t is not None and bool((mask_t > 0).all().item()):
+            CONSOLE.log(
+                f"[live] {frame_name}: dropping frame — gripper mask is all-1 "
+                f"(publisher fell back to placeholder; image-mask mismatch)."
+            )
             self._timing["LIVE.tick_total"].append(time.time() - tick_t0); self._last_tick_end_t = time.time()
             self._global_frame_counter += 1
             return
@@ -2232,23 +2632,54 @@ class DynamicGSPipeline(VanillaPipeline):
 
         # --- TIMING: D0.6 CoTracker init (sample 2D points inside the rendered object mask, back-project to world via depth, store as reference) ---
         t0 = time.time()
-        # Use the gripper-masked tracking RGB so the D0 reference frame stored
-        # by CoTracker matches what subsequent DN frames will look like.
-        live_rgb_fullres = self._build_tracking_rgb(batch)
+        # Match the per-tick path in ``_apply_motion_estimator``: KLT/XFeat
+        # see the gripper-blue-composited image, neural trackers see the raw
+        # natural image. The D0 reference must look exactly like the DN
+        # input or the descriptor / appearance distribution diverges.
+        _d0_tracker_kind = getattr(self.model.config, "dynamic_tracker", "cotracker")
+        if _d0_tracker_kind in ("klt", "xfeat"):
+            live_rgb_fullres = self._build_tracking_rgb(batch)
+        else:
+            live_rgb_fullres = self.model.get_live_rgb(batch, apply_training_downscale=False)
         self.model.capture_reference_object_pose()
-        # Use the rendered object Gaussian mask as the seed mask for
-        # CoTracker — its 2D footprint defines which pixels we want to
-        # track. Falls back to the ESAM live-object mask if rendered is
-        # empty.
-        seed_mask = rendered_obj_mask if self._has_nonempty_mask(rendered_obj_mask) else None
+        # Erode the splat-rasterized mask to its inner 85% so D0 keypoints
+        # don't land on the low-opacity halo at the object's edge (those
+        # halo pixels show background depth + texture, which would poison
+        # the D0 anchor and every match against it). Then AND with the
+        # gripper-keep mask so keypoints never fall on the gripper either
+        # (gripper occludes the object — a keypoint at a gripper-covered
+        # pixel would get gripper-surface depth and gripper-texture
+        # descriptors).
+        seed_mask = self._erode_mask_to_inner_fraction(
+            rendered_obj_mask, _TRACKER_MASK_INNER_FRACTION,
+        )
+        gripper_keep_mask = self.model._get_batch_mask(batch)
+        if seed_mask is not None and gripper_keep_mask is not None:
+            gk = gripper_keep_mask
+            if gk.ndim == 3 and gk.shape[-1] == 1 and seed_mask.ndim == 2:
+                gk = gk[..., 0]
+            elif gk.ndim == 2 and seed_mask.ndim == 3 and seed_mask.shape[-1] == 1:
+                gk = gk[..., None]
+            seed_mask = (seed_mask.bool() & gk.to(seed_mask.device).bool()).to(seed_mask.dtype)
+        if not self._has_nonempty_mask(seed_mask):
+            seed_mask = None
         instance_id_for_co = getattr(self, "_d0_selected_instance_id", 0)
+        _tracker_kind = getattr(self.model.config, "dynamic_tracker", "cotracker")
+        _tracker_label = self._TRACKER_LABELS.get(_tracker_kind, "Tracker")
         if instance_id_for_co > 0 and seed_mask is not None:
-            self._initialize_cotracker(
+            self._initialize_motion_estimator(
                 live_rgb_fullres, batch["depth_image"], camera, mask=seed_mask,
             )
         else:
-            CONSOLE.log("[dynamic-gs] CoTracker init skipped: no instance selected or seed mask empty")
-        self._timing["D0.6_cotracker_init"].append(time.time() - t0)
+            obj_pixels = int(rendered_obj_mask.sum().item()) if rendered_obj_mask is not None else -1
+            obj_flag_count = int((self.model.object_flags.squeeze(-1) > 0.5).sum().item())
+            CONSOLE.log(
+                f"[dynamic-gs] {_tracker_label} init skipped: "
+                f"instance_id={instance_id_for_co}, "
+                f"rendered_obj_mask_pixels={obj_pixels}, "
+                f"object_flags_count={obj_flag_count}"
+            )
+        self._timing["D0.6_tracker_init"].append(time.time() - t0)
 
         if self.config.save_debug_images:
             self._save_image_with_points(rendered_obj_mask, None, debug_dir / f"{frame_name}_rendered_object_mask.png")
@@ -2296,7 +2727,7 @@ class DynamicGSPipeline(VanillaPipeline):
             f"sam3d_gen={self._timing['D0.2_sam3d_generation'][-1]:.2f}s, "
             f"sam3d_ins={self._timing['D0.3_sam3d_insertion'][-1]:.2f}s, "
             f"obj_mask={self._timing['D0.4_render_object_mask'][-1]:.2f}s, "
-            f"cotracker_init={self._timing['D0.6_cotracker_init'][-1]:.2f}s, "
+            f"tracker_init={self._timing['D0.6_tracker_init'][-1]:.2f}s, "
             f"render_rs00={self._timing['D0.7_render_rs00'][-1]:.2f}s, "
             f"change_mask={self._timing['D0.8_change_mask_cd0'][-1]:.2f}s, "
             f"debug_imgs={self._timing['D0.9_debug_images'][-1]:.2f}s"
@@ -2309,10 +2740,10 @@ class DynamicGSPipeline(VanillaPipeline):
         t_total = time.time()
 
         # --- TIMING: DN.3 CoTracker advance (pairwise track of D0-sampled object points; RANSAC-Kabsch for absolute world (R, t)) ---
-        if self._sam3d_inserted and self._cotracker_motion is not None:
+        if self._sam3d_inserted and self._motion_estimator is not None:
             t0 = time.time()
-            self._apply_cotracker_motion(camera, batch)
-            self._timing["DN.3_cotracker_motion"].append(time.time() - t0)
+            self._apply_motion_estimator(camera, batch)
+            self._timing["DN.3_tracker_motion"].append(time.time() - t0)
 
         # --- TIMING: DN.5 Render RDN (render full scene after rigid transform applied to object Gaussians) ---
         t0 = time.time()
@@ -2366,7 +2797,7 @@ class DynamicGSPipeline(VanillaPipeline):
         CONSOLE.log(
             f"[timing] frame {self.current_dynamic_frame_idx}: "
             f"total={self._timing['DN.9_total_frame_n'][-1]:.3f}s, "
-            f"cotracker={self._timing.get('DN.3_cotracker_motion', [0])[-1]:.3f}s, "
+            f"cotracker={self._timing.get('DN.3_tracker_motion', [0])[-1]:.3f}s, "
             f"render={self._timing['DN.5_render_rdn'][-1]:.3f}s, "
             f"obj_mask={self._timing['DN.6_render_object_mask'][-1]:.3f}s, "
             f"change={self._timing['DN.7_change_mask_cdn'][-1]:.3f}s, "
@@ -2574,9 +3005,9 @@ class DynamicGSPipeline(VanillaPipeline):
             if obj_mask_pre.any()
             else None
         )
-        if self._sam3d_inserted and self._cotracker_motion is not None:
-            self._apply_cotracker_motion(camera, batch)
-        self._timing["DN.3_cotracker_motion"].append(time.time() - t0)
+        if self._sam3d_inserted and self._motion_estimator is not None:
+            self._apply_motion_estimator(camera, batch)
+        self._timing["DN.3_tracker_motion"].append(time.time() - t0)
         centroid_after = (
             self.model.means[obj_mask_pre].detach().mean(dim=0)
             if obj_mask_pre.any()
@@ -2688,8 +3119,14 @@ class DynamicGSPipeline(VanillaPipeline):
         # 1. Tracker tick
         cadence = max(1, int(self.config.tracker_tick_every_steps))
         if self.config.live:
-            if self._dynamic_step_counter % cadence == 0:
-                self._tracker_tick_live()
+            # Live mode always ticks every step: the object pose should
+            # update as fast as TAPIR + ROS allow, regardless of whether
+            # optimization is on. The dedup-return in _tracker_tick_live
+            # handles over-polling cheaply, and when optimization is on
+            # the pool optim step still runs after the tick on the same
+            # step. `tracker_tick_every_steps` only applies to recorded
+            # mode (the elif branch below).
+            self._tracker_tick_live()
         elif (
             self._dynamic_step_counter % cadence == 0
             and self._next_frame_to_track < self.total_dynamic_frames
@@ -2737,6 +3174,10 @@ class DynamicGSPipeline(VanillaPipeline):
             loss_dict = self.model.get_loss_dict(model_outputs, frame.live_batch, metrics_dict)
             result = (model_outputs, loss_dict, metrics_dict)
 
+            # Diagnostic dump: render, live GT, effective mask, overlay.
+            # Throttled by `save_live_optim_debug_every`.
+            self._maybe_save_live_optim_debug(step, frame, model_outputs, effective)
+
         # Refresh per-Gaussian gate using the just-set self.info from the
         # full-scene render. Backward (called by the trainer after this
         # function returns) reads scene_opt_active_mask via the registered
@@ -2776,6 +3217,10 @@ class DynamicGSPipeline(VanillaPipeline):
     def get_training_callbacks(self, training_callback_attributes: TrainingCallbackAttributes):
         callbacks = super().get_training_callbacks(training_callback_attributes)
         trainer = training_callback_attributes.trainer
+        # Stash the trainer so _tracker_tick_live can reach
+        # trainer.viewer_state.render_statemachines and force re-renders
+        # the moment object means change.
+        self._trainer = trainer
         if trainer is not None:
             if self.config.live:
                 # Live mode has no a-priori frame budget — the operator
@@ -2943,8 +3388,10 @@ class DynamicGSPipeline(VanillaPipeline):
         tracker_kind = getattr(self.model.config, "dynamic_tracker", "cotracker")
         tracker_label = {
             "tapir": "TAPIR",
+            "tapnext": "TAPNext",
             "cotracker": "CoTracker",
             "klt": "KLT",
+            "xfeat": "XFeat",
         }.get(tracker_kind, "CoTracker")
         # --- Descriptions for each timer key (chronological within phase) ---
         d0_keys = [
@@ -2970,13 +3417,13 @@ class DynamicGSPipeline(VanillaPipeline):
             ("D0.3e_persistent_membership", "  -> Persistent membership (sklearn KNN over all candidate Gaussians)"),
             ("D0.3f_save_fused_and_log", "  -> Save fused PLY + write fusion log"),
             ("D0.4_render_object_mask", "Render object mask (rasterize object_flags Gaussians from simulation)"),
-            ("D0.6_cotracker_init", f"{tracker_label} D0 seed (sample 2D points inside the rendered object mask, back-project to world via depth)"),
+            ("D0.6_tracker_init", f"{tracker_label} D0 seed (sample 2D points inside the rendered object mask, back-project to world via depth)"),
             ("D0.7_render_rs00", "Render RS00 (re-render scene after SAM3D insertion)"),
             ("D0.8_change_mask_cd0", "Change mask CD0 (MSSIM RS00 vs D0, excluding gripper + object)"),
             ("D0.9_debug_images", "Debug images (save overlay PNGs to disk)"),
         ]
         dn_keys = [
-            ("DN.3_cotracker_motion", f"{tracker_label} 2D-track advance + RANSAC-Kabsch (R, t) on the moved-object Gaussians"),
+            ("DN.3_tracker_motion", f"{tracker_label} 2D-track advance + RANSAC-Kabsch (R, t) on the moved-object Gaussians"),
             ("DN.3a_get_live_rgb", "  -> get_live_rgb (uint8->float, optional downscale, GPU upload, background composite)"),
             ("DN.3_estimate_total", "  -> estimate_and_advance total (sum of 3b+3c+3d+3e plus minor overhead)"),
             ("DN.3b_estimator_input_prep", "    -> input prep total (rgb/depth/intrinsics/c2w extraction, includes CUDA syncs)"),
@@ -3196,12 +3643,12 @@ class DynamicGSPipeline(VanillaPipeline):
                     lines.append(f"  {key:<42s}      N/A     N/A    {desc}")
             # Cross-reference: how much of tick_total is the tracker
             # motion (which has its own DN.3 breakdown).
-            motion_vals = self._timing.get("DN.3_cotracker_motion", [])
+            motion_vals = self._timing.get("DN.3_tracker_motion", [])
             if motion_vals:
                 avg_motion_ms = sum(motion_vals) / len(motion_vals) * 1000
                 pct = (avg_motion_ms / avg_tick_ms * 100) if avg_tick_ms > 0 else 0.0
                 lines.append(
-                    f"  {'(reference) DN.3_cotracker_motion':<42s} {avg_motion_ms:>8.1f}ms  {pct:>6.1f}%    "
+                    f"  {'(reference) DN.3_tracker_motion':<42s} {avg_motion_ms:>8.1f}ms  {pct:>6.1f}%    "
                     f"tracker motion total — see DN.3* breakdown above for sub-syncs"
                 )
             lines.append("")

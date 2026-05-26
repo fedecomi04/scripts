@@ -2,6 +2,164 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+<!-- ============================================================ -->
+<!-- BEGIN: CLEANUP NOTES (working section, prepend new items here) -->
+<!-- ============================================================ -->
+
+# Dynamic-GS Cleanup
+
+Working section for the in-progress cleanup of the dynamic-gs pipeline. All new cleanup-related notes go here, above the separator below. Older project documentation stays untouched after the separator.
+
+## Goal
+
+Do a whole cleanup of the dynamic-gs pipeline (model, pipeline, datamanager, config, utils). Open scope — entries below will refine what "cleanup" covers.
+
+## Notes
+
+### Live tracker 30 Hz fix (2026-05-26)
+
+Root cause: gazebo RTF=0.32 (sim ran at 32 % real-time) → camera produced ~10 wall-clock fps; `rostopic hz` reported "30 Hz" using sim time and misled the diagnosis for hours.
+
+Sim-side fixes (the ones that solved it):
+- Replaced triangle-mesh `<collision>` with cylinder/box primitives on 6 world objects (coke_can, banana, fidget_spinner, side_plate, wooden_box, bolt); originals kept as XML comments.
+- Dropped ODE `<iters>` 500 → 50 in [empty_world.world](../../dev/teleop/catkin_ws/src/active_camera_arm_control/active_camera_arm_gazebo/worlds/dynamic_gaussian_splat/empty_world.world).
+- Capped pose-plugin `<updateRate>` 0.0 → 250 Hz in both dynaarm URDFs (was firing every 1000 Hz world tick).
+
+Publisher-side improvements kept as permanent wins even though they did NOT fix the root cause:
+- RGB `/compressed` (JPEG) + depth `/compressedDepth` (PNG-16UC1) transports, with auto-launched C++ `image_transport republish` for depth and a decoder that skips the 12-byte ConfigHeader.
+- Worker-thread architecture in [live_ros_publisher.py](dynamic_gs/utils/live_ros_publisher.py): `_on_synced` just enqueues into `queue.Queue(maxsize=4)` with drop-oldest; `_worker_loop` drains and does cv_bridge + pose interp + mask render + shm write.
+- 50 Hz throttle (`_POSE_JOINT_MIN_DT_SEC = 0.02`) on pose/joint callbacks (we only need bracketing samples per ~33 ms image stamp).
+
+Diagnostic dead-ends — removed; do not re-add:
+- E-core CPU pinning (`taskset -c 20-23`) — made the publisher slower because E-cores are slower per clock than P-cores.
+- `DGS_PUB_NO_POSE_JOINT` / `DGS_PUB_SKIP_POSE_JOINT` env vars — tested the wrong hypothesis (pose/joint GIL contention was never the cause).
+- `_count_rgb_cb` / `_count_depth_cb` + `_maybe_log_rates` — measured per-topic inbound Hz; answer was always "10 Hz" so the cap was upstream of rospy.
+- `rospy.AnyMsg` + manual `struct.unpack` bypass — pointless once wall-vs-sim clock measurement revealed RTF was the real issue.
+
+Confirmation tool: [/tmp/test_wall_rate.py](file:///tmp/test_wall_rate.py) subscribes to `/clock`, `/image_raw`, `/image_raw/compressed` via `rospy.AnyMsg` and computes rate from `time.time()`; `/clock` wall-rate ÷ physics target gives true RTF. RTF < 1.0 ⇒ no rospy tuning can help.
+
+### Splatfacto per-iteration sequence (with code references)
+
+Reference trace of what Nerfstudio + Splatfacto actually do per training step. Useful as the baseline to compare the dynamic-gs custom phase/optim logic against.
+
+- Outer loop sets `self.step = step` — [trainer.py:247](../nerfstudio/nerfstudio/engine/trainer.py#L247)
+- Fire `BEFORE_TRAIN_ITERATION` callbacks — [trainer.py:260-263](../nerfstudio/nerfstudio/engine/trainer.py#L260-L263)
+- `step_cb` stashes step, optimizers, schedulers onto the model — [splatfacto.py:407-410](../nerfstudio/nerfstudio/models/splatfacto.py#L407-L410)
+- Call `train_iteration(step)` — [trainer.py:266](../nerfstudio/nerfstudio/engine/trainer.py#L266)
+- Zero gradients on this step's active param groups — [trainer.py:497](../nerfstudio/nerfstudio/engine/trainer.py#L497)
+- `pipeline.get_train_loss_dict(step)` called — [trainer.py:502](../nerfstudio/nerfstudio/engine/trainer.py#L502)
+- Pipeline calls `model.get_outputs(camera)` — [splatfacto.py:485](../nerfstudio/nerfstudio/models/splatfacto.py#L485)
+  - Apply learned camera-pose correction — [splatfacto.py:501](../nerfstudio/nerfstudio/models/splatfacto.py#L501)
+  - Build view matrix + intrinsics K — [splatfacto.py:534-535](../nerfstudio/nerfstudio/models/splatfacto.py#L534-L535)
+  - Call `gsplat.rasterization(...)` → `render, alpha, self.info` — [splatfacto.py:555-575](../nerfstudio/nerfstudio/models/splatfacto.py#L555-L575)
+  - `strategy.step_pre_backward(...)` (registers `means2d` to retain its gradient) — [splatfacto.py:577-579](../nerfstudio/nerfstudio/models/splatfacto.py#L577-L579)
+  - Composite rendered RGB with background — [splatfacto.py:583](../nerfstudio/nerfstudio/models/splatfacto.py#L583)
+- Pipeline calls `model.get_loss_dict(outputs, batch)` — [splatfacto.py:652](../nerfstudio/nerfstudio/models/splatfacto.py#L652)
+  - Composite GT image with background — [splatfacto.py:660](../nerfstudio/nerfstudio/models/splatfacto.py#L660)
+  - Compute L1 = `mean(|gt − pred|)` — [splatfacto.py:673](../nerfstudio/nerfstudio/models/splatfacto.py#L673)
+  - Compute `1 − SSIM(gt, pred)` — [splatfacto.py:674](../nerfstudio/nerfstudio/models/splatfacto.py#L674)
+  - Combine: `(1 − ssim_lambda)·L1 + ssim_lambda·(1 − SSIM)` — [splatfacto.py:689](../nerfstudio/nerfstudio/models/splatfacto.py#L689)
+- Sum loss_dict into scalar `loss` — [trainer.py:503](../nerfstudio/nerfstudio/engine/trainer.py#L503)
+- `grad_scaler.scale(loss).backward()` fills `.grad` on every param tensor and on `info["means2d"]` — [trainer.py:504](../nerfstudio/nerfstudio/engine/trainer.py#L504)
+- `optimizer_scaler_step_some` → Adam step on each active param group — [trainer.py:510](../nerfstudio/nerfstudio/engine/trainer.py#L510)
+- `scheduler_step_all` → schedulers decay LRs for next step — [trainer.py:527](../nerfstudio/nerfstudio/engine/trainer.py#L527)
+- `train_iteration` returns to outer loop
+- Fire `AFTER_TRAIN_ITERATION` callbacks — [trainer.py:269-272](../nerfstudio/nerfstudio/engine/trainer.py#L269-L272)
+- `step_post_backward` dispatcher runs — [splatfacto.py:365](../nerfstudio/nerfstudio/models/splatfacto.py#L365)
+- Delegates to `strategy.step_post_backward(...)` — [splatfacto.py:367-374](../nerfstudio/nerfstudio/models/splatfacto.py#L367-L374)
+  - If outside refinement window or wrong step → return early
+  - Else read `info["means2d"].grad`, decide clone/split/prune, mutate `gauss_params` + each Adam's `m`,`v` state in lockstep
+  - Every `reset_alpha_every × refine_every` steps: reset all opacities low
+- Loop to next step
+
+### Splatfacto `get_outputs(camera)` — the render function
+
+Pure forward render: given one camera, returns the rendered image (plus depth/alpha). Does **not** compute loss, does **not** call backward, does **not** modify Gaussians.
+
+1. **Apply pose correction** — `camera_optimizer.apply_to_camera(camera)` adds the learned 6D offset to the dataset c2w (training only, if camera-opt is on) — [splatfacto.py:501](../nerfstudio/nerfstudio/models/splatfacto.py#L501).
+2. **Pick which Gaussians to render** — all of them, unless a `crop_box` is set (viewer feature) — [splatfacto.py:506-528](../nerfstudio/nerfstudio/models/splatfacto.py#L506-L528).
+3. **Build camera matrices** — `viewmat` from corrected c2w, intrinsics `K` — [splatfacto.py:534-535](../nerfstudio/nerfstudio/models/splatfacto.py#L534-L535).
+4. **Pick render mode** — `"RGB+ED"` if depth is needed this step, else `"RGB"` — [splatfacto.py:544-547](../nerfstudio/nerfstudio/models/splatfacto.py#L544-L547).
+5. **Active SH degree** — `min(step // sh_degree_interval, max_sh_degree)` — coarse-to-fine color schedule — [splatfacto.py:549-553](../nerfstudio/nerfstudio/models/splatfacto.py#L549-L553).
+6. **Call `gsplat.rasterization(...)`** — the differentiable splatting kernel; inputs the 7 param tensors + camera matrices; returns `render`, `alpha`, `self.info` — [splatfacto.py:555-575](../nerfstudio/nerfstudio/models/splatfacto.py#L555-L575).
+7. **`strategy.step_pre_backward(...)`** — registers `means2d` so its gradient is retained through backward (needed by densification) — [splatfacto.py:577-579](../nerfstudio/nerfstudio/models/splatfacto.py#L577-L579).
+8. **Composite with background** — `rgb = render + (1 − alpha) · background`, clamp [0,1] — [splatfacto.py:582-584](../nerfstudio/nerfstudio/models/splatfacto.py#L582-L584).
+9. **Apply bilateral grid** — only if enabled and training; per-image color correction — [splatfacto.py:587-589](../nerfstudio/nerfstudio/models/splatfacto.py#L587-L589).
+10. **Extract depth** — mask out empty regions (alpha = 0) — [splatfacto.py:591-595](../nerfstudio/nerfstudio/models/splatfacto.py#L591-L595).
+11. **Return** `{"rgb", "depth", "accumulation" (= alpha), "background"}` — [splatfacto.py:600-604](../nerfstudio/nerfstudio/models/splatfacto.py#L600-L604).
+
+**`alpha`** is per-pixel accumulated opacity in `[0, 1]`: `alpha = 1 − Π(1 − αᵢ)` over all Gaussians touching that pixel. Used to composite the background and to mask depth.
+
+### Splatfacto `get_loss_dict(outputs, batch, metrics_dict)` — the loss function
+
+Takes the rendered output and GT batch, returns a dict of scalar losses that the trainer sums and backprops.
+
+1. **Composite GT with background** — same background as the render, so they're compared on equal footing — [splatfacto.py:660](../nerfstudio/nerfstudio/models/splatfacto.py#L660).
+2. **Apply mask if present** — if `batch["mask"]` exists, multiply both GT and pred so masked pixels contribute zero — [splatfacto.py:665-671](../nerfstudio/nerfstudio/models/splatfacto.py#L665-L671).
+3. **L1 loss** — `mean(|gt − pred|)` — [splatfacto.py:673](../nerfstudio/nerfstudio/models/splatfacto.py#L673).
+4. **SSIM loss** — `1 − SSIM(gt, pred)`; windowed structural similarity — [splatfacto.py:674](../nerfstudio/nerfstudio/models/splatfacto.py#L674).
+5. **Combine** — `main_loss = (1 − ssim_lambda)·L1 + ssim_lambda·(1 − SSIM)`, default `ssim_lambda = 0.2` — [splatfacto.py:689](../nerfstudio/nerfstudio/models/splatfacto.py#L689).
+6. **Scale regularization** (optional, only if `use_scale_regularization=True`, every 10 steps) — penalizes Gaussians with large max/min scale ratio (PhysGaussian) — [splatfacto.py:675-686](../nerfstudio/nerfstudio/models/splatfacto.py#L675-L686).
+7. **MCMC regularizers** (only if `strategy="mcmc"`) — L1 on opacity and exp(scale) — [splatfacto.py:693-702](../nerfstudio/nerfstudio/models/splatfacto.py#L693-L702).
+8. **Camera optimizer loss** (training only) — regularization on learned pose offsets — [splatfacto.py:704-706](../nerfstudio/nerfstudio/models/splatfacto.py#L704-L706).
+
+Returns: `{"main_loss", "scale_reg", possibly "mcmc_opacity_reg", "mcmc_scale_reg", "camera_opt_*"}`.
+
+### Splatfacto optional features (opt-in via config)
+
+| Feature | Flag | Default | What it does |
+|---|---|---|---|
+| **Bilateral grid** | `use_bilateral_grid` | `False` | Per-image learnable color correction (exposure/WB drift) |
+| **Camera-pose optimization** | `camera_optimizer.mode` | `"off"` | Learnable 6D pose offset per training image (`"SO3xR3"` or `"SE3"`) |
+| **Antialiased rasterization** | `rasterize_mode` | `"classic"` | `"antialiased"` adjusts opacity to keep splats consistent across resolutions; reduces aliasing |
+| **Scale regularization** | `use_scale_regularization` | `False` | Penalizes spiky/elongated Gaussians (max/min scale ratio > `max_gauss_ratio`); from PhysGaussian |
+| **Absolute-gradient densification** | `use_absgrad` | `True` | Uses absolute screen-space grad instead of signed; densifies more aggressively |
+| **MCMC strategy** | `strategy` | `"default"` | `"mcmc"` swaps clone/split/prune for Langevin-dynamics sampling; adds opacity + scale L1 regs |
+| **Random init** | `random_init` | `False` | Init Gaussians in a random cube instead of SfM points |
+| **Output depth during training** | `output_depth_during_training` | `False` | Render depth every train step (slower, enables depth losses) |
+| **Color-corrected metrics** | `color_corrected_metrics` | `False` | Histogram match before PSNR/SSIM — fair comparison under color drift |
+| **Background color** | `background_color` | `"random"` | `"random"` / `"black"` / `"white"`; randomization prevents memorizing a fixed bg |
+| **Max Gaussian cap** | `max_gs_num` | `1_000_000` | Hard cap; densification stops past this |
+| **SH degree schedule** | `sh_degree` + `sh_degree_interval` | `3`, every `1000` steps | Activates one extra SH band per interval — coarse-to-fine on color |
+| **Resolution schedule** | `num_downscales` + `resolution_schedule` | `2`, every `3000` steps | Start at 1/4 res, double up to full — coarse-to-fine on image res |
+
+In dynamic-gs, `camera_optimizer.mode="SO3xR3"` is overridden on in `DynamicGSModelConfig`.
+
+### Live-mode viewer refresh fix (2026-05-25)
+
+**Problem.** In live tracking-only mode the tracker mutated object Gaussian means at ~8 Hz, but the viser viewer only repainted them at ~0.5–2 Hz (camera-move was smooth, object motion was not). Two throttles on the render path were the cause:
+
+1. **`viewer.update_scene(step)`'s step-count gate** at [viewer.py:520](../nerfstudio/nerfstudio/viewer/viewer.py#L520) — fires a `"step"` render action only every `render_freq = train_util * vis_time / (train_time - train_util * train_time)` train iterations. With `train_time` very small (tracker-tick-only step), `render_freq` blows up to ~70+ iters/render → ~3–4 actions/sec.
+2. **`RenderStateMachine.action()` filter** at [render_state_machine.py:99](../nerfstudio/nerfstudio/viewer/render_state_machine.py#L99) — ignores `"step"` when `self.state == "low_move"`. Viser camera `on_update` events (fired by the browser even on passive interaction) keep the state in `low_move`. So even the few `"step"` actions that did fire were dropped → state never promoted to `"high"` → `_calculate_image_res` returned the `vis_rays_per_sec / target_fps` fallback (~60 px) instead of `max_res`.
+
+**Why `"rerender"` is the wrong action.** The state transitions in [render_state_machine.py:73-78](../nerfstudio/nerfstudio/viewer/render_state_machine.py#L73-L78):
+- `low_static + step → high` (promotes)
+- `high + rerender → low_static` (DEMOTES — `"rerender"` means "restart at low res then re-promote", not "scene changed material")
+
+**Fix.** Don't go through `action()` at all. Directly push a high-res render on every fresh tracker tick:
+
+```python
+# dynamic_gs/dynamic_gs_pipeline.py — _force_viewer_rerender helper
+sm.state = "low_static"                              # force out of low_move
+sm.next_action = RenderAction("step", camera_state)   # queue high-res step
+sm.render_trigger.set()                               # wake render thread
+```
+
+Called from [`_tracker_tick_live`](dynamic_gs/dynamic_gs_pipeline.py#L1893) immediately after `_apply_cotracker_motion` returns. Zero modifications to nerfstudio core code — the back-reference to the trainer (and thus `trainer.viewer_state.render_statemachines`) is acquired via `training_callback_attributes.trainer` in [`get_training_callbacks`](dynamic_gs/dynamic_gs_pipeline.py#L2962).
+
+**Net effect.** Visual rate becomes whatever `_render_img` itself can do (limited by render cost + `train_lock` contention), instead of being throttled to 0.5–2 Hz. `outside-tick` in the `[tracker-rate]` line grows correspondingly — that's real render work now, not dedup-spinning.
+
+**What this means for the rewrite.** The viewer / trainer / tracker integration is currently three independent throttles fighting each other (`update_scene`'s step gate, `action()`'s state filter, `train_lock`). In a clean rewrite, consider:
+- A direct "scene mutated" signal from the tracker to the render thread that bypasses the state machine entirely (single threading.Event per client).
+- Either eliminate `train_lock` in tracking-only mode (the trainer doesn't mutate during a tracker tick) or use RWLock so renders can run concurrently with read-only tracker ticks.
+- The render state machine's `low_move/low_static/high` heuristic is designed for interactive NeRF training. For live tracking it's mostly noise — a fixed `high` state with `max_res` would be simpler and equally correct.
+
+<!-- ============================================================ -->
+<!-- END: CLEANUP NOTES — existing project documentation below     -->
+<!-- ============================================================ -->
+
+---
+
 ## Project Overview
 
 **dynamic-gs** is a two-phase static + dynamic Gaussian Splatting system integrated with [Nerfstudio](https://github.com/nerfstudio-project/nerfstudio). It reconstructs and tracks dynamic objects (e.g., robot arms, manipulated objects) in scenes where most of the environment is static. It is designed for robotic teleoperation scenarios.
@@ -14,6 +172,26 @@ pip install -e .
 ```
 
 After installation, `dynamic-gs` will be registered as a Nerfstudio method via the entry-point in `pyproject.toml`.
+
+## Conda Environments
+
+Current layout after the 2026-05-14 work (TAPIR + SAM3D consolidation + ROS migration).
+
+| Env | Python | torch | sm_120 native | Role |
+|---|---|---|---|---|
+| `dynamic_gs` | 3.12 | 2.11+cu128 | ✅ | Main env. Hosts `ns-train dynamic-gs`, ESAM, gsplat, nerfstudio, **cotracker + TAPIR (vendored)**. TAPIR runtime deps installed 2026-05-14: `einshape`, `dm-tree`. |
+| `sam3_dynamic_gs` | 3.12 | 2.11+cu128 | ✅ | SAM3 + SAM3D subprocess env (consolidated 2026-05-13). Hosts: SAM3, sam3d_objects, pytorch3d 0.7.8 (source-built native sm_120), spconv-cu118 (cu11.8 wheels — sparse-conv kernels PTX-translate to sm_120; rest native), gsplat, moge, open3d, hydra-core, pyrender etc. Worker scripts invoke this env via `conda run`. SAM3D default per `sam3d.py:SAM3D_CONDA_ENV="sam3_dynamic_gs"`. |
+| `dynamic_gs_ros` | 3.8 | none | n/a | NEW 2026-05-14 — minimal ROS-only env for the live publisher subprocess. ROS Noetic bindings come from `/opt/ros/noetic/lib/python3/dist-packages` via `source /opt/ros/noetic/setup.bash` in the spawn wrapper. Installed: numpy 1.24, opencv-python, pyyaml, rospkg, netifaces, lxml, pyparsing, pyopengl, pyrender (env-local), urdfpy (env-local), trimesh, scipy, six, pycollada, freetype-py. Replaces the deleted `radiance_ros_4060`. |
+| ~~`radiance_ros`~~ | — | — | — | DELETED 2026-05-12. Snapshot: `~/env_backups/radiance_ros_2026-05-12/`. |
+| ~~`radiance_ros_4060`~~ | — | — | — | DELETED 2026-05-12. Snapshot: `~/env_backups/radiance_ros_4060_2026-05-12/`. |
+
+The live publisher subprocess (`dynamic_gs/utils/live_shm_reader.py`) is now spawned via `bash -c "source /opt/ros/noetic/setup.bash && export PYTHONNOUSERSITE=1 && exec <env_py> ..."`. The `PYTHONNOUSERSITE=1` is critical — without it, user-local Python 3.8 site-packages (~/.local/lib/python3.8/site-packages) shadow the env's pyrender/urdfpy and the publisher fails on `from OpenGL.GL import *` since user-local pyrender pre-dates the OpenGL install.
+
+URDF restoration (2026-05-14): The publisher's URDF FK needs `camera_pose_link` defined as a `<link>` in the gripper URDF. The current on-disk URDF (`dynaarm_with_gripper_for_gazebo_only_no_wrist_collision.urdf` in `~/dev/teleop/catkin_ws/src/.../dynaarm_description/urdf/`) had `camera_pose_link` removed at some point. The 2026-05-04 historic version (from VS Code history `~/.config/Code/User/History/-45f4ea38/KHwu.urdf`) has the link plus the `libactive_camera_arm_link_pose_publisher.so` Gazebo plugin that publishes `/dynaarm_arm/dynaarm_arm/camera1/gazebo_pose`. The autonomous run restored that version (backup in `.bak_*`). Also created path-symlinks: `dynaarm_description/urdf/dynamic_gaussian_splat/dynaarm_with_gripper_for_gazebo_only_no_wrist_collision.urdf` and `active_camera_arm_gazebo/worlds/dynamic_gaussian_splat/empty_world.world` (the publisher expects these under `dynamic_gaussian_splat/` subdirs that didn't exist).
+
+Legacy teleop workflows that referenced `radiance_ros` (`ns-ros-save`, `ns-ros splatfacto`, `save_data_img_depth_mask_pose.py`, `joint_state_merger.py`, and the catkin build artifacts in `~/dev/teleop/catkin_ws/build/` + `~/Documents/dynamic_gaussian_splat/build/`) are broken until that env is recreated from the snapshot. Note that `live_ros_publisher.py` (which DOES still work via `dynamic_gs_ros`) imports `save_data_img_depth_mask_pose.py` as a helper module — only the helper functions are exercised, not the script's `__main__` flow.
+
+Note: `radiance_ros` and `radiance_ros_4060` were hardlinked clones — when both existed, `du -sh` per-env was misleading (one got credit for the shared ~13 GB, the other appeared small). Deleting one alone freed only the ~5 GB unique to it; deleting both freed ~10–11 GB total once the conda pkgs cache was purged.
 
 ## Running
 
@@ -579,15 +757,22 @@ D0 bootstrap (Path A, post-optimization):
 |   `D0.1f_post_save` | ≈0.21 s with debug saves on, ≈0 s off |
 | `D0.6_fp_init` | ≈milliseconds — picks the pre-built tracker from `_fp_trackers_by_instance` (constructed in Phase 0b) and seeds `pose_last`. Set `fp_init_refine_iter>0` to add per-iteration `track_one` cost on D0. |
 
-Per-frame averages in the dynamic loop (DN, with default `save_debug_images=True`):
+Per-frame averages in the dynamic loop (DN). Numbers from 2026-05-14 live autonomous run on RTX 5070 Ti (native sm_120, `save_debug_images=False`, stationary robot in front of Coke can, default tracker TAPIR).
 
 | Substep | Time/frame | Notes |
 |---|---|---|
-| `DN.8_debug_images` | ≈600 ms | Disk I/O — set `save_debug_images=False` to drop to ≈0 |
-| `DN.3_fp_track` | ≈64 ms | FoundationPose `track_one` (refiner forward, no RANSAC) |
-| `DN.7_change_mask_cdn` | ≈240 ms | MSSIM + cleanup; uses `_compute_change_mask` (pipeline) which still calls the full `build_change_mask` recipe |
-| `DN.5_render_rdn` | ≈15 ms | gsplat rasterize |
-| `DN.6_render_object_mask` | ≈3 ms | object-only rasterize |
+| `DN.3_cotracker_motion` (=TAPIR) | mean 47.4 ms, median 46 ms, p10 33 / p90 61 ms | TAPIR BootsTAPIR causal `predictor_forward` (DN.3c = 390 ms warm-up-skewed mean over 3 ticks → steady-state ≈46 ms from 141 runtime emissions). Faster than CoTracker 51 ms baseline; ~16 ms faster than KLT 56 ms baseline. |
+| `DN.5_render_rdn` | ≈15 ms | gsplat rasterize (unchanged) |
+| `DN.6_render_object_mask` | ≈3 ms | object-only rasterize (unchanged) |
+| `DN.7_change_mask_cdn` | N/A this run | Stationary-robot run never tripped CDN >threshold so MSSIM compute was never invoked. The historical ≈240 ms hotspot only appears with real scene motion. |
+| `DN.8_debug_images` | 0 ms | gated off via `save_debug_images=False` |
+
+Live tracker rate (autonomous run, 141 samples, ROS publish at 5 Hz):
+- Mean **9.85 Hz**, median **9.80 Hz**, p90 **10.5 Hz**, max **11.1 Hz**
+- 97.9 % of samples ≥ 9 Hz; 42.6 % ≥ 10 Hz
+- Was 6.6 Hz with KLT default + PTX-translated SAM3D env (pre-2026-05-13)
+- Was ≈4-5 Hz user-reported live regime before this work
+- The 4-5 Hz floor mentioned in earlier hotspot analysis was a function of two compounding factors: PTX-translated CUDA kernels (~10× slower than native) AND CDN-MSSIM in steady-state motion. Switching to native sm_120 + TAPIR brought stationary-robot live to ≈10 Hz; CDN-MSSIM optimization is still pending for runs with actual scene motion.
 
 (`DN.1_sam2_live_propagation` no longer exists — SAM2 was removed; the
 projected object-Gaussian mask carries the object exclusion alone.)
@@ -600,10 +785,11 @@ Per-frame dynamic training step (50 steps/frame):
 
 **Hotspot summary (open work — see "Dynamic Tracking Roadmap" below):**
 
-1. **`DN.3_fp_track`** — FoundationPose `track_one` (refiner forward at `fp_track_refine_iter=2`). FP is stateful (`pose_last` is cached and refined per frame), so there's no per-frame D0 encoder cost or RANSAC step. Per-frame cost is dominated by the refiner + scorer forward.
-2. **`DN.7_change_mask_cdn`** ≈240 ms — MSSIM compute. Cleanup recipe is already collapsed to one scipy.label, but the 3-level multiscale SSIM convolutions still dominate.
+1. **`DN.3_cotracker_motion`** (=TAPIR after 2026-05-14) ≈47 ms steady-state — biggest tick cost. Already faster than CoTracker (51 ms) and KLT (56 ms). Further reduction would need TAPIR encoder/transformer optimization (e.g. `predictor_iters` reduction or input downsample).
+2. **`DN.7_change_mask_cdn`** ≈240 ms (historical) — MSSIM compute. Did NOT trigger in the 2026-05-14 stationary-robot run (no scene motion ⇒ no real change mask compute). Re-measure on a run with active scene motion before applying any optimization variant.
 3. **`DN.8_debug_images`** ≈600 ms — pure disk I/O. Already gated by `save_debug_images=False` for production runs.
-4. **`S0.2_sam3d_multi_generation`** ≈380 s for 4 objects — dominated by SAM3D inference, cached on re-runs.
+4. **`S0.3_fusion_obj_*` CPD** — 421-490 s for ONE object on 554k SAM3D source × 29k scene target. Severe outlier. The probreg CPD complexity is O(source × target × iterations). Voxel-downsampling the source pre-CPD to e.g. 50k would reduce this 10×. Tracked as a future optimization; for now Phase 0b dominates startup time (~8 min/object).
+5. **`S0.2_sam3d_multi_generation`** ≈380 s for 4 objects (CLAUDE.md baseline, PTX) — should be 5-10× faster on native sm_120 in `sam3_dynamic_gs`; not re-measured this run because Phase 0a was cached.
 
 #### Known timing instrumentation notes
 
@@ -785,7 +971,7 @@ The data root must contain two subdirectories:
 For live robot teleoperation data:
 ```bash
 source /path/to/devel/setup.bash
-conda activate radiance_ros
+conda activate radiance_ros   # NOTE: deleted on 2026-05-12. Recreate from ~/env_backups/radiance_ros_2026-05-12/ before running these scripts.
 python scripts/save_data_img_depth_mask_pose.py    # Collects RGB, depth, gripper mask, camera poses
 python scripts/joint_state_merger.py               # Merges robot + gripper joint states
 ```
@@ -836,7 +1022,7 @@ The method currently uses `NoSaveTrainer`, so checkpoint saving is intentionally
 
 - **`sam-3d-objects/`**: SAM3D model for single-view 3D object reconstruction from RGB + mask. Uses `pipeline_runtime_small.yaml`. Required checkpoints: `ss_generator`, `slat_generator`, `ss_decoder`, `slat_decoder_gs`. The mesh decoder, GS4 decoder, and `ss_encoder` are not used. Multi-object path (`run_sam3d_multi_object`) loads the model once and processes masks sequentially on the full image (no cropping).
 - **SAM3** ([github.com/facebookresearch/sam3](https://github.com/facebookresearch/sam3)): Text-prompted segmentation for Phase 0 object discovery. Requires separate conda env `sam3_dynamic_gs` (Python 3.12+, PyTorch 2.7+, CUDA 12.6+) because the training env is incompatible. Invoked via `conda run -n sam3_dynamic_gs python`.
-- **FoundationPose** ([github.com/NVlabs/FoundationPose](https://github.com/NVlabs/FoundationPose)): Cloned at `third_party/FoundationPose/`. Weights at `third_party/FoundationPose/weights/{2023-10-28-18-33-37,2024-01-11-20-02-45}/model_best.pth`. Runtime deps in `radiance_ros` env: `torch + cu118` matching nvcc 11.8 (installed into the env via `conda-forge cuda-nvcc`), `nvdiffrast` (built from source against torch 2.1/cu118), `pytorch3d` (already there), `kornia`, `warp-lang`, `transformations`, `ruamel.yaml`, `pyrender`. The native `mycpp` extension is built per-Python-version via `cmake .. -DPYTHON_EXECUTABLE=...`; both `mycpp.cpython-38-*.so` (radiance_ros) and `mycpp.cpython-311-*.so` (foundationpose env) coexist in `mycpp/build/`.
+- **FoundationPose** ([github.com/NVlabs/FoundationPose](https://github.com/NVlabs/FoundationPose)): Cloned at `third_party/FoundationPose/`. Weights at `third_party/FoundationPose/weights/{2023-10-28-18-33-37,2024-01-11-20-02-45}/model_best.pth`. Runtime deps were installed in `radiance_ros` (**deleted 2026-05-12** — snapshot at `~/env_backups/radiance_ros_2026-05-12/`): `torch + cu118` matching nvcc 11.8 (installed into the env via `conda-forge cuda-nvcc`), `nvdiffrast` (built from source against torch 2.1/cu118), `pytorch3d` (already there), `kornia`, `warp-lang`, `transformations`, `ruamel.yaml`, `pyrender`. The native `mycpp` extension is built per-Python-version via `cmake .. -DPYTHON_EXECUTABLE=...`; the `mycpp.cpython-38-*.so` and `mycpp.cpython-311-*.so` builds in `mycpp/build/` survive env deletion but will need rebuild against any replacement env's Python version. Note: the current default tracker on `klt` branch is the KLT optical-flow tracker, which does not depend on FoundationPose.
 - **SAM2**: **Deactivated** in the current pipeline. The previous code path (live-mask propagation D(N-1)→DN to gate the change mask) was made redundant by FoundationPose's stateful pose tracking — the projected object-Gaussian mask after the rigid transform now drives the change-mask exclusion alone. The wrapper file `dynamic_gs/utils/sam2.py` is kept on disk but is no longer imported or referenced by `dynamic_gs_pipeline.py`, `dynamic_gs_model.py`, or `dynamic_gs/utils/__init__.py`.
 - **ESAM**: Interactive segmentation model for frame 0 object mask extraction.
 - **PROBREG / Open3D**: Used in `sam3d_fusion.py` for point cloud registration and CPD-based similarity refinement.
