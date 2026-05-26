@@ -460,53 +460,14 @@ class XFeatMotionEstimator:
             if current_object_mask is not None else None
         )
 
-        # Per-frame post-match filter region. Composes:
-        #   keep_region = gripper_keep ∩ dilate(rendered_object_mask, R)
-        # The rendered object mask shows where the model THINKS the object
-        # is now; the real object may have moved up to one tick's worth of
-        # pixels since the last successful update. Dilating by R px gives
-        # XFeat+LighterGlue a search radius around the prediction. When the
-        # object hasn't moved this collapses back to roughly the object
-        # silhouette (plus R-px halo) → matches are still object-focused.
-        # The PREVIOUS design pre-masked the current image (zeroed every
-        # pixel outside this region BEFORE the XFeat extract). That worked
-        # only for stationary objects; the moment the true object moved
-        # outside the rendered-mask region the pre-mask blacked out the
-        # actual surface and XFeat found zero keypoints there. Filtering
-        # AFTER the match is gentler: XFeat extracts on the full frame,
-        # LighterGlue rejects ambiguous background pairs via attention, and
-        # only matches whose current-frame pixel falls inside the dilated
-        # region survive to Kabsch.
-        if obj_mask_for_debug is not None and self._object_search_radius_px > 0:
-            ksize = 2 * self._object_search_radius_px + 1
-            dilated_obj = cv2.dilate(
-                obj_mask_for_debug.astype(np.uint8),
-                np.ones((ksize, ksize), np.uint8),
-                iterations=1,
-            ).astype(bool)
-        else:
-            dilated_obj = obj_mask_for_debug
-        if gripper_keep_np is not None and dilated_obj is not None:
-            keep_region = gripper_keep_np & dilated_obj
-        elif dilated_obj is not None:
-            keep_region = dilated_obj
-        else:
-            keep_region = gripper_keep_np
-
-        # Pre-mask the current image with the dilated keep region so XFeat's
-        # top_k keypoint budget is spent on the object's predicted search
-        # halo, not the whole frame. ``_pre_mask_image`` only zeros pixels
-        # — the returned ``image_size`` stays at the full live-frame (W, H),
-        # so LighterGlue's positional encoding receives the natural-image
-        # coord system. The post-match filter on ``keep_region`` then
-        # double-gates surviving matches (no-op given the pre-mask, but
-        # cheap and defensive).
-        if keep_region is not None:
-            current_rgb_for_extract = self._pre_mask_image(
-                current_rgb_prepared, keep_region, erode_px=5,
-            )
-        else:
-            current_rgb_for_extract = current_rgb_prepared
+        # Per-frame post-match filter region. With the per-tick object
+        # mask removed, this is just ``gripper_keep`` — matches that
+        # land on the gripper get dropped, everything else is kept.
+        # XFeat extracts globally on the full frame; LighterGlue relies
+        # on its transformer attention to reject ambiguous background
+        # pairs. RANSAC handles whatever outliers slip through.
+        keep_region = gripper_keep_np
+        current_rgb_for_extract = current_rgb_prepared
 
         # --- Sub-timing: XFeat extract on the current frame ---
         # Reports as ``xfeat_extract`` (sparse XFeat NN forward + .cpu() pull of

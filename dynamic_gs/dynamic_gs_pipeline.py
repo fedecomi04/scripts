@@ -133,6 +133,16 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     are flagged different above ``static_convergence_rgb_threshold``,
     training continues. Below 1 %, transition to the dynamic phase."""
 
+    live_render_kick_every_n_ticks: int = 1
+    """Render-throttle for live tracking-only mode. Every Nth tracker
+    tick pushes a ``_force_viewer_rerender``; the others skip it.
+    Default N=1 = every tick (preserves baseline visual smoothness).
+    With ``train_lock`` removed (see NoSaveTrainer.setup), renders and
+    tracker ticks share the GPU; pushing a render every tick (N=1)
+    means GPU contention can extend per-tick CUDA work. Bump N higher
+    (e.g. 3) when you want maximum tracker rate (~30 Hz) and accept
+    coarser visual update (~10 Hz)."""
+
     live: bool = False
     """When True, run the interactive ROS-driven session before
     nerfstudio constructs the datamanager: prompt the user, capture
@@ -1470,40 +1480,25 @@ class DynamicGSPipeline(VanillaPipeline):
         else:
             current_live_rgb = self.model.get_live_rgb(batch, apply_training_downscale=False)
         self._timing["DN.3a_get_live_rgb"].append(time.time() - t)
-        # KLT samples FAST keypoints inside (eroded object ∩ gripper-keep).
-        # XFeat extracts globally then filters MATCHES inside the same
-        # region; both need the rendered object mask + gripper mask.
-        # TAPIR / CoTracker ignore the kwarg.
-        # --- Sub-timing: DN.3j object mask render + erode (XFeat/KLT only) ---
+        # KLT samples FAST keypoints inside the object mask, so it must
+        # render the mask per tick. XFeat extracts globally and relies
+        # only on gripper_keep for filtering — no per-tick object mask
+        # needed. TAPIR / CoTracker ignore the kwarg.
+        # --- Sub-timing: DN.3j object mask render + erode (KLT only) ---
         t_mask = time.time()
         current_object_mask = None
-        if tracker_kind in ("klt", "xfeat"):
-            # Cache the object mask for ``xfeat_object_mask_cache_ticks``
-            # consecutive ticks (XFeat only — KLT samples keypoints from
-            # this mask and the staleness would shift sampled locations,
-            # so KLT always re-renders). The downstream keep_region
-            # dilates by ``xfeat_object_search_radius_px`` (default 80 px),
-            # giving plenty of slack for a few ticks of object drift.
-            self._object_mask_tick_count = getattr(self, "_object_mask_tick_count", 0) + 1
-            cache_ticks = (
-                int(getattr(self.model.config, "xfeat_object_mask_cache_ticks", 1))
-                if tracker_kind == "xfeat" else 1
-            )
-            cached = getattr(self, "_cached_object_mask", None)
-            stale = (cached is None) or (self._object_mask_tick_count % max(cache_ticks, 1) == 1)
-            if stale:
-                with torch.no_grad():
-                    # Splat-rasterized mask, then eroded to keep only the inner
-                    # 85% of the area. The outer 15% is the low-opacity halo
-                    # where keypoints would land on background pixels just
-                    # outside the object's actual silhouette.
-                    current_object_mask = self.model.render_object_mask(camera).detach()
-                    current_object_mask = self._erode_mask_to_inner_fraction(
-                        current_object_mask, _TRACKER_MASK_INNER_FRACTION,
-                    )
-                self._cached_object_mask = current_object_mask
-            else:
-                current_object_mask = cached
+        if tracker_kind == "klt":
+            with torch.no_grad():
+                current_object_mask = self.model.render_object_mask(camera).detach()
+                current_object_mask = self._erode_mask_to_inner_fraction(
+                    current_object_mask, _TRACKER_MASK_INNER_FRACTION,
+                )
+            if current_mask is None:
+                current_mask = self.model._get_batch_mask(batch)
+        elif tracker_kind == "xfeat":
+            # XFeat path: ensure gripper_keep is available for the
+            # post-match filter inside the estimator, but skip the
+            # object-mask render entirely.
             if current_mask is None:
                 current_mask = self.model._get_batch_mask(batch)
         self._timing["DN.3j_object_mask_render"].append(time.time() - t_mask)
@@ -1582,6 +1577,16 @@ class DynamicGSPipeline(VanillaPipeline):
             motion_estimate.rotation, motion_estimate.translation,
         )
         self._timing["DN.3g_apply_transform"].append(time.time() - t)
+        # Stash per-tick inlier/correspondence so the [tracker-rate] log
+        # can show mean inlier ratio per window without re-enabling the
+        # per-frame success log (which would flood the console at 16 Hz).
+        self._last_inlier_count = int(motion_estimate.inlier_count)
+        self._last_correspondence_count = int(motion_estimate.correspondence_count)
+        if not hasattr(self, "_inlier_window"):
+            self._inlier_window = []
+            self._corr_window = []
+        self._inlier_window.append(self._last_inlier_count)
+        self._corr_window.append(self._last_correspondence_count)
         if moved_count == 0:
             CONSOLE.log(
                 f"[dynamic-gs] {tracker_label} estimated motion for {frame_name}, "
@@ -2037,6 +2042,14 @@ class DynamicGSPipeline(VanillaPipeline):
         # itself.
         if hasattr(self, "_last_tick_end_t"):
             self._timing["LIVE.between_tick_gap"].append(tick_t0 - self._last_tick_end_t)
+        # GAP.pipeline_prelude = wall-clock from train_iteration entry
+        # to actual tracker-tick start. Captures _sync_phase + the
+        # pipeline dispatch path (_dynamic_get_train_loss_dict prelude).
+        # Combined with GAP.trainer_outer_loop and GAP.pipeline_postlude
+        # (both recorded by the trainer), these three should sum to
+        # LIVE.between_tick_gap.
+        if getattr(self, "_last_iter_entry_t", None) is not None:
+            self._timing["GAP.pipeline_prelude"].append(tick_t0 - self._last_iter_entry_t)
         # --- LIVE.frame_age: how stale was the most recent ROS frame
         # at the moment we picked it up? If this is consistently
         # similar to between_tick_gap, the supply (Gazebo camera plugin)
@@ -2119,10 +2132,19 @@ class DynamicGSPipeline(VanillaPipeline):
         t0 = time.time()
         if self._sam3d_inserted and self._motion_estimator is not None:
             self._apply_motion_estimator(camera, batch)
-            # Object means just changed — force a viewer re-render
-            # immediately. Otherwise update_scene's render_freq
-            # step-count throttle caps visual update to ~0.5-2 Hz.
-            self._force_viewer_rerender()
+            # Object means just changed — force a viewer re-render.
+            # Throttled: with ``train_lock`` removed (NoSaveTrainer.setup),
+            # renders and the tracker tick now share the GPU. Rendering
+            # 789k Gaussians at 512² takes ~25 ms and stalls the next
+            # tracker tick's CUDA kernels (xfeat/match/apply roughly
+            # 2× slower under contention). Pushing every Nth tick caps
+            # render rate at tracker_rate/N, freeing GPU for the tick
+            # cadence the user actually cares about. N=3 means visual
+            # ~5-6 Hz from a ~16 Hz tracker — still smooth, and lets
+            # tick_total return to its lock-serialised baseline.
+            self._render_kick_tick = getattr(self, "_render_kick_tick", 0) + 1
+            if self._render_kick_tick % max(1, int(getattr(self.config, "live_render_kick_every_n_ticks", 3))) == 0:
+                self._force_viewer_rerender()
         self._timing["DN.3_tracker_motion"].append(time.time() - t0)
 
         # Rolling tick-rate report. Plain `print` (not CONSOLE.log) so
@@ -2192,16 +2214,40 @@ class DynamicGSPipeline(VanillaPipeline):
                     f"net+match={c:.1f} postproc={d:.1f} ransac={e:.1f} apply={g:.1f} "
                     f"estimate_total={est:.1f}  total={tot:.1f}ms"
                 )
+            # Per-window inlier/correspondence stats from the last `fresh`
+            # successful Kabsch fits. Both lists are appended only when
+            # the apply path runs (i.e. RANSAC succeeded), so the mean
+            # reflects accepted ticks only. Failed ticks (raw=0 / inliers
+            # below threshold) don't dilute the average — they show up
+            # implicitly as the gap between `fresh` and `len(inlier_win)`.
+            inlier_win = getattr(self, "_inlier_window", [])
+            corr_win = getattr(self, "_corr_window", [])
+            window_inliers = inlier_win[-fresh:] if inlier_win else []
+            window_corr = corr_win[-fresh:] if corr_win else []
+            if window_inliers:
+                in_mean = sum(window_inliers) / len(window_inliers)
+                co_mean = sum(window_corr) / len(window_corr)
+                in_min = min(window_inliers)
+                inlier_str = f" | inliers={in_mean:.0f}/{co_mean:.0f} avg (min {in_min}, n={len(window_inliers)}/{fresh})"
+            else:
+                inlier_str = " | inliers=N/A (no successful ticks)"
             print(
                 f"\n==> [tracker-rate] {hz:.1f} Hz over {elapsed:.1f}s "
                 f"({tracker_label} last={tracker_ms:.0f}ms | "
-                f"dedup {dedup_ratio*100:.0f}% | outside-tick {gap_ms:.0f}ms)"
+                f"dedup {dedup_ratio*100:.0f}% | outside-tick {gap_ms:.0f}ms"
+                f"{inlier_str})"
                 f"\n    breakdown(mean/tick over {n}): {breakdown}\n",
                 flush=True,
             )
             self._live_tick_window_t0 = now
             self._live_tick_window_count = 0
             self._live_dedup_window_count = 0
+            # Trim the inlier accumulators so they don't grow unbounded
+            # over a long live session (keep ~10 windows of history).
+            max_history = max(200, fresh * 10)
+            if len(inlier_win) > max_history:
+                self._inlier_window = inlier_win[-max_history:]
+                self._corr_window = corr_win[-max_history:]
 
         # Tracking-only mode: skip the RDN render, object mask, CDN
         # compute, and pool push. The object Gaussians have already
@@ -3515,6 +3561,9 @@ class DynamicGSPipeline(VanillaPipeline):
         live_keys = [
             ("LIVE.tick_total", "Whole-tick wall-clock (live mode only). Includes early-return ticks that didn't reach the renders."),
             ("LIVE.between_tick_gap", "**Wall-clock between consecutive ticks** (= time spent OUTSIDE _tracker_tick_live: trainer outer loop, optim step, callbacks, viewer render). Large gap + small tick_total = bottleneck is here, not in the tracker."),
+            ("GAP.trainer_outer_loop", "  -> [gap split] trainer outer loop: AFTER_TRAIN_ITERATION callbacks (splatfacto step_post_backward), writer scalars, viewer state update. Time BETWEEN train_iteration return and next train_iteration entry."),
+            ("GAP.pipeline_prelude", "  -> [gap split] pipeline-side prelude: from train_iteration entry to actual _tracker_tick_live start. Captures _sync_phase + _dynamic_get_train_loss_dict dispatch."),
+            ("GAP.pipeline_postlude", "  -> [gap split] pipeline-side postlude: from _tracker_tick_live exit to get_train_loss_dict return. Captures timing-summary check + zero-loss dummy. Sum of these three GAP.* ≈ LIVE.between_tick_gap."),
             ("LIVE.frame_dt_seq", "Stamp delta between consecutive PROCESSED ROS frames. Reflects effective camera publishing rate as seen by the consumer."),
             ("LIVE.frame_age", "Wall-clock age of the ROS frame at the moment we picked it up (now - frame.stamp)."),
             ("LIVE.peek_latest", "  -> ROS subscriber peek_latest (atomic read, should be sub-ms)"),

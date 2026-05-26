@@ -175,9 +175,9 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     # one ``TAPNextTrackingState`` instance with the LRU caches of all 12
     # TRecViT blocks, so per-frame inference is a single ``model(...)``
     # call. Same RANSAC pipeline downstream as TAPIR.
-    tapnext_query_point_count: int = 64
+    tapnext_query_point_count: int = 32
     tapnext_min_track_points: int = 12
-    tapnext_ransac_iterations: int = 128
+    tapnext_ransac_iterations: int = 32
     tapnext_ransac_inlier_threshold: float = 0.025
     """RANSAC inlier residual cap, metres. Same depth-noise rationale as
     TAPIR — sub-pixel 2D tracks back-project to mm-precision so the

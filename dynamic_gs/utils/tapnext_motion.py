@@ -110,7 +110,7 @@ class TapnextMotionEstimator:
         self.visibility_threshold = float(visibility_threshold)
 
         self._model = None
-        self._tracking_state = None  # tapnext_torch.TAPNextTrackingState
+        self._tracking_state = None  # tapnext_torch.TAPNextTrackingState (D0 anchor; reused every tick to prevent recurrent state drift)
         self._original_size: Optional[tuple[int, int]] = None  # (H, W) of input frames
 
         self._previous_rgb: Optional[Tensor] = None
@@ -198,11 +198,16 @@ class TapnextMotionEstimator:
         if rgb.shape[-1] > 3:
             rgb = rgb[..., :3]
         rgb = rgb.detach().to(self.device, dtype=torch.float32, non_blocking=True)
+        # ``initialize`` calls _prepare_tracking_rgb (CPU, [0,255]); the live
+        # tick uses _prepare_tracking_rgb_gpu ([0,1]). Normalise defensively
+        # without a host sync: divide by 255 iff the tensor is in [0,255].
+        scale = torch.where(rgb.amax() > 1.5, torch.tensor(1.0 / 255.0, device=rgb.device), torch.tensor(1.0, device=rgb.device))
+        rgb = rgb * scale
         # Permute and resize on the device.
         rgb = rgb.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
         rgb = F.interpolate(rgb, size=self.input_resolution, mode="bilinear", align_corners=True)
         rgb = rgb.permute(0, 2, 3, 1)  # [1, h, w, 3]
-        # ``get_live_rgb`` already gave us [0, 1] floats; map to [-1, 1].
+        # Map [0, 1] to [-1, 1].
         rgb = rgb * 2.0 - 1.0
         return rgb.unsqueeze(1)  # [1, 1, h, w, 3]
 
@@ -344,11 +349,18 @@ class TapnextMotionEstimator:
         timings["preprocess_frame"] = time.time() - t
         with torch.no_grad():
             t = time.time()
-            tracks, _, visible_logits, state = model(
+            # Always anchor against the D0 state — do NOT propagate the
+            # per-tick output state. TAPNext's recurrent TRecViT state
+            # accumulates small per-frame errors that walk the tracked
+            # 2D points off the true D0 pixel over many ticks; with the
+            # 3D reference pinned at D0, that drift back-projects into
+            # divergent (R, t). Reusing the D0 state means each tick is
+            # an independent "what does the current frame look like as
+            # frame 1 after D0" prediction.
+            tracks, _, visible_logits, _ = model(
                 video=frame_t, state=self._tracking_state,
             )
             timings["estimate_traj"] = time.time() - t
-            self._tracking_state = state
             # tracks: [B=1, T=1, Q, 2] with last dim = (y, x) at model resolution.
             # visible_logits: [B=1, T=1, Q, 1]. Visible iff logit > threshold.
             visibles = visible_logits[..., 0] > self.visibility_threshold

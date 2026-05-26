@@ -40,6 +40,22 @@ class NoSaveTrainer(Trainer):
         if not live_tracking_only:
             return super().train_iteration(step)
 
+        # GAP.trainer_outer_loop = wall-clock spent between the PREVIOUS
+        # train_iteration return and this entry. This is everything the
+        # Nerfstudio outer loop does between iterations: AFTER_TRAIN_ITERATION
+        # callbacks (splatfacto step_post_backward), writer scalars, viewer
+        # state update, scheduler bumps for non-tracking-only paths. With
+        # the rest of between_tick_gap accounted for by pipeline overhead
+        # (GAP.pipeline_overhead, computed in the report), this isolates
+        # the trainer's cost from the pipeline's cost.
+        iter_entry_t = time.time()
+        if hasattr(pipeline, "_timing") and hasattr(pipeline, "_last_iter_exit_t"):
+            pipeline._timing["GAP.trainer_outer_loop"].append(iter_entry_t - pipeline._last_iter_exit_t)
+        # Stash entry time so _tracker_tick_live can compute the
+        # pipeline-side prelude (sync_phase, dispatch, etc.) between
+        # train_iteration entry and the actual tracker tick.
+        pipeline._last_iter_entry_t = iter_entry_t
+
         # Tracking-only fast path. The pipeline contract for live mode is:
         #   - ``get_train_loss_dict`` fires ``_tracker_tick_live`` and
         #     ``_force_viewer_rerender`` as side effects.
@@ -56,4 +72,10 @@ class NoSaveTrainer(Trainer):
         # timing_report.txt as a sanity check.
         if hasattr(pipeline, "_timing"):
             pipeline._timing["TRAIN.tracking_only_step"].append(time.time() - t)
+            # GAP.pipeline_postlude = time spent in get_train_loss_dict
+            # AFTER _tracker_tick_live finished. This is the pipeline-side
+            # tail (timing-summary checks, return of zero loss).
+            if hasattr(pipeline, "_last_tick_end_t"):
+                pipeline._timing["GAP.pipeline_postlude"].append(time.time() - pipeline._last_tick_end_t)
+            pipeline._last_iter_exit_t = time.time()
         return loss, loss_dict, metrics_dict

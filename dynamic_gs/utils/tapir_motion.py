@@ -168,10 +168,15 @@ class TapirMotionEstimator:
         if rgb.shape[-1] > 3:
             rgb = rgb[..., :3]
         rgb = rgb.detach().to(self.device, dtype=torch.float32, non_blocking=True)
+        # ``initialize`` calls _prepare_tracking_rgb (CPU, [0,255]); the live
+        # tick uses _prepare_tracking_rgb_gpu ([0,1]). Normalise defensively
+        # without a host sync.
+        scale = torch.where(rgb.amax() > 1.5, torch.tensor(1.0 / 255.0, device=rgb.device), torch.tensor(1.0, device=rgb.device))
+        rgb = rgb * scale
         rgb = rgb.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
         rgb = F.interpolate(rgb, size=self.input_resolution, mode="bilinear", align_corners=True)
         rgb = rgb.permute(0, 2, 3, 1)  # [1, h, w, 3]
-        # get_live_rgb produces [0, 1] floats; map to [-1, 1].
+        # Map [0, 1] to [-1, 1].
         rgb = rgb * 2.0 - 1.0
         return rgb.unsqueeze(1)  # [1, 1, h, w, 3]
 
