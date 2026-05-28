@@ -173,6 +173,13 @@ class ViserDirectScene:
         self.tracked_instance_id: Optional[int] = None
         self._tracked_count = 0
         self._static_count = 0
+        # Per-FF-call insert handles: each FF call adds ONE new small
+        # handle here, never re-uploads prior ones. Capped at
+        # ``_ff_handle_cap`` — when exceeded, the oldest handle is
+        # removed to keep the scene-graph bounded.
+        self.ff_handles: list = []
+        self._ff_handle_cap = 500
+        self._ff_call_counter = 0
 
     # ------------------------------------------------------------------
     # Handle setup
@@ -480,6 +487,52 @@ class ViserDirectScene:
             f"coalesced {coalesced} FF calls)",
             flush=True,
         )
+
+    # ------------------------------------------------------------------
+    # Incremental FF-insert visualization
+    # ------------------------------------------------------------------
+    def add_ff_insert_chunk(self, model, inserted_ids) -> None:
+        """Upload JUST the splats freshly inserted by this FF call as a
+        new standalone splat handle. The handle is appended to
+        ``ff_handles``; prior handles are never re-uploaded. Per-call
+        upload is tens to hundreds of KB on the wire.
+
+        ``inserted_ids``: 1-D tensor returned by
+        ``model.insert_inpaint_gaussians`` (the index range of the new
+        splats in the now-resized ``gauss_params`` tensors).
+        """
+        if inserted_ids is None:
+            return
+        try:
+            ids = inserted_ids.detach().cpu().long() if isinstance(inserted_ids, torch.Tensor) else torch.as_tensor(inserted_ids, dtype=torch.long)
+        except Exception:
+            return
+        if ids.numel() == 0:
+            return
+        N = int(model.means.shape[0])
+        mask = torch.zeros(N, dtype=torch.bool, device=model.means.device)
+        valid = ids[(ids >= 0) & (ids < N)]
+        if valid.numel() == 0:
+            return
+        mask[valid] = True
+        chunk_name = f"/ff_inserts/call_{self._ff_call_counter:04d}"
+        self._ff_call_counter += 1
+        try:
+            handle_or_list, n_kept, _ = self._add_handle(chunk_name, model, mask)
+        except Exception as exc:
+            print(f"[viser-direct] add_ff_insert_chunk failed: {exc}", flush=True)
+            return
+        if isinstance(handle_or_list, list):
+            self.ff_handles.extend(handle_or_list)
+        else:
+            self.ff_handles.append(handle_or_list)
+        # Cap scene-graph size — remove the oldest handles past the cap.
+        while len(self.ff_handles) > self._ff_handle_cap:
+            old = self.ff_handles.pop(0)
+            try:
+                old.remove()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     def close(self) -> None:

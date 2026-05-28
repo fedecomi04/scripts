@@ -2793,6 +2793,17 @@ class DynamicGSPipeline(VanillaPipeline):
             )
             self._timing["FF.5_insert"].append(time.time() - t0)
 
+            # Viser-direct incremental FF visualization: upload JUST
+            # these new splats as a fresh standalone handle. Tiny per-call
+            # upload (~600 splats × 64 B = ~38 KB typical), no re-upload
+            # of prior inserts. See ViserDirectScene.add_ff_insert_chunk
+            # for the cap + scene-graph hygiene.
+            if getattr(self, "_viser_direct", None) is not None:
+                try:
+                    self._viser_direct.add_ff_insert_chunk(self.model, inserted_ids)
+                except Exception as exc:
+                    CONSOLE.log(f"[viser-direct] add_ff_insert_chunk failed: {exc}")
+
             n_inserted = int(inserted_ids.numel())
             total_inserted += n_inserted
             total_deleted += n_deleted
