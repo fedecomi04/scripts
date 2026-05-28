@@ -68,7 +68,7 @@ DynamicGS = MethodSpecification(
             },
         },
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-        vis="viewer",
+        vis="tensorboard",
     ),
     description="Two-phase static+dynamic Gaussian Splatting with masked mean updates and depth supervision.",
 )

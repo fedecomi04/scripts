@@ -30,6 +30,13 @@ except Exception:  # pragma: no cover - cv2 is a hard dep elsewhere in this repo
 
 from nerfstudio.utils.spherical_harmonics import RGB2SH
 
+try:
+    from scipy.ndimage import label as _scipy_label  # type: ignore
+    from scipy.ndimage import binary_erosion as _scipy_binary_erosion  # type: ignore
+    _HAS_SCIPY = True
+except Exception:  # pragma: no cover
+    _HAS_SCIPY = False
+
 
 def _camera_intrinsics(target_camera) -> tuple[float, float, float, float, int, int]:
     """Extract (fx, fy, cx, cy, width, height) from a single-frame Cameras."""
@@ -225,6 +232,11 @@ def decode_component_to_gaussians(
     normal_smoothing_radius: int = 3,
     min_valid_fraction: float = 0.95,
     thin_axis_ratio: float = 0.25,
+    scale_multiplier: float = 5.0,
+    cliff_threshold_m: float = 0.05,
+    post_cliff_erode_px: int = 1,
+    rendered_depth_m: Optional[torch.Tensor] = None,
+    leak_threshold_m: float = 0.02,
 ) -> Optional[dict]:
     """Decode the pixels of one component mask into per-pixel frozen Gaussians.
 
@@ -281,13 +293,120 @@ def decode_component_to_gaussians(
     fx, fy, cx, cy, _, _ = _camera_intrinsics(target_camera)
     c2w = _camera_c2w(target_camera).to(device=device, dtype=dtype)
 
+    # ---- Leak cut: drop pixels whose sensor depth is behind the rendered
+    # scene depth by more than `leak_threshold_m`. The sensor depth at table
+    # edges leaks into the floor behind (1-5 cm typical for RealSense/TOF),
+    # which back-projects "table" pixels behind the actual table. The
+    # rendered depth is the trusted "scene-as-it-currently-stands" surface;
+    # a legitimate new occluder appears IN FRONT of it, never behind, so
+    # we only drop pixels that are behind. 0 disables.
+    leak_dropped = 0
+    if (
+        rendered_depth_m is not None
+        and float(leak_threshold_m) > 0
+    ):
+        rd = rendered_depth_m
+        if rd.ndim == 3 and rd.shape[-1] == 1:
+            rd = rd[..., 0]
+        rd = rd.to(device=device, dtype=dtype)
+        if rd.shape != (H, W):
+            raise ValueError(
+                f"rendered_depth_m must be (H, W) or (H, W, 1); got {tuple(rendered_depth_m.shape)}"
+            )
+        # Compare ONLY where rendered depth is itself valid (rd > 0). Where
+        # rendered depth is 0 (e.g. background gaps in the splat scene), we
+        # have no reference, so we keep the sensor pixel.
+        rd_valid = rd > 0
+        behind = (gt_depth_m > rd + float(leak_threshold_m)) & rd_valid
+        new_valid = valid_mask & ~behind
+        leak_dropped = int(valid_mask.sum().item() - new_valid.sum().item())
+        valid_mask = new_valid
+        valid_count = int(valid_mask.sum().item())
+        valid_fraction = float(valid_count) / float(total_count) if total_count > 0 else 0.0
+        if valid_count == 0:
+            return {
+                "skipped": True,
+                "diagnostics": {
+                    "valid_fraction": valid_fraction,
+                    "total_pixels": total_count,
+                    "valid_pixels": valid_count,
+                    "leak_dropped": leak_dropped,
+                },
+            }
+
+    # ---- Cliff cut: drop pixels adjacent to a depth discontinuity, then
+    # re-segment so each remaining sub-component sits on one surface ----
+    # Without this, finite-difference normals at the cliff cross a 10-100 cm
+    # depth jump and the splat ends up oriented edge-on to the camera (visible
+    # as streaks). The 3D position of the cliff-adjacent splat is also bad
+    # because the smoothed depth used for normals leaks the cliff into the
+    # neighbouring pixels' orientation.
+    cliff_th = float(cliff_threshold_m)
+    erode_px = int(post_cliff_erode_px)
+    sub_component_masks: list[torch.Tensor] = []
+    cliff_dropped = 0
+    if cliff_th > 0 and _HAS_SCIPY:
+        valid_np = valid_mask.detach().cpu().numpy().astype(bool)
+        depth_np = gt_depth_m.detach().cpu().numpy()
+        # |∂depth/∂u| and |∂depth/∂v| via 1-px shifts; depth=0 (invalid) is
+        # treated as cliff to keep dropouts out of finite-diff windows.
+        du = np.zeros_like(depth_np)
+        dv = np.zeros_like(depth_np)
+        du[:, 1:] = np.abs(depth_np[:, 1:] - depth_np[:, :-1])
+        dv[1:, :] = np.abs(depth_np[1:, :] - depth_np[:-1, :])
+        # Invalid-neighbour pixels: any neighbour ≤0 → mark as cliff.
+        invalid_left = np.zeros_like(valid_np); invalid_left[:, 1:] = ~valid_np[:, :-1]
+        invalid_up = np.zeros_like(valid_np); invalid_up[1:, :] = ~valid_np[:-1, :]
+        cliff = (du > cliff_th) | (dv > cliff_th) | invalid_left | invalid_up
+        # Mirror onto the OTHER neighbour so the cliff "thickness" is 2 px (the
+        # pixel before AND after the jump are dropped — both have wrong normals).
+        cliff[:, :-1] |= cliff[:, 1:]
+        cliff[:-1, :] |= cliff[1:, :]
+        clean_np = valid_np & ~cliff
+        cliff_dropped = int(valid_np.sum() - clean_np.sum())
+        if erode_px > 0 and clean_np.any():
+            structure = np.ones((2 * erode_px + 1, 2 * erode_px + 1), dtype=bool)
+            clean_np = _scipy_binary_erosion(clean_np, structure=structure)
+        if not clean_np.any():
+            return {
+                "skipped": True,
+                "diagnostics": {
+                    "valid_fraction": valid_fraction,
+                    "total_pixels": total_count,
+                    "valid_pixels": valid_count,
+                    "cliff_dropped": cliff_dropped,
+                    "after_cliff_pixels": 0,
+                },
+            }
+        labels_np, n_sub = _scipy_label(clean_np)
+        for k in range(1, n_sub + 1):
+            sub_np = labels_np == k
+            if int(sub_np.sum()) < 8:
+                continue  # too few pixels to define a meaningful surface
+            sub_component_masks.append(
+                torch.from_numpy(sub_np).to(device=device)
+            )
+        if not sub_component_masks:
+            return {
+                "skipped": True,
+                "diagnostics": {
+                    "valid_fraction": valid_fraction,
+                    "total_pixels": total_count,
+                    "valid_pixels": valid_count,
+                    "cliff_dropped": cliff_dropped,
+                    "n_sub_components": 0,
+                },
+            }
+    else:
+        sub_component_masks = [valid_mask]
+
     # ---- Surface normals from bilateral-smoothed depth on the whole frame ----
+    # Smoothing is done once; the smoothing kernel itself won't bridge cliffs
+    # because of σ_depth=2 cm, AND the cliff pixels were already dropped above.
     depth_smoothed = _bilateral_smooth_depth(
         gt_depth_m, valid_mask=(gt_depth_m > 0),
         radius=int(normal_smoothing_radius),
     )
-
-    # Build the per-pixel XYZ grid on smoothed depth (vectorized over the full image).
     vs, us = torch.meshgrid(
         torch.arange(H, device=device, dtype=dtype),
         torch.arange(W, device=device, dtype=dtype),
@@ -302,60 +421,85 @@ def decode_component_to_gaussians(
     xyz_smooth_grid = t[None, None, :] + rays_d_un_grid * depth_smoothed[..., None]
     normals_grid = _normals_from_xyz_grid(xyz_smooth_grid)  # (H, W, 3)
 
-    # ---- Per-pixel positions from un-smoothed depth ----
-    coords = torch.nonzero(valid_mask, as_tuple=False)  # (N, 2) [v, u]
-    v_idx = coords[:, 0]
-    u_idx = coords[:, 1]
-    d_pix = gt_depth_m[v_idx, u_idx]
-    xyz_pix = _backproject_world(u_idx, v_idx, d_pix, fx, fy, cx, cy, c2w)
+    # ---- Per-sub-component decode + merge ----
+    xyz_list, dc_list, rest_list, op_list, sc_list, q_list = [], [], [], [], [], []
+    sub_diag = []
+    for sub_mask in sub_component_masks:
+        coords = torch.nonzero(sub_mask, as_tuple=False)
+        if coords.shape[0] == 0:
+            continue
+        v_idx = coords[:, 0]
+        u_idx = coords[:, 1]
+        d_pix = gt_depth_m[v_idx, u_idx]
+        xyz_pix = _backproject_world(u_idx, v_idx, d_pix, fx, fy, cx, cy, c2w)
 
-    # ---- Per-pixel colour ----
-    rgb_pix = live_rgb[v_idx, u_idx].to(dtype).clamp(0.0, 1.0)
-    features_dc = RGB2SH(rgb_pix)  # (N, 3)
-    # Splatfacto expects features_rest = (N, dim_sh - 1, 3) and our model uses
-    # sh_degree=3 → 15 rest coefficients. We zero them out.
-    sh_degree_max_coeffs = 15  # matches DynamicGSModelConfig.sh_degree=3
-    features_rest = torch.zeros(
-        (xyz_pix.shape[0], sh_degree_max_coeffs, 3), device=device, dtype=dtype
-    )
+        rgb_pix = live_rgb[v_idx, u_idx].to(dtype).clamp(0.0, 1.0)
+        features_dc = RGB2SH(rgb_pix)
+        sh_degree_max_coeffs = 15  # matches DynamicGSModelConfig.sh_degree=3
+        features_rest = torch.zeros(
+            (xyz_pix.shape[0], sh_degree_max_coeffs, 3), device=device, dtype=dtype
+        )
 
-    # ---- Per-pixel scale: pixel world footprint at this depth ----
-    scale_u = d_pix / float(fx)
-    scale_v = d_pix / float(fy)
-    scale_n = float(thin_axis_ratio) * torch.minimum(scale_u, scale_v)
-    scales_lin = torch.stack([scale_u, scale_v, scale_n], dim=-1).clamp(min=1e-6)
-    scales = torch.log(scales_lin)
+        scale_mul = float(scale_multiplier)
+        scale_u = d_pix * (scale_mul / float(fx))
+        scale_v = d_pix * (scale_mul / float(fy))
+        scale_n = float(thin_axis_ratio) * torch.minimum(scale_u, scale_v)
+        scales_lin = torch.stack([scale_u, scale_v, scale_n], dim=-1).clamp(min=1e-6)
+        scales = torch.log(scales_lin)
 
-    # ---- Per-pixel rotation aligned to the local surface normal ----
-    normals_pix = normals_grid[v_idx, u_idx]  # (N, 3)
-    # Sanitize: any zero-normal (e.g. boundary or all-zero gradient) gets +z.
-    bad = normals_pix.norm(dim=-1) < 1e-6
-    if bad.any():
-        normals_pix = normals_pix.clone()
-        normals_pix[bad] = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
-    R_pix = _rotation_from_normal(normals_pix)  # (N, 3, 3)
-    quats = _rotmat_to_wxyz(R_pix)  # (N, 4) wxyz
+        normals_pix = normals_grid[v_idx, u_idx]
+        bad = normals_pix.norm(dim=-1) < 1e-6
+        if bad.any():
+            normals_pix = normals_pix.clone()
+            normals_pix[bad] = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
+        R_pix = _rotation_from_normal(normals_pix)
+        quats = _rotmat_to_wxyz(R_pix)
 
-    # ---- Per-pixel opacity ----
-    opacity_t = torch.full(
-        (xyz_pix.shape[0], 1), float(opacity),
-        device=device, dtype=dtype,
-    ).clamp(1e-4, 1 - 1e-4)
-    opacities = torch.logit(opacity_t)
+        opacity_t = torch.full(
+            (xyz_pix.shape[0], 1), float(opacity),
+            device=device, dtype=dtype,
+        ).clamp(1e-4, 1 - 1e-4)
+        opacities = torch.logit(opacity_t)
+
+        xyz_list.append(xyz_pix)
+        dc_list.append(features_dc)
+        rest_list.append(features_rest)
+        op_list.append(opacities)
+        sc_list.append(scales)
+        q_list.append(quats)
+        sub_diag.append({
+            "pixels": int(xyz_pix.shape[0]),
+            "depth_min_m": float(d_pix.min().item()),
+            "depth_max_m": float(d_pix.max().item()),
+        })
+
+    if not xyz_list:
+        return {
+            "skipped": True,
+            "diagnostics": {
+                "valid_fraction": valid_fraction,
+                "total_pixels": total_count,
+                "valid_pixels": valid_count,
+                "cliff_dropped": cliff_dropped,
+                "n_sub_components": 0,
+            },
+        }
 
     return {
         "skipped": False,
-        "xyz": xyz_pix,
-        "features_dc": features_dc,
-        "features_rest": features_rest,
-        "opacities": opacities,
-        "scales": scales,
-        "quats": quats,
+        "xyz": torch.cat(xyz_list, dim=0),
+        "features_dc": torch.cat(dc_list, dim=0),
+        "features_rest": torch.cat(rest_list, dim=0),
+        "opacities": torch.cat(op_list, dim=0),
+        "scales": torch.cat(sc_list, dim=0),
+        "quats": torch.cat(q_list, dim=0),
         "diagnostics": {
             "valid_fraction": valid_fraction,
             "total_pixels": total_count,
             "valid_pixels": valid_count,
-            "depth_min_m": float(d_pix.min().item()),
-            "depth_max_m": float(d_pix.max().item()),
+            "leak_dropped": leak_dropped,
+            "cliff_dropped": cliff_dropped,
+            "n_sub_components": len(sub_diag),
+            "sub": sub_diag,
         },
     }

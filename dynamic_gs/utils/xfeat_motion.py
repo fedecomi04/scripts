@@ -350,8 +350,19 @@ class XFeatMotionEstimator:
         seed_mask_np = (
             self._mask_to_numpy(mask, rgb_t.shape[:2]) if mask is not None else None
         )
-        masked_rgb = self._pre_mask_image(rgb_t, seed_mask_np, erode_px=5)
-        keypoints, descriptors, keypoints_gpu, image_size = self._extract(masked_rgb)
+        # Extract XFeat features on the FULL image (NOT pre-masked).
+        # Pre-masking by zeroing pixels outside the mask used to be the seed
+        # path here, but XFeat's descriptors include a local image patch
+        # around each keypoint. At the object boundary that patch would span
+        # half "real pixels" / half "zeros" — completely different from the
+        # per-tick descriptors at the same locations (which have "real
+        # background" in the same patch). LighterGlue then can't match seed
+        # vs per-tick descriptors and returns 0 correspondences (especially
+        # for small objects like a fidget spinner, where most keypoints are
+        # boundary keypoints). After extraction, _restrict_depth_valid_to_image_mask
+        # filters keypoints to those inside the seed mask, so the anchor's
+        # descriptor pool stays object-focused.
+        keypoints, descriptors, keypoints_gpu, image_size = self._extract(rgb_t)
         if keypoints.shape[0] < self.min_track_points:
             self.last_init_fast_point_count = int(keypoints.shape[0])
             self.last_init_sampled_count = int(keypoints.shape[0])

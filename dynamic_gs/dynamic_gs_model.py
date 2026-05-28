@@ -73,7 +73,7 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     before convergence checks fire."""
 
     change_mask_depth_threshold: float = 0.02
-    change_mask_rgb_threshold: float = 0.10
+    change_mask_rgb_threshold: float = 0.07
     change_mask_use_rgb: bool = False
     change_mask_blur_kernel_size: int = 5
     change_mask_blur_sigma: float = 1.0
@@ -83,6 +83,21 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     rigid_inlier_threshold: float = 1e-4
     use_sam3d_object_init: bool = True
     reuse_sam3d_generated_ply: bool = True
+    # SAM3D Phase-0b registration backend. "cpd" = probreg coherent point drift
+    # (legacy, robust but slow — 400-500 s/object on large clouds). "teaser" =
+    # color-aware FPFH correspondences + TEASER++ truncated-least-squares solver
+    # (fast, outlier-robust; expects teaserpp_python installed). Both produce a
+    # similarity_transform 4x4 with the same downstream contract.
+    sam3d_registration_backend: Literal["cpd", "teaser"] = "cpd"
+    # TEASER++ tuning (only consulted when sam3d_registration_backend == "teaser").
+    # noise_bound is metric meters — the per-correspondence inlier tolerance.
+    sam3d_teaser_noise_bound: float = 0.02
+    sam3d_teaser_max_correspondences: int = 5000
+    sam3d_teaser_fpfh_normal_radius_mult: float = 2.0
+    sam3d_teaser_fpfh_feature_radius_mult: float = 5.0
+    # Color weight in the matching descriptor. 0.0 = geometry-only FPFH, 1.0 =
+    # color-only. Mid values blend L2-normalised FPFH with normalised RGB.
+    sam3d_teaser_color_weight: float = 0.3
     enable_dynamic_mean_optimization: bool = False
     # 2D point tracker = XFeat sparse + LighterGlue + Kabsch-RANSAC.
     # The pipeline samples 2D points at D0, back-projects via depth,
@@ -102,8 +117,7 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     # L2-normalised 64-D descriptors. Bench on RTX 5070 Ti (native
     # cu128): sparse 1280x720 ~7 ms end-to-end (extract A + extract B +
     # match). Semi-dense (XFeat*) at the same res takes ~12 ms - to try
-    # it, swap match_xfeat for match_xfeat_star in xfeat_motion.py.
-    # L2-normalised 64-D descriptors. Bench on RTX 5070 Ti (native
+    # it, swap match_xfeat for match_xfeat_star in xfeat_motion.    # L2-normalised 64-D descriptors. Bench on RTX 5070 Ti (native
     # cu128): sparse 1280x720 ~7 ms end-to-end (extract A + extract B +
     # match). Semi-dense (XFeat*) at the same res takes ~12 ms - to try
     # it, swap match_xfeat for match_xfeat_star in xfeat_motion.py.
@@ -172,6 +186,13 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     by ``xfeat_object_search_radius_px`` (default 80 px), so even a
     stale mask still encloses the true object location for the few-tick
     window. Set to 1 to disable the cache (re-render every tick)."""
+    xfeat_d0_seed_mask_raw: bool = True
+    """When True (default), the D0 XFeat reference seed samples features from
+    the full rendered object mask (rasterized ``object_flags > 0.5`` Gaussians)
+    WITHOUT the inner-85% erosion or the gripper-keep AND. Set False to restore
+    the legacy filtered behavior. The filtered version drops too much area for
+    thin/gripped objects (e.g. a fidget spinner being held), leaving only a
+    sliver of pixels which then can't produce matchable XFeat descriptors."""
     xfeat_object_search_radius_px: int = 80
     """Dilation radius (pixels) applied to the rendered object mask before
     using it as the per-frame post-match filter on the current frame. The
@@ -712,8 +733,17 @@ class DynamicGSModel(SplatfactoModel):
         return object_count
 
     @torch.no_grad()
+    def _tracked_object_mask(self) -> "torch.Tensor":
+        """Mask of Gaussians the rigid tracker should move: ``object_flags=1``
+        AND ``instance_id != 999`` — excludes feedforward-decoded inpaint
+        patches (instance 999) so adding inserts doesn't invalidate the
+        reference-pose count and silently freeze the can."""
+        of = self.object_flags.squeeze(-1) > 0.5
+        ids = self.object_instance_ids.squeeze(-1)
+        return of & (ids != 999)
+
     def capture_reference_object_pose(self) -> int:
-        object_mask = self.object_flags.squeeze(-1) > 0.5
+        object_mask = self._tracked_object_mask()
         object_count = int(object_mask.sum().item())
         if object_count == 0:
             self._reference_object_means = None
@@ -725,7 +755,7 @@ class DynamicGSModel(SplatfactoModel):
 
     @torch.no_grad()
     def apply_rigid_object_transform_from_reference(self, rotation, translation) -> int:
-        object_mask = self.object_flags.squeeze(-1) > 0.5
+        object_mask = self._tracked_object_mask()
         object_count = int(object_mask.sum().item())
         if object_count == 0:
             return 0
@@ -1451,6 +1481,14 @@ class DynamicGSModel(SplatfactoModel):
             debug_dir=image_debug_dir,
             artifact_dir=artifact_dir,
             output_stem=output_stem,
+            registration_backend=self.config.sam3d_registration_backend,
+            teaser_params={
+                "noise_bound": self.config.sam3d_teaser_noise_bound,
+                "max_correspondences": self.config.sam3d_teaser_max_correspondences,
+                "normal_radius_mult": self.config.sam3d_teaser_fpfh_normal_radius_mult,
+                "feature_radius_mult": self.config.sam3d_teaser_fpfh_feature_radius_mult,
+                "color_weight": self.config.sam3d_teaser_color_weight,
+            },
         )
         t_registration = time.time() - _t
 
@@ -1861,7 +1899,11 @@ class DynamicGSModel(SplatfactoModel):
             K = scaled_camera.get_intrinsics_matrices().to(self.device)
             width, height = int(scaled_camera.width.item()), int(scaled_camera.height.item())
 
-            obj_mask = self.object_flags.squeeze(-1) > 0.5
+            # Tracked-object Gaussians only. Feedforward inserts (instance_id=999)
+            # also carry object_flags=1 but are static patches, not part of the
+            # moving object — including them here makes the object mask grow with
+            # every insert, which corrupts CDN exclusion and the dual debug pair.
+            obj_mask = self._tracked_object_mask()
             if not obj_mask.any():
                 return torch.zeros(height, width, 1, device=self.device)
 

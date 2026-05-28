@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 import torch
 
-SAM3D_REPO_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "sam-3d-objects"
+SAM3D_REPO_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "Fast-SAM3D"
 SAM3D_CONFIG_PATH = SAM3D_REPO_ROOT / "checkpoints" / "hf" / "pipeline.yaml"
 SAM3D_RUNTIME_CONFIG_PATH = SAM3D_REPO_ROOT / "checkpoints" / "hf" / "pipeline_runtime_small.yaml"
 
@@ -159,6 +159,18 @@ def _write_runtime_config() -> Path:
     config.compile_model = False
     config.dtype = "float16"
     config.depth_model.device = "cpu"
+    # Fast-SAM3D's bundled config hard-codes an author-machine absolute path
+    # (/data3/wmq/.../moge-vitl/model.pt) for the MoGe depth model. Override
+    # with the HF repo id so MoGeModel.from_pretrained downloads it (or hits
+    # the local HF cache at ~/.cache/huggingface/hub/models--Ruicheng--moge-vitl).
+    # MoGe is bypassed at inference time when we pass `pointmap=...` explicitly,
+    # but the model still gets constructed at Inference.__init__ time.
+    config.depth_model.model.pretrained_model_name_or_path = "Ruicheng/moge-vitl"
+    # Fast-SAM3D resolves sub-config + ckpt paths via
+    # `os.path.join(workspace_dir, <relative_path>)`. Default workspace_dir
+    # is "" so paths get resolved against process cwd (= scripts/) where the
+    # YAMLs don't live. Point workspace_dir at the YAML directory.
+    config.workspace_dir = str(SAM3D_CONFIG_PATH.parent.resolve())
     # SAM3D mesh decoder: FoundationPose needs a triangle mesh, but the
     # mesh decoder's 256^3 FlexiCubes grid (~740 MB) plus the rest of the
     # SAM3D pipeline pushes peak GPU usage past 8 GiB. The user's fork
@@ -167,9 +179,18 @@ def _write_runtime_config() -> Path:
     # mesh-only post-pass is implemented (or a larger GPU is available),
     # decode gaussian only. The FP tracker will warn and skip when no
     # mesh PLY is found in `phase0_manifest.json`.
+    # Decode Gaussian-only to avoid the mesh decoder's OOM (per user note:
+    # "if also the other one was outputted then it would OOM"). The upstream
+    # bug where outputs["mesh"] is read unconditionally was patched in
+    # inference_pipeline_pointmap.py (guard with `if "mesh" in outputs`).
     config.decode_formats = ["gaussian"]
-    config.slat_decoder_mesh_config_path = None
-    config.slat_decoder_mesh_ckpt_path = None
+    # Fast-SAM3D bug: init_slat_decoder_mesh() does not None-guard like
+    # init_slat_decoder_gs() does, so setting *_mesh paths to None crashes
+    # with a bare FileNotFoundError. Provide the paths even though we only
+    # decode "gaussian" — the mesh decoder loads into memory but is never
+    # invoked during inference.
+    config.slat_decoder_mesh_config_path = "slat_decoder_mesh.yaml"
+    config.slat_decoder_mesh_ckpt_path = "slat_decoder_mesh.ckpt"
     config.slat_decoder_gs_4_config_path = None
     config.slat_decoder_gs_4_ckpt_path = None
     OmegaConf.save(config, SAM3D_RUNTIME_CONFIG_PATH)
@@ -417,6 +438,10 @@ def run_sam3d_single_object(
 
     runtime_config_path = _write_runtime_config()
     Inference = _import_official_api()
+    # Fast-SAM3D's Inference.__init__ requires a loaded DictConfig (see notes
+    # at the multi-object path). Load once and reuse across resize attempts.
+    from omegaconf import OmegaConf as _OmegaConf
+    runtime_config_obj = _OmegaConf.load(str(runtime_config_path))
     used_shape = None
 
     output = None
@@ -444,7 +469,20 @@ def run_sam3d_single_object(
 
         inference = None
         try:
-            inference = Inference(str(runtime_config_path), compile=False)
+            inference = Inference(runtime_config_obj, compile=False)
+            # See multi-object path for hfer_2d / params notes (upstream issue #9 + get_params contract).
+            inference.hfer_2d = 0
+            inference._pipeline.hfer_2d = 0
+            inference._pipeline.ss_params = {
+                "ss_faster_stride": 3, "ss_warmup": 2, "ss_order": 1, "ss_momentum_beta": 0.5,
+            }
+            inference._pipeline.slat_params = {
+                "slat_thresh": 0.5, "slat_warmup": 2, "slat_token_ratio": 0.15,
+            }
+            inference._pipeline.mesh_params = {
+                "mesh_spectral_threshold_low": 0.5, "mesh_spectral_threshold_high": 0.7,
+            }
+            inference._pipeline.enable_mesh = False
             if resized_pointmap is not None:
                 pm = resized_pointmap
                 if not isinstance(pm, torch.Tensor):
@@ -599,15 +637,44 @@ def run_sam3d_multi_object(
     runtime_config_path = _write_runtime_config()
     Inference = _import_official_api()
 
+    # Fast-SAM3D's Inference.__init__ expects a loaded DictConfig (it calls
+    # `config.rendering_engine = ...` directly). The previous sam-3d-objects
+    # API accepted a path string. Load via OmegaConf so the same call works.
+    from omegaconf import OmegaConf as _OmegaConf
+    runtime_config_obj = _OmegaConf.load(str(runtime_config_path))
+
     # Load model once
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     inference = None
     try:
-        inference = Inference(str(runtime_config_path), compile=False)
+        inference = Inference(runtime_config_obj, compile=False)
     except Exception as exc:
         raise RuntimeError(f"Failed to load SAM3D model: {exc}") from exc
+
+    # Fast-SAM3D's inference_pipeline_pointmap.run() reads `self.hfer_2d`
+    # without checking if it was set. Issue #9 in the upstream repo confirms
+    # this — the maintainer's downstream function signature
+    # (inference_pipeline.py:685) accepts `hfer_2d=0` as a default, so setting
+    # 0 here is consistent with their "feature inactive" path.
+    inference.hfer_2d = 0
+    inference._pipeline.hfer_2d = 0
+    # Fast-SAM3D's run() also reads ss_params / slat_params / mesh_params /
+    # enable_mesh from the pipeline. These are populated by the upstream's
+    # get_params() helper from CLI argparse defaults — we replicate the
+    # "all-accel disabled, baseline path" defaults so the run() reads
+    # don't AttributeError.
+    inference._pipeline.ss_params = {
+        "ss_faster_stride": 3, "ss_warmup": 2, "ss_order": 1, "ss_momentum_beta": 0.5,
+    }
+    inference._pipeline.slat_params = {
+        "slat_thresh": 0.5, "slat_warmup": 2, "slat_token_ratio": 0.15,
+    }
+    inference._pipeline.mesh_params = {
+        "mesh_spectral_threshold_low": 0.5, "mesh_spectral_threshold_high": 0.7,
+    }
+    inference._pipeline.enable_mesh = False
 
     all_results: list[Dict[str, Path]] = []
     try:
@@ -803,6 +870,10 @@ def run_sam3d_multi_object_subprocess(
             f"STDERR:\n{completed.stderr}"
         )
 
+    # Diagnostic: log STDERR so silent failures (rc=0 but no PLY written) are visible.
+    if completed.stderr.strip():
+        print(f"[sam3d-multi-launcher] subprocess STDERR (rc=0):\n{completed.stderr}", file=sys.stderr)
+
     # Rebuild output paths from stems
     all_results: list[Dict[str, Path]] = []
     for stem in output_stems:
@@ -946,7 +1017,22 @@ def _main() -> int:
             )
         return 0
     except Exception as exc:  # pragma: no cover - CLI convenience
+        import traceback as _tb
         print(f"SAM3D worker failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print("--- full traceback ---", file=sys.stderr)
+        _tb.print_exc(file=sys.stderr)
+        # If this is a Hydra InstantiationException, the underlying cause is
+        # usually the real FileNotFoundError with the missing path. Hydra
+        # swallows the path in str(exc); chain the __cause__ to surface it.
+        cause = getattr(exc, "__cause__", None)
+        depth = 0
+        while cause is not None and depth < 8:
+            print(f"--- chained cause [{depth}] {type(cause).__name__}: {cause}", file=sys.stderr)
+            inner_tb = getattr(cause, "__traceback__", None)
+            if inner_tb is not None:
+                _tb.print_tb(inner_tb, file=sys.stderr)
+            cause = getattr(cause, "__cause__", None)
+            depth += 1
         return 1
 
 

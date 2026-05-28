@@ -96,6 +96,29 @@ def keep_largest_component(mask):
     return torch.from_numpy(keep_np).to(device=mask.device).float()[..., None]
 
 
+def keep_all_components_above_min_area(mask, min_area):
+    """Drop connected components below ``min_area`` but keep ALL surviving ones.
+
+    Sibling of ``keep_largest_component_with_min_area`` for callers that need
+    multi-component output (e.g. the feedforward closed-loop path, where every
+    changed region should be back-projected, not just the largest).
+    """
+    mask = _to_hw1(mask)
+    binary = mask[..., 0] > 0.5
+    if not torch.any(binary):
+        return torch.zeros_like(mask)
+    labels_np, num = _scipy_label(binary.detach().cpu().numpy())
+    if num == 0:
+        return torch.zeros_like(mask)
+    areas = np.bincount(labels_np.ravel(), minlength=num + 1)
+    areas[0] = 0
+    keep_labels = np.where(areas >= int(min_area))[0]
+    if keep_labels.size == 0:
+        return torch.zeros_like(mask)
+    keep_np = np.isin(labels_np, keep_labels)
+    return torch.from_numpy(keep_np).to(device=mask.device).float()[..., None]
+
+
 def keep_largest_component_with_min_area(mask, min_area):
     """Combined `remove_small_components(min_area)` + `keep_largest_component`.
 
@@ -313,17 +336,16 @@ def _threshold_mask(score, valid_mask, threshold):
     return mask.float()[..., None]
 
 
-def _apply_cleanup_recipe(mask, valid_mask=None, close_radius=0, open_radius=0, min_area=1):
+def _apply_cleanup_recipe(mask, valid_mask=None, close_radius=0, open_radius=0, min_area=1, keep_largest_only=True):
     cleaned = _to_hw1(mask)
     if close_radius > 0:
         cleaned = close_binary_mask(cleaned, close_radius)
     if open_radius > 0:
         cleaned = open_binary_mask(cleaned, open_radius)
-    # Combined "drop tiny + keep largest" — one scipy.label CPU round-trip
-    # instead of two. The caller in `prepare_dynamic_update` skips the
-    # outer `keep_largest_component` when no dilation runs in between,
-    # because this already produces the single largest component.
-    cleaned = keep_largest_component_with_min_area(cleaned, min_area)
+    if keep_largest_only:
+        cleaned = keep_largest_component_with_min_area(cleaned, min_area)
+    else:
+        cleaned = keep_all_components_above_min_area(cleaned, min_area)
     if valid_mask is not None:
         cleaned = cleaned * _to_hw1(valid_mask)
     if torch.any(cleaned):
@@ -344,6 +366,7 @@ def build_change_mask(
     blur_sigma=1.0,
     filter_radius=1,
     min_component_size=64,
+    keep_largest_only=True,
 ):
     """Build the dynamic-gs change mask.
 
@@ -377,6 +400,7 @@ def build_change_mask(
         close_radius=OFFICIAL_FILTER_CLOSE_RADIUS,
         open_radius=OFFICIAL_FILTER_OPEN_RADIUS,
         min_area=OFFICIAL_FILTER_MIN_AREA,
+        keep_largest_only=keep_largest_only,
     )
     final_mask = filtered_mask
     if valid_mask is not None:

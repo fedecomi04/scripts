@@ -38,6 +38,11 @@ try:
 except ImportError:  # pragma: no cover - training env dependency
     cpd = None
 
+try:
+    import teaserpp_python as _teaserpp
+except ImportError:  # pragma: no cover - optional registration backend
+    _teaserpp = None
+
 SAM3D_P3D_TO_NS_CAMERA = np.diag([-1.0, 1.0, -1.0]).astype(np.float32)
 
 
@@ -495,6 +500,426 @@ def _build_explicit_correspondences(
     return o3d_mod.utility.Vector2iVector(pair_array), int(len(pair_array))
 
 
+def _l2_normalize_rows(arr: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    return arr / np.maximum(norms, eps)
+
+
+def _multiscale_fpfh_descriptors(
+    points: np.ndarray,
+    colors: np.ndarray,
+    voxel_size: float,
+    normal_radius_mult: float,
+    feature_radius_mults: list[float],
+    color_weight: float,
+    fpfh_max_nn: int = 500,
+    normal_max_nn: int = 30,
+) -> np.ndarray:
+    """Concatenate FPFH descriptors at multiple radii (each L2-normalised) with optional color block."""
+    o3d = _require_open3d()
+    pcd = _to_pcd(points, colors)
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=normal_radius_mult * voxel_size, max_nn=normal_max_nn
+        )
+    )
+    blocks: list[np.ndarray] = []
+    geom_weight = (1.0 - color_weight) / max(len(feature_radius_mults), 1)
+    for mult in feature_radius_mults:
+        fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+            pcd,
+            o3d.geometry.KDTreeSearchParamHybrid(
+                radius=mult * voxel_size, max_nn=fpfh_max_nn
+            ),
+        )
+        fpfh_arr = np.asarray(fpfh.data).T.astype(np.float32)
+        blocks.append(_l2_normalize_rows(fpfh_arr) * geom_weight)
+    if color_weight > 0:
+        blocks.append(_l2_normalize_rows(colors.astype(np.float32)) * color_weight)
+    return np.concatenate(blocks, axis=1)
+
+
+def _euclidean_nn_correspondences(
+    src_pts: np.ndarray,
+    tgt_pts: np.ndarray,
+    max_dist: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Mutual NN in 3D space with a distance threshold. Used for post-TEASER reprojection."""
+    from scipy.spatial import cKDTree
+
+    tree_tgt = cKDTree(tgt_pts)
+    tree_src = cKDTree(src_pts)
+    d_st, nn_t_for_s = tree_tgt.query(src_pts, k=1)
+    _, nn_s_for_t = tree_src.query(tgt_pts, k=1)
+    idx_s = np.arange(len(src_pts))
+    keep = (nn_s_for_t[nn_t_for_s] == idx_s) & (d_st < max_dist)
+    return idx_s[keep], nn_t_for_s[keep]
+
+
+def _estimate_normals_np(points: np.ndarray, voxel_size: float, normal_max_nn: int = 30) -> np.ndarray:
+    """Open3D normal estimation -> (N, 3) float32 numpy array. Orientation is unconstrained."""
+    o3d = _require_open3d()
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=2.0 * voxel_size, max_nn=normal_max_nn
+        )
+    )
+    return np.asarray(pcd.normals, dtype=np.float32)
+
+
+def _normal_consistency_filter(
+    src_normals: np.ndarray,
+    tgt_normals: np.ndarray,
+    src_idx: np.ndarray,
+    tgt_idx: np.ndarray,
+    max_deg: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Drop correspondences whose source/target normals disagree by more than max_deg degrees.
+
+    Uses |cos_sim| because Open3D normal orientation is ambiguous (no consistent
+    tangent-plane orientation is applied for speed).
+    """
+    cos_thresh = float(np.cos(np.deg2rad(max_deg)))
+    sn = src_normals[src_idx]
+    tn = tgt_normals[tgt_idx]
+    cos_sim = np.abs(np.einsum("ij,ij->i", sn, tn))
+    keep = cos_sim > cos_thresh
+    return src_idx[keep], tgt_idx[keep]
+
+
+def _teaser_solve_xyz(
+    src_xyz: np.ndarray, dst_xyz: np.ndarray, noise_bound: float,
+) -> tuple[np.ndarray, float]:
+    """Run TEASER on already-paired (3, N) correspondences. Returns (similarity_4x4, scale)."""
+    if _teaserpp is None:
+        return np.eye(4, dtype=np.float32), 1.0
+    params = _teaserpp.RobustRegistrationSolver.Params()
+    params.noise_bound = float(noise_bound)
+    params.cbar2 = 1.0
+    params.estimate_scaling = True
+    params.rotation_estimation_algorithm = (
+        _teaserpp.RotationEstimationAlgorithm.GNC_TLS
+    )
+    params.rotation_gnc_factor = 1.4
+    params.rotation_max_iterations = 100
+    params.rotation_cost_threshold = 1e-6
+    solver = _teaserpp.RobustRegistrationSolver(params)
+    solver.solve(src_xyz, dst_xyz)
+    sol = solver.getSolution()
+    T = _compose_similarity_transform(
+        float(sol.scale),
+        np.asarray(sol.rotation, dtype=np.float64),
+        np.asarray(sol.translation, dtype=np.float64),
+    )
+    return T.astype(np.float32), float(sol.scale)
+
+
+def _run_icp_polish(
+    src_pts: np.ndarray,
+    tgt_pts: np.ndarray,
+    init_T: np.ndarray,
+    voxel_size: float,
+    max_corr_dist_mult: float = 2.0,
+    iterations: int = 50,
+) -> tuple[np.ndarray, dict]:
+    """Point-to-plane ICP polish. Source/target are pre-paired clouds in world coords;
+    init_T is the transform you'd apply to (un-pre-aligned) source to land near target.
+
+    Returns (refined_T, meta). meta has fitness and inlier_rmse from Open3D.
+    """
+    o3d = _require_open3d()
+    src = o3d.geometry.PointCloud()
+    src.points = o3d.utility.Vector3dVector(src_pts.astype(np.float64))
+    tgt = o3d.geometry.PointCloud()
+    tgt.points = o3d.utility.Vector3dVector(tgt_pts.astype(np.float64))
+    nrm = o3d.geometry.KDTreeSearchParamHybrid(radius=2.0 * voxel_size, max_nn=30)
+    src.estimate_normals(nrm)
+    tgt.estimate_normals(nrm)
+    icp = o3d.pipelines.registration.registration_icp(
+        src, tgt,
+        max_correspondence_distance=max_corr_dist_mult * voxel_size,
+        init=init_T.astype(np.float64),
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=iterations),
+    )
+    return np.asarray(icp.transformation, dtype=np.float32), {
+        "fitness": float(icp.fitness),
+        "inlier_rmse": float(icp.inlier_rmse),
+        "max_corr_dist_mult": float(max_corr_dist_mult),
+        "iterations": int(iterations),
+    }
+
+
+def _color_aware_fpfh_descriptors(
+    points: np.ndarray,
+    colors: np.ndarray,
+    voxel_size: float,
+    normal_radius_mult: float,
+    feature_radius_mult: float,
+    color_weight: float,
+    fpfh_max_nn: int = 100,
+    normal_max_nn: int = 30,
+) -> np.ndarray:
+    """Returns an (N, 33+3) descriptor: L2-normalised FPFH * (1-w) concatenated with L2-normalised RGB * w.
+
+    ``fpfh_max_nn`` caps how many neighbors FPFH actually integrates over. Open3D
+    uses Hybrid kNN+radius search, so if the cloud is dense the radius is silently
+    capped at max_nn (default 100 was hiding the radius knob on dense clouds).
+    """
+    o3d = _require_open3d()
+    pcd = _to_pcd(points, colors)
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=normal_radius_mult * voxel_size, max_nn=normal_max_nn
+        )
+    )
+    fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        pcd,
+        o3d.geometry.KDTreeSearchParamHybrid(
+            radius=feature_radius_mult * voxel_size, max_nn=fpfh_max_nn
+        ),
+    )
+    fpfh_arr = np.asarray(fpfh.data).T.astype(np.float32)  # (N, 33)
+    fpfh_norm = _l2_normalize_rows(fpfh_arr) * (1.0 - color_weight)
+    rgb_norm = _l2_normalize_rows(colors.astype(np.float32)) * color_weight
+    return np.concatenate([fpfh_norm, rgb_norm], axis=1)
+
+
+def _mutual_nearest_neighbor(
+    feat_a: np.ndarray,
+    feat_b: np.ndarray,
+    ratio_thresh: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Returns (idx_a, idx_b) of mutual nearest-neighbor matches between rows of feat_a and feat_b.
+
+    If ``ratio_thresh`` is given, applies Lowe's ratio test on the a->b side:
+    a query is only kept when its 1st-NN distance is < ratio_thresh * 2nd-NN distance.
+    """
+    from scipy.spatial import cKDTree
+
+    tree_b = cKDTree(feat_b)
+    tree_a = cKDTree(feat_a)
+
+    if ratio_thresh is None:
+        _, nn_b_for_a = tree_b.query(feat_a, k=1)
+        keep_a = np.ones(len(feat_a), dtype=bool)
+    else:
+        dists, top2 = tree_b.query(feat_a, k=2)
+        nn_b_for_a = top2[:, 0]
+        keep_a = dists[:, 0] < ratio_thresh * np.maximum(dists[:, 1], 1e-12)
+
+    _, nn_a_for_b = tree_a.query(feat_b, k=1)
+    idx_a = np.arange(len(feat_a))
+    mutual = (nn_a_for_b[nn_b_for_a] == idx_a) & keep_a
+    return idx_a[mutual], nn_b_for_a[mutual]
+
+
+def _run_teaser_similarity_refinement(
+    source_points: np.ndarray,
+    source_colors: np.ndarray,
+    target_points: np.ndarray,
+    target_colors: np.ndarray,
+    init_transform: np.ndarray,
+    voxel_size: float,
+    *,
+    noise_bound: float = 0.02,
+    max_correspondences: int = 5000,
+    normal_radius_mult: float = 2.0,
+    feature_radius_mult: float = 5.0,
+    color_weight: float = 0.3,
+    fpfh_max_nn: int = 100,
+    normal_max_nn: int = 30,
+    ratio_thresh: float | None = None,
+    multi_scale_radii: list[float] | None = None,
+    normal_filter_deg: float | None = None,
+) -> tuple[np.ndarray, int, dict]:
+    """Returns (refined_transform, correspondence_count, teaser_meta).
+
+    teaser_meta keys:
+      noise_bound          – configured per-correspondence inlier tolerance (m)
+      fpfh_correspondences – mutual-NN match count before subsampling
+      used_correspondences – actual count fed to the TEASER solver
+      scale                – recovered similarity scale (1.0 if scale estimation off)
+      stop_reason          – "ok" if solve returned, "skipped" if backend unavailable
+                             or too few correspondences, "exception" on solver error
+    """
+    _empty_meta: dict = {
+        "noise_bound": float(noise_bound),
+        "fpfh_correspondences": 0,
+        "used_correspondences": 0,
+        "scale": 1.0,
+        "stop_reason": "skipped",
+    }
+
+    if _teaserpp is None:
+        return init_transform.astype(np.float32), 0, _empty_meta
+    if len(source_points) < 3 or len(target_points) < 3:
+        return init_transform.astype(np.float32), 0, _empty_meta
+
+    transformed_source = _transform_points(source_points, init_transform)
+    if len(source_colors) != len(transformed_source):
+        source_colors = np.full((len(transformed_source), 3), 0.5, dtype=np.float32)
+    if len(target_colors) != len(target_points):
+        target_colors = np.full((len(target_points), 3), 0.5, dtype=np.float32)
+
+    if multi_scale_radii is not None and len(multi_scale_radii) > 1:
+        src_feat = _multiscale_fpfh_descriptors(
+            transformed_source, source_colors, voxel_size,
+            normal_radius_mult, multi_scale_radii, color_weight,
+            fpfh_max_nn=fpfh_max_nn, normal_max_nn=normal_max_nn,
+        )
+        dst_feat = _multiscale_fpfh_descriptors(
+            target_points, target_colors, voxel_size,
+            normal_radius_mult, multi_scale_radii, color_weight,
+            fpfh_max_nn=fpfh_max_nn, normal_max_nn=normal_max_nn,
+        )
+    else:
+        src_feat = _color_aware_fpfh_descriptors(
+            transformed_source, source_colors, voxel_size,
+            normal_radius_mult, feature_radius_mult, color_weight,
+            fpfh_max_nn=fpfh_max_nn, normal_max_nn=normal_max_nn,
+        )
+        dst_feat = _color_aware_fpfh_descriptors(
+            target_points, target_colors, voxel_size,
+            normal_radius_mult, feature_radius_mult, color_weight,
+            fpfh_max_nn=fpfh_max_nn, normal_max_nn=normal_max_nn,
+        )
+
+    src_idx, dst_idx = _mutual_nearest_neighbor(src_feat, dst_feat, ratio_thresh=ratio_thresh)
+    n_after_mutual = int(len(src_idx))
+
+    if normal_filter_deg is not None and len(src_idx) >= 3:
+        src_normals = _estimate_normals_np(transformed_source, voxel_size, normal_max_nn=normal_max_nn)
+        tgt_normals = _estimate_normals_np(target_points, voxel_size, normal_max_nn=normal_max_nn)
+        src_idx, dst_idx = _normal_consistency_filter(
+            src_normals, tgt_normals, src_idx, dst_idx, max_deg=normal_filter_deg,
+        )
+    fpfh_correspondences = int(len(src_idx))
+    if fpfh_correspondences < 3:
+        meta = dict(_empty_meta, fpfh_correspondences=fpfh_correspondences, stop_reason="too_few_correspondences")
+        return init_transform.astype(np.float32), fpfh_correspondences, meta
+
+    if fpfh_correspondences > max_correspondences:
+        rng = np.random.default_rng(0)
+        sub = rng.choice(fpfh_correspondences, size=max_correspondences, replace=False)
+        src_idx = src_idx[sub]
+        dst_idx = dst_idx[sub]
+
+    src_xyz = transformed_source[src_idx].T.astype(np.float64)  # (3, N)
+    dst_xyz = target_points[dst_idx].T.astype(np.float64)
+
+    params = _teaserpp.RobustRegistrationSolver.Params()
+    params.noise_bound = float(noise_bound)
+    params.cbar2 = 1.0
+    params.estimate_scaling = True
+    params.rotation_estimation_algorithm = (
+        _teaserpp.RotationEstimationAlgorithm.GNC_TLS
+    )
+    params.rotation_gnc_factor = 1.4
+    params.rotation_max_iterations = 100
+    params.rotation_cost_threshold = 1e-6
+
+    try:
+        solver = _teaserpp.RobustRegistrationSolver(params)
+        solver.solve(src_xyz, dst_xyz)
+        solution = solver.getSolution()
+    except Exception:  # noqa: BLE001 - solver wraps C++ exceptions
+        return (
+            init_transform.astype(np.float32),
+            fpfh_correspondences,
+            dict(_empty_meta, fpfh_correspondences=fpfh_correspondences, stop_reason="exception"),
+        )
+
+    teaser_transform = _compose_similarity_transform(
+        float(solution.scale),
+        np.asarray(solution.rotation, dtype=np.float64),
+        np.asarray(solution.translation, dtype=np.float64),
+    )
+    refined_transform = teaser_transform @ init_transform.astype(np.float32)
+
+    meta = {
+        "noise_bound": float(noise_bound),
+        "fpfh_correspondences": fpfh_correspondences,
+        "after_mutual_match": n_after_mutual,
+        "used_correspondences": int(len(src_idx)),
+        "scale": float(solution.scale),
+        "stop_reason": "ok",
+        "fpfh_max_nn": int(fpfh_max_nn),
+        "ratio_thresh": None if ratio_thresh is None else float(ratio_thresh),
+        "multi_scale_radii": list(multi_scale_radii) if multi_scale_radii else None,
+        "normal_filter_deg": None if normal_filter_deg is None else float(normal_filter_deg),
+    }
+    return refined_transform.astype(np.float32), int(len(src_idx)), meta
+
+
+def _run_teaser_reproject_refinement(
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+    init_transform: np.ndarray,
+    voxel_size: float,
+    *,
+    noise_bound: float = 0.005,
+    max_corr_dist_mult: float = 3.0,
+    max_correspondences: int = 5000,
+) -> tuple[np.ndarray, int, dict]:
+    """Second TEASER pass using Euclidean NN correspondences in 3D.
+
+    Use this AFTER a first TEASER pass has produced an init_transform that's
+    already close. We apply init_transform to source, then build mutual nearest
+    neighbor correspondences in 3D space within ``max_corr_dist_mult * voxel_size``,
+    then re-solve with TEASER on those geometric pairs.
+    """
+    empty_meta = {
+        "noise_bound": float(noise_bound),
+        "geom_correspondences": 0,
+        "used_correspondences": 0,
+        "max_corr_dist_mult": float(max_corr_dist_mult),
+        "stop_reason": "skipped",
+    }
+    if _teaserpp is None:
+        return init_transform.astype(np.float32), 0, empty_meta
+    if len(source_points) < 3 or len(target_points) < 3:
+        return init_transform.astype(np.float32), 0, empty_meta
+
+    aligned_src = _transform_points(source_points, init_transform)
+    max_dist = max_corr_dist_mult * voxel_size
+    src_idx, tgt_idx = _euclidean_nn_correspondences(aligned_src, target_points, max_dist)
+    n_corr = int(len(src_idx))
+    if n_corr < 3:
+        meta = dict(empty_meta, geom_correspondences=n_corr, stop_reason="too_few_correspondences")
+        return init_transform.astype(np.float32), n_corr, meta
+
+    if n_corr > max_correspondences:
+        rng = np.random.default_rng(0)
+        sub = rng.choice(n_corr, size=max_correspondences, replace=False)
+        src_idx = src_idx[sub]
+        tgt_idx = tgt_idx[sub]
+
+    src_xyz = aligned_src[src_idx].T.astype(np.float64)
+    dst_xyz = target_points[tgt_idx].T.astype(np.float64)
+    try:
+        delta_T, scale = _teaser_solve_xyz(src_xyz, dst_xyz, noise_bound)
+    except Exception:
+        return (
+            init_transform.astype(np.float32),
+            n_corr,
+            dict(empty_meta, geom_correspondences=n_corr, stop_reason="exception"),
+        )
+
+    final_T = delta_T @ init_transform.astype(np.float32)
+    meta = {
+        "noise_bound": float(noise_bound),
+        "geom_correspondences": n_corr,
+        "used_correspondences": int(len(src_idx)),
+        "max_corr_dist_mult": float(max_corr_dist_mult),
+        "delta_scale": float(scale),
+        "stop_reason": "ok",
+    }
+    return final_T.astype(np.float32), int(len(src_idx)), meta
+
+
 def _run_probreg_similarity_refinement(
     source_points: np.ndarray,
     source_colors: np.ndarray,
@@ -562,7 +987,7 @@ def _run_probreg_similarity_refinement(
             maxiter=_MAXITER,
             tol=_TOL,
             w=0.5,
-            use_color=False,
+            use_color=True,
             callbacks=[_iter_cb],
         )
     except Exception:
@@ -600,6 +1025,8 @@ def register_and_fuse_sam3d_object(
     debug_dir: Path | None = None,
     artifact_dir: Path | None = None,
     output_stem: str | None = None,
+    registration_backend: str = "cpd",
+    teaser_params: dict | None = None,
 ) -> Sam3DInsertionResult:
     if len(source_points) == 0:
         raise ValueError("SAM3D source point cloud is empty.")
@@ -643,17 +1070,42 @@ def register_and_fuse_sam3d_object(
     target_down_points, target_down_colors = _voxel_downsample(target_points, target_colors, voxel_size)
     t_voxel_downsample = time.time() - _t
 
-    # --- TIMING: D0.3b3 probreg CPD similarity refinement (up to _MAXITER iterations, early-stop at _TOL) ---
+    # --- TIMING: D0.3b3 similarity refinement (backend = "cpd" probreg CPD, or "teaser" color-aware FPFH + TEASER++) ---
     _t = time.time()
     similarity_transform = np.eye(4, dtype=np.float32)
-    similarity_transform, similarity_correspondence_count, cpd_meta = _run_probreg_similarity_refinement(
-        source_down_points,
-        source_down_colors,
-        target_down_points,
-        target_down_colors,
-        similarity_transform,
-        voxel_size,
-    )
+    if registration_backend == "teaser":
+        tp = teaser_params or {}
+        similarity_transform, similarity_correspondence_count, refinement_meta = _run_teaser_similarity_refinement(
+            source_down_points,
+            source_down_colors,
+            target_down_points,
+            target_down_colors,
+            similarity_transform,
+            voxel_size,
+            noise_bound=float(tp.get("noise_bound", 0.02)),
+            max_correspondences=int(tp.get("max_correspondences", 5000)),
+            normal_radius_mult=float(tp.get("normal_radius_mult", 2.0)),
+            feature_radius_mult=float(tp.get("feature_radius_mult", 5.0)),
+            color_weight=float(tp.get("color_weight", 0.3)),
+            fpfh_max_nn=int(tp.get("fpfh_max_nn", 100)),
+            normal_max_nn=int(tp.get("normal_max_nn", 30)),
+            ratio_thresh=tp.get("ratio_thresh", None),
+        )
+        refinement_meta_key = "D0.3b3_teaser_meta"
+    elif registration_backend == "cpd":
+        similarity_transform, similarity_correspondence_count, refinement_meta = _run_probreg_similarity_refinement(
+            source_down_points,
+            source_down_colors,
+            target_down_points,
+            target_down_colors,
+            similarity_transform,
+            voxel_size,
+        )
+        refinement_meta_key = "D0.3b3_cpd_meta"
+    else:
+        raise ValueError(
+            f"Unknown SAM3D registration backend: {registration_backend!r}. Expected 'cpd' or 'teaser'."
+        )
     t_cpd_refinement = time.time() - _t
 
     # --- TIMING: D0.3b4 explicit correspondence building (KD-tree per-point search) ---
@@ -742,8 +1194,9 @@ def register_and_fuse_sam3d_object(
         timing={
             "D0.3b1_nn_distances": t_nn_distances,
             "D0.3b2_voxel_downsample": t_voxel_downsample,
-            "D0.3b3_cpd_refinement": t_cpd_refinement,
-            "D0.3b3_cpd_meta": cpd_meta,
+            "D0.3b3_refinement": t_cpd_refinement,
+            "D0.3b3_backend": registration_backend,
+            refinement_meta_key: refinement_meta,
             "D0.3b4_correspondences": t_correspondences,
             "D0.3b5_dedup": t_dedup,
             "D0.3b6_plot_and_save": t_plot_and_save,

@@ -42,6 +42,39 @@ from .utils.sam3d import (
 )
 
 
+def _ensure_sam3_subprocess_env() -> None:
+    """Ensure CONDA_PREFIX and PATH are set so the SAM3 / SAM3D
+    subprocesses launched via ``conda run -n sam3_dynamic_gs`` work
+    when ``ns-train dynamic-gs`` is invoked directly (i.e. without the
+    ``run_mode_b.sh`` wrapper, e.g. ``ns-train dynamic-gs --live``).
+
+    - Fast-SAM3D's worker reads ``$CONDA_PREFIX`` at import time to find
+      ``CUDA_HOME``; it must point at the *sam3_dynamic_gs* env, not at
+      whatever env the trainer was launched from.
+    - ``conda run -n <env> ...`` needs ``conda`` on PATH.
+
+    Both can be overridden by exporting ``DYNAMIC_GS_SAM3_CONDA_PREFIX``
+    / ``DYNAMIC_GS_CONDA_BIN`` before launch.
+    """
+    sam3_env = os.environ.get(
+        "DYNAMIC_GS_SAM3_CONDA_PREFIX",
+        "/home/mrc-cuhk/miniconda3/envs/sam3_dynamic_gs",
+    )
+    conda_bin = os.environ.get(
+        "DYNAMIC_GS_CONDA_BIN",
+        "/home/mrc-cuhk/miniconda3/bin",
+    )
+    if Path(sam3_env).exists():
+        os.environ["CONDA_PREFIX"] = sam3_env
+    if Path(conda_bin).exists():
+        current_path = os.environ.get("PATH", "")
+        if conda_bin not in current_path.split(os.pathsep):
+            os.environ["PATH"] = f"{conda_bin}{os.pathsep}{current_path}"
+
+
+_ensure_sam3_subprocess_env()
+
+
 @dataclass
 class DynamicGSPipelineConfig(VanillaPipelineConfig):
     _target: Type = field(default_factory=lambda: DynamicGSPipeline)
@@ -143,7 +176,24 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     (e.g. 3) when you want maximum tracker rate (~30 Hz) and accept
     coarser visual update (~10 Hz)."""
 
-    live: bool = False
+    # ------------------------------------------------------------------
+    # Viser-direct visualization (Path A, hybrid). When enabled, the
+    # pipeline spins up a standalone viser server and pushes per-object
+    # rigid transforms there each tracker tick — the browser does the
+    # WebGL splatting, freeing the training GPU. Use with --vis=tensorboard
+    # so Nerfstudio's viewer isn't also rendering. The static handle is
+    # re-uploaded after each FF call (count changed). See dynamic_gs/utils/
+    # viser_direct.py.
+    # ------------------------------------------------------------------
+    enable_viser_direct: bool = True
+    """Spin up a standalone viser server and push per-object rigid
+    transforms each tracker tick. Browser does WebGL splatting; training
+    GPU does not render for the viewer. Use with ``--vis=tensorboard``."""
+    viser_direct_port: int = 8081
+    """Port for the standalone viser server when ``enable_viser_direct=True``.
+    Open http://localhost:<port> in a browser to view."""
+
+    live: bool = True
     """When True, run the interactive ROS-driven session before
     nerfstudio constructs the datamanager: prompt the user, capture
     SAM3 + SAM3D outputs, record static views to disk, build the
@@ -174,7 +224,7 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     # Feedforward hole-fill (RGB-D decode) — see docs/feedforward_dev_design.md
     # and the plan at ~/.claude/plans/eventual-gliding-quilt.md
     # ------------------------------------------------------------------
-    enable_feedforward_inpaint: Literal["off", "rgbd_decode"] = "off"
+    enable_feedforward_inpaint: Literal["off", "rgbd_decode"] = "rgbd_decode"
     """When != "off", route hole-fill through the feedforward path
     instead of (or in addition to) the optim pool. Auto-implies
     ``disable_dynamic_optimization`` semantics for the dynamic phase
@@ -185,20 +235,16 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     this dynamic-phase step, select the top ``feedforward_top_n_components``
     CDN components of the latest pool entry and inpaint each. Set to
     0 to disable Mode A (e.g. when running Mode B alone)."""
-    feedforward_recurring_every_n_ticks: int = 0
+    feedforward_recurring_every_n_ticks: int = 3
     """Mode B trigger cadence (>0 enables; 0 disables). Every Nth
-    tracker tick, inpaint all components passing
-    ``feedforward_min_component_area``. Set to 0 to disable Mode B
-    (e.g. when running Mode A alone)."""
+    tracker tick, inpaint every CDN component that survived the cleanup
+    recipe (760-px floor). Set to 0 to disable Mode B."""
     feedforward_top_n_components: int = 3
     """Mode A: take at most this many components, sorted by area."""
     feedforward_dominant_area_ratio: float = 0.3
     """Mode A: drop a top-N component whose area is below this fraction
     of the largest component's area. 0.0 disables the dominance filter
     (used by Mode B)."""
-    feedforward_min_component_area: int = 1500
-    """Skip any component with fewer than this many pixels. Applied
-    regardless of mode."""
     feedforward_anchor_frame: Optional[int] = None
     """Dataset frame index used as the fixed anchor camera pose for
     the recorded video. None → ``_accepted_dynamic_frames[-1]``."""
@@ -220,10 +266,96 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     """Bilateral-filter radius (pixels) on the depth map used for the
     per-pixel surface-normal computation. The un-smoothed depth is
     still used for position."""
+    feedforward_rgbd_leak_threshold_m: float = 0.01
+    """Per-pixel leak filter. A sensor-depth pixel is dropped if it sits
+    more than this many metres BEHIND the rendered scene depth at the
+    same pixel. Sensor depth near a depth edge typically leaks into the
+    surface behind by 1-5 cm (RealSense / TOF), producing per-pixel
+    Gaussians that hang behind the actual surface. Only "behind" leaks
+    are dropped — a legitimate new occluder appears IN FRONT of the
+    rendered surface, never behind, so the asymmetry is safe. 0 disables."""
+    feedforward_rgbd_cliff_threshold_m: float = 0.05
+    """Adjacent-pixel depth jump (metres) treated as a discontinuity. The
+    decoder drops pixels straddling such cliffs (both sides), re-segments
+    the component into per-surface sub-components, and decodes each
+    independently. Prevents per-pixel splats at table edges from inheriting
+    a normal that crosses the cliff (which renders as a streak). 0 disables."""
+    feedforward_rgbd_post_cliff_erode_px: int = 1
+    """Extra erosion (pixels) applied to each sub-component after the
+    cliff cut. Removes the last row of pixels whose 3-pixel normal
+    smoothing window still touches the cliff. 0 disables."""
+    feedforward_rgbd_scale_multiplier: float = 5.0
+    """Multiplier on the per-pixel world-space scale (``depth/fx``).
+    ``depth/fx`` alone gives one pixel's *width* at that depth, which
+    renders as a sub-pixel splat that vanishes from any view farther
+    than the source camera (this was the "Mode A doesn't change the
+    scene" failure). ``5.0`` makes one source pixel cover ~5 px at the
+    source depth and ≥1 px from cameras up to ~5× farther."""
     feedforward_object_mask_dilate_px: int = 2
     """Dilation applied to the current rendered object mask before it
     is subtracted from CDN. Covers tracker-edge slack so we don't
     back-project the live object's surface as flat patches."""
+    feedforward_cull_in_front: bool = True
+    """Per-component, before inserting new feedforward Gaussians, project
+    every existing Gaussian (instance_id in {0, 999}) to the camera. For
+    those whose 2D footprint lands in the component AND whose camera-z depth
+    is more than ``feedforward_cull_in_front_depth_tol_m`` in FRONT of the
+    sensor depth at that pixel, delete them. Stops floating
+    artifacts from re-triggering CDN every tick (the loop can't stabilise
+    by adding more Gaussians if a front-floater is what's occluding the
+    true surface). Tracked-object Gaussians (instance_ids != 0 and != 999)
+    are never touched. Defaults to True."""
+    feedforward_cull_in_front_depth_tol_m: float = 0.001
+    """Depth tolerance for the cull-in-front filter. A Gaussian is dropped
+    iff ``D_g < D_sensor - this_tol``. 5 mm by default — strict enough to
+    catch real floaters, loose enough to leave the legitimate surface
+    Gaussians (which sit ~depth_unit_scale_factor = 1 mm in front)."""
+    feedforward_skip_delete: bool = True
+    """If True, ``_run_feedforward`` does not delete existing Gaussians
+    in the component footprint — pure additive correction. Inserts
+    naturally self-stabilize as the rendered scene begins to match the
+    live image (next-tick CDN shrinks at correctly-filled regions).
+    Set False to restore the legacy delete-then-insert behavior."""
+    feedforward_anchor_z_offset_m: float = 0.0
+    """Pull the anchor camera back along its local +z axis (the OpenGL
+    "behind the camera" direction) by this many metres. Use a positive
+    value (e.g. 0.5) to zoom the comparison-video viewpoint OUT so the
+    whole table fits in frame."""
+    feedforward_cdn_downsample_factor: int = 0
+    """Integer downsample factor applied to (render, live) RGB before the
+    feedforward CDN MS-SSIM compute. **0 = auto** (compute from frame size
+    via ``feedforward_cdn_target_mssim_side``, keeps the MSSIM pixel count
+    constant across resolutions). 1 = off (native resolution). 2 = half
+    each side. The output mask is nearest-upsampled back to native. Use
+    a non-zero value to ignore small details (specular shimmer, sensor
+    noise, tracker-edge jitter) so the detector only fires on big holes."""
+    feedforward_cdn_target_mssim_side: int = 100
+    """Used when ``feedforward_cdn_downsample_factor=0`` (auto mode). The
+    auto-computed DS = ``max(1, int(sqrt(H * W) / target_side))``, which
+    scales the downsample factor with the geometric mean of the image
+    dimensions so the MSSIM compute always runs on roughly
+    ``target_side * target_side`` pixels regardless of native resolution
+    or aspect ratio. Default 100 = ~10k MSSIM pixels (matches the
+    calibrated DS=8 at 800x800 that produced good ablation results)."""
+    feedforward_cdn_keep_largest_only: bool = False
+    """When False (default for closed-loop Mode B), the CDN cleanup keeps
+    EVERY connected component above the min-area threshold instead of
+    only the single largest. Set True to revert to the legacy single-
+    component behavior. Only affects the feedforward path's CDN compute."""
+    feedforward_save_debug_pair: bool = False
+    """When True, save a per-tick pair of debug PNGs into
+    ``<data_root>/dynamic_scene/debug/feedforward/``:
+      ``<frame>_a_render_overlays.png`` — render + CDN (red) + gripper/object (black)
+      ``<frame>_b_real.png`` — the raw live RGB
+    Designed for fast A/B flipping in an image viewer."""
+
+    save_change_detection_masks: bool = False
+    """Diagnostic: when True, save the render-with-CDN-overlay PNG for
+    every tracker tick (including frames the keyframe filter rejected
+    and frames below the min-change-pixels gate) into
+    ``<data_root>/dynamic_scene/change_detection_masks/``. Forces CDN
+    compute even in tracking-only mode. Used to visually verify the
+    change-detection signal across the full dynamic phase."""
 # Fraction of the splat-rasterized object mask kept after distance-transform
 # erosion before passing to the tracker. 0.85 = keep the inner 85% of the
 # area, drop the boundary 15% — the low-opacity halo where keypoints would
@@ -434,6 +566,26 @@ class DynamicGSPipeline(VanillaPipeline):
             and self.model.config.sam3_prompt_text
         ):
             self._sam3d_generation_outputs = self._run_sam3_and_sam3d_generation()
+
+        # Viser-direct visualization (Path A). Spin up the server now;
+        # splat handles are built lazily at D0 (after _prepare_frame_0
+        # sets _d0_selected_instance_id so we know which Gaussians are
+        # the tracked object). Browser-side WebGL splatting frees the
+        # training GPU; use ``--vis=tensorboard`` so Nerfstudio's viewer
+        # isn't also rendering.
+        self._viser_direct = None
+        if self.config.enable_viser_direct:
+            try:
+                from .utils.viser_direct import ViserDirectScene
+                self._viser_direct = ViserDirectScene(port=int(self.config.viser_direct_port))
+                CONSOLE.log(
+                    f"[viser-direct] server up on port {self.config.viser_direct_port} "
+                    f"— open http://localhost:{self.config.viser_direct_port}"
+                )
+                atexit.register(self._viser_direct.close)
+            except Exception as exc:
+                CONSOLE.log(f"[viser-direct] failed to start: {exc} — falling back to viewer pipeline")
+                self._viser_direct = None
 
     def _reset_dynamic_segmentation_state(self) -> None:
         self._sam3d_inserted = False
@@ -833,11 +985,11 @@ class DynamicGSPipeline(VanillaPipeline):
             # post-static optimized pose above, so read it directly.
             c2w_rotation = camera.camera_to_worlds[0, :3, :3].detach().cpu().numpy().astype(np.float32)
 
+            backend = self.model.config.sam3d_registration_backend
             t_cpd = time.time()
             print(
-                f"==> [phase-0b] obj {obj_idx + 1}/{n_objs}: running CPD registration "
-                f"(source={len(source_points)} pts, target={len(target_points_np)} pts) "
-                f"— this is the slow part",
+                f"==> [phase-0b] obj {obj_idx + 1}/{n_objs}: running {backend.upper()} registration "
+                f"(source={len(source_points)} pts, target={len(target_points_np)} pts)",
                 flush=True,
             )
             insertion_result = register_and_fuse_sam3d_object(
@@ -850,9 +1002,17 @@ class DynamicGSPipeline(VanillaPipeline):
                 debug_dir=debug_dir,
                 artifact_dir=artifact_dir,
                 output_stem=f"static0_obj_{obj_idx:02d}_sam3d",
+                registration_backend=backend,
+                teaser_params={
+                    "noise_bound": self.model.config.sam3d_teaser_noise_bound,
+                    "max_correspondences": self.model.config.sam3d_teaser_max_correspondences,
+                    "normal_radius_mult": self.model.config.sam3d_teaser_fpfh_normal_radius_mult,
+                    "feature_radius_mult": self.model.config.sam3d_teaser_fpfh_feature_radius_mult,
+                    "color_weight": self.model.config.sam3d_teaser_color_weight,
+                },
             )
             print(
-                f"==> [phase-0b] obj {obj_idx + 1}/{n_objs}: CPD done in {time.time() - t_cpd:.1f}s "
+                f"==> [phase-0b] obj {obj_idx + 1}/{n_objs}: {backend.upper()} done in {time.time() - t_cpd:.1f}s "
                 f"(kept {insertion_result.kept_point_count} pts)",
                 flush=True,
             )
@@ -1617,6 +1777,9 @@ class DynamicGSPipeline(VanillaPipeline):
         moved_count = self.model.apply_rigid_object_transform_from_reference(
             motion_estimate.rotation, motion_estimate.translation,
         )
+        # Stash for viser-direct: the live tick reads `self._last_motion_estimate`
+        # to push the world-frame rigid transform to the tracked-object handle.
+        self._last_motion_estimate = motion_estimate
         self._timing["DN.3g_apply_transform"].append(time.time() - t)
         # Stash per-tick inlier/correspondence so the [tracker-rate] log
         # can show mean inlier ratio per window without re-enabling the
@@ -1831,6 +1994,88 @@ class DynamicGSPipeline(VanillaPipeline):
     def _get_debug_dir(self) -> Path:
         return Path(self.datamanager.config.data) / self.datamanager.config.dynamic_subdir / "debug"
 
+    def _get_change_detection_dir(self) -> Path:
+        return Path(self.datamanager.config.data) / self.datamanager.config.dynamic_subdir / "change_detection_masks"
+
+    def _get_feedforward_debug_dir(self) -> Path:
+        return Path(self.datamanager.config.data) / self.datamanager.config.dynamic_subdir / "debug" / "feedforward"
+
+    def _resolved_cdn_downsample(self, rgb_or_shape) -> int:
+        """Resolve the feedforward CDN downsample factor.
+
+        When ``feedforward_cdn_downsample_factor`` is 0 (auto), scale DS
+        with the geometric mean of the frame's (H, W) so the MSSIM compute
+        runs on ~``target_mssim_side * target_mssim_side`` pixels regardless
+        of resolution or aspect ratio. Otherwise return the configured int.
+        """
+        cfg = int(self.config.feedforward_cdn_downsample_factor)
+        if cfg != 0:
+            return max(1, cfg)
+        if hasattr(rgb_or_shape, "shape"):
+            H, W = int(rgb_or_shape.shape[0]), int(rgb_or_shape.shape[1])
+        else:
+            H, W = int(rgb_or_shape[0]), int(rgb_or_shape[1])
+        target = max(1, int(self.config.feedforward_cdn_target_mssim_side))
+        import math as _math
+        ds = int(_math.sqrt(float(H) * float(W)) / float(target))
+        return max(1, ds)
+
+    def _save_feedforward_debug_pair(self, frame_name: str, rdn_rgb, gt_rgb, cdn,
+                                     rendered_obj_mask=None, gripper_mask=None):
+        """Save the per-tick A/B debug pair for fast flipping in an image viewer.
+
+          ``<frame>_a_render_overlays.png`` — rendered RGB with CDN in transparent
+            red and (object ∪ inverted-gripper) in transparent black.
+          ``<frame>_b_real.png`` — raw live RGB at native resolution.
+
+        Sorting puts them adjacent so flipping reveals the diff.
+        """
+        out_dir = self._get_feedforward_debug_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            target_h, target_w = rdn_rgb.shape[:2]
+            img = rdn_rgb.detach().float().clamp(0.0, 1.0).clone()
+            # CDN overlay (red, alpha 0.5).
+            if cdn is not None:
+                m = cdn.detach().float()
+                if m.ndim == 3 and m.shape[-1] == 1:
+                    m = m[..., 0]
+                if m.shape[:2] != img.shape[:2]:
+                    m = TF.interpolate(m.unsqueeze(0).unsqueeze(0), size=(target_h, target_w),
+                                       mode="nearest").squeeze(0).squeeze(0)
+                m_bin = (m > 0.5)
+                red = torch.tensor((1.0, 0.0, 0.0), device=img.device).view(1, 1, 3).expand_as(img)
+                img = torch.where(m_bin.unsqueeze(-1), img * 0.5 + red * 0.5, img)
+            # Object + gripper overlay (black, alpha 0.5).
+            black_mask = None
+            if rendered_obj_mask is not None:
+                obj = rendered_obj_mask.detach().float()
+                if obj.ndim == 3 and obj.shape[-1] == 1:
+                    obj = obj[..., 0]
+                if obj.shape[:2] != img.shape[:2]:
+                    obj = TF.interpolate(obj.unsqueeze(0).unsqueeze(0), size=(target_h, target_w),
+                                         mode="nearest").squeeze(0).squeeze(0)
+                black_mask = (obj > 0.5)
+            if gripper_mask is not None:
+                grip = gripper_mask.detach().float().to(img.device)
+                if grip.ndim == 3 and grip.shape[-1] == 1:
+                    grip = grip[..., 0]
+                if grip.shape[:2] != img.shape[:2]:
+                    grip = TF.interpolate(grip.unsqueeze(0).unsqueeze(0), size=(target_h, target_w),
+                                          mode="nearest").squeeze(0).squeeze(0)
+                # `gripper_mask` is a keep-mask (1=keep), so the gripper itself
+                # is where the mask is 0. Overlay the gripper region.
+                grip_bin = (grip < 0.5)
+                black_mask = grip_bin if black_mask is None else (black_mask | grip_bin)
+            if black_mask is not None:
+                blk = torch.zeros((1, 1, 3), device=img.device).expand_as(img)
+                img = torch.where(black_mask.unsqueeze(-1), img * 0.5 + blk * 0.5, img)
+            Image.fromarray(img.mul(255).byte().cpu().numpy()).save(out_dir / f"{frame_name}_a_render_overlays.png")
+            real = gt_rgb.detach().float().clamp(0.0, 1.0)
+            Image.fromarray(real.mul(255).byte().cpu().numpy()).save(out_dir / f"{frame_name}_b_real.png")
+        except Exception as exc:
+            CONSOLE.log(f"[feedforward-debug] save failed for {frame_name}: {exc}")
+
     @torch.no_grad()
     def _render_from_camera(self, camera):
         """Render from camera in training mode (to get training-resolution output)."""
@@ -1842,8 +2087,18 @@ class DynamicGSPipeline(VanillaPipeline):
             if not was_training:
                 self.model.eval()
 
-    def _compute_change_mask(self, rendered_rgb, rendered_depth, live_rgb, gt_depth, gripper_mask, object_mask):
-        """Compute change mask between render and live, excluding gripper + object regions."""
+    def _compute_change_mask(self, rendered_rgb, rendered_depth, live_rgb, gt_depth, gripper_mask, object_mask,
+                             downsample_factor: int = 1, keep_largest_only: bool = True):
+        """Compute change mask between render and live, excluding gripper + object regions.
+
+        ``downsample_factor`` > 1 bilinearly downsamples (render, live) RGB
+        (and the valid mask) before the MS-SSIM cleanup. The resulting mask
+        is nearest-upsampled back to native resolution at the end. Use to
+        ignore small details (specular shimmer, tracker jitter).
+
+        ``keep_largest_only=False`` keeps every connected component above
+        the min-area threshold (multi-blob output for the feedforward path).
+        """
         target_h, target_w = rendered_rgb.shape[:2]
         valid_mask = None
         if object_mask is not None:
@@ -1859,10 +2114,68 @@ class DynamicGSPipeline(VanillaPipeline):
             grip = self._resize_mask_to(grip, target_h, target_w)
             valid_mask = grip * valid_mask if valid_mask is not None else grip
 
+        # Optional downsample of inputs for cheaper / less-detail-sensitive MSSIM.
+        # Masked-average pool: invalid pixels (gripper, object) contribute 0 to
+        # both the RGB sum and the count, so the downsampled block colour is
+        # the clean average of only the valid pixels in the block. Without this
+        # the bilinear blend would pull dark gripper pixels into neighbouring
+        # blocks and MSSIM would flag the boundary as a false-positive change.
+        # Strict block validity: a block is only valid if EVERY one of its
+        # DS*DS source pixels is valid; otherwise it's marked invalid for MSSIM
+        # and the final mask is re-clipped against the native-resolution
+        # valid_mask, so behind-gripper change still gets caught next tick
+        # once the gripper has moved.
+        ds = max(1, int(downsample_factor))
+        if ds > 1:
+            def _avg_pool(t, ds):
+                return TF.avg_pool2d(t, kernel_size=ds, stride=ds, ceil_mode=False)
+            def _max_pool(t, ds):
+                return TF.max_pool2d(t, kernel_size=ds, stride=ds, ceil_mode=False)
+            if valid_mask is not None:
+                valid_chw = valid_mask.permute(2, 0, 1).unsqueeze(0)  # (1,1,H,W) in [0,1]
+            else:
+                valid_chw = torch.ones((1, 1, target_h, target_w), device=rendered_rgb.device, dtype=rendered_rgb.dtype)
+
+            def _masked_avg_rgb(rgb):
+                # rgb: (H,W,3) → masked-average downsample to (h', w', 3).
+                rgb_chw = rgb.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
+                num = _avg_pool(rgb_chw * valid_chw, ds)  # (1,3,h',w')
+                den = _avg_pool(valid_chw, ds).clamp(min=1e-8)  # (1,1,h',w')
+                out = num / den
+                return out.squeeze(0).permute(1, 2, 0)
+
+            def _masked_depth(d):
+                if d is None:
+                    return None
+                d_in = d if d.ndim == 3 else d[..., None]
+                d_chw = d_in.permute(2, 0, 1).unsqueeze(0)
+                num = _avg_pool(d_chw * valid_chw, ds)
+                den = _avg_pool(valid_chw, ds).clamp(min=1e-8)
+                out = num / den
+                return out.squeeze(0).permute(1, 2, 0)
+
+            rendered_rgb_use = _masked_avg_rgb(rendered_rgb)
+            live_rgb_use = _masked_avg_rgb(live_rgb)
+            rendered_depth_use = _masked_depth(rendered_depth)
+            gt_depth_use = _masked_depth(gt_depth)
+            # Strict block validity: 1 iff ALL source pixels were valid.
+            # `1 - max_pool(1 - valid)` returns 1 only where every source pixel
+            # was 1 in the block. (max_pool over invalid=1 detects any invalid.)
+            invalid_chw = 1.0 - valid_chw
+            invalid_block = _max_pool(invalid_chw, ds)
+            valid_block = (1.0 - invalid_block).clamp(min=0.0, max=1.0)
+            valid_mask_use = valid_block.squeeze(0).permute(1, 2, 0)
+        else:
+            rendered_rgb_use = rendered_rgb
+            live_rgb_use = live_rgb
+            rendered_depth_use = rendered_depth
+            gt_depth_use = gt_depth
+            valid_mask_use = valid_mask
+
         change_mask = build_change_mask(
-            rendered_depth, gt_depth,
-            pred_rgb=rendered_rgb, gt_rgb=live_rgb,
-            valid_mask=valid_mask,
+            rendered_depth_use, gt_depth_use,
+            pred_rgb=rendered_rgb_use, gt_rgb=live_rgb_use,
+            valid_mask=valid_mask_use,
             depth_threshold=self.model.config.change_mask_depth_threshold,
             rgb_threshold=self.model.config.change_mask_rgb_threshold,
             use_rgb=self.model.config.change_mask_use_rgb,
@@ -1870,7 +2183,15 @@ class DynamicGSPipeline(VanillaPipeline):
             blur_sigma=self.model.config.change_mask_blur_sigma,
             filter_radius=self.model.config.change_mask_filter_radius,
             min_component_size=self.model.config.change_mask_min_component_size,
+            keep_largest_only=keep_largest_only,
         )
+        if ds > 1:
+            # Upsample mask back to native size (nearest — it's binary).
+            m = change_mask
+            if m.ndim == 2:
+                m = m[..., None]
+            change_mask = TF.interpolate(m.permute(2, 0, 1).unsqueeze(0), size=(target_h, target_w),
+                                         mode="nearest").squeeze(0).permute(1, 2, 0)
         if self.model.config.active_mask_dilate_radius > 0:
             change_mask = dilate_binary_mask(change_mask, self.model.config.active_mask_dilate_radius)
         # Re-clip to valid_mask so the dilation cannot bleed back into the
@@ -1881,19 +2202,22 @@ class DynamicGSPipeline(VanillaPipeline):
 
     # ---- Feedforward hole-fill helpers (rgbd_decode path) ----
 
-    def _feedforward_clean_cdn(self, camera, cdn):
-        """Subtract the *current* rendered object mask (dilated) from CDN.
+    def _feedforward_clean_cdn(self, camera, cdn, frame_name: Optional[str] = None, prerendered_obj_mask=None):
+        """Subtract the moving object's rendered Gaussian footprint from CDN.
 
-        Prevents the path from back-projecting the live can's surface
-        as flat Gaussians on top of the tracked 3D can. The CDN stored
-        in the pool was object-excluded at capture time; the object may
-        have moved since.
+        Prevents the decoder from back-projecting the live object's
+        surface as flat Gaussians on top of the tracked 3D object.
+        Reuses the per-tick obj_mask if the caller passed it in (saves
+        a duplicate ``render_object_mask`` call).
         """
-        try:
-            obj_mask_now = self.model.render_object_mask(camera)
-        except Exception as exc:
-            CONSOLE.log(f"[feedforward] render_object_mask failed: {exc}; using raw CDN")
-            return cdn
+        if prerendered_obj_mask is not None:
+            obj_mask_now = prerendered_obj_mask
+        else:
+            try:
+                obj_mask_now = self.model.render_object_mask(camera)
+            except Exception as exc:
+                CONSOLE.log(f"[feedforward] render_object_mask failed: {exc}; using raw CDN")
+                return cdn
         if obj_mask_now is None:
             return cdn
         if obj_mask_now.ndim == 2:
@@ -1954,6 +2278,138 @@ class DynamicGSPipeline(VanillaPipeline):
         return model.delete_gaussian_indices(indices)
 
     @torch.no_grad()
+    def _feedforward_cull_in_front_of_depth(
+        self, camera, component_mask, gt_depth_m, depth_tol_m: float = 0.005,
+    ) -> int:
+        """Delete Gaussians sitting in front of the real sensor surface.
+
+        For every Gaussian whose 2D projection lands inside ``component_mask``,
+        compare its camera-space depth ``D_g`` to the sensor depth at that
+        pixel ``D_sensor``. If ``D_g < D_sensor - depth_tol_m``, the Gaussian
+        is floating between camera and surface — usually a leftover artifact
+        from a previous inpaint that the CDN keeps re-flagging because it
+        occludes the true surface. Delete only those.
+
+        Restricted to ``object_instance_ids ∈ {0, 999}`` (scene + prior
+        feedforward inserts); tracked objects (instance_ids in
+        ``_fp_trackers_by_instance``) are never touched.
+
+        Requires ``model.info`` populated by a recent full-scene render at
+        the same camera.
+        """
+        from .utils.active_mask import extract_projected_centers_and_radii
+
+        model = self.model
+        if model.num_points == 0:
+            return 0
+
+        # 2D projection (pixel centers).
+        try:
+            centers_2d, _radii = extract_projected_centers_and_radii(
+                model.info, model.num_points
+            )
+        except Exception as exc:
+            CONSOLE.log(f"[feedforward] cull projection failed: {exc}; skipping")
+            return 0
+
+        # 3D world means → camera-z depth (positive = in front of camera).
+        # Nerfstudio c2w is OpenGL: camera forward = -z_cam, so depth = -z_cam.
+        c2w = camera.camera_to_worlds
+        if c2w.ndim == 3:
+            c2w = c2w[0]
+        c2w = c2w.to(model.means.device, dtype=model.means.dtype)
+        R = c2w[:3, :3]
+        t = c2w[:3, 3]
+        means_cam = (model.means - t[None, :]) @ R  # P_cam = R^T (P - t); (M @ R) == (R^T M^T)^T
+        depths_g = -means_cam[:, 2]  # (N,) positive forward
+
+        # Sensor depth at each Gaussian's 2D pixel.
+        depth = gt_depth_m
+        if depth.ndim == 3 and depth.shape[-1] == 1:
+            depth = depth[..., 0]
+        depth = depth.to(centers_2d.device)
+        H, W = depth.shape
+        comp = component_mask
+        if comp.ndim == 3 and comp.shape[-1] == 1:
+            comp = comp[..., 0]
+        comp = (comp > 0.5).to(centers_2d.device)
+
+        # Pixel indices, clamped to image bounds.
+        u = centers_2d[:, 0].round().long().clamp(0, W - 1)
+        v = centers_2d[:, 1].round().long().clamp(0, H - 1)
+        in_bounds = (
+            (centers_2d[:, 0] >= 0) & (centers_2d[:, 0] < W) &
+            (centers_2d[:, 1] >= 0) & (centers_2d[:, 1] < H)
+        )
+        in_region = comp[v, u] & in_bounds
+
+        sensor_depth_at = depth[v, u]
+        has_valid_depth = sensor_depth_at > 0
+        # Strictly in front, beyond tolerance.
+        in_front = (depths_g.to(sensor_depth_at.device) < (sensor_depth_at - float(depth_tol_m)))
+
+        instance_ids = model.object_instance_ids.squeeze(-1).to(in_front.device)
+        eligible = (instance_ids == 0) | (instance_ids == 999)
+
+        to_delete = in_region & has_valid_depth & in_front & eligible
+        indices = torch.nonzero(to_delete, as_tuple=False).squeeze(-1)
+        if indices.numel() == 0:
+            return 0
+        return model.delete_gaussian_indices(indices)
+
+    @torch.no_grad()
+    def _dump_scene_splats(self, path) -> None:
+        """Dump the model's full Gaussian state (means + covariances +
+        rgbs + opacities) to a .pt file in the same layout
+        ``scripts/view_splats_viser.py`` expects. Used for visual
+        inspection of feedforward inserts inside the scene.
+        """
+        from pathlib import Path as _Path
+
+        model = self.model
+        means = model.means.detach().cpu().numpy().astype("float32")  # (N, 3)
+        scales_lin = torch.exp(model.scales.detach()).cpu()  # (N, 3)
+        quats = model.quats.detach().cpu()  # (N, 4) wxyz, may not be unit
+        quats = quats / quats.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+        w, x, y, z = quats.unbind(-1)
+        R = torch.stack([
+            torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], dim=-1),
+            torch.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], dim=-1),
+            torch.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], dim=-1),
+        ], dim=-2)
+        S2 = (scales_lin ** 2)[:, :, None] * torch.eye(3, dtype=R.dtype)[None]
+        cov = (R @ S2 @ R.transpose(-1, -2)).numpy().astype("float32")
+        # features_dc is the SH DC band; RGB ≈ C0 * features_dc + 0.5
+        C0 = 0.28209479177387814
+        dc = model.features_dc.detach().cpu().numpy()
+        if dc.ndim == 3:  # (N, 1, 3) in some splatfacto variants
+            dc = dc[:, 0, :]
+        rgbs = (C0 * dc + 0.5).clip(0.0, 1.0).astype("float32")
+        opacities = torch.sigmoid(model.opacities.detach()).cpu().numpy().reshape(-1, 1).astype("float32")
+        inserted_flags = getattr(model, "inserted_flags", None)
+        instance_ids = getattr(model, "object_instance_ids", None)
+        blob = {
+            "means": means,
+            "covariances": cov,
+            "rgbs": rgbs,
+            "opacities": opacities,
+            "inserted_flags": inserted_flags.detach().cpu().numpy().squeeze(-1).astype("uint8")
+            if inserted_flags is not None else None,
+            "object_instance_ids": instance_ids.detach().cpu().numpy().squeeze(-1).astype("int64")
+            if instance_ids is not None else None,
+            "anchor_frame": str(getattr(self, "_d0_frame_name", "scene")),
+            "selected_frames": [],
+        }
+        path = _Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(blob, path)
+        ins = int(blob["inserted_flags"].sum()) if blob["inserted_flags"] is not None else -1
+        CONSOLE.log(
+            f"[feedforward] dumped scene splats ({means.shape[0]} total, "
+            f"{ins} inserted_flag=1) → {path}"
+        )
+
+    @torch.no_grad()
     def _get_anchor_camera(self):
         """Build the fixed-pose camera for the comparison video.
 
@@ -1965,7 +2421,15 @@ class DynamicGSPipeline(VanillaPipeline):
             return None
         anchor_idx = self.config.feedforward_anchor_frame
         if anchor_idx is None:
-            anchor_idx = self._accepted_dynamic_frames[-1]
+            # Fix the anchor at the FIRST accepted frame so the Mode B
+            # video keeps a constant viewpoint — otherwise the camera
+            # tracks the latest accepted frame and the moving object
+            # appears stationary in image space because the camera moved
+            # with it. Cache the first-resolved index so it's stable for
+            # the rest of the run.
+            if getattr(self, "_anchor_idx_cached", None) is None:
+                self._anchor_idx_cached = int(self._accepted_dynamic_frames[0])
+            anchor_idx = self._anchor_idx_cached
         anchor_idx = int(anchor_idx)
 
         try:
@@ -1991,6 +2455,18 @@ class DynamicGSPipeline(VanillaPipeline):
                     camera.camera_to_worlds = opt_c2w
         except Exception:
             pass
+
+        # Optional: pull the camera back along its local +z (Nerfstudio /
+        # OpenGL convention has -z as "forward into scene", so adding to
+        # +z moves the camera AWAY from the subject).
+        z_off = float(self.config.feedforward_anchor_z_offset_m)
+        if z_off != 0.0:
+            c2w = camera.camera_to_worlds  # (1, 3, 4) or (3, 4)
+            c2w_local = c2w[0] if c2w.ndim == 3 else c2w
+            local_z = c2w_local[:3, 2]            # camera local +z in world coords
+            c2w_local = c2w_local.clone()
+            c2w_local[:3, 3] = c2w_local[:3, 3] + z_off * local_z
+            camera.camera_to_worlds = c2w_local.unsqueeze(0) if c2w.ndim == 3 else c2w_local
         return camera
 
     @torch.no_grad()
@@ -2127,7 +2603,8 @@ class DynamicGSPipeline(VanillaPipeline):
         return contextlib.nullcontext()
 
     @torch.no_grad()
-    def _run_feedforward(self, target_frame, mode_label: str) -> None:
+    def _run_feedforward(self, target_frame, mode_label: str, prerendered_obj_mask=None,
+                         prerendered_depth=None) -> None:
         """Dispatcher for feedforward hole-fill at a target OptimFrame.
 
         ``mode_label`` is "oneshot" or "recurring" — used only for logs
@@ -2153,14 +2630,21 @@ class DynamicGSPipeline(VanillaPipeline):
         frame_idx = int(target_frame.frame_idx)
         cdn = target_frame.cdn
 
-        # Pin the datamanager so we can pull this frame's GT RGB-D.
-        self.datamanager.set_dynamic_frame_idx(frame_idx)
-        self.current_dynamic_frame_idx = frame_idx
-        try:
-            _, batch = self.datamanager.get_current_dynamic_train_batch()
-        except Exception as exc:
-            CONSOLE.log(f"[feedforward] could not pull batch for frame {frame_idx}: {exc}")
-            return
+        # Live mode: the OptimFrame carries the actual ROS batch
+        # (rgb / depth / mask captured at this frame's timestamp). The
+        # datamanager's dynamic dataset is a single-frame stub in live
+        # mode, so pulling from it would decode stale stub pixels into
+        # the live scene. Prefer the on-frame batch when present and
+        # only fall back to the datamanager for the recorded path.
+        batch = getattr(target_frame, "live_batch", None)
+        if batch is None:
+            self.datamanager.set_dynamic_frame_idx(frame_idx)
+            self.current_dynamic_frame_idx = frame_idx
+            try:
+                _, batch = self.datamanager.get_current_dynamic_train_batch()
+            except Exception as exc:
+                CONSOLE.log(f"[feedforward] could not pull batch for frame {frame_idx}: {exc}")
+                return
 
         bg = self.model._get_background_color()
         live_rgb_full = self.model.composite_with_background(
@@ -2172,24 +2656,34 @@ class DynamicGSPipeline(VanillaPipeline):
             return
 
         t0 = time.time()
-        cdn_clean = self._feedforward_clean_cdn(camera, cdn)
+        try:
+            frame_name_for_cdn = self.datamanager.get_dynamic_frame_name(frame_idx)
+        except Exception:
+            frame_name_for_cdn = None
+        cdn_clean = self._feedforward_clean_cdn(
+            camera, cdn, frame_name=frame_name_for_cdn,
+            prerendered_obj_mask=prerendered_obj_mask,
+        )
         self._timing["FF.1_cdn_clean"].append(time.time() - t0)
 
         t0 = time.time()
+        # No second area filter — the CDN cleanup recipe in build_change_mask
+        # has already applied the 760-px floor (OFFICIAL_FILTER_MIN_AREA).
+        # Every connected component that survived that is decoded.
         if mode_label == "oneshot":
             components = select_top_n_components_filtered(
                 cdn_clean,
                 n=int(self.config.feedforward_top_n_components),
                 area_ratio=float(self.config.feedforward_dominant_area_ratio),
-                min_area=int(self.config.feedforward_min_component_area),
+                min_area=1,
             )
         else:
-            # Mode B (recurring): all components above min_area, no dominance filter.
+            # Mode B (recurring): all components, no dominance filter.
             components = select_top_n_components_filtered(
                 cdn_clean,
-                n=64,
+                n=256,
                 area_ratio=0.0,
-                min_area=int(self.config.feedforward_min_component_area),
+                min_area=1,
             )
         self._timing["FF.2_component_select"].append(time.time() - t0)
 
@@ -2217,6 +2711,11 @@ class DynamicGSPipeline(VanillaPipeline):
                 opacity=float(self.config.feedforward_rgbd_opacity),
                 normal_smoothing_radius=int(self.config.feedforward_rgbd_normal_smoothing_radius),
                 min_valid_fraction=float(self.config.feedforward_rgbd_min_valid_fraction),
+                scale_multiplier=float(self.config.feedforward_rgbd_scale_multiplier),
+                cliff_threshold_m=float(self.config.feedforward_rgbd_cliff_threshold_m),
+                post_cliff_erode_px=int(self.config.feedforward_rgbd_post_cliff_erode_px),
+                rendered_depth_m=prerendered_depth,
+                leak_threshold_m=float(self.config.feedforward_rgbd_leak_threshold_m),
             )
             self._timing["FF.3_decode"].append(time.time() - t0)
 
@@ -2240,13 +2739,39 @@ class DynamicGSPipeline(VanillaPipeline):
             # finally run against the shrunk buffers).
             if self.device == torch.device("cuda") or self.device.type == "cuda":
                 torch.cuda.synchronize()
-            # Populate model.info at current N before the delete-in-region call.
-            try:
-                _ = self._render_from_camera(camera)
-            except Exception as exc:
-                CONSOLE.log(f"[feedforward] pre-delete render failed: {exc}; skip comp")
-                continue
-            n_deleted = self._feedforward_delete_in_region(camera, comp_mask)
+            # Optionally delete existing Gaussians in the component footprint.
+            # With ``feedforward_skip_delete=True`` (new closed-loop default),
+            # we keep all prior Gaussians and just additively insert — the
+            # next-tick CDN will be near zero wherever the insert was correct,
+            # so the loop self-stabilizes without ever dropping scene content.
+            if not self.config.feedforward_skip_delete:
+                try:
+                    _ = self._render_from_camera(camera)
+                except Exception as exc:
+                    CONSOLE.log(f"[feedforward] pre-delete render failed: {exc}; skip comp")
+                    continue
+                n_deleted = self._feedforward_delete_in_region(camera, comp_mask)
+            else:
+                n_deleted = 0
+
+            # Cull-in-front: drop Gaussians floating BETWEEN the camera and
+            # the real sensor surface (i.e. occluding the true geometry).
+            # Without this, an artifact Gaussian in front of the table will
+            # keep MSSIM-triggering CDN every tick, so the loop never
+            # stabilises — adding new Gaussians on top doesn't help when
+            # the existing ones block the view.
+            n_culled = 0
+            if self.config.feedforward_cull_in_front:
+                try:
+                    _ = self._render_from_camera(camera)
+                except Exception as exc:
+                    CONSOLE.log(f"[feedforward] cull-in-front pre-render failed: {exc}; skip cull")
+                else:
+                    n_culled = self._feedforward_cull_in_front_of_depth(
+                        camera, comp_mask, gt_depth,
+                        depth_tol_m=float(self.config.feedforward_cull_in_front_depth_tol_m),
+                    )
+            n_deleted += n_culled
             self._timing["FF.4_crop_and_delete"].append(time.time() - t0)
 
             t0 = time.time()
@@ -2492,15 +3017,33 @@ class DynamicGSPipeline(VanillaPipeline):
 
         # --- LIVE.gt_setup: model.composite_with_background + _get_gt_depth
         # + _get_batch_mask. Pure GPU ops on tensors already on device.
-        t0 = time.time()
-        bg = self.model._get_background_color()
-        gt_rgb = self.model.composite_with_background(self.model.get_gt_img(batch["image"]), bg)
-        gt_depth = self.model._get_gt_depth(batch)
-        gripper_mask = self.model._get_batch_mask(batch)
-        self._timing["LIVE.gt_setup"].append(time.time() - t0)
+        # These are FEEDFORWARD-only on the steady-state live path
+        # (XFeat tracker has its own per-tick depth + mask reads inside
+        # _apply_motion_estimator). Made lazy via _gt_setup_state; only
+        # the FF-firing tick / D0 init / non-FF (recorded) path forces
+        # the compute via _ensure_gt_setup().
+        _gt_setup_state = {"done": False, "bg": None, "gt_rgb": None,
+                            "gt_depth": None, "gripper_mask": None}
+        def _ensure_gt_setup():
+            if _gt_setup_state["done"]:
+                return
+            t_e = time.time()
+            _gt_setup_state["bg"] = self.model._get_background_color()
+            _gt_setup_state["gt_rgb"] = self.model.composite_with_background(
+                self.model.get_gt_img(batch["image"]), _gt_setup_state["bg"]
+            )
+            _gt_setup_state["gt_depth"] = self.model._get_gt_depth(batch)
+            _gt_setup_state["gripper_mask"] = self.model._get_batch_mask(batch)
+            _gt_setup_state["done"] = True
+            self._timing["LIVE.gt_setup"].append(time.time() - t_e)
 
         is_first = self._global_frame_counter == 0
         if is_first:
+            _ensure_gt_setup()
+            bg = _gt_setup_state["bg"]
+            gt_rgb = _gt_setup_state["gt_rgb"]
+            gt_depth = _gt_setup_state["gt_depth"]
+            gripper_mask = _gt_setup_state["gripper_mask"]
             live_rgb = self.model.get_live_rgb(batch, background=bg, apply_training_downscale=True)
             init_debug_dir = self.datamanager.get_initialization_debug_dir()
             init_artifact_dir = self.datamanager.get_initialization_artifact_dir()
@@ -2512,6 +3055,31 @@ class DynamicGSPipeline(VanillaPipeline):
             self._optim_pool.push(OptimFrame(
                 frame_idx=0, camera=camera, cdn=cdn, live_batch=batch,
             ))
+            # Viser-direct: scene is finalised post-D0 (instance_id known
+            # via _d0_selected_instance_id; FP tracker chosen; reference
+            # object pose captured). Build the splat handles ONCE here;
+            # from now on, per-tick transform pushes are O(1) on the wire.
+            if self._viser_direct is not None:
+                try:
+                    # Use the live D0 camera's c2w as the initial viser
+                    # browser camera, so the user sees the same view
+                    # the robot saw when D0 was captured (vs. defaulting
+                    # to a fit-bbox auto-frame that's far off because
+                    # the static scene has sky outliers tens of meters out).
+                    c2w_4x4 = np.eye(4, dtype=np.float32)
+                    c2w_4x4[:3, :4] = camera.camera_to_worlds[0].detach().cpu().numpy().astype(np.float32)
+                    self._viser_direct.setup_handles(
+                        self.model,
+                        tracked_instance_id=getattr(self, "_d0_selected_instance_id", None),
+                        initial_c2w=c2w_4x4,
+                    )
+                except Exception as exc:
+                    import traceback as _tb
+                    CONSOLE.log(
+                        f"[viser-direct] setup_handles failed ({type(exc).__name__}): {exc!r}\n"
+                        f"{_tb.format_exc()}"
+                    )
+                    self._viser_direct = None
             self._global_frame_counter += 1
             return
 
@@ -2519,20 +3087,32 @@ class DynamicGSPipeline(VanillaPipeline):
         t0 = time.time()
         if self._sam3d_inserted and self._motion_estimator is not None:
             self._apply_motion_estimator(camera, batch)
-            # Object means just changed — force a viewer re-render.
-            # Throttled: with ``train_lock`` removed (NoSaveTrainer.setup),
-            # renders and the tracker tick now share the GPU. Rendering
-            # 789k Gaussians at 512² takes ~25 ms and stalls the next
-            # tracker tick's CUDA kernels (xfeat/match/apply roughly
-            # 2× slower under contention). Pushing every Nth tick caps
-            # render rate at tracker_rate/N, freeing GPU for the tick
-            # cadence the user actually cares about. N=3 means visual
-            # ~5-6 Hz from a ~16 Hz tracker — still smooth, and lets
-            # tick_total return to its lock-serialised baseline.
-            self._render_kick_tick = getattr(self, "_render_kick_tick", 0) + 1
-            if self._render_kick_tick % max(1, int(getattr(self.config, "live_render_kick_every_n_ticks", 3))) == 0:
-                self._force_viewer_rerender()
+            # Viser-direct path: just push the latest world-frame rigid
+            # (R, t) to the tracked-object splat handle. The browser
+            # re-rasterizes; the training GPU does not render. This is
+            # the whole point of Path A.
+            if self._viser_direct is not None:
+                est = getattr(self, "_last_motion_estimate", None)
+                if est is not None and getattr(est, "success", False):
+                    try:
+                        self._viser_direct.push_tracker_transform(est.rotation, est.translation)
+                    except Exception as exc:
+                        CONSOLE.log(f"[viser-direct] push failed: {exc}")
+            else:
+                # Legacy Nerfstudio-viewer path: force a server-side render.
+                # Object means just changed — force a viewer re-render.
+                # Throttled: with ``train_lock`` removed (NoSaveTrainer.setup),
+                # renders and the tracker tick now share the GPU. Rendering
+                # 789k Gaussians at 512² takes ~25 ms and stalls the next
+                # tracker tick's CUDA kernels. N=3 means visual ~5-6 Hz
+                # from a ~16 Hz tracker.
+                self._render_kick_tick = getattr(self, "_render_kick_tick", 0) + 1
+                if self._render_kick_tick % max(1, int(getattr(self.config, "live_render_kick_every_n_ticks", 3))) == 0:
+                    self._force_viewer_rerender()
         self._timing["DN.3_tracker_motion"].append(time.time() - t0)
+        # GAP timer: time spent between DN.3 end and DN.5 start (rolling-print
+        # window code, keyframe-filter branch, early-return guards).
+        _gap_chk = time.time()
 
         # Rolling tick-rate report. Plain `print` (not CONSOLE.log) so
         # the line surfaces above nerfstudio's rich progress bar and
@@ -2622,11 +3202,50 @@ class DynamicGSPipeline(VanillaPipeline):
                 self._inlier_window = inlier_win[-max_history:]
                 self._corr_window = corr_win[-max_history:]
 
-        # Tracking-only mode: skip the RDN render, object mask, CDN
-        # compute, and pool push. The object Gaussians have already
-        # been moved by `_apply_motion_estimator`; the viewer pulls
-        # the latest pose on its own render.
-        if self.config.disable_dynamic_optimization:
+        # Feedforward Mode B in live mode: even when
+        # `disable_dynamic_optimization=True` (the default whenever
+        # feedforward is enabled), we still need to compute the per-tick
+        # CDN and call `_run_feedforward` — the closed-loop hole-fill
+        # IS the dynamic-phase work in this configuration. We skip the
+        # optim pool push (no scene-opt to feed) and the keyframe
+        # filter (every tick is a chance to fill a new hole).
+        feedforward_on = (
+            self.config.enable_feedforward_inpaint == "rgbd_decode"
+            and self.config.feedforward_recurring_every_n_ticks > 0
+        )
+        # CADENCE GATE: when feedforward is on, RDN render + obj mask +
+        # CDN are needed ONLY on ticks that will fire FF. With cadence=3
+        # that's 1-in-3 ticks; the other 2-in-3 ticks can skip the
+        # render+CDN compute entirely (~30ms saved/tick). The cadence
+        # counter is incremented unconditionally here so it matches the
+        # check inside the FF block below.
+        save_debug_pair = bool(getattr(self.config, "feedforward_save_debug_pair", False))
+        if feedforward_on:
+            self._tracker_tick_count += 1
+            ff_will_fire_this_tick = (
+                (self._tracker_tick_count % int(self.config.feedforward_recurring_every_n_ticks)) == 0
+            )
+        else:
+            ff_will_fire_this_tick = False
+        # Renders are needed for: (a) FF firing this tick, (b) debug-pair
+        # saves (every tick when enabled), (c) optim-pool push (recorded
+        # mode only — gated separately below by feedforward_on).
+        need_renders_this_tick = ff_will_fire_this_tick or save_debug_pair or (not feedforward_on)
+
+        if self.config.disable_dynamic_optimization and not feedforward_on:
+            # Tracking-only mode: skip RDN render, object mask, CDN
+            # compute, and pool push. The object Gaussians have already
+            # been moved by `_apply_motion_estimator`; the viewer pulls
+            # the latest pose on its own render.
+            self._timing["LIVE.tick_total"].append(time.time() - tick_t0); self._last_tick_end_t = time.time()
+            self._global_frame_counter += 1
+            return
+
+        # Fast-path: feedforward on but not firing this tick AND no
+        # debug-pair save → skip everything below (renders, CDN, FF
+        # block, debug saves). Tracker has already mutated object
+        # Gaussians; nothing else to do this tick.
+        if feedforward_on and not need_renders_this_tick:
             self._timing["LIVE.tick_total"].append(time.time() - tick_t0); self._last_tick_end_t = time.time()
             self._global_frame_counter += 1
             return
@@ -2637,34 +3256,56 @@ class DynamicGSPipeline(VanillaPipeline):
         # cost zero GPU on RDN + object mask + CDN (~258 ms saved per
         # rejected frame). The CDN pixel-count gate still runs after
         # the renders below since it requires the change mask itself.
+        # Feedforward bypasses the keyframe filter — every accepted
+        # tick is a fresh opportunity to fill revealed surfaces.
         # --- LIVE.keyframe_filter: pose-only check (cheap, pure CPU)
-        t0 = time.time()
-        c2w_3x4 = camera.camera_to_worlds[0].detach().cpu()
-        accepted = (
-            self._dynamic_keyframe_filter is None
-            or self._dynamic_keyframe_filter.accept(c2w_3x4)
-        )
-        self._timing["LIVE.keyframe_filter"].append(time.time() - t0)
-        if not accepted:
-            self._timing["LIVE.tick_total"].append(time.time() - tick_t0); self._last_tick_end_t = time.time()
-            self._global_frame_counter += 1
-            return
+        if not feedforward_on:
+            t0 = time.time()
+            c2w_3x4 = camera.camera_to_worlds[0].detach().cpu()
+            accepted = (
+                self._dynamic_keyframe_filter is None
+                or self._dynamic_keyframe_filter.accept(c2w_3x4)
+            )
+            self._timing["LIVE.keyframe_filter"].append(time.time() - t0)
+            if not accepted:
+                self._timing["LIVE.tick_total"].append(time.time() - tick_t0); self._last_tick_end_t = time.time()
+                self._global_frame_counter += 1
+                return
+
+        self._timing["LIVE.gap_pre_render"].append(time.time() - _gap_chk)
+
+        # All FF/CDN work below needs gt_rgb/gt_depth/gripper_mask now.
+        _ensure_gt_setup()
+        gt_rgb = _gt_setup_state["gt_rgb"]
+        gt_depth = _gt_setup_state["gt_depth"]
+        gripper_mask = _gt_setup_state["gripper_mask"]
 
         t0 = time.time()
         rdn_outputs = self._render_from_camera(camera)
         self._timing["DN.5_render_rdn"].append(time.time() - t0)
         rdn_rgb = rdn_outputs["rgb"]
         rdn_depth = rdn_outputs["depth"]
+        _gap_chk = time.time()
 
         t0 = time.time()
         rendered_obj_mask = self.model.render_object_mask(camera)
         self._timing["DN.6_render_object_mask"].append(time.time() - t0)
+        _gap_chk = time.time()
 
         t0 = time.time()
-        cdn = self._compute_change_mask(
-            rdn_rgb, rdn_depth, gt_rgb, gt_depth, gripper_mask, rendered_obj_mask,
-        )
+        if self.config.enable_feedforward_inpaint != "off":
+            cdn = self._compute_change_mask(
+                rdn_rgb, rdn_depth, gt_rgb, gt_depth, gripper_mask, rendered_obj_mask,
+                downsample_factor=self._resolved_cdn_downsample(rdn_rgb),
+                keep_largest_only=bool(self.config.feedforward_cdn_keep_largest_only),
+            )
+        else:
+            cdn = self._compute_change_mask(
+                rdn_rgb, rdn_depth, gt_rgb, gt_depth, gripper_mask, rendered_obj_mask,
+            )
         self._timing["DN.7_change_mask_cdn"].append(time.time() - t0)
+        # GAP: between CDN end and FF call / pool push.
+        _gap_chk_pre_ff = time.time()
 
         cdn_px = int((cdn[..., 0] > 0.5).sum().item()) if cdn.ndim >= 3 else int((cdn > 0.5).sum().item())
         if cdn_px < self.config.optim_pool_min_change_pixels:
@@ -2683,6 +3324,68 @@ class DynamicGSPipeline(VanillaPipeline):
                 f"[live] {frame_name}: dropping frame — gripper mask is all-1 "
                 f"(publisher fell back to placeholder; image-mask mismatch)."
             )
+            self._timing["LIVE.tick_total"].append(time.time() - tick_t0); self._last_tick_end_t = time.time()
+            self._global_frame_counter += 1
+            return
+
+        # Live change-detection debug pair (one PNG triplet per tick when
+        # enabled). Saves the same overlays the recorded path saves:
+        #   <frame>_a_render_overlays.png — render + CDN(red) + (object ∪ gripper)(black)
+        #   <frame>_b_real.png            — raw live frame at native resolution
+        # Saved to <data_root>/dynamic_scene/debug/feedforward/. Unconditional
+        # (every tick that reaches this point), independent of the Mode B
+        # cadence — useful for diagnosis even when feedforward doesn't fire.
+        if (
+            self.config.enable_feedforward_inpaint != "off"
+            and self.config.feedforward_save_debug_pair
+        ):
+            self._save_feedforward_debug_pair(
+                frame_name=frame_name,
+                rdn_rgb=rdn_rgb, gt_rgb=gt_rgb, cdn=cdn,
+                rendered_obj_mask=rendered_obj_mask,
+                gripper_mask=gripper_mask,
+            )
+
+        # ---- Feedforward Mode B hook (closed-loop hole-fill, live) ----
+        # Mirrors the recorded-path block in `_tracker_tick` after the
+        # per-tick CDN compute. Uses the FRESH (camera, cdn, obj_mask,
+        # depth) directly so the loop is correctly closed against the
+        # current scene state (which already includes prior-tick
+        # inserts). Cadence is controlled by
+        # `feedforward_recurring_every_n_ticks`.
+        if feedforward_on:
+            # Counter already incremented at top of tick; reuse the
+            # decision computed there.
+            ff_fired = ff_will_fire_this_tick
+            if ff_fired:
+                fresh_frame = OptimFrame(
+                    frame_idx=0, camera=camera, cdn=cdn.detach().clone(),
+                    live_batch=batch,
+                )
+                _t_ff_outer = time.time()
+                with self._feedforward_train_lock():
+                    self._run_feedforward(
+                        fresh_frame, mode_label="recurring",
+                        prerendered_obj_mask=rendered_obj_mask,
+                        prerendered_depth=rdn_depth,
+                    )
+                # GAP: outer wall-clock wraparound around the FF call.
+                # Compare to FF.6_total_per_call inside _run_feedforward — if
+                # outer >> FF.6, lock acquire or post-FF cleanup is hidden.
+                self._timing["LIVE.gap_ff_outer"].append(time.time() - _t_ff_outer)
+                # Viser-direct: the static-scene splat count just changed
+                # (FF inserts and/or culls). Re-upload the static handle so
+                # the browser shows the new state. Tracked-object handle is
+                # untouched (FF never modifies the tracked-object subset).
+                if self._viser_direct is not None:
+                    try:
+                        self._viser_direct.refresh_static_handle(self.model)
+                    except Exception as exc:
+                        CONSOLE.log(f"[viser-direct] static refresh failed: {exc}")
+            # When feedforward is on we don't push to the optim pool —
+            # there's no scene-opt consumer in this configuration.
+            # GAP: from CDN end (or FF end if it fired) to tick_total append.
+            self._timing["LIVE.gap_post_ff"].append(time.time() - _gap_chk_pre_ff)
             self._timing["LIVE.tick_total"].append(time.time() - tick_t0); self._last_tick_end_t = time.time()
             self._global_frame_counter += 1
             return
@@ -3074,7 +3777,7 @@ class DynamicGSPipeline(VanillaPipeline):
                     "D0.3b_registration",
                     "D0.3b1_nn_distances",
                     "D0.3b2_voxel_downsample",
-                    "D0.3b3_cpd_refinement",
+                    "D0.3b3_refinement",
                     "D0.3b4_correspondences",
                     "D0.3b5_dedup",
                     "D0.3b6_plot_and_save",
@@ -3085,8 +3788,11 @@ class DynamicGSPipeline(VanillaPipeline):
                 ):
                     if sub_key in sam3d_stats:
                         self._timing[sub_key].append(sam3d_stats[sub_key])
-                # CPD metadata is a dict, not a float — store separately
-                self._cpd_info = sam3d_stats.get("D0.3b3_cpd_meta", {})
+                # Backend metadata is a dict, not a float — store separately. Key
+                # depends on backend: D0.3b3_cpd_meta for probreg CPD, D0.3b3_teaser_meta for TEASER++.
+                self._cpd_info = sam3d_stats.get(
+                    "D0.3b3_cpd_meta", sam3d_stats.get("D0.3b3_teaser_meta", {})
+                )
                 self._sam3d_inserted = True
                 self.model.refresh_dynamic_state_after_insertion(
                     camera, stats["render_object_mask"], stats["optim_mask"],
@@ -3116,25 +3822,27 @@ class DynamicGSPipeline(VanillaPipeline):
         # diverges.
         live_rgb_fullres = self._build_tracking_rgb(batch)
         self.model.capture_reference_object_pose()
-        # Erode the splat-rasterized mask to its inner 85% so D0 keypoints
-        # don't land on the low-opacity halo at the object's edge (those
-        # halo pixels show background depth + texture, which would poison
-        # the D0 anchor and every match against it). Then AND with the
-        # gripper-keep mask so keypoints never fall on the gripper either
-        # (gripper occludes the object — a keypoint at a gripper-covered
-        # pixel would get gripper-surface depth and gripper-texture
-        # descriptors).
-        seed_mask = self._erode_mask_to_inner_fraction(
-            rendered_obj_mask, _TRACKER_MASK_INNER_FRACTION,
-        )
-        gripper_keep_mask = self.model._get_batch_mask(batch)
-        if seed_mask is not None and gripper_keep_mask is not None:
-            gk = gripper_keep_mask
-            if gk.ndim == 3 and gk.shape[-1] == 1 and seed_mask.ndim == 2:
-                gk = gk[..., 0]
-            elif gk.ndim == 2 and seed_mask.ndim == 3 and seed_mask.shape[-1] == 1:
-                gk = gk[..., None]
-            seed_mask = (seed_mask.bool() & gk.to(seed_mask.device).bool()).to(seed_mask.dtype)
+        if self.model.config.xfeat_d0_seed_mask_raw:
+            # Use the full rendered object mask as-is for D0 feature sampling.
+            # Skips both the inner-85% erosion AND the gripper-keep AND.
+            # Necessary when the object is thin and/or held by the gripper
+            # (e.g. fidget spinner) — the filtered version drops too much area
+            # and leaves no usable XFeat keypoints.
+            seed_mask = rendered_obj_mask
+        else:
+            # Legacy behaviour: erode to inner 85% (drop low-opacity halo)
+            # then AND with gripper-keep (drop pixels covered by gripper).
+            seed_mask = self._erode_mask_to_inner_fraction(
+                rendered_obj_mask, _TRACKER_MASK_INNER_FRACTION,
+            )
+            gripper_keep_mask = self.model._get_batch_mask(batch)
+            if seed_mask is not None and gripper_keep_mask is not None:
+                gk = gripper_keep_mask
+                if gk.ndim == 3 and gk.shape[-1] == 1 and seed_mask.ndim == 2:
+                    gk = gk[..., 0]
+                elif gk.ndim == 2 and seed_mask.ndim == 3 and seed_mask.shape[-1] == 1:
+                    gk = gk[..., None]
+                seed_mask = (seed_mask.bool() & gk.to(seed_mask.device).bool()).to(seed_mask.dtype)
         if not self._has_nonempty_mask(seed_mask):
             seed_mask = None
         instance_id_for_co = getattr(self, "_d0_selected_instance_id", 0)
@@ -3234,9 +3942,16 @@ class DynamicGSPipeline(VanillaPipeline):
 
         # --- TIMING: DN.7 Change mask CDN (MSSIM comparison RDN vs DN, excluding gripper + projected object mask) ---
         t0 = time.time()
-        cdn = self._compute_change_mask(
-            rdn_rgb, rdn_depth, gt_rgb, gt_depth, gripper_mask, combined_obj_mask,
-        )
+        if self.config.enable_feedforward_inpaint != "off":
+            cdn = self._compute_change_mask(
+                rdn_rgb, rdn_depth, gt_rgb, gt_depth, gripper_mask, combined_obj_mask,
+                downsample_factor=self._resolved_cdn_downsample(rdn_rgb),
+                keep_largest_only=bool(self.config.feedforward_cdn_keep_largest_only),
+            )
+        else:
+            cdn = self._compute_change_mask(
+                rdn_rgb, rdn_depth, gt_rgb, gt_depth, gripper_mask, combined_obj_mask,
+            )
         self._timing["DN.7_change_mask_cdn"].append(time.time() - t0)
 
         # --- TIMING: DN.8 Debug images (save ~9 overlay PNGs to disk) ---
@@ -3465,6 +4180,13 @@ class DynamicGSPipeline(VanillaPipeline):
             self._optim_pool.push(OptimFrame(
                 frame_idx=frame_idx, camera=camera, cdn=cdn,
             ))
+            if self.config.save_change_detection_masks:
+                try:
+                    d0_render = self._render_from_camera(camera)["rgb"].detach()
+                    out_path = self._get_change_detection_dir() / f"{frame_name}_render_w_cdn.png"
+                    self._save_overlay(d0_render, cdn, out_path)
+                except Exception as exc:
+                    CONSOLE.log(f"[change-detection-masks] D0 save failed for {frame_name}: {exc}")
             if self.config.feedforward_video_out is not None:
                 self._record_anchor_video_tick()
             self._global_frame_counter += 1
@@ -3474,7 +4196,10 @@ class DynamicGSPipeline(VanillaPipeline):
         # Capture the object centroid before / after FP so we can verify
         # in the log that the means actually shift on rejected frames.
         t0 = time.time()
-        obj_mask_pre = self.model.object_flags.squeeze(-1) > 0.5
+        # Use the tracker-scoped mask so the diagnostic reflects ONLY the
+        # tracked object (not feedforward inpaint patches at instance 999
+        # which the tracker doesn't move).
+        obj_mask_pre = self.model._tracked_object_mask()
         centroid_before = (
             self.model.means[obj_mask_pre].detach().mean(dim=0)
             if obj_mask_pre.any()
@@ -3505,11 +4230,14 @@ class DynamicGSPipeline(VanillaPipeline):
             self._record_anchor_video_tick()
 
         # Tracking-only mode: skip RDN render + CDN compute + pool push.
-        # EXCEPTION: when feedforward inpaint is enabled, we still need the
-        # CDN + pool push so Mode B has something to consume.
+        # EXCEPTION: when feedforward inpaint OR the
+        # save_change_detection_masks diagnostic is enabled, we still
+        # need the CDN compute so the downstream paths have something
+        # to consume / save.
         if (
             self.config.disable_dynamic_optimization
             and self.config.enable_feedforward_inpaint == "off"
+            and not self.config.save_change_detection_masks
         ):
             self._global_frame_counter += 1
             return
@@ -3531,12 +4259,53 @@ class DynamicGSPipeline(VanillaPipeline):
         self._timing["DN.6_render_object_mask"].append(time.time() - t0)
 
         t0 = time.time()
-        cdn = self._compute_change_mask(
-            rdn_rgb, rdn_depth, gt_rgb, gt_depth, gripper_mask, rendered_obj_mask,
-        )
+        if self.config.enable_feedforward_inpaint != "off":
+            cdn = self._compute_change_mask(
+                rdn_rgb, rdn_depth, gt_rgb, gt_depth, gripper_mask, rendered_obj_mask,
+                downsample_factor=self._resolved_cdn_downsample(rdn_rgb),
+                keep_largest_only=bool(self.config.feedforward_cdn_keep_largest_only),
+            )
+        else:
+            cdn = self._compute_change_mask(
+                rdn_rgb, rdn_depth, gt_rgb, gt_depth, gripper_mask, rendered_obj_mask,
+            )
         self._timing["DN.7_change_mask_cdn"].append(time.time() - t0)
 
         cdn_px = int((cdn[..., 0] > 0.5).sum().item()) if cdn.ndim >= 3 else int((cdn > 0.5).sum().item())
+
+        # Feedforward dual debug pair (one per tick, always saved when enabled).
+        if (
+            self.config.enable_feedforward_inpaint != "off"
+            and self.config.feedforward_save_debug_pair
+        ):
+            self._save_feedforward_debug_pair(
+                frame_name=frame_name,
+                rdn_rgb=rdn_rgb, gt_rgb=gt_rgb, cdn=cdn,
+                rendered_obj_mask=rendered_obj_mask,
+                gripper_mask=gripper_mask,
+            )
+
+        # Diagnostic save: render+CDN overlay AND raw masks for every tick.
+        # MVP-side consumers (e.g. mvsplat) need binary CDN + object mask
+        # + the rendered RGB to do their own input-masking.
+        if self.config.save_change_detection_masks:
+            out_dir = self._get_change_detection_dir()
+            try:
+                self._save_overlay(rdn_rgb, cdn, out_dir / f"{frame_name}_render_w_cdn.png")
+                cdn_bin = cdn[..., 0] if cdn.ndim == 3 else cdn
+                cdn_u8 = (cdn_bin.detach().float() > 0.5).byte().mul(255).cpu().numpy()
+                Image.fromarray(cdn_u8).save(out_dir / f"{frame_name}_cdn_mask.png")
+                # Rendered object mask (the can's projected footprint at the
+                # current tracked pose); used by MVP scripts to mask the input
+                # images before sending to MVSplat.
+                obj_bin = rendered_obj_mask[..., 0] if rendered_obj_mask.ndim == 3 else rendered_obj_mask
+                obj_u8 = (obj_bin.detach().float() > 0.5).byte().mul(255).cpu().numpy()
+                Image.fromarray(obj_u8).save(out_dir / f"{frame_name}_object_mask.png")
+                # Save the rendered scene image too (RGB uint8) for
+                # downstream visualization.
+                self._save_image(rdn_rgb, out_dir / f"{frame_name}_render.png")
+            except Exception as exc:
+                CONSOLE.log(f"[change-detection-masks] save failed for {frame_name}: {exc}")
 
         if not is_accepted:
             CONSOLE.log(
@@ -3569,17 +4338,27 @@ class DynamicGSPipeline(VanillaPipeline):
         )
         self._global_frame_counter += 1
 
-        # ---- Feedforward Mode B hook + anchor-pose video tick ----
+        # ---- Feedforward Mode B hook (closed-loop correction) ----
+        # Use the FRESH per-tick (camera, cdn, rendered_obj_mask) directly.
+        # The CDN here was just computed against the current scene state
+        # (which already includes any prior-tick inserts), so the loop is
+        # correctly closed. Passing the already-rendered obj mask avoids
+        # a duplicate render_object_mask call (~3 ms saved per dispatch).
         self._tracker_tick_count += 1
         if (
             self.config.enable_feedforward_inpaint == "rgbd_decode"
             and self.config.feedforward_recurring_every_n_ticks > 0
             and (self._tracker_tick_count % int(self.config.feedforward_recurring_every_n_ticks) == 0)
         ):
-            tail = self._optim_pool._q[-1] if len(self._optim_pool) > 0 else None
-            if tail is not None:
-                with self._feedforward_train_lock():
-                    self._run_feedforward(tail, mode_label="recurring")
+            fresh_frame = OptimFrame(
+                frame_idx=frame_idx, camera=camera, cdn=cdn.detach().clone(),
+            )
+            with self._feedforward_train_lock():
+                self._run_feedforward(
+                    fresh_frame, mode_label="recurring",
+                    prerendered_obj_mask=rendered_obj_mask,
+                    prerendered_depth=rdn_depth,
+                )
 
     def _zero_loss_dummy(self):
         """Trivial loss tuple used when the pool is empty.
@@ -3664,6 +4443,16 @@ class DynamicGSPipeline(VanillaPipeline):
                             CONSOLE.log(f"[feedforward] pre-render failed: {exc}")
                     # Run the dispatcher; this mutates the scene.
                     self._run_feedforward(target, mode_label="oneshot")
+                    # Dump full post-inpaint scene (means + covariances + rgb +
+                    # opacity for every Gaussian) so the user can open it in
+                    # viser via `scripts/view_splats_viser.py`. Pure debug
+                    # side-effect, gated on Mode A only.
+                    try:
+                        self._dump_scene_splats(
+                            self._get_debug_dir() / "feedforward_scene_splats.pt"
+                        )
+                    except Exception as exc:
+                        CONSOLE.log(f"[feedforward] scene dump failed: {exc}")
                     # Render post-inpaint and pull the anchor frame's live image
                     # for a 3-panel comparison.
                     if anchor_cam is not None and pre_rgb is not None:
@@ -3892,36 +4681,79 @@ class DynamicGSPipeline(VanillaPipeline):
 
         return result
 
+    @staticmethod
+    def _sum_ms(vals):
+        return (sum(vals) * 1000.0) if vals else 0.0
+
+    @staticmethod
+    def _avg_ms(vals):
+        return (sum(vals) / len(vals) * 1000.0) if vals else 0.0
+
     def _print_timing_summary(self):
-        """Print a concise timing summary to the console log."""
-        CONSOLE.log("[timing] === FULL PIPELINE SUMMARY ===")
-        for key in sorted(k for k in self._timing if k.startswith("S0.")):
-            vals = self._timing[key]
-            if vals:
-                CONSOLE.log(f"  {key}: {sum(vals):.2f}s")
-        s = self._timing["static_step"]
-        if s:
-            CONSOLE.log(f"  Static phase: {len(s)} steps, {sum(s):.1f}s total, {sum(s)/len(s)*1000:.1f}ms/step avg")
-        for key in sorted(k for k in self._timing if k.startswith("D0.")):
-            vals = self._timing[key]
-            CONSOLE.log(f"  {key}: {sum(vals):.2f}s")
-        for key in sorted(k for k in self._timing if k.startswith("DN.")):
-            vals = self._timing[key]
-            if vals:
-                CONSOLE.log(f"  {key}: avg={sum(vals)/len(vals)*1000:.1f}ms, total={sum(vals):.2f}s ({len(vals)} frames)")
-        d = self._timing["dynamic_step"]
-        if d:
-            CONSOLE.log(f"  Dynamic training: {len(d)} steps, {sum(d):.1f}s total, {sum(d)/len(d)*1000:.1f}ms/step avg")
-        all_times = sum(sum(v) for v in self._timing.values())
-        CONSOLE.log(f"  Grand total measured: {all_times:.1f}s")
+        """Live-first console summary. Headlines the feedforward impact on
+        the per-tick wall-clock budget — the metric that matters when
+        feedforward is slowing the tracker."""
+        CONSOLE.log("[timing] === DYNAMIC-GS SUMMARY ===")
+        # Live tick headline.
+        live_ticks = self._timing.get("LIVE.tick_total", [])
+        if live_ticks:
+            tick_ms = self._avg_ms(live_ticks)
+            gap_ms = self._avg_ms(self._timing.get("LIVE.between_tick_gap", []))
+            cycle = tick_ms + gap_ms
+            hz = (1000.0 / cycle) if cycle > 0 else 0.0
+            ff_calls = self._timing.get("FF.6_total_per_call", [])
+            ff_avg_ms = self._avg_ms(ff_calls)
+            cadence = max(1, int(self.config.feedforward_recurring_every_n_ticks))
+            ff_amort = ff_avg_ms / cadence
+            ff_share = (ff_amort / tick_ms * 100.0) if tick_ms > 0 else 0.0
+            tracker_ms = self._avg_ms(self._timing.get("DN.3_tracker_motion", []))
+            CONSOLE.log(
+                f"  Live: {len(live_ticks)} ticks @ {hz:.1f} Hz "
+                f"(tick {tick_ms:.0f}ms + gap {gap_ms:.0f}ms)"
+            )
+            CONSOLE.log(
+                f"  Tracker DN.3:   {tracker_ms:.0f}ms/tick"
+            )
+            if ff_calls:
+                CONSOLE.log(
+                    f"  Feedforward:    {len(ff_calls)} calls, {ff_avg_ms:.0f}ms/call, "
+                    f"amortized {ff_amort:.0f}ms/tick "
+                    f"(~{ff_share:.0f}% of tick budget, cadence=1/{cadence})"
+                )
+            else:
+                CONSOLE.log("  Feedforward:    (no calls observed)")
+        # Recorded-mode / startup one-liners.
+        static = self._timing.get("static_step", [])
+        if static:
+            CONSOLE.log(f"  Static phase:   {len(static)} steps, {sum(static):.1f}s total")
+        s0a = sum(self._timing.get("S0.4a_generation_total", [])) or 0.0
+        s0b = sum(self._timing.get("S0.4b_fusion_total", [])) or 0.0
+        if s0a or s0b:
+            CONSOLE.log(f"  SAM3D startup:  gen={s0a:.1f}s + fuse={s0b:.1f}s = {s0a+s0b:.1f}s")
+        dyn = self._timing.get("dynamic_step", [])
+        if dyn:
+            CONSOLE.log(
+                f"  Dynamic train:  {len(dyn)} steps, {sum(dyn):.1f}s total, "
+                f"{sum(dyn)/len(dyn)*1000:.0f}ms/step avg"
+            )
+        CONSOLE.log("  (full report in <data_root>/timing_report.txt)")
 
     def _write_timing_report(self):
-        """Write a detailed timing report file with per-phase breakdowns and percentages.
+        """Live-first timing report. Headlines the metric the user actually
+        watches: the per-tick wall-clock budget and how much of it the
+        feedforward decode is eating.
 
-        Called both at the last training step and via atexit so that Ctrl+C
-        interrupts still produce a report.  Missing timing keys (e.g. because
-        the run was interrupted before that phase completed) show 0.0s; the
-        last collected value for each key is always used as-is.
+        Structure:
+          1. TOP-LINE — live tick performance + feedforward impact
+          2. LIVE TICK BREAKDOWN — per-substep ms inside a tick
+          3. TRACKER MOTION (DN.3) BREAKDOWN — what the tracker is doing
+          4. FEEDFORWARD INPAINT (FF.*) BREAKDOWN — per-call decomposition
+          5. STARTUP COSTS — static + Phase 0 SAM3D + D0 bootstrap
+          6. RECORDED-MODE PER-FRAME (only if not live) — DT / DN tables
+          7. GRAND TOTAL
+
+        Called at the last training step AND via atexit so Ctrl+C still
+        produces a report. Missing timing keys (interrupted runs) show 0.
         """
         if self._timing_report_written:
             return
@@ -3938,316 +4770,342 @@ class DynamicGSPipeline(VanillaPipeline):
 
         from datetime import datetime
 
+        live_mode = bool(getattr(self.config, "live", False))
         tracker_label = "XFeat"
-        # --- Descriptions for each timer key (chronological within phase) ---
-        d0_keys = [
-            ("D0.1_initial_change_detection", "Initial change detection (total)"),
-            ("D0.1a_forward_render", "  -> Forward render (get_outputs in eval mode)"),
-            ("D0.1b_change_mask", "  -> Change mask (MSSIM depth+RGB, morphological filtering)"),
-            ("D0.1c_esam_render", "  -> ESAM on render (includes model load on first call)"),
-            ("D0.1d_esam_live", "  -> ESAM on live image"),
-            ("D0.1e_gaussian_flagging", "  -> Gaussian flagging (project centers, build active mask)"),
-            ("D0.1f_post_save", "  -> Post-D0.1 debug image saves (~10 PNGs of inputs/intermediates)"),
-            ("D0.2_sam3d_generation", "SAM3D object generation (subprocess)"),
-            ("D0.3_sam3d_insertion", "SAM3D object insertion (total)"),
-            ("D0.3a_load_ply", "  -> Load SAM3D PLY (plyfile read from disk)"),
-            ("D0.3b_registration", "  -> Registration total (bbox scale + centroid + downsample + CPD + dedup)"),
-            ("D0.3b1_nn_distances", "    -> Median NN distances for voxel size (Open3D, source + target)"),
-            ("D0.3b2_voxel_downsample", "    -> Voxel downsample (source + target)"),
-            ("D0.3b3_cpd_refinement", "    -> Probreg CPD similarity refinement (maxiter=50, tol=1e-2)"),
-            ("D0.3b4_correspondences", "    -> Explicit correspondence build + point transforms"),
-            ("D0.3b5_dedup", "    -> Dedup distance computation (Open3D point cloud distance)"),
-            ("D0.3b6_plot_and_save", "    -> Correspondence plot (matplotlib 3D) + artifact PLY saves"),
-            ("D0.3c_save_aligned_ply", "  -> Save aligned PLY"),
-            ("D0.3d_insert_gaussians", "  -> Insert Gaussians (k_nearest for scale, param concat, optimizer rebuild)"),
-            ("D0.3e_persistent_membership", "  -> Persistent membership (sklearn KNN over all candidate Gaussians)"),
-            ("D0.3f_save_fused_and_log", "  -> Save fused PLY + write fusion log"),
-            ("D0.4_render_object_mask", "Render object mask (rasterize object_flags Gaussians from simulation)"),
-            ("D0.6_tracker_init", f"{tracker_label} D0 seed (sample 2D points inside the rendered object mask, back-project to world via depth)"),
-            ("D0.7_render_rs00", "Render RS00 (re-render scene after SAM3D insertion)"),
-            ("D0.8_change_mask_cd0", "Change mask CD0 (MSSIM RS00 vs D0, excluding gripper + object)"),
-            ("D0.9_debug_images", "Debug images (save overlay PNGs to disk)"),
-        ]
-        dn_keys = [
-            ("DN.3_tracker_motion", f"{tracker_label} 2D-track advance + RANSAC-Kabsch (R, t) on the moved-object Gaussians"),
-            ("DN.3a_get_live_rgb", "  -> get_live_rgb (uint8->float, optional downscale, GPU upload, background composite)"),
-            ("DN.3j_object_mask_render", "  -> render_object_mask + erode (XFeat/KLT only; cached every xfeat_object_mask_cache_ticks for XFeat)"),
-            ("DN.3_estimate_total", "  -> estimate_and_advance total (sum of 3b+3c+3d+3e plus minor overhead)"),
-            ("DN.3b_estimator_input_prep", "    -> input prep total (rgb/depth/intrinsics/c2w extraction, includes CUDA syncs)"),
-            ("DN.3b1_prep_rgb_cpu", f"      -> rgb .cpu() + .item() ({tracker_label}-only; CUDA sync)"),
-            ("DN.3b2_prep_depth_cpu", f"      -> depth .cpu().numpy() ({tracker_label}-only; CUDA sync)"),
-            ("DN.3b3_prep_intrinsics", f"      -> intrinsics .cpu().numpy() ({tracker_label}-only; CUDA sync)"),
-            ("DN.3b4_prep_c2w", f"      -> camera_to_world .cpu().numpy() ({tracker_label}-only; CUDA sync)"),
-            ("DN.3c_predictor_forward", f"    -> predictor forward total ({tracker_label} NN inference + .cpu() pull; XFeat reports its sparse-extract leg here)"),
-            ("DN.3c_xfeat_extract", "      -> XFeat extract (XFeat-only; sparse detectAndCompute forward + keypoint .cpu() pull)"),
-            ("DN.3c1_preprocess_frame", f"      -> preprocess frame to model ({tracker_label}-only; .item() sync + interpolate)"),
-            ("DN.3c2_feature_grids", f"      -> feature_grids ({tracker_label}-only; encoder forward)"),
-            ("DN.3c3_estimate_traj", f"      -> estimate_trajectories ({tracker_label}-only; transformer forward)"),
-            ("DN.3c4_tracks_to_cpu", f"      -> tracks/visibles .cpu().numpy() ({tracker_label}-only; final CUDA sync)"),
-            ("DN.3i_lighterglue_match", "    -> LighterGlue match (XFeat-only; LightGlue transformer forward over 64-D descriptors; falls back to MNN time if LighterGlue unavailable)"),
-            ("DN.3d_postprocess", "    -> postprocess (image-bound filter, mask filter, bilinear depth sample, world back-projection — CPU/numpy)"),
-            ("DN.3e_ransac_kabsch", "    -> RANSAC-Kabsch (numpy loop, scales with ransac_iterations × correspondence count)"),
-            ("DN.3h_resample", "    -> KLT keypoint resample (FAST inside eroded object ∩ gripper-keep; KLT-only)"),
-            ("DN.3f_debug_io", "  -> debug I/O (motion log + tracked-points overlay PNG)"),
-            ("DN.3g_apply_transform", "  -> apply rigid transform to flagged Gaussians (CUDA means+quat update)"),
-            ("DN.5_render_rdn", "Render RDN (render scene after rigid transform)"),
-            ("DN.6_render_object_mask", "Render object mask (rasterize object_flags Gaussians from simulation)"),
-            ("DN.7_change_mask_cdn", "Change mask CDN (MSSIM RDN vs DN, excluding gripper + projected object mask)"),
-            ("DN.8_debug_images", "Debug images (save overlay PNGs to disk)"),
-        ]
-        live_keys = [
-            ("LIVE.tick_total", "Whole-tick wall-clock (live mode only). Includes early-return ticks that didn't reach the renders."),
-            ("LIVE.between_tick_gap", "**Wall-clock between consecutive ticks** (= time spent OUTSIDE _tracker_tick_live: trainer outer loop, optim step, callbacks, viewer render). Large gap + small tick_total = bottleneck is here, not in the tracker."),
-            ("GAP.trainer_outer_loop", "  -> [gap split] trainer outer loop: AFTER_TRAIN_ITERATION callbacks (splatfacto step_post_backward), writer scalars, viewer state update. Time BETWEEN train_iteration return and next train_iteration entry."),
-            ("GAP.pipeline_prelude", "  -> [gap split] pipeline-side prelude: from train_iteration entry to actual _tracker_tick_live start. Captures _sync_phase + _dynamic_get_train_loss_dict dispatch."),
-            ("GAP.pipeline_postlude", "  -> [gap split] pipeline-side postlude: from _tracker_tick_live exit to get_train_loss_dict return. Captures timing-summary check + zero-loss dummy. Sum of these three GAP.* ≈ LIVE.between_tick_gap."),
-            ("LIVE.frame_dt_seq", "Stamp delta between consecutive PROCESSED ROS frames. Reflects effective camera publishing rate as seen by the consumer."),
-            ("LIVE.frame_age", "Wall-clock age of the ROS frame at the moment we picked it up (now - frame.stamp)."),
-            ("LIVE.peek_latest", "  -> ROS subscriber peek_latest (atomic read, should be sub-ms)"),
-            ("LIVE.wrap_batch", "  -> _wrap_live_tuple_as_batch (3x pageable H2D copies: rgb~5MB + depth~3.6MB + mask~0.9MB + Cameras object)"),
-            ("LIVE.gt_setup", "  -> gt_rgb composite + _get_gt_depth + _get_batch_mask (GPU ops on device-resident tensors)"),
-            ("LIVE.keyframe_filter", "  -> dynamic keyframe filter accept (pure pose math, sub-ms)"),
-        ]
-        ff_keys = [
-            ("FF.1_cdn_clean", "Object-mask render + subtract from CDN (per inpaint call)"),
-            ("FF.2_component_select", "select_top_n_components_filtered (scipy.label on cleaned CDN)"),
-            ("FF.3_decode", "decode_component_to_gaussians per component (sub-ms vectorized GPU work)"),
-            ("FF.4_crop_and_delete", "Footprint filter (extract_projected_centers_and_radii + build_active_mask) + delete_gaussian_indices"),
-            ("FF.5_insert", "insert_inpaint_gaussians (concat + buffer resize + optimizer rebuild)"),
-            ("FF.6_total_per_call", "Per-call FF total: sum of FF.1-5"),
-            ("FF.video_render_tick", "Per-frame anchor-pose render for the comparison video (cv2 BGR write + tmp file)"),
-        ]
+
+        # --- helpers ---
+        def row(key, desc, vals, denom_ms=None):
+            if not vals:
+                return f"  {key:<38s}        N/A          —    {desc}"
+            n = len(vals)
+            avg_ms = self._avg_ms(vals)
+            total_s = sum(vals)
+            pct_str = ""
+            if denom_ms and denom_ms > 0:
+                pct_str = f"  {avg_ms/denom_ms*100:>5.1f}%"
+            return (
+                f"  {key:<38s} n={n:<5d} avg={avg_ms:>7.1f}ms total={total_s:>6.1f}s"
+                f"{pct_str}    {desc}"
+            )
 
         lines = []
-        total_steps = self._total_train_steps()
+
+        # ============================================================
+        # HEADER
+        # ============================================================
+        try:
+            total_steps = self._total_train_steps()
+        except Exception:
+            total_steps = 0
         completed_steps = len(self._timing.get("static_step", [])) + len(self._timing.get("dynamic_step", []))
-        interrupted = completed_steps < total_steps
-        header = "=== PIPELINE TIMING REPORT (INTERRUPTED — PARTIAL) ===" if interrupted else "=== PIPELINE TIMING REPORT ==="
-        lines.append(header)
-        lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        interrupted = total_steps > 0 and completed_steps < total_steps
+        suffix = " (INTERRUPTED — PARTIAL)" if interrupted else ""
+        lines.append(f"=== DYNAMIC-GS TIMING REPORT{suffix} ===")
+        lines.append(f"Generated:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"Mode:         {'LIVE (ROS)' if live_mode else 'RECORDED'}")
+        lines.append(f"Tracker:      {tracker_label}")
+        ff_mode = str(getattr(self.config, "enable_feedforward_inpaint", "off"))
+        ff_cadence = int(getattr(self.config, "feedforward_recurring_every_n_ticks", 0) or 0)
+        ff_cadence_str = f"every {ff_cadence} tick(s)" if ff_cadence > 0 else "DISABLED (cadence=0)"
+        lines.append(f"Feedforward:  mode={ff_mode}, cadence={ff_cadence_str}")
         if interrupted:
-            lines.append(f"WARNING: training stopped early ({completed_steps}/{total_steps} steps). Timings below reflect only what was collected.")
-        lines.append(
-            f"Config: static_num_steps={self.config.static_num_steps}, "
-            f"dynamic_steps_per_frame={self.config.dynamic_steps_per_frame}, "
-            f"total_dynamic_frames={self.total_dynamic_frames}"
-        )
-        lines.append(
-            f"Keyframe filter: static kept "
-            f"{self.datamanager.static_accepted_frames}/{self.datamanager.static_total_frames}, "
-            f"dynamic kept "
-            f"{len(self._accepted_dynamic_frames)}/{self.total_dynamic_frames}"
-        )
-        lines.append("")
-
-        # --- Phase 0: split into 0a (pre-static generation) + 0b (post-static fusion) ---
-        # The two halves run minutes apart on the timeline (generation in
-        # __init__, fusion at the static→dynamic boundary), so we report
-        # them separately. Combined "Phase 0 total" is shown at the bottom
-        # of the section for backward-compatible interpretation.
-        s0_gen_vals = self._timing.get("S0.4a_generation_total", [])
-        s0_fuse_vals = self._timing.get("S0.4b_fusion_total", [])
-        s0_gen_total = sum(s0_gen_vals) if s0_gen_vals else 0.0
-        s0_fuse_total = sum(s0_fuse_vals) if s0_fuse_vals else 0.0
-        s0_phase_total = s0_gen_total + s0_fuse_total
-        if s0_phase_total > 0:
-            s0_keys: list[tuple[str, str]] = [
-                ("S0.1_sam3_segmentation", "SAM3 text-prompted segmentation (subprocess in sam3_dynamic_gs env)"),
-                ("S0.2_sam3d_multi_generation", "SAM3D multi-object generation (single subprocess, sequential per-mask)"),
-                ("S0.4a_generation_total", "Phase 0a total (generation, runs in __init__ pre-static)"),
-            ]
-            # Per-object fusion keys (Phase 0b)
-            for key in sorted(k for k in self._timing if k.startswith("S0.3_fusion_obj_")):
-                obj_idx = key.split("_")[-1]
-                s0_keys.append((key, f"Object {obj_idx} fusion (register + insert + propagate)"))
-            s0_keys.append(("S0.4b_fusion_total", "Phase 0b total (fusion, runs at static→dynamic boundary)"))
-
-            lines.append("--- PHASE 0: SAM3D OBJECT INITIALIZATION (0a generation + 0b fusion) ---")
             lines.append(
-                f"Phase total: {s0_phase_total:.1f}s  "
-                f"(0a generation: {s0_gen_total:.1f}s, 0b fusion: {s0_fuse_total:.1f}s)"
-            )
-            lines.append("")
-            for key, desc in s0_keys:
-                vals = self._timing.get(key, [])
-                t = sum(vals) if vals else 0.0
-                pct = (t / s0_phase_total * 100) if s0_phase_total > 0 else 0.0
-                lines.append(f"  {key:<42s} {t:>8.2f}s  {pct:>6.1f}%    {desc}")
-            lines.append("")
-
-        # --- Phase 1: Static ---
-        s = self._timing["static_step"]
-        static_total = sum(s) if s else 0.0
-        conv = self._timing.get("S.convergence_check", [])
-        conv_total = sum(conv) if conv else 0.0
-        # ``static_step`` is wall-clock around the whole get_train_loss_dict
-        # call, so it already includes the convergence-check spikes that run
-        # inside _sync_phase. Subtract for an honest "pure step" average.
-        pure_total = max(static_total - conv_total, 0.0)
-        pure_count = max(len(s) - len(conv), 1)
-        lines.append("--- PHASE 1: STATIC TRAINING ---")
-        lines.append(f"Phase total: {static_total:.1f}s  (training: {pure_total:.1f}s, convergence checks: {conv_total:.1f}s)")
-        lines.append("")
-        if s:
-            pure_avg_ms = pure_total / pure_count * 1000
-            lines.append(
-                f"  S.1  Pure training step (avg over {pure_count} steps, excl. convergence checks)  "
-                f"{pure_avg_ms:>10.1f}ms"
-            )
-        if conv:
-            avg_s = conv_total / len(conv)
-            lines.append(
-                f"  S.2  Static convergence check (avg over {len(conv)} calls)  "
-                f"{avg_s*1000:>10.1f}ms total {conv_total:.2f}s"
+                f"WARNING: training stopped early ({completed_steps}/{total_steps} steps). "
+                f"Timings below reflect only what was collected."
             )
         lines.append("")
 
-        # --- Phase 2: Dynamic initialization (Frame 0) ---
-        d0_total_vals = self._timing.get("D0.10_total_frame_0", [])
-        d0_phase_total = sum(d0_total_vals) if d0_total_vals else 0.0
-        lines.append("--- PHASE 2: DYNAMIC INITIALIZATION (Frame 0) ---")
-        lines.append(f"Phase total: {d0_phase_total:.1f}s")
-        lines.append("")
-        for key, desc in d0_keys:
-            vals = self._timing.get(key, [])
-            t = sum(vals) if vals else 0.0
-            pct = (t / d0_phase_total * 100) if d0_phase_total > 0 else 0.0
-            lines.append(f"  {key:<42s} {t:>8.2f}s  {pct:>6.1f}%    {desc}")
-            if key == "D0.3b3_cpd_refinement" and self._cpd_info:
-                m = self._cpd_info
-                if m.get("stop_reason") == "tol":
-                    lines.append(
-                        f"  {'':42s}                      "
-                        f"CPD converged at iteration {m['iterations']}/{m['maxiter']} "
-                        f"(tol={m['tol']:.0e} reached)"
-                    )
-                elif m.get("stop_reason") == "maxiter":
-                    q_delta = m.get("last_q_delta")
-                    q_str = f"{q_delta:.3e}" if q_delta is not None else "unavailable"
-                    lines.append(
-                        f"  {'':42s}                      "
-                        f"CPD hit maxiter={m['maxiter']}, last |q_delta|={q_str}"
-                    )
-        lines.append("")
-
-        # --- Phase 3: Dynamic loop ---
-        dn_total_vals = self._timing.get("DN.9_total_frame_n", [])
-        frame_prep_total = sum(dn_total_vals) if dn_total_vals else 0.0
-        n_frames = len(dn_total_vals)
-        d = self._timing["dynamic_step"]
-        dyn_train_total = sum(d) if d else 0.0
-        dyn_phase_total = frame_prep_total + dyn_train_total
-
-        lines.append(
-            f"--- PHASE 3: DYNAMIC LOOP "
-            f"(kept {len(self._accepted_dynamic_frames)}/{self.total_dynamic_frames} keyframes) ---"
-        )
-        lines.append(f"Phase total: {dyn_phase_total:.1f}s")
-        lines.append(f"  Frame prep total: {frame_prep_total:.1f}s")
-        lines.append(f"  Training total: {dyn_train_total:.1f}s")
-        lines.append("")
-
-        lines.append(f"  [Per-frame prep averages over {n_frames} frames]")
-        avg_frame_total = (frame_prep_total / n_frames) if n_frames > 0 else 0.0
-        for key, desc in dn_keys:
-            vals = self._timing.get(key, [])
-            if vals:
-                avg_ms = sum(vals) / len(vals) * 1000
-                pct = (avg_ms / (avg_frame_total * 1000) * 100) if avg_frame_total > 0 else 0.0
-                lines.append(f"  {key:<42s} {avg_ms:>8.1f}ms  {pct:>6.1f}%    {desc}")
-            else:
-                lines.append(f"  {key:<42s}      N/A     N/A    {desc}")
-        lines.append("")
-
-        lines.append(f"  [Per-epoch training average over {len(d)} steps]")
-        if d:
-            avg_dyn_ms = dyn_train_total / len(d) * 1000
-            lines.append(f"  {'DT.1 dynamic_step':<42s} {avg_dyn_ms:>8.1f}ms  {100.0:>6.1f}%    Full training iteration (masked loss + backward + optimizer)")
-        lines.append("")
-
-        # --- Phase 3b: Live tick breakdown (live mode only) ---
+        # ============================================================
+        # 1. TOP-LINE — LIVE TICK PERFORMANCE + FEEDFORWARD IMPACT
+        # ============================================================
         live_tick_vals = self._timing.get("LIVE.tick_total", [])
         if live_tick_vals:
+            lines.append("=" * 78)
+            lines.append("1. TOP-LINE — LIVE TICK PERFORMANCE")
+            lines.append("=" * 78)
             n_ticks = len(live_tick_vals)
-            avg_tick_ms = sum(live_tick_vals) / n_ticks * 1000
-            tick_hz = (1000.0 / avg_tick_ms) if avg_tick_ms > 0 else 0.0
-            # Effective end-to-end rate from inter-tick gap.
+            dedup_n = len(self._timing.get("LIVE.dedup_returns", []))
+            tick_ms = self._avg_ms(live_tick_vals)
+            tick_max_ms = max(live_tick_vals) * 1000.0
             gap_vals = self._timing.get("LIVE.between_tick_gap", [])
-            if gap_vals:
-                avg_gap_ms = sum(gap_vals) / len(gap_vals) * 1000
-                cycle_ms = avg_tick_ms + avg_gap_ms
-                effective_hz = (1000.0 / cycle_ms) if cycle_ms > 0 else 0.0
-            else:
-                effective_hz = tick_hz
-            # Dedup ratio: dedup-returns vs. processed ticks.
-            dedup_count = len(self._timing.get("LIVE.dedup_returns", []))
-            total_calls = n_ticks + dedup_count
-            dedup_ratio = (dedup_count / total_calls) if total_calls > 0 else 0.0
+            gap_ms = self._avg_ms(gap_vals)
+            cycle_ms = tick_ms + gap_ms
+            tracker_hz = (1000.0 / cycle_ms) if cycle_ms > 0 else 0.0
+            tracker_ms = self._avg_ms(self._timing.get("DN.3_tracker_motion", []))
             lines.append(
-                f"--- LIVE TICK BREAKDOWN ({n_ticks} processed ticks + {dedup_count} dedup-returns; "
-                f"in-tick avg {avg_tick_ms:.1f}ms; **effective rate {effective_hz:.1f} Hz** with "
-                f"between-tick gap; dedup ratio {dedup_ratio*100:.0f}%) ---"
+                f"  Processed ticks:        {n_ticks}  (+ {dedup_n} dedup-returns; "
+                f"dedup ratio {dedup_n/max(1,n_ticks+dedup_n)*100:.0f}%)"
             )
             lines.append(
-                "  [Sub-step averages. LIVE.tick_total includes early-return ticks (filter rejects, "
-                "tracking-only short-circuit). LIVE.between_tick_gap is wall-clock spent OUTSIDE this "
-                "function (trainer outer loop, optim, viewer). If gap >> tick_total, the bottleneck "
-                "is outside the tracker.]"
+                f"  Effective tracker rate: {tracker_hz:.2f} Hz"
+                f"   (in-tick {tick_ms:.0f}ms + outside-tick gap {gap_ms:.0f}ms = cycle {cycle_ms:.0f}ms)"
             )
-            for key, desc in live_keys:
-                vals = self._timing.get(key, [])
-                if vals:
-                    avg_ms = sum(vals) / len(vals) * 1000
-                    pct = (avg_ms / avg_tick_ms * 100) if avg_tick_ms > 0 else 0.0
-                    lines.append(f"  {key:<42s} {avg_ms:>8.1f}ms  {pct:>6.1f}%    {desc}")
-                else:
-                    lines.append(f"  {key:<42s}      N/A     N/A    {desc}")
-            # Cross-reference: how much of tick_total is the tracker
-            # motion (which has its own DN.3 breakdown).
-            motion_vals = self._timing.get("DN.3_tracker_motion", [])
-            if motion_vals:
-                avg_motion_ms = sum(motion_vals) / len(motion_vals) * 1000
-                pct = (avg_motion_ms / avg_tick_ms * 100) if avg_tick_ms > 0 else 0.0
+            lines.append(
+                f"  Per-tick: avg {tick_ms:.0f}ms, max {tick_max_ms:.0f}ms"
+            )
+            lines.append(
+                f"  Tracker share (DN.3):   {tracker_ms:.0f}ms/tick "
+                f"({tracker_ms/tick_ms*100 if tick_ms>0 else 0:.0f}% of in-tick)"
+            )
+
+            # Feedforward impact: this is the headline the user came for.
+            ff_calls = self._timing.get("FF.6_total_per_call", [])
+            if ff_calls:
+                n_ff = len(ff_calls)
+                ff_avg_ms = self._avg_ms(ff_calls)
+                ff_max_ms = max(ff_calls) * 1000.0
+                ff_total_s = sum(ff_calls)
+                cadence = max(1, ff_cadence)
+                # Two views on impact:
+                #   (a) on-tick: when FF fires, the tick costs ~tracker + ff_avg_ms.
+                #   (b) amortized over all ticks: ff_avg_ms / cadence ms/tick avg.
+                amort_ms = ff_avg_ms / cadence
+                expected_ff = n_ticks / cadence
+                # Hypothetical rate without FF — naive (subtract amort from tick).
+                tick_wo_ff = max(0.0, tick_ms - amort_ms)
+                cycle_wo_ff = tick_wo_ff + gap_ms
+                hz_wo_ff = (1000.0 / cycle_wo_ff) if cycle_wo_ff > 0 else 0.0
+                lines.append("")
+                lines.append("  >>> FEEDFORWARD IMPACT <<<")
                 lines.append(
-                    f"  {'(reference) DN.3_tracker_motion':<42s} {avg_motion_ms:>8.1f}ms  {pct:>6.1f}%    "
-                    f"tracker motion total — see DN.3* breakdown above for sub-syncs"
+                    f"    Calls observed:       {n_ff}  (expected ~ ticks/cadence = {expected_ff:.0f})"
                 )
+                lines.append(
+                    f"    Per call:             avg {ff_avg_ms:.0f}ms, max {ff_max_ms:.0f}ms, total {ff_total_s:.1f}s"
+                )
+                lines.append(
+                    f"    Amortized per tick:   {amort_ms:.0f}ms  ("
+                    f"{amort_ms/tick_ms*100 if tick_ms>0 else 0:.0f}% of tick budget)"
+                )
+                lines.append(
+                    f"    Rate cost:            ~{tracker_hz:.2f} Hz now → "
+                    f"~{hz_wo_ff:.2f} Hz if feedforward disabled"
+                )
+            else:
+                lines.append("")
+                lines.append("  >>> FEEDFORWARD: no calls observed (cadence too high, gate failed, or disabled)")
             lines.append("")
 
-        # --- Feedforward (FF.*) ---
+        # Static/dynamic step + keyframe summary for context.
+        try:
+            stat_acc = self.datamanager.static_accepted_frames
+            stat_tot = self.datamanager.static_total_frames
+            dyn_acc = len(self._accepted_dynamic_frames)
+            dyn_tot = self.total_dynamic_frames
+            lines.append(
+                f"Static-step config: static_num_steps={self.config.static_num_steps}, "
+                f"dynamic_steps_per_frame={self.config.dynamic_steps_per_frame}, "
+                f"total_dynamic_frames={dyn_tot}"
+            )
+            lines.append(
+                f"Keyframe filter:    static {stat_acc}/{stat_tot} kept, "
+                f"dynamic {dyn_acc}/{dyn_tot} kept"
+            )
+        except Exception:
+            pass
+        lines.append("")
+
+        # ============================================================
+        # 2. LIVE TICK BREAKDOWN (live mode only)
+        # ============================================================
+        if live_tick_vals:
+            avg_tick_ms = self._avg_ms(live_tick_vals)
+            lines.append("=" * 78)
+            lines.append(f"2. LIVE TICK BREAKDOWN — per-substep avg over {len(live_tick_vals)} ticks")
+            lines.append("=" * 78)
+            lines.append(
+                "  (% column = share of avg in-tick budget. Substeps below should sum close "
+                "to LIVE.tick_total. Anything outside the tick lands in LIVE.between_tick_gap.)"
+            )
+            live_keys = [
+                ("LIVE.tick_total",     "Whole-tick wall-clock (INCLUDES feedforward when it fires)"),
+                ("LIVE.between_tick_gap","Wall-clock OUTSIDE the tick (trainer loop + viewer render + callbacks)"),
+                ("GAP.pipeline_prelude","  -> [gap split] train_iteration entry → tracker tick start"),
+                ("LIVE.peek_latest",   "  ROS subscriber atomic read of latest tuple"),
+                ("LIVE.wrap_batch",    "  H2D copy rgb+depth+mask + Cameras object build"),
+                ("LIVE.gt_setup",      "  gt_rgb composite + _get_gt_depth + _get_batch_mask"),
+                ("DN.3_tracker_motion","  XFeat extract + LighterGlue match + RANSAC-Kabsch (R, t)"),
+                ("LIVE.keyframe_filter","  Pose-only keyframe accept (skipped when feedforward on)"),
+                ("LIVE.gap_pre_render", "  [gap] DN.3 end → DN.5 start (Python overhead + rolling-print code)"),
+                ("DN.5_render_rdn",    "  Render RDN at current camera pose (gsplat rasterize)"),
+                ("DN.6_render_object_mask","  Render object-only mask (object_flags rasterize)"),
+                ("DN.7_change_mask_cdn","  CDN compute (MSSIM RDN vs DN, excl. gripper + object)"),
+                ("FF.6_total_per_call","  Feedforward inpaint per call (when triggered; see Section 4)"),
+                ("LIVE.gap_ff_outer",  "  [gap] outer wall-clock around FF call (lock acquire + dispatch)"),
+                ("LIVE.gap_post_ff",   "  [gap] CDN end → tick end (includes FF and any post-FF cleanup)"),
+                ("LIVE.frame_dt_seq",  "Stamp delta between consecutive PROCESSED frames"),
+                ("LIVE.frame_age",     "Wall-clock age of frame at tick start (now - frame.stamp)"),
+            ]
+            for key, desc in live_keys:
+                lines.append(row(key, desc, self._timing.get(key, []), denom_ms=avg_tick_ms))
+            lines.append("")
+
+        # ============================================================
+        # 3. TRACKER MOTION (DN.3) BREAKDOWN
+        # ============================================================
+        motion_vals = self._timing.get("DN.3_tracker_motion", [])
+        if motion_vals:
+            avg_motion_ms = self._avg_ms(motion_vals)
+            lines.append("=" * 78)
+            lines.append(f"3. TRACKER MOTION (DN.3) BREAKDOWN — {tracker_label}, "
+                         f"avg {avg_motion_ms:.1f}ms over {len(motion_vals)} ticks")
+            lines.append("=" * 78)
+            dn3_keys = [
+                ("DN.3a_get_live_rgb",       "  get_live_rgb (uint8→float, downscale, GPU upload, composite)"),
+                ("DN.3j_object_mask_render", "  render_object_mask + erode (XFeat-only; cached)"),
+                ("DN.3_estimate_total",      "  Estimator total (input prep + forward + post + RANSAC)"),
+                ("DN.3b_estimator_input_prep","    -> input prep (rgb/depth/K/c2w extraction, CUDA syncs)"),
+                ("DN.3c_predictor_forward",  "    -> predictor forward (NN inference)"),
+                ("DN.3c_xfeat_extract",      "      -> XFeat sparse detectAndCompute + keypoint .cpu()"),
+                ("DN.3i_lighterglue_match",  "    -> LighterGlue transformer match over 64-D descriptors"),
+                ("DN.3d_postprocess",        "    -> postprocess (filter + depth sample + back-project)"),
+                ("DN.3e_ransac_kabsch",      "    -> RANSAC-Kabsch (numpy loop)"),
+                ("DN.3f_debug_io",           "  Debug I/O (motion log + tracked-points overlay)"),
+                ("DN.3g_apply_transform",    "  Apply rigid transform to flagged Gaussians (CUDA means+quat)"),
+            ]
+            for key, desc in dn3_keys:
+                lines.append(row(key, desc, self._timing.get(key, []), denom_ms=avg_motion_ms))
+            lines.append("")
+
+        # ============================================================
+        # 4. FEEDFORWARD INPAINT (FF.*) BREAKDOWN
+        # ============================================================
         ff_call_vals = self._timing.get("FF.6_total_per_call", [])
         if ff_call_vals:
             n_calls = len(ff_call_vals)
-            total_ff = sum(ff_call_vals)
-            avg_ms = total_ff / n_calls * 1000
+            ff_avg_ms = self._avg_ms(ff_call_vals)
+            ff_max_ms = max(ff_call_vals) * 1000.0
+            ff_total_s = sum(ff_call_vals)
+            lines.append("=" * 78)
             lines.append(
-                f"--- FEEDFORWARD INPAINT ({n_calls} call(s); avg {avg_ms:.1f}ms/call; "
-                f"total {total_ff:.2f}s) ---"
+                f"4. FEEDFORWARD INPAINT — {n_calls} call(s), avg {ff_avg_ms:.0f}ms, "
+                f"max {ff_max_ms:.0f}ms, total {ff_total_s:.1f}s"
             )
+            lines.append("=" * 78)
+            lines.append(
+                "  FF.1..FF.5 are PER-COMPONENT (one decode per CDN component); FF.6 is the "
+                "PER-CALL total (sum across components). When a call decodes multiple components, "
+                "expect n_components > n_calls in the FF.1..FF.5 rows."
+            )
+            ff_keys = [
+                ("FF.1_cdn_clean",        "Subtract current rendered object mask from CDN (per call)"),
+                ("FF.2_component_select", "select_top_n_components_filtered (scipy.label on cleaned CDN)"),
+                ("FF.3_decode",           "decode_component_to_gaussians (per component, vectorized GPU)"),
+                ("FF.4_crop_and_delete",  "Footprint filter + delete_gaussian_indices + cull-in-front"),
+                ("FF.5_insert",           "insert_inpaint_gaussians (concat + buffer resize + optim rebuild)"),
+                ("FF.6_total_per_call",   "PER-CALL TOTAL (sum of FF.1-5 across all components in call)"),
+                ("FF.video_render_tick",  "Anchor-pose render for the comparison video (recorded mode)"),
+            ]
             for key, desc in ff_keys:
-                vals = self._timing.get(key, [])
-                if vals:
-                    avg = sum(vals) / len(vals) * 1000
-                    pct = (avg / avg_ms * 100) if avg_ms > 0 else 0.0
-                    lines.append(
-                        f"  {key:<32s} n={len(vals):<4d} avg={avg:>8.2f}ms total={sum(vals):>7.2f}s  "
-                        f"{pct:>5.1f}%   {desc}"
-                    )
-                else:
-                    lines.append(f"  {key:<32s}      N/A     N/A    {desc}")
+                lines.append(row(key, desc, self._timing.get(key, []), denom_ms=ff_avg_ms))
             lines.append("")
 
-        # --- Grand total ---
-        grand_total = static_total + d0_phase_total + dyn_phase_total
-        lines.append("--- GRAND TOTAL ---")
-        if grand_total > 0:
-            lines.append(f"  Static phase:           {static_total:>8.1f}s  {static_total/grand_total*100:>6.1f}%")
-            lines.append(f"  Dynamic initialization: {d0_phase_total:>8.1f}s  {d0_phase_total/grand_total*100:>6.1f}%")
-            lines.append(f"  Dynamic loop:           {dyn_phase_total:>8.1f}s  {dyn_phase_total/grand_total*100:>6.1f}%")
-            lines.append(f"    Frame prep subtotal:  {frame_prep_total:>8.1f}s  {frame_prep_total/grand_total*100:>6.1f}%")
-            lines.append(f"    Training subtotal:    {dyn_train_total:>8.1f}s  {dyn_train_total/grand_total*100:>6.1f}%")
-            lines.append(f"  Pipeline total:         {grand_total:>8.1f}s")
-        lines.append("")
+        # ============================================================
+        # 5. STARTUP COSTS (one-shot, paid before live tracking)
+        # ============================================================
+        s0_gen = sum(self._timing.get("S0.4a_generation_total", [])) or 0.0
+        s0_fuse = sum(self._timing.get("S0.4b_fusion_total", [])) or 0.0
+        static_vals = self._timing.get("static_step", [])
+        conv_vals = self._timing.get("S.convergence_check", [])
+        static_total = sum(static_vals) if static_vals else 0.0
+        conv_total = sum(conv_vals) if conv_vals else 0.0
+        pure_total = max(static_total - conv_total, 0.0)
+        d0_total = sum(self._timing.get("D0.10_total_frame_0", [])) or 0.0
+        startup_total = s0_gen + s0_fuse + static_total + d0_total
+        if startup_total > 0:
+            lines.append("=" * 78)
+            lines.append(f"5. STARTUP COSTS (one-shot) — total {startup_total:.1f}s")
+            lines.append("=" * 78)
+            if s0_gen or s0_fuse:
+                lines.append(
+                    f"  Phase 0 SAM3D:    gen {s0_gen:.1f}s + fuse {s0_fuse:.1f}s = {s0_gen+s0_fuse:.1f}s"
+                )
+                if s0_gen:
+                    lines.append(row(
+                        "S0.1_sam3_segmentation", "  SAM3 text-prompted segmentation",
+                        self._timing.get("S0.1_sam3_segmentation", []),
+                    ))
+                    lines.append(row(
+                        "S0.2_sam3d_multi_generation", "  SAM3D multi-object generation",
+                        self._timing.get("S0.2_sam3d_multi_generation", []),
+                    ))
+                for key in sorted(k for k in self._timing if k.startswith("S0.3_fusion_obj_")):
+                    obj_idx = key.split("_")[-1]
+                    lines.append(row(key, f"  Object {obj_idx} CPD fusion + propagate",
+                                     self._timing.get(key, [])))
+            if static_vals:
+                pure_avg_ms = (pure_total / max(1, len(static_vals) - len(conv_vals))) * 1000
+                lines.append(
+                    f"  Static phase:     {len(static_vals)} steps in {static_total:.1f}s "
+                    f"(training {pure_total:.1f}s @ {pure_avg_ms:.0f}ms/step, "
+                    f"convergence checks {conv_total:.1f}s)"
+                )
+            if d0_total:
+                lines.append(f"  D0 bootstrap:     {d0_total:.1f}s")
+                # D0 subkey detail only when present
+                d0_detail_keys = [
+                    ("D0.1_initial_change_detection", "Initial change detection (MSSIM + ESAM + flag)"),
+                    ("D0.2_sam3d_generation",         "SAM3D generation (Path B only)"),
+                    ("D0.3_sam3d_insertion",          "SAM3D insertion + CPD fusion"),
+                    ("D0.6_tracker_init",             f"{tracker_label} D0 seed"),
+                    ("D0.8_change_mask_cd0",          "CD0 change mask"),
+                ]
+                for key, desc in d0_detail_keys:
+                    v = self._timing.get(key, [])
+                    if v:
+                        lines.append(row(key, "  " + desc, v))
+            lines.append("")
+
+        # ============================================================
+        # 6. RECORDED-MODE PER-FRAME (only when not live)
+        # ============================================================
+        dyn_train_vals = self._timing.get("dynamic_step", [])
+        dn_total_vals = self._timing.get("DN.9_total_frame_n", [])
+        if not live_mode and (dyn_train_vals or dn_total_vals):
+            lines.append("=" * 78)
+            lines.append("6. RECORDED-MODE PER-FRAME")
+            lines.append("=" * 78)
+            n_dyn_frames = len(dn_total_vals)
+            dn_avg_ms = self._avg_ms(dn_total_vals)
+            if dn_total_vals:
+                lines.append(
+                    f"  Frame prep:  {n_dyn_frames} frames, avg {dn_avg_ms:.0f}ms/frame, "
+                    f"total {sum(dn_total_vals):.1f}s"
+                )
+            if dyn_train_vals:
+                avg_dyn_ms = self._avg_ms(dyn_train_vals)
+                lines.append(
+                    f"  Train step:  {len(dyn_train_vals)} steps, avg {avg_dyn_ms:.0f}ms/step, "
+                    f"total {sum(dyn_train_vals):.1f}s"
+                )
+            lines.append("")
+
+        # ============================================================
+        # 7. GRAND TOTAL
+        # ============================================================
+        live_total = sum(live_tick_vals) if live_tick_vals else 0.0
+        dyn_train_total = sum(dyn_train_vals) if dyn_train_vals else 0.0
+        dn_total_s = sum(dn_total_vals) if dn_total_vals else 0.0
+        grand = static_total + s0_gen + s0_fuse + d0_total + live_total + dyn_train_total + dn_total_s
+        if grand > 0:
+            lines.append("=" * 78)
+            lines.append("7. GRAND TOTAL")
+            lines.append("=" * 78)
+            def add(label, v):
+                if v > 0:
+                    lines.append(f"  {label:<28s} {v:>8.1f}s  {v/grand*100:>5.1f}%")
+            add("Phase 0 SAM3D (gen+fuse)", s0_gen + s0_fuse)
+            add("Static training", static_total)
+            add("D0 bootstrap", d0_total)
+            if live_mode or live_total > 0:
+                add("Live ticks (in-tick)", live_total)
+                ff_total = sum(self._timing.get("FF.6_total_per_call", [])) or 0.0
+                add("  -> of which feedforward", ff_total)
+            if not live_mode:
+                add("Dynamic frame prep", dn_total_s)
+                add("Dynamic training", dyn_train_total)
+            lines.append(f"  {'PIPELINE TOTAL':<28s} {grand:>8.1f}s")
+            lines.append("")
 
         report_text = "\n".join(lines)
 
