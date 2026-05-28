@@ -130,7 +130,8 @@ class ViserDirectScene:
     """
 
     def __init__(self, port: int = 8081, opacity_floor: float = 0.05,
-                 static_refresh_min_gap_s: float = -1.0):
+                 static_refresh_min_gap_s: float = -1.0,
+                 push_min_gap_s: float = 0.033):
         """``opacity_floor`` drops splats with sigmoid(opacities) below
         the threshold. The prior viser dump-tool symptom (white browser)
         was 95% near-zero-opacity splats overwhelming Chrome WebGL.
@@ -147,6 +148,15 @@ class ViserDirectScene:
         self.static_refresh_min_gap_s = float(static_refresh_min_gap_s)
         self._last_static_refresh_t = 0.0
         self._pending_refresh_count = 0
+        # Per-tick transform push throttle. At 25+ Hz tracker with chunked
+        # tracked-handles, the per-tick push fires many handle.position +
+        # .wxyz writes in rapid succession, which hits a known race in
+        # websockets.legacy.protocol._drain_helper (AssertionError on
+        # `waiter is None or waiter.cancelled()`). Throttling to ~30 Hz
+        # wall-clock (default 33 ms gap) has no visual cost but stops the
+        # drain race. Set to 0 to disable throttling.
+        self.push_min_gap_s = float(push_min_gap_s)
+        self._last_push_t = 0.0
         # Always-on world axes — diagnostic: if axes show in the browser
         # but splats don't, the camera is correct and splat-data conversion
         # is wrong; if even axes don't show, the camera or the WebGL bundle
@@ -158,7 +168,8 @@ class ViserDirectScene:
         # Lazy: handles created when ``setup_handles`` is called (after
         # Phase 0b fusion finalises the scene).
         self.static_handle = None        # all non-tracked-object Gaussians
-        self.tracked_handle = None       # the (single) moved object
+        self.tracked_handle = None       # the (single) moved object (chunks)
+        self.tracked_root = None         # parent FrameHandle for tracked chunks
         self.tracked_instance_id: Optional[int] = None
         self._tracked_count = 0
         self._static_count = 0
@@ -219,12 +230,25 @@ class ViserDirectScene:
         )
         self._static_count = n_static_kept
         if int(tracked_mask.sum().item()) > 0:
+            # Parent frame for all tracked-object chunks. Per-tick transform
+            # pushes update THIS frame's wxyz+position; viser propagates the
+            # transform to all children via scene-graph hierarchy. This way
+            # we send 2 attr writes per tick instead of 2 × N_chunks ×
+            # N_clients (which triggered the websockets _drain_helper race).
+            self.tracked_root = self.server.scene.add_frame(
+                name="/tracked_object_root",
+                show_axes=False,
+                wxyz=(1.0, 0.0, 0.0, 0.0),
+                position=(0.0, 0.0, 0.0),
+            )
+            # Chunk names are CHILDREN of the parent frame.
             self.tracked_handle, n_tr_kept, n_tr_total = self._add_handle(
-                "/tracked_object", model, tracked_mask, cam_pos=cam_pos,
+                "/tracked_object_root/splats", model, tracked_mask, cam_pos=cam_pos,
             )
             self._tracked_count = n_tr_kept
         else:
             self.tracked_handle = None
+            self.tracked_root = None
             self._tracked_count = 0
             n_tr_kept, n_tr_total = 0, 0
 
@@ -381,20 +405,24 @@ class ViserDirectScene:
     # ------------------------------------------------------------------
     def push_tracker_transform(self, R, t) -> None:
         """Push the latest world-frame rigid (R, t) to the tracked-object
-        handle(s). R: (3, 3) numpy/torch; t: (3,) numpy/torch. When
-        ``tracked_handle`` is a list (chunked upload), the same transform
-        is applied to every chunk — they all belong to the same rigid
-        body, so they move together."""
-        if self.tracked_handle is None:
+        parent frame. Children (the splat chunks) inherit the transform
+        via the viser scene graph, so we only emit 2 attribute writes
+        per tick regardless of chunk count or client count. Throttled
+        to ``push_min_gap_s``."""
+        if self.tracked_root is None:
             return
+        if self.push_min_gap_s > 0.0:
+            import time as _time
+            now = _time.time()
+            if (now - self._last_push_t) < self.push_min_gap_s:
+                return
+            self._last_push_t = now
         R_np = R.detach().cpu().numpy() if isinstance(R, torch.Tensor) else np.asarray(R)
         t_np = t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else np.asarray(t)
         wxyz = _rotmat_to_wxyz_np(R_np[:3, :3])
         pos = t_np.astype(np.float32).reshape(3)
-        handles = self.tracked_handle if isinstance(self.tracked_handle, list) else [self.tracked_handle]
-        for h in handles:
-            h.wxyz = wxyz
-            h.position = pos
+        self.tracked_root.wxyz = wxyz
+        self.tracked_root.position = pos
 
     # ------------------------------------------------------------------
     # Static-handle refresh (call after FF inserts/deletes)

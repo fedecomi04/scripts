@@ -239,6 +239,13 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     """Mode B trigger cadence (>0 enables; 0 disables). Every Nth
     tracker tick, inpaint every CDN component that survived the cleanup
     recipe (760-px floor). Set to 0 to disable Mode B."""
+    feedforward_recurring_min_gap_s: float = 0.3
+    """Minimum wall-clock gap between consecutive FF firings (default
+    300 ms = max 3.3 Hz). At high tracker rates the tick-count cadence
+    alone fires FF too often (e.g. cadence=3 at 25 Hz tracker = 8 Hz FF
+    = ~120 ms FF cost amortized per tick). This wall-clock floor lets
+    FF deliver visible hole-fill progress without dominating tick time.
+    Set to 0 to disable (cadence-only)."""
     feedforward_top_n_components: int = 3
     """Mode A: take at most this many components, sorted by area."""
     feedforward_dominant_area_ratio: float = 0.3
@@ -3225,6 +3232,12 @@ class DynamicGSPipeline(VanillaPipeline):
             ff_will_fire_this_tick = (
                 (self._tracker_tick_count % int(self.config.feedforward_recurring_every_n_ticks)) == 0
             )
+            # Additional wall-clock floor: even if the tick-count cadence
+            # says "fire", skip if the previous fire was too recent.
+            min_gap = float(getattr(self.config, "feedforward_recurring_min_gap_s", 0.0))
+            if ff_will_fire_this_tick and min_gap > 0.0:
+                if (time.time() - getattr(self, "_last_ff_fire_t", 0.0)) < min_gap:
+                    ff_will_fire_this_tick = False
         else:
             ff_will_fire_this_tick = False
         # Renders are needed for: (a) FF firing this tick, (b) debug-pair
@@ -3358,6 +3371,7 @@ class DynamicGSPipeline(VanillaPipeline):
             # decision computed there.
             ff_fired = ff_will_fire_this_tick
             if ff_fired:
+                self._last_ff_fire_t = time.time()
                 fresh_frame = OptimFrame(
                     frame_idx=0, camera=camera, cdn=cdn.detach().clone(),
                     live_batch=batch,
