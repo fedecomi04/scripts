@@ -224,12 +224,46 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     # Feedforward hole-fill (RGB-D decode) — see docs/feedforward_dev_design.md
     # and the plan at ~/.claude/plans/eventual-gliding-quilt.md
     # ------------------------------------------------------------------
-    enable_feedforward_inpaint: Literal["off", "rgbd_decode"] = "rgbd_decode"
+    enable_feedforward_inpaint: Literal["off", "rgbd_decode", "anysplat_decode"] = "rgbd_decode"
     """When != "off", route hole-fill through the feedforward path
     instead of (or in addition to) the optim pool. Auto-implies
     ``disable_dynamic_optimization`` semantics for the dynamic phase
     (the default), so the only mutations are tracker rigid transforms
-    and feedforward insertions."""
+    and feedforward insertions. ``anysplat_decode`` routes per FF call
+    through the AnySplat subprocess worker (env ``anysplat_dynamic_gs``),
+    producing predicted Gaussians + canonical-frame cameras; the pipeline
+    runs Umeyama against the known scene c2w of each input view, applies
+    the 7-DoF similarity to the predicted Gaussians, then spatial-filters
+    by the CDN component mask before inserting."""
+    feedforward_anysplat_context_frames: int = 2
+    """Number of context frames (in addition to the target frame) passed
+    to AnySplat. K = context + 1 total input views. Default 2 gives K=3.
+    Minimum 1 for a well-conditioned Umeyama (K=2). AnySplat is multi-view;
+    higher K usually helps reconstruction quality at linear inference cost."""
+    feedforward_anysplat_conda_env: str = "anysplat_dynamic_gs"
+    """Conda env name where the AnySplat worker runs (see scripts/anysplat_worker.py)."""
+    feedforward_anysplat_worker_timeout_s: float = 300.0
+    """Subprocess timeout for one AnySplat worker invocation."""
+    feedforward_anysplat_min_opacity: float = 0.05
+    """Drop AnySplat-predicted Gaussians below this opacity (post-sigmoid).
+    AnySplat outputs many near-zero-opacity points; filtering them keeps the
+    insertion cost bounded."""
+    feedforward_anysplat_debug_dump: bool = True
+    """When True, save the raw .npz worker output + a diagnostic image per
+    FF call under ``<data_root>/dynamic_scene/debug/feedforward_anysplat/``."""
+    feedforward_anysplat_min_gap_s: float = 0.5
+    """Per-mode wall-clock throttle for ``anysplat_decode`` (default 0.5 s = 2 Hz max).
+    AnySplat costs ~12 s per call (cold subprocess + ~9 s warm model load + 0.6 s inference),
+    so we throttle harder than the rgbd path. Overrides
+    ``feedforward_recurring_min_gap_s`` when the active mode is anysplat_decode."""
+    feedforward_anysplat_scale_multiplier: float = 5.0
+    """Multiplier on the per-axis world-space scale after Umeyama. AnySplat
+    outputs sub-millimeter gaussians (median 1.7 mm), designed for dense
+    overlapping packing (~570k gaussians per scene). The CDN spatial filter
+    typically keeps only 5-20k of them, which alone are too sparse + too
+    small to produce a visible insert. The multiplier inflates each gaussian
+    so the kept subset covers the same physical region. Mirrors the
+    ``feedforward_rgbd_scale_multiplier`` in the rgbd_decode path."""
     feedforward_oneshot_step: int = 0
     """Mode A trigger step (>0 enables; 0 disables). Once per run, at
     this dynamic-phase step, select the top ``feedforward_top_n_components``
@@ -312,9 +346,9 @@ class DynamicGSPipelineConfig(VanillaPipelineConfig):
     by adding more Gaussians if a front-floater is what's occluding the
     true surface). Tracked-object Gaussians (instance_ids != 0 and != 999)
     are never touched. Defaults to True."""
-    feedforward_cull_in_front_depth_tol_m: float = 0.001
+    feedforward_cull_in_front_depth_tol_m: float = 0.002
     """Depth tolerance for the cull-in-front filter. A Gaussian is dropped
-    iff ``D_g < D_sensor - this_tol``. 5 mm by default — strict enough to
+    iff ``D_g < D_sensor - this_tol``. 2 mm by default — strict enough to
     catch real floaters, loose enough to leave the legitimate surface
     Gaussians (which sit ~depth_unit_scale_factor = 1 mm in front)."""
     feedforward_skip_delete: bool = True
@@ -422,6 +456,8 @@ class DynamicGSPipeline(VanillaPipeline):
         self._feedforward_oneshot_done: bool = False
         self._tracker_tick_count: int = 0
         self._feedforward_video_writer = None  # opened lazily in _record_anchor_video_tick
+        self._anysplat_persistent_worker = None  # spawned at static→dynamic transition; killed on atexit
+        atexit.register(self._close_anysplat_persistent_worker)
         self._feedforward_video_frame_count: int = 0
         atexit.register(self._close_feedforward_video_writer)
 
@@ -2290,70 +2326,65 @@ class DynamicGSPipeline(VanillaPipeline):
     ) -> int:
         """Delete Gaussians sitting in front of the real sensor surface.
 
-        For every Gaussian whose 2D projection lands inside ``component_mask``,
-        compare its camera-space depth ``D_g`` to the sensor depth at that
-        pixel ``D_sensor``. If ``D_g < D_sensor - depth_tol_m``, the Gaussian
-        is floating between camera and surface — usually a leftover artifact
-        from a previous inpaint that the CDN keeps re-flagging because it
-        occludes the true surface. Delete only those.
+        For every Gaussian whose 2D projection (centre) lands inside ``component_mask``,
+        compare its camera-space depth ``D_g`` to the sensor depth at that pixel
+        ``D_sensor``. If ``D_g < D_sensor - depth_tol_m``, the Gaussian is floating
+        between camera and surface — usually a leftover artifact from a previous
+        inpaint that the CDN keeps re-flagging because it occludes the true surface.
+        Delete only those.
 
-        Restricted to ``object_instance_ids ∈ {0, 999}`` (scene + prior
-        feedforward inserts); tracked objects (instance_ids in
-        ``_fp_trackers_by_instance``) are never touched.
+        Restricted to ``object_instance_ids ∈ {0, 999}`` (scene + prior feedforward
+        inserts); tracked objects (instance_ids in ``_fp_trackers_by_instance``) are
+        never touched.
 
-        Requires ``model.info`` populated by a recent full-scene render at
-        the same camera.
+        Direct projection — does NOT require a prior render. Saves the ~14 ms
+        full-scene rasterize that the previous gsplat-info path needed.
         """
-        from .utils.active_mask import extract_projected_centers_and_radii
-
         model = self.model
         if model.num_points == 0:
             return 0
 
-        # 2D projection (pixel centers).
-        try:
-            centers_2d, _radii = extract_projected_centers_and_radii(
-                model.info, model.num_points
-            )
-        except Exception as exc:
-            CONSOLE.log(f"[feedforward] cull projection failed: {exc}; skipping")
-            return 0
+        # --- Camera intrinsics (scene resolution) ---
+        def _scalar(x):
+            if isinstance(x, torch.Tensor):
+                return float(x.detach().cpu().reshape(-1)[0].item())
+            return float(x)
+        fx = _scalar(camera.fx); fy = _scalar(camera.fy)
+        cx = _scalar(camera.cx); cy = _scalar(camera.cy)
+        W = int(_scalar(camera.width)); H = int(_scalar(camera.height))
 
-        # 3D world means → camera-z depth (positive = in front of camera).
-        # Nerfstudio c2w is OpenGL: camera forward = -z_cam, so depth = -z_cam.
+        # --- World means → camera (OpenGL) frame ---
         c2w = camera.camera_to_worlds
         if c2w.ndim == 3:
             c2w = c2w[0]
         c2w = c2w.to(model.means.device, dtype=model.means.dtype)
-        R = c2w[:3, :3]
-        t = c2w[:3, 3]
-        means_cam = (model.means - t[None, :]) @ R  # P_cam = R^T (P - t); (M @ R) == (R^T M^T)^T
-        depths_g = -means_cam[:, 2]  # (N,) positive forward
+        R = c2w[:3, :3]; t = c2w[:3, 3]
+        means_cam = (model.means - t[None, :]) @ R   # (N, 3) in OpenGL cam frame
+        depths_g = -means_cam[:, 2]                   # (N,) positive forward
+        in_front_of_cam = depths_g > 1e-6
 
-        # Sensor depth at each Gaussian's 2D pixel.
+        # --- Direct pixel projection (OpenGL: u = fx * x/(-z) + cx, v = fy * (-y)/(-z) + cy) ---
+        safe_d = torch.where(in_front_of_cam, depths_g, torch.ones_like(depths_g))
+        u = fx * (means_cam[:, 0] / safe_d) + cx
+        v = fy * (-means_cam[:, 1] / safe_d) + cy
+        u_idx = u.round().long().clamp(0, W - 1)
+        v_idx = v.round().long().clamp(0, H - 1)
+        in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H) & in_front_of_cam
+
+        # --- Sensor depth + component mask lookup ---
         depth = gt_depth_m
         if depth.ndim == 3 and depth.shape[-1] == 1:
             depth = depth[..., 0]
-        depth = depth.to(centers_2d.device)
-        H, W = depth.shape
+        depth = depth.to(means_cam.device)
         comp = component_mask
         if comp.ndim == 3 and comp.shape[-1] == 1:
             comp = comp[..., 0]
-        comp = (comp > 0.5).to(centers_2d.device)
+        comp = (comp > 0.5).to(means_cam.device)
 
-        # Pixel indices, clamped to image bounds.
-        u = centers_2d[:, 0].round().long().clamp(0, W - 1)
-        v = centers_2d[:, 1].round().long().clamp(0, H - 1)
-        in_bounds = (
-            (centers_2d[:, 0] >= 0) & (centers_2d[:, 0] < W) &
-            (centers_2d[:, 1] >= 0) & (centers_2d[:, 1] < H)
-        )
-        in_region = comp[v, u] & in_bounds
-
-        sensor_depth_at = depth[v, u]
+        sensor_depth_at = depth[v_idx, u_idx]
+        in_region = comp[v_idx, u_idx] & in_bounds
         has_valid_depth = sensor_depth_at > 0
-        # Strictly in front, beyond tolerance.
-        in_front = (depths_g.to(sensor_depth_at.device) < (sensor_depth_at - float(depth_tol_m)))
+        in_front = depths_g < (sensor_depth_at - float(depth_tol_m))
 
         instance_ids = model.object_instance_ids.squeeze(-1).to(in_front.device)
         eligible = (instance_ids == 0) | (instance_ids == 999)
@@ -2626,6 +2657,14 @@ class DynamicGSPipeline(VanillaPipeline):
         component's footprint, inserts feedforward-decoded Gaussians
         as ``object_flags=1, instance_id=999``.
         """
+        # Fork: anysplat_decode is a different per-call shape (one model call,
+        # then per-component spatial filter), so it gets its own implementation.
+        if str(getattr(self.config, "enable_feedforward_inpaint", "off")) == "anysplat_decode":
+            return self._run_feedforward_anysplat(
+                target_frame, mode_label,
+                prerendered_obj_mask=prerendered_obj_mask,
+            )
+
         from .utils.active_mask import select_top_n_components_filtered
         from .utils.rgbd_decode import decode_component_to_gaussians
 
@@ -2769,15 +2808,10 @@ class DynamicGSPipeline(VanillaPipeline):
             # the existing ones block the view.
             n_culled = 0
             if self.config.feedforward_cull_in_front:
-                try:
-                    _ = self._render_from_camera(camera)
-                except Exception as exc:
-                    CONSOLE.log(f"[feedforward] cull-in-front pre-render failed: {exc}; skip cull")
-                else:
-                    n_culled = self._feedforward_cull_in_front_of_depth(
-                        camera, comp_mask, gt_depth,
-                        depth_tol_m=float(self.config.feedforward_cull_in_front_depth_tol_m),
-                    )
+                n_culled = self._feedforward_cull_in_front_of_depth(
+                    camera, comp_mask, gt_depth,
+                    depth_tol_m=float(self.config.feedforward_cull_in_front_depth_tol_m),
+                )
             n_deleted += n_culled
             self._timing["FF.4_crop_and_delete"].append(time.time() - t0)
 
@@ -2825,6 +2859,300 @@ class DynamicGSPipeline(VanillaPipeline):
             f"frame={frame_idx} components={len(per_component_diag)} "
             f"inserted={total_inserted} deleted={total_deleted} total_ms={total_per_call*1000:.1f} "
             f"object_flags_count={obj_count} inserted_flags_count={ins_count} "
+            f"total_gauss={self.model.num_points}"
+        )
+
+    # ---- AnySplat feedforward path ----
+
+    def _start_anysplat_persistent_worker(self) -> None:
+        """Spawn the long-lived AnySplat worker. Called once at the static→dynamic boundary."""
+        if self._anysplat_persistent_worker is not None:
+            return
+        from .utils.anysplat_decode import PersistentAnysplatWorker
+        try:
+            t0 = time.time()
+            CONSOLE.log("[anysplat] spawning persistent worker (loading model in subprocess)...")
+            self._anysplat_persistent_worker = PersistentAnysplatWorker(
+                conda_env=str(self.config.feedforward_anysplat_conda_env),
+                startup_timeout_s=120.0,
+            )
+            CONSOLE.log(
+                f"[anysplat] persistent worker ready in {time.time()-t0:.1f}s "
+                f"(worker reported load = {self._anysplat_persistent_worker.load_seconds:.1f}s)"
+            )
+        except Exception as exc:
+            CONSOLE.log(f"[anysplat] persistent worker spawn FAILED: {exc}; "
+                        f"will fall back to per-call subprocess spawn")
+            self._anysplat_persistent_worker = None
+
+    def _close_anysplat_persistent_worker(self) -> None:
+        w = getattr(self, "_anysplat_persistent_worker", None)
+        if w is None:
+            return
+        try:
+            w.close()
+        except Exception:
+            pass
+        self._anysplat_persistent_worker = None
+
+
+    def _resolve_anysplat_context_image_paths(self, target_frame_idx: int) -> tuple[list[Path], list[int]]:
+        """Return (image_paths, frame_indices) — target first, then K-1 previous accepted frames.
+
+        Recorded mode only. Falls back gracefully when the accepted list
+        doesn't have K-1 frames before the target (uses what's available).
+        """
+        try:
+            ds = self.datamanager.dynamic_manager.train_dataset
+        except AttributeError:
+            return [], []
+        all_filenames = ds.image_filenames
+        K_ctx = max(0, int(getattr(self.config, "feedforward_anysplat_context_frames", 2)))
+
+        target_path = Path(all_filenames[target_frame_idx])
+        out_paths: list[Path] = [target_path]
+        out_idx: list[int] = [int(target_frame_idx)]
+
+        if K_ctx > 0:
+            accepted = list(getattr(self, "_accepted_dynamic_frames", []) or [])
+            if target_frame_idx in accepted:
+                pos = accepted.index(int(target_frame_idx))
+                ctx_indices = accepted[max(0, pos - K_ctx):pos]
+            else:
+                # Target isn't in the accepted list (Mode A picks any frame).
+                # Use the most-recent K_ctx accepted frames strictly before target_frame_idx.
+                ctx_indices = [i for i in accepted if i < target_frame_idx][-K_ctx:]
+            for fi in ctx_indices:
+                out_paths.append(Path(all_filenames[fi]))
+                out_idx.append(int(fi))
+        return out_paths, out_idx
+
+    def _scene_c2w_for_frame(self, frame_idx: int) -> np.ndarray:
+        """Look up the post-camera-optimizer c2w (4x4) for a recorded dynamic frame."""
+        ds = self.datamanager.dynamic_manager.train_dataset
+        cam = ds.cameras[frame_idx : frame_idx + 1].to(self.device)
+        c2w = cam.camera_to_worlds
+        if c2w.ndim == 3:
+            c2w = c2w[0]
+        if c2w.shape == (3, 4):
+            bottom = torch.tensor([[0.0, 0.0, 0.0, 1.0]], device=c2w.device, dtype=c2w.dtype)
+            c2w = torch.cat([c2w, bottom], dim=0)
+        return c2w.detach().cpu().numpy().astype(np.float32)
+
+    def _run_feedforward_anysplat(self, target_frame, mode_label: str, prerendered_obj_mask=None) -> None:
+        """AnySplat path: K=1 single-image inference per FF call, then scene-K back-projection.
+
+        Pipeline per call:
+          1. Spawn ``scripts/anysplat_worker.py`` on the TARGET image only (K=1).
+          2. For each CDN component, run the canonical reprojection
+             (``anysplat_decode.reproject_anysplat_to_scene``):
+                - per gaussian: pred-pixel (u, v) via pred_K → sensor-depth lookup at (u, v)
+                  → back-project through SCENE K + scene_c2w (OpenGL) → world position
+                - per-gauss scale = sensor_depth / pred_z (preserves image-space footprint)
+                - rotation = R_scene @ flip @ R_pred^T @ R_g_canonical
+                - filter by the (resized) CDN component mask
+          3. Insert via ``model.insert_inpaint_gaussians`` as instance_id=999.
+
+        Canonical method 2026-05-30 (memory: anysplat-reprojection-method): scene-K
+        back-projection avoids the ~28% lateral-error pattern from AnySplat's wrong
+        predicted focal length (pred fx ≈ 190 vs scene fx ≈ 267 at 448×448).
+        """
+        from .utils.active_mask import select_top_n_components_filtered
+        from .utils.anysplat_decode import (
+            reproject_anysplat_to_scene,
+            run_anysplat_subprocess,
+        )
+
+        call_id = self._feedforward_call_counter
+        self._feedforward_call_counter += 1
+
+        t_call0 = time.time()
+        camera = target_frame.camera
+        frame_idx = int(target_frame.frame_idx)
+        cdn = target_frame.cdn
+
+        # Clean CDN (subtract current rendered object mask).
+        t0 = time.time()
+        try:
+            frame_name_for_cdn = self.datamanager.get_dynamic_frame_name(frame_idx)
+        except Exception:
+            frame_name_for_cdn = None
+        cdn_clean = self._feedforward_clean_cdn(
+            camera, cdn, frame_name=frame_name_for_cdn,
+            prerendered_obj_mask=prerendered_obj_mask,
+        )
+        self._timing["FF.1_cdn_clean"].append(time.time() - t0)
+
+        t0 = time.time()
+        if mode_label == "oneshot":
+            components = select_top_n_components_filtered(
+                cdn_clean,
+                n=int(self.config.feedforward_top_n_components),
+                area_ratio=float(self.config.feedforward_dominant_area_ratio),
+                min_area=1,
+            )
+        else:
+            components = select_top_n_components_filtered(cdn_clean, n=256, area_ratio=0.0, min_area=1)
+        self._timing["FF.2_component_select"].append(time.time() - t0)
+
+        if not components:
+            CONSOLE.log(
+                f"[anysplat] {mode_label} call={call_id} step={self._dynamic_step_counter} "
+                f"frame={frame_idx} no components"
+            )
+            return
+
+        # Target image only (K=1). Scene K + sensor depth handle the geometry.
+        image_paths, _ = self._resolve_anysplat_context_image_paths(frame_idx)
+        if len(image_paths) < 1:
+            CONSOLE.log(f"[anysplat] call={call_id} no target image; skip")
+            return
+        image_paths = [image_paths[0]]   # force K=1
+
+        # Pull sensor depth + scene intrinsics from the target camera.
+        batch = getattr(target_frame, "live_batch", None)
+        if batch is None:
+            self.datamanager.set_dynamic_frame_idx(frame_idx)
+            try:
+                _, batch = self.datamanager.get_current_dynamic_train_batch()
+            except Exception as exc:
+                CONSOLE.log(f"[anysplat] could not pull batch for frame {frame_idx}: {exc}")
+                return
+        gt_depth = self.model._get_gt_depth(batch)
+        if gt_depth is None:
+            CONSOLE.log(f"[anysplat] frame {frame_idx} has no depth — skip")
+            return
+        sensor_depth_np = gt_depth.detach().cpu().numpy().astype(np.float32)
+        if sensor_depth_np.ndim == 3:
+            sensor_depth_np = sensor_depth_np[..., 0]
+
+        def _scalar(x):
+            return float(x.detach().cpu().reshape(-1)[0].item()) if isinstance(x, torch.Tensor) else float(x)
+        scene_intr = {
+            "w":    int(_scalar(camera.width)),
+            "h":    int(_scalar(camera.height)),
+            "fl_x": _scalar(camera.fx),
+            "fl_y": _scalar(camera.fy),
+            "cx":   _scalar(camera.cx),
+            "cy":   _scalar(camera.cy),
+        }
+        scene_c2w_np = self._scene_c2w_for_frame(frame_idx)
+        if scene_c2w_np.shape == (3, 4):
+            scene_c2w_np = np.vstack([scene_c2w_np, [[0, 0, 0, 1]]]).astype(np.float64)
+        else:
+            scene_c2w_np = scene_c2w_np.astype(np.float64)
+
+        # Output debug dir.
+        debug_dir = Path(self.datamanager.config.data) / "dynamic_scene" / "debug" / "feedforward_anysplat"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        out_npz = debug_dir / f"call_{call_id:04d}_step_{self._dynamic_step_counter}_frame_{frame_idx}.npz"
+
+        # ---- Inference (persistent worker if available, else cold-spawn) ----
+        t0 = time.time()
+        try:
+            if self._anysplat_persistent_worker is not None:
+                self._anysplat_persistent_worker.inference(
+                    image_paths, out_npz,
+                    timeout_s=float(self.config.feedforward_anysplat_worker_timeout_s),
+                )
+            else:
+                run_anysplat_subprocess(
+                    image_paths, out_npz,
+                    conda_env=str(self.config.feedforward_anysplat_conda_env),
+                    timeout_s=float(self.config.feedforward_anysplat_worker_timeout_s),
+                )
+        except Exception as exc:
+            CONSOLE.log(f"[anysplat] call={call_id} worker FAILED: {exc}")
+            return
+        self._timing["FF.3a_anysplat_inference"].append(time.time() - t0)
+
+        # ---- Load worker output ----
+        data = np.load(out_npz, allow_pickle=True)
+        means_can = data["means_canonical"]
+        log_scales = data["log_scales"]
+        quats = data["quats_wxyz"]
+        opacity_logits = data["opacity_logits"]
+        features_dc = data["features_dc"]
+        features_rest = data["features_rest"]
+        pred_c2w_0 = data["pred_extrinsic_c2w"][0]
+        pred_K_norm = data["pred_intrinsic_norm"][0]
+        H_any, W_any = 448, 448
+
+        # ---- Per-component scene-K back-projection + cull-in-front + insert ----
+        total_inserted = 0
+        total_culled = 0
+        for k, comp_mask in enumerate(components):
+            t0 = time.time()
+            comp_np = comp_mask.detach().cpu().numpy() if torch.is_tensor(comp_mask) else np.asarray(comp_mask)
+
+            decoded = reproject_anysplat_to_scene(
+                means_canonical=means_can,
+                log_scales=log_scales,
+                quats_wxyz=quats,
+                opacity_logits=opacity_logits,
+                features_dc=features_dc,
+                features_rest=features_rest,
+                pred_c2w_0=pred_c2w_0,
+                pred_K_norm=pred_K_norm,
+                pred_image_hw=(H_any, W_any),
+                sensor_depth_m=sensor_depth_np,
+                scene_c2w=scene_c2w_np,
+                scene_intr=scene_intr,
+                opacity_min=float(self.config.feedforward_anysplat_min_opacity),
+                component_mask=comp_np,
+            )
+            self._timing["FF.3b_anysplat_reproject"].append(time.time() - t0)
+
+            n_in_comp = int(decoded["xyz"].shape[0])
+            if n_in_comp == 0:
+                CONSOLE.log(f"[anysplat] call={call_id} comp={k} empty; skip")
+                continue
+
+            # ---- Cull-in-front (same logic as rgbd_decode path) ----
+            # Drop existing Gaussians sitting between the camera and the real sensor
+            # surface in this component's footprint. Without this, leftover artifacts
+            # from previous AnySplat inserts keep re-triggering CDN every tick because
+            # they occlude the true surface. Restricted to scene + prior-insert
+            # instance_ids ({0, 999}); tracked objects are never touched.
+            t0 = time.time()
+            n_culled = 0
+            if self.config.feedforward_cull_in_front:
+                n_culled = self._feedforward_cull_in_front_of_depth(
+                    camera, comp_mask, gt_depth,
+                    depth_tol_m=float(self.config.feedforward_cull_in_front_depth_tol_m),
+                )
+            total_culled += int(n_culled)
+            self._timing["FF.4_crop_and_delete"].append(time.time() - t0)
+
+            t0 = time.time()
+            inserted_ids = self.model.insert_inpaint_gaussians(
+                xyz=torch.from_numpy(decoded["xyz"]).to(self.device),
+                features_dc=torch.from_numpy(decoded["features_dc"]).to(self.device),
+                features_rest=torch.from_numpy(decoded["features_rest"]).to(self.device),
+                opacities=torch.from_numpy(decoded["opacities"]).to(self.device),
+                scales=torch.from_numpy(decoded["scales"]).to(self.device),
+                quats=torch.from_numpy(decoded["quats"]).to(self.device),
+                instance_id=999,
+            )
+            self._timing["FF.5_insert"].append(time.time() - t0)
+
+            if getattr(self, "_viser_direct", None) is not None:
+                try:
+                    self._viser_direct.add_ff_insert_chunk(self.model, inserted_ids)
+                except Exception as exc:
+                    CONSOLE.log(f"[viser-direct] add_ff_insert_chunk failed: {exc}")
+
+            total_inserted += int(inserted_ids.numel())
+
+        total_per_call = time.time() - t_call0
+        self._timing["FF.6_total_per_call"].append(total_per_call)
+        obj_count = int((self.model.object_flags.squeeze(-1) > 0.5).sum().item())
+        ins_count = int((self.model.inserted_flags.squeeze(-1) > 0.5).sum().item())
+        CONSOLE.log(
+            f"[anysplat] {mode_label} call={call_id} step={self._dynamic_step_counter} "
+            f"frame={frame_idx} components={len(components)} inserted={total_inserted} "
+            f"culled={total_culled} total_ms={total_per_call*1000:.0f} "
+            f"object_flags={obj_count} inserted_flags={ins_count} "
             f"total_gauss={self.model.num_points}"
         )
 
@@ -3228,7 +3556,7 @@ class DynamicGSPipeline(VanillaPipeline):
         # optim pool push (no scene-opt to feed) and the keyframe
         # filter (every tick is a chance to fill a new hole).
         feedforward_on = (
-            self.config.enable_feedforward_inpaint == "rgbd_decode"
+            self.config.enable_feedforward_inpaint != "off"
             and self.config.feedforward_recurring_every_n_ticks > 0
         )
         # CADENCE GATE: when feedforward is on, RDN render + obj mask +
@@ -3244,8 +3572,13 @@ class DynamicGSPipeline(VanillaPipeline):
                 (self._tracker_tick_count % int(self.config.feedforward_recurring_every_n_ticks)) == 0
             )
             # Additional wall-clock floor: even if the tick-count cadence
-            # says "fire", skip if the previous fire was too recent.
-            min_gap = float(getattr(self.config, "feedforward_recurring_min_gap_s", 0.0))
+            # says "fire", skip if the previous fire was too recent. Per-mode
+            # override so anysplat (heavy) throttles harder than rgbd_decode.
+            ff_mode = str(getattr(self.config, "enable_feedforward_inpaint", "off"))
+            if ff_mode == "anysplat_decode":
+                min_gap = float(getattr(self.config, "feedforward_anysplat_min_gap_s", 0.5))
+            else:
+                min_gap = float(getattr(self.config, "feedforward_recurring_min_gap_s", 0.0))
             if ff_will_fire_this_tick and min_gap > 0.0:
                 if (time.time() - getattr(self, "_last_ff_fire_t", 0.0)) < min_gap:
                     ff_will_fire_this_tick = False
@@ -4159,6 +4492,11 @@ class DynamicGSPipeline(VanillaPipeline):
                 # static photometric optimization).
                 if self._sam3d_generation_outputs:
                     self._fuse_sam3d_objects_into_scene(self._sam3d_generation_outputs)
+                # Spawn the persistent AnySplat worker now (after fusion, before any
+                # FF call) so the ~9 s model-load cost is paid out-of-band and every
+                # subsequent inference is just GPU forward (~0.6 s + IPC).
+                if str(self.config.enable_feedforward_inpaint) == "anysplat_decode":
+                    self._start_anysplat_persistent_worker()
             CONSOLE.log(f"[dynamic-gs] phase -> {phase} at step {step}")
 
         if phase == "static":
@@ -4371,7 +4709,7 @@ class DynamicGSPipeline(VanillaPipeline):
         # a duplicate render_object_mask call (~3 ms saved per dispatch).
         self._tracker_tick_count += 1
         if (
-            self.config.enable_feedforward_inpaint == "rgbd_decode"
+            self.config.enable_feedforward_inpaint != "off"
             and self.config.feedforward_recurring_every_n_ticks > 0
             and (self._tracker_tick_count % int(self.config.feedforward_recurring_every_n_ticks) == 0)
         ):
@@ -4444,7 +4782,7 @@ class DynamicGSPipeline(VanillaPipeline):
 
         # ---- Feedforward Mode A trigger ----
         if (
-            self.config.enable_feedforward_inpaint == "rgbd_decode"
+            self.config.enable_feedforward_inpaint != "off"
             and not self._feedforward_oneshot_done
             and int(self.config.feedforward_oneshot_step) > 0
             and step >= int(self.config.feedforward_oneshot_step)

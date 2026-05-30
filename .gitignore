@@ -5,5 +5,6 @@ __pycache__/
 .mypy_cache/
 outputs/
 third_party/sam-3d-objects/
+third_party/AnySplat/
 checkpoints/
 outputs/feedforward/
