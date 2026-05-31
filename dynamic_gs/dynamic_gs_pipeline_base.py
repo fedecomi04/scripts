@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -283,8 +284,16 @@ class DynamicGSPipelineBase(VanillaPipeline):
         # the FF anysplat path can resolve context frames. Empty in live.
         self._accepted_dynamic_frames: list[int] = []
 
+        # Off-thread AnySplat dispatch: this lock is held while a bg
+        # AnySplat call (worker.inference + reproject + cull + insert) is
+        # in flight. Tracker ticks that find it locked skip the FF dispatch
+        # so we never queue overlapping calls. _cleanup_anysplat_bg waits
+        # for it to drain at shutdown.
+        self._anysplat_slot_lock = threading.Lock()
+
         atexit.register(self._cleanup_viser_direct)
         atexit.register(self._cleanup_anysplat_worker)
+        atexit.register(self._cleanup_anysplat_bg)  # registered after worker -> runs BEFORE worker (LIFO)
         atexit.register(self._cleanup_anysplat_ipc_file)
         atexit.register(self._cleanup_feedforward_video_writer)
         atexit.register(self._save_final_snapshot_if_enabled)
@@ -410,6 +419,18 @@ class DynamicGSPipelineBase(VanillaPipeline):
                 ipc_path.unlink()
         except Exception:
             pass
+
+    def _cleanup_anysplat_bg(self) -> None:
+        """Block on the AnySplat bg slot at shutdown so the worker isn't
+        killed mid-call (this hook is registered AFTER the worker cleanup
+        and atexit runs in LIFO -> bg drain happens first). 60 s timeout
+        in case a call wedged."""
+        lock = getattr(self, "_anysplat_slot_lock", None)
+        if lock is None:
+            return
+        acquired = lock.acquire(blocking=True, timeout=60.0)
+        if acquired:
+            lock.release()
 
     def _save_final_snapshot_if_enabled(self) -> None:
         """Dump the post-feedforward model state to disk at exit.
@@ -1442,14 +1463,16 @@ class DynamicGSPipelineBase(VanillaPipeline):
 
     def _run_feedforward_anysplat(self, target_frame: TrackerFrame, mode_label: str,
                                    prerendered_obj_mask=None) -> None:
-        """AnySplat path: K=1 single-image inference per FF call, then
-        scene-K back-projection. See utils/anysplat_decode.py for canonical
-        reprojection method."""
+        """Main-thread dispatch for the AnySplat FF path.
+
+        Runs the fast prep (~10 ms: CDN clean, component selection, snapshot
+        per-frame inputs) on the main thread, then hands the slow part
+        (worker.inference + reproject + cull + insert, ~200 ms) to a daemon
+        thread. The tracker loop is freed to keep ticking; the bg thread
+        takes ``model_lock`` only during the actual cull + insert mutations
+        (~5 ms total). At most one bg call is in flight; new dispatches that
+        find the slot lock held are skipped (with a log line)."""
         from .utils.active_mask import select_top_n_components_filtered
-        from .utils.anysplat_decode import (
-            reproject_anysplat_to_scene,
-            run_anysplat_subprocess,
-        )
 
         call_id = self._feedforward_call_counter
         self._feedforward_call_counter += 1
@@ -1523,150 +1546,181 @@ class DynamicGSPipelineBase(VanillaPipeline):
         else:
             scene_c2w_np = scene_c2w_np.astype(np.float64)
 
-        # IPC: write to tmpfs (/dev/shm) instead of the dataset disk. AnySplat
-        # FF is gated by feedforward_anysplat_min_gap_s, so there's never a
-        # concurrent write; a single fixed filename is sufficient and avoids
-        # debug-dir clutter. /dev/shm is tmpfs (RAM) on Linux; this drops
-        # ~90 ms of disk roundtrip (~30 % of the per-call cost).
+        # Off-thread the slow part. If a previous AnySplat call is still
+        # running we skip this dispatch instead of queueing (the FF
+        # min-gap config usually prevents this but cold calls can exceed
+        # the gap; queueing would just stack stale frames).
+        if not self._anysplat_slot_lock.acquire(blocking=False):
+            CONSOLE.log(
+                f"[anysplat] {mode_label} call={call_id} step={self._dynamic_step_counter} "
+                f"frame={frame_idx} skipped — previous FF call still in flight"
+            )
+            return
+
+        bg_args = dict(
+            t_call0=t_call0,
+            call_id=call_id,
+            mode_label=mode_label,
+            frame_idx=frame_idx,
+            camera=camera,
+            components=components,
+            image_paths=image_paths,
+            gt_depth=gt_depth,
+            sensor_depth_np=sensor_depth_np,
+            scene_intr=scene_intr,
+            scene_c2w_np=scene_c2w_np,
+        )
+        threading.Thread(
+            target=self._anysplat_bg_run, args=(bg_args,),
+            daemon=True, name=f"anysplat-bg-{call_id}",
+        ).start()
+
+    def _anysplat_bg_run(self, args: dict) -> None:
+        """Background worker for the AnySplat FF path. Calls the persistent
+        subprocess (~150 ms), loads the IPC blob (~15 ms), reprojects each
+        component (~45 ms), then takes ``model_lock`` briefly to cull + insert.
+        Always releases ``_anysplat_slot_lock`` on exit so the next FF call
+        can dispatch."""
+        from .utils.anysplat_decode import reproject_anysplat_to_scene, run_anysplat_subprocess
+
+        t_call0          = args["t_call0"]
+        call_id          = args["call_id"]
+        mode_label       = args["mode_label"]
+        frame_idx        = args["frame_idx"]
+        camera           = args["camera"]
+        components       = args["components"]
+        image_paths      = args["image_paths"]
+        gt_depth         = args["gt_depth"]
+        sensor_depth_np  = args["sensor_depth_np"]
+        scene_intr       = args["scene_intr"]
+        scene_c2w_np     = args["scene_c2w_np"]
+
         out_npz = Path(f"/dev/shm/anysplat_ipc_{os.getpid()}.npz")
 
-        t0 = time.time()
-        worker_timings: dict = {}
         try:
-            if self._anysplat_persistent_worker is not None:
-                worker_timings = self._anysplat_persistent_worker.inference(
-                    image_paths, out_npz,
-                    timeout_s=float(self.config.feedforward_anysplat_worker_timeout_s),
-                )
-            else:
-                run_anysplat_subprocess(
-                    image_paths, out_npz,
-                    conda_env=str(self.config.feedforward_anysplat_conda_env),
-                    timeout_s=float(self.config.feedforward_anysplat_worker_timeout_s),
-                )
-        except Exception as exc:
-            CONSOLE.log(f"[anysplat] call={call_id} worker FAILED: {exc}")
-            return
-        self._timing["FF.3a_anysplat_inference"].append(time.time() - t0)
-        # Worker-emitted per-phase timings (persistent worker only)
-        for k_in, k_out in (
-            ("t_ipc_send_ms",    "FF.3a.ipc_send"),
-            ("t_images_load_ms", "FF.3a.images_load"),
-            ("t_forward_ms",     "FF.3a.forward"),
-            ("t_convert_ms",     "FF.3a.convert_to_numpy"),
-            ("t_npz_save_ms",    "FF.3a.npz_save"),
-            ("t_ipc_wait_ms",    "FF.3a.ipc_wait"),
-        ):
-            v = worker_timings.get(k_in)
-            if v is not None:
-                self._timing[k_out].append(float(v) / 1000.0)
-
-        t_load0 = time.time()
-        import pickle
-        with open(out_npz, "rb") as f:
-            data = pickle.load(f)
-        means_can = data["means_canonical"]
-        log_scales = data["log_scales"]
-        quats = data["quats_wxyz"]
-        opacity_logits = data["opacity_logits"]
-        features_dc = data["features_dc"]
-        features_rest = data["features_rest"]
-        pred_c2w_0 = data["pred_extrinsic_c2w"][0]
-        pred_K_norm = data["pred_intrinsic_norm"][0]
-        self._timing["FF.3a.npz_load"].append(time.time() - t_load0)
-        H_any, W_any = 448, 448
-
-        total_inserted = 0
-        total_culled = 0
-        for k, comp_mask in enumerate(components):
             t0 = time.time()
-            comp_np = comp_mask.detach().cpu().numpy() if torch.is_tensor(comp_mask) else np.asarray(comp_mask)
-
-            decoded = reproject_anysplat_to_scene(
-                means_canonical=means_can,
-                log_scales=log_scales,
-                quats_wxyz=quats,
-                opacity_logits=opacity_logits,
-                features_dc=features_dc,
-                features_rest=features_rest,
-                pred_c2w_0=pred_c2w_0,
-                pred_K_norm=pred_K_norm,
-                pred_image_hw=(H_any, W_any),
-                sensor_depth_m=sensor_depth_np,
-                scene_c2w=scene_c2w_np,
-                scene_intr=scene_intr,
-                opacity_min=float(self.config.feedforward_anysplat_min_opacity),
-                component_mask=comp_np,
-            )
-            self._timing["FF.3b_anysplat_reproject"].append(time.time() - t0)
-
-            n_in_comp = int(decoded["xyz"].shape[0])
-            if n_in_comp == 0:
-                CONSOLE.log(f"[anysplat] call={call_id} comp={k} empty; skip")
-                continue
-
-            t0 = time.time()
-            n_culled = 0
-            with self._viser_lock_ctx():
-                if self.config.feedforward_cull_in_front:
-                    n_culled = self._feedforward_cull_in_front_of_depth(
-                        camera, comp_mask, gt_depth,
-                        depth_tol_m=float(self.config.feedforward_cull_in_front_depth_tol_m),
+            worker_timings: dict = {}
+            try:
+                if self._anysplat_persistent_worker is not None:
+                    worker_timings = self._anysplat_persistent_worker.inference(
+                        image_paths, out_npz,
+                        timeout_s=float(self.config.feedforward_anysplat_worker_timeout_s),
                     )
-            total_culled += int(n_culled)
-            self._timing["FF.4_crop_and_delete"].append(time.time() - t0)
+                else:
+                    run_anysplat_subprocess(
+                        image_paths, out_npz,
+                        conda_env=str(self.config.feedforward_anysplat_conda_env),
+                        timeout_s=float(self.config.feedforward_anysplat_worker_timeout_s),
+                    )
+            except Exception as exc:
+                CONSOLE.log(f"[anysplat] call={call_id} worker FAILED: {exc}")
+                return
+            self._timing["FF.3a_anysplat_inference"].append(time.time() - t0)
+            for k_in, k_out in (
+                ("t_ipc_send_ms",    "FF.3a.ipc_send"),
+                ("t_images_load_ms", "FF.3a.images_load"),
+                ("t_forward_ms",     "FF.3a.forward"),
+                ("t_convert_ms",     "FF.3a.convert_to_numpy"),
+                ("t_npz_save_ms",    "FF.3a.npz_save"),
+                ("t_ipc_wait_ms",    "FF.3a.ipc_wait"),
+            ):
+                v = worker_timings.get(k_in)
+                if v is not None:
+                    self._timing[k_out].append(float(v) / 1000.0)
 
-            t0 = time.time()
-            with self._viser_lock_ctx():
-                inserted_ids = self.model.insert_inpaint_gaussians(
-                    xyz=torch.from_numpy(decoded["xyz"]).to(self.device),
-                    features_dc=torch.from_numpy(decoded["features_dc"]).to(self.device),
-                    features_rest=torch.from_numpy(decoded["features_rest"]).to(self.device),
-                    opacities=torch.from_numpy(decoded["opacities"]).to(self.device),
-                    scales=torch.from_numpy(decoded["scales"]).to(self.device),
-                    quats=torch.from_numpy(decoded["quats"]).to(self.device),
-                    instance_id=999,
+            t_load0 = time.time()
+            import pickle
+            with open(out_npz, "rb") as f:
+                data = pickle.load(f)
+            means_can      = data["means_canonical"]
+            log_scales     = data["log_scales"]
+            quats          = data["quats_wxyz"]
+            opacity_logits = data["opacity_logits"]
+            features_dc    = data["features_dc"]
+            features_rest  = data["features_rest"]
+            pred_c2w_0     = data["pred_extrinsic_c2w"][0]
+            pred_K_norm    = data["pred_intrinsic_norm"][0]
+            self._timing["FF.3a.npz_load"].append(time.time() - t_load0)
+            H_any, W_any = 448, 448
+
+            total_inserted = 0
+            total_culled = 0
+            for k, comp_mask in enumerate(components):
+                t0 = time.time()
+                comp_np = comp_mask.detach().cpu().numpy() if torch.is_tensor(comp_mask) else np.asarray(comp_mask)
+                decoded = reproject_anysplat_to_scene(
+                    means_canonical=means_can, log_scales=log_scales, quats_wxyz=quats,
+                    opacity_logits=opacity_logits, features_dc=features_dc, features_rest=features_rest,
+                    pred_c2w_0=pred_c2w_0, pred_K_norm=pred_K_norm,
+                    pred_image_hw=(H_any, W_any),
+                    sensor_depth_m=sensor_depth_np, scene_c2w=scene_c2w_np,
+                    scene_intr=scene_intr,
+                    opacity_min=float(self.config.feedforward_anysplat_min_opacity),
+                    component_mask=comp_np,
                 )
-            self._timing["FF.5_insert"].append(time.time() - t0)
+                self._timing["FF.3b_anysplat_reproject"].append(time.time() - t0)
 
-            self._viser_direct_register_ff_insert(inserted_ids)
+                n_in_comp = int(decoded["xyz"].shape[0])
+                if n_in_comp == 0:
+                    CONSOLE.log(f"[anysplat] call={call_id} comp={k} empty; skip")
+                    continue
 
-            total_inserted += int(inserted_ids.numel())
+                t0 = time.time()
+                n_culled = 0
+                with self._viser_lock_ctx():
+                    if self.config.feedforward_cull_in_front:
+                        n_culled = self._feedforward_cull_in_front_of_depth(
+                            camera, comp_mask, gt_depth,
+                            depth_tol_m=float(self.config.feedforward_cull_in_front_depth_tol_m),
+                        )
+                total_culled += int(n_culled)
+                self._timing["FF.4_crop_and_delete"].append(time.time() - t0)
 
-        total_per_call = time.time() - t_call0
-        self._timing["FF.6_total_per_call"].append(total_per_call)
-        obj_count = int((self.model.object_flags.squeeze(-1) > 0.5).sum().item())
-        ins_count = int((self.model.inserted_flags.squeeze(-1) > 0.5).sum().item())
-        # Per-call FF breakdown so we don't have to wait for the
-        # end-of-run timing report to see where the time is going. Each
-        # FF.* timing list grows by 1 per call, so [-1] is this call.
-        def _last_ms(key: str) -> float:
-            arr = self._timing.get(key, [])
-            return arr[-1] * 1000.0 if arr else 0.0
-        CONSOLE.log(
-            f"[anysplat] {mode_label} call={call_id} step={self._dynamic_step_counter} "
-            f"frame={frame_idx} components={len(components)} inserted={total_inserted} "
-            f"culled={total_culled} total_ms={total_per_call*1000:.0f} "
-            f"object_flags={obj_count} inserted_flags={ins_count} "
-            f"total_gauss={self.model.num_points} "
-            f"| cdn={_last_ms('FF.1_cdn_clean'):.0f} "
-            f"comp_sel={_last_ms('FF.2_component_select'):.0f} "
-            f"anysplat_inf={_last_ms('FF.3a_anysplat_inference'):.0f} "
-            f"reproj={_last_ms('FF.3b_anysplat_reproject'):.0f} "
-            f"cull={_last_ms('FF.4_crop_and_delete'):.0f} "
-            f"insert={_last_ms('FF.5_insert'):.0f}"
-        )
-        # AnySplat per-call breakdown (short field names so rich doesn't wrap
-        # the line). ipc_wait covers the full worker turnaround; phases won't
-        # sum exactly (JSON write/read + Python overhead unmeasured).
-        if "FF.3a.ipc_send" in self._timing:
+                t0 = time.time()
+                with self._viser_lock_ctx():
+                    inserted_ids = self.model.insert_inpaint_gaussians(
+                        xyz=torch.from_numpy(decoded["xyz"]).to(self.device),
+                        features_dc=torch.from_numpy(decoded["features_dc"]).to(self.device),
+                        features_rest=torch.from_numpy(decoded["features_rest"]).to(self.device),
+                        opacities=torch.from_numpy(decoded["opacities"]).to(self.device),
+                        scales=torch.from_numpy(decoded["scales"]).to(self.device),
+                        quats=torch.from_numpy(decoded["quats"]).to(self.device),
+                        instance_id=999,
+                    )
+                self._timing["FF.5_insert"].append(time.time() - t0)
+                self._viser_direct_register_ff_insert(inserted_ids)
+                total_inserted += int(inserted_ids.numel())
+
+            total_per_call = time.time() - t_call0
+            self._timing["FF.6_total_per_call"].append(total_per_call)
+            obj_count = int((self.model.object_flags.squeeze(-1) > 0.5).sum().item())
+            ins_count = int((self.model.inserted_flags.squeeze(-1) > 0.5).sum().item())
+            def _last_ms(key: str) -> float:
+                arr = self._timing.get(key, [])
+                return arr[-1] * 1000.0 if arr else 0.0
             CONSOLE.log(
-                f"[anysplat]   ph(ms): "
-                f"snd={_last_ms('FF.3a.ipc_send'):.1f} "
-                f"img={_last_ms('FF.3a.images_load'):.0f} "
-                f"fwd={_last_ms('FF.3a.forward'):.0f} "
-                f"cvt={_last_ms('FF.3a.convert_to_numpy'):.0f} "
-                f"sav={_last_ms('FF.3a.npz_save'):.0f} "
-                f"wait={_last_ms('FF.3a.ipc_wait'):.0f} "
-                f"ld={_last_ms('FF.3a.npz_load'):.0f}"
+                f"[anysplat] {mode_label} call={call_id} step={self._dynamic_step_counter} "
+                f"frame={frame_idx} components={len(components)} inserted={total_inserted} "
+                f"culled={total_culled} total_ms={total_per_call*1000:.0f} "
+                f"object_flags={obj_count} inserted_flags={ins_count} "
+                f"total_gauss={self.model.num_points} "
+                f"| cdn={_last_ms('FF.1_cdn_clean'):.0f} "
+                f"comp_sel={_last_ms('FF.2_component_select'):.0f} "
+                f"anysplat_inf={_last_ms('FF.3a_anysplat_inference'):.0f} "
+                f"reproj={_last_ms('FF.3b_anysplat_reproject'):.0f} "
+                f"cull={_last_ms('FF.4_crop_and_delete'):.0f} "
+                f"insert={_last_ms('FF.5_insert'):.0f}"
             )
+            if "FF.3a.ipc_send" in self._timing:
+                CONSOLE.log(
+                    f"[anysplat]   ph(ms): "
+                    f"snd={_last_ms('FF.3a.ipc_send'):.1f} "
+                    f"img={_last_ms('FF.3a.images_load'):.0f} "
+                    f"fwd={_last_ms('FF.3a.forward'):.0f} "
+                    f"cvt={_last_ms('FF.3a.convert_to_numpy'):.0f} "
+                    f"sav={_last_ms('FF.3a.npz_save'):.0f} "
+                    f"wait={_last_ms('FF.3a.ipc_wait'):.0f} "
+                    f"ld={_last_ms('FF.3a.npz_load'):.0f}"
+                )
+        finally:
+            self._anysplat_slot_lock.release()
