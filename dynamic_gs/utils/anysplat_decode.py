@@ -90,17 +90,33 @@ class PersistentAnysplatWorker:
     def load_seconds(self) -> float:
         return getattr(self, "_load_s", 0.0)
 
-    def inference(self, image_paths: list[Path], output_npz: Path, timeout_s: float = 60.0) -> Path:
-        """Run one inference; return the output .npz path. Raises on worker error."""
+    def inference(self, image_paths: list[Path], output_npz: Path, timeout_s: float = 60.0) -> dict:
+        """Run one inference. Returns a dict with the output .npz path plus per-phase
+        timing breakdown:
+
+            {"output": Path, "t_ipc_send_ms": ..., "t_ipc_wait_ms": ...,
+             "t_images_load_ms": ..., "t_forward_ms": ..., "t_convert_ms": ...,
+             "t_npz_save_ms": ...}
+
+        ``ipc_send`` = stdin write+flush. ``ipc_wait`` = round-trip from end-of-send
+        to response readline (this includes the entire worker-side cost plus
+        stdout buffering / readline blocking). Worker-side phases are reported
+        verbatim from the worker's ``_run_one``. They will not sum to ``ipc_wait``
+        because the JSON write itself and Python overhead are unmeasured.
+        Raises on worker error."""
         import json as _json
         if self._proc.poll() is not None:
             raise RuntimeError("AnySplat persistent worker is no longer running")
         output_npz.parent.mkdir(parents=True, exist_ok=True)
         req = {"images": [str(p) for p in image_paths], "output": str(output_npz)}
+
+        t_send0 = time.time()
         self._proc.stdin.write(_json.dumps(req) + "\n")
         self._proc.stdin.flush()
+        t_ipc_send_ms = (time.time() - t_send0) * 1000.0
 
-        t0 = time.time()
+        t_wait0 = time.time()
+        t0 = t_wait0
         while True:
             if time.time() - t0 > timeout_s:
                 raise TimeoutError(f"AnySplat inference exceeded {timeout_s}s")
@@ -115,7 +131,16 @@ class PersistentAnysplatWorker:
             except Exception:
                 continue
             if resp.get("status") == "ok":
-                return Path(resp["output"])
+                t_ipc_wait_ms = (time.time() - t_wait0) * 1000.0
+                return {
+                    "output": Path(resp["output"]),
+                    "t_ipc_send_ms": t_ipc_send_ms,
+                    "t_ipc_wait_ms": t_ipc_wait_ms,
+                    "t_images_load_ms": float(resp.get("t_images_load_ms", 0.0)),
+                    "t_forward_ms": float(resp.get("t_forward_ms", 0.0)),
+                    "t_convert_ms": float(resp.get("t_convert_ms", 0.0)),
+                    "t_npz_save_ms": float(resp.get("t_npz_save_ms", 0.0)),
+                }
             if resp.get("status") == "error":
                 raise RuntimeError(f"AnySplat worker error: {resp.get('msg')}")
 

@@ -54,6 +54,7 @@ The 3 abstract hooks the subclass must implement
 from __future__ import annotations
 
 import atexit
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -204,11 +205,9 @@ class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
     """Dilation applied to the rendered object mask before subtracting it
     from CDN in :meth:`_feedforward_clean_cdn`."""
 
-    feedforward_anysplat_context_frames: int = 2
     feedforward_anysplat_conda_env: str = "anysplat_dynamic_gs"
     feedforward_anysplat_worker_timeout_s: float = 300.0
     feedforward_anysplat_min_opacity: float = 0.05
-    feedforward_anysplat_debug_dump: bool = True
     feedforward_anysplat_scale_multiplier: float = 5.0
 
 
@@ -286,6 +285,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
 
         atexit.register(self._cleanup_viser_direct)
         atexit.register(self._cleanup_anysplat_worker)
+        atexit.register(self._cleanup_anysplat_ipc_file)
         atexit.register(self._cleanup_feedforward_video_writer)
         atexit.register(self._save_final_snapshot_if_enabled)
         atexit.register(self._write_timing_report)
@@ -400,6 +400,16 @@ class DynamicGSPipelineBase(VanillaPipeline):
             except Exception:
                 pass
             self._anysplat_persistent_worker = None
+
+    def _cleanup_anysplat_ipc_file(self) -> None:
+        """Remove the /dev/shm IPC file written by the AnySplat worker.
+        Best-effort; the file is small (a few MB) but living in tmpfs."""
+        try:
+            ipc_path = Path(f"/dev/shm/anysplat_ipc_{os.getpid()}.npz")
+            if ipc_path.exists():
+                ipc_path.unlink()
+        except Exception:
+            pass
 
     def _save_final_snapshot_if_enabled(self) -> None:
         """Dump the post-feedforward model state to disk at exit.
@@ -1399,34 +1409,22 @@ class DynamicGSPipelineBase(VanillaPipeline):
             self._anysplat_persistent_worker = None
 
     def _resolve_anysplat_context_image_paths(self, target_frame_idx: int) -> tuple[list[Path], list[int]]:
-        """Return (image_paths, frame_indices) — target first, then K-1 previous accepted frames.
+        """Return ([target_image_path], [target_frame_idx]).
 
-        TODO(phase-3-stage-D): this reads recorded-mode-only state
-        (``_accepted_dynamic_frames`` + dataset.image_filenames). Live
-        subclass should override (or skip — anysplat in live needs a
-        different context strategy)."""
+        AnySplat is invoked with a single frame (the target). Multi-frame
+        context was tested and gave no forward-time benefit while producing
+        an inconsistent (often noisier) output cloud; the previous
+        ``feedforward_anysplat_context_frames`` knob was removed.
+
+        TODO(phase-3-stage-D): recorded-only because it reads
+        ``dataset.image_filenames``. Live subclass overrides this with the
+        in-memory RGB frame path."""
         try:
             ds = self.datamanager.dynamic_manager.train_dataset
         except AttributeError:
             return [], []
-        all_filenames = ds.image_filenames
-        K_ctx = max(0, int(getattr(self.config, "feedforward_anysplat_context_frames", 2)))
-
-        target_path = Path(all_filenames[target_frame_idx])
-        out_paths: list[Path] = [target_path]
-        out_idx: list[int] = [int(target_frame_idx)]
-
-        if K_ctx > 0:
-            accepted = list(getattr(self, "_accepted_dynamic_frames", []) or [])
-            if target_frame_idx in accepted:
-                pos = accepted.index(int(target_frame_idx))
-                ctx_indices = accepted[max(0, pos - K_ctx):pos]
-            else:
-                ctx_indices = [i for i in accepted if i < target_frame_idx][-K_ctx:]
-            for fi in ctx_indices:
-                out_paths.append(Path(all_filenames[fi]))
-                out_idx.append(int(fi))
-        return out_paths, out_idx
+        target_path = Path(ds.image_filenames[target_frame_idx])
+        return [target_path], [int(target_frame_idx)]
 
     def _scene_c2w_for_frame(self, frame_idx: int) -> np.ndarray:
         """Look up the post-camera-optimizer c2w (4x4) for a recorded dynamic frame.
@@ -1525,14 +1523,18 @@ class DynamicGSPipelineBase(VanillaPipeline):
         else:
             scene_c2w_np = scene_c2w_np.astype(np.float64)
 
-        debug_dir = Path(self.datamanager.config.data) / "dynamic_scene" / "debug" / "feedforward_anysplat"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        out_npz = debug_dir / f"call_{call_id:04d}_step_{self._dynamic_step_counter}_frame_{frame_idx}.npz"
+        # IPC: write to tmpfs (/dev/shm) instead of the dataset disk. AnySplat
+        # FF is gated by feedforward_anysplat_min_gap_s, so there's never a
+        # concurrent write; a single fixed filename is sufficient and avoids
+        # debug-dir clutter. /dev/shm is tmpfs (RAM) on Linux; this drops
+        # ~90 ms of disk roundtrip (~30 % of the per-call cost).
+        out_npz = Path(f"/dev/shm/anysplat_ipc_{os.getpid()}.npz")
 
         t0 = time.time()
+        worker_timings: dict = {}
         try:
             if self._anysplat_persistent_worker is not None:
-                self._anysplat_persistent_worker.inference(
+                worker_timings = self._anysplat_persistent_worker.inference(
                     image_paths, out_npz,
                     timeout_s=float(self.config.feedforward_anysplat_worker_timeout_s),
                 )
@@ -1546,8 +1548,23 @@ class DynamicGSPipelineBase(VanillaPipeline):
             CONSOLE.log(f"[anysplat] call={call_id} worker FAILED: {exc}")
             return
         self._timing["FF.3a_anysplat_inference"].append(time.time() - t0)
+        # Worker-emitted per-phase timings (persistent worker only)
+        for k_in, k_out in (
+            ("t_ipc_send_ms",    "FF.3a.ipc_send"),
+            ("t_images_load_ms", "FF.3a.images_load"),
+            ("t_forward_ms",     "FF.3a.forward"),
+            ("t_convert_ms",     "FF.3a.convert_to_numpy"),
+            ("t_npz_save_ms",    "FF.3a.npz_save"),
+            ("t_ipc_wait_ms",    "FF.3a.ipc_wait"),
+        ):
+            v = worker_timings.get(k_in)
+            if v is not None:
+                self._timing[k_out].append(float(v) / 1000.0)
 
-        data = np.load(out_npz, allow_pickle=True)
+        t_load0 = time.time()
+        import pickle
+        with open(out_npz, "rb") as f:
+            data = pickle.load(f)
         means_can = data["means_canonical"]
         log_scales = data["log_scales"]
         quats = data["quats_wxyz"]
@@ -1556,6 +1573,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
         features_rest = data["features_rest"]
         pred_c2w_0 = data["pred_extrinsic_c2w"][0]
         pred_K_norm = data["pred_intrinsic_norm"][0]
+        self._timing["FF.3a.npz_load"].append(time.time() - t_load0)
         H_any, W_any = 448, 448
 
         total_inserted = 0
@@ -1638,3 +1656,17 @@ class DynamicGSPipelineBase(VanillaPipeline):
             f"cull={_last_ms('FF.4_crop_and_delete'):.0f} "
             f"insert={_last_ms('FF.5_insert'):.0f}"
         )
+        # AnySplat per-call breakdown (short field names so rich doesn't wrap
+        # the line). ipc_wait covers the full worker turnaround; phases won't
+        # sum exactly (JSON write/read + Python overhead unmeasured).
+        if "FF.3a.ipc_send" in self._timing:
+            CONSOLE.log(
+                f"[anysplat]   ph(ms): "
+                f"snd={_last_ms('FF.3a.ipc_send'):.1f} "
+                f"img={_last_ms('FF.3a.images_load'):.0f} "
+                f"fwd={_last_ms('FF.3a.forward'):.0f} "
+                f"cvt={_last_ms('FF.3a.convert_to_numpy'):.0f} "
+                f"sav={_last_ms('FF.3a.npz_save'):.0f} "
+                f"wait={_last_ms('FF.3a.ipc_wait'):.0f} "
+                f"ld={_last_ms('FF.3a.npz_load'):.0f}"
+            )

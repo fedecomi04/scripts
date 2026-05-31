@@ -63,33 +63,32 @@ def _load_and_preprocess(image_paths: list[Path], device: torch.device) -> torch
 
 
 def _convert_gaussians_to_splatfacto(g) -> dict[str, np.ndarray]:
-    """Drop SH degree-4 band; transpose harmonics; log-scale; logit-opacity."""
+    """Drop SH-4 band; transpose harmonics; log-scale; logit-opacity.
 
-    means = g.means[0].detach().cpu().numpy().astype(np.float32)        # (N, 3)
-    scales_lin = g.scales[0].detach().cpu().numpy().astype(np.float32)  # (N, 3) linear
-    quats = g.rotations[0].detach().cpu().numpy().astype(np.float32)    # (N, 4) wxyz
-    opacities = g.opacities[0].detach().cpu().numpy().astype(np.float32)  # (N,) in [0,1]
-    harmonics = g.harmonics[0].detach().cpu().numpy().astype(np.float32)  # (N, 3, 25)
-
-    log_scales = np.log(np.clip(scales_lin, 1e-12, None))
-    opacity_logits = np.log(np.clip(opacities, 1e-6, 1 - 1e-6) / (1 - np.clip(opacities, 1e-6, 1 - 1e-6)))
-
-    sh_total = harmonics.shape[-1]
+    All slice/permute/log/logit math runs on GPU so the H2D transfer carries
+    only the data we actually keep — the SH-4 truncation alone removes 36 %
+    of the harmonics bandwidth (the dominant payload)."""
+    sh_total = g.harmonics.shape[-1]
     if sh_total < 16:
         raise RuntimeError(f"AnySplat returned only {sh_total} SH coeffs; need >= 16")
-    harm_trunc = harmonics[..., :16]  # (N, 3, 16) → drop SH-4 band
-    harm_splat = np.transpose(harm_trunc, (0, 2, 1)).astype(np.float32)  # (N, 16, 3)
-    # Splatfacto stores features_dc as (N, 3) — just the DC band, not (N, 1, 3).
-    features_dc = harm_splat[:, 0, :]    # (N, 3)
-    features_rest = harm_splat[:, 1:, :] # (N, 15, 3)
 
+    # GPU-side prep: slice [..., :16] + permute (3,16) -> (16,3), contiguous so
+    # the .cpu() below is a single dense copy of N*16*3 floats (not N*25*3).
+    harm_t = g.harmonics[0].detach()[..., :16].permute(0, 2, 1).contiguous()  # (N, 16, 3) GPU
+    log_scales_t = torch.log(g.scales[0].detach().clamp(min=1e-12))           # (N, 3) GPU
+    opac_clamped = g.opacities[0].detach().clamp(min=1e-6, max=1 - 1e-6)
+    opac_logits_t = torch.log(opac_clamped / (1.0 - opac_clamped))            # (N,) GPU
+
+    # Single H2D per tensor. PyTorch queues them on the default stream; the
+    # first .numpy() triggers one cudaStreamSynchronize for all.
+    harm_np = harm_t.cpu().numpy().astype(np.float32, copy=False)
     return {
-        "means_canonical": means,
-        "log_scales": log_scales.astype(np.float32),
-        "quats_wxyz": quats,
-        "opacity_logits": opacity_logits.astype(np.float32),
-        "features_dc": features_dc,
-        "features_rest": features_rest,
+        "means_canonical": g.means[0].detach().cpu().numpy().astype(np.float32, copy=False),
+        "log_scales":      log_scales_t.cpu().numpy().astype(np.float32, copy=False),
+        "quats_wxyz":      g.rotations[0].detach().cpu().numpy().astype(np.float32, copy=False),
+        "opacity_logits":  opac_logits_t.cpu().numpy().astype(np.float32, copy=False),
+        "features_dc":     harm_np[:, 0, :],     # (N, 3)
+        "features_rest":   harm_np[:, 1:, :],    # (N, 15, 3)
     }
 
 
@@ -101,29 +100,50 @@ def _convert_pred_cameras(pred: dict) -> dict[str, np.ndarray]:
 
 
 def _run_one(model, image_paths: list[Path], output_npz: Path, device: torch.device) -> dict:
-    t1 = time.time()
+    is_cuda = device.type == "cuda"
+
+    t_img0 = time.time()
     images = _load_and_preprocess(image_paths, device)
+    if is_cuda:
+        torch.cuda.synchronize()  # fold H2D copy into images_load
+    t_images_load_ms = (time.time() - t_img0) * 1000.0
+
+    t_fwd0 = time.time()
     with torch.no_grad():
         gaussians, pred = model.inference((images + 1) * 0.5)
-    if device.type == "cuda":
+    if is_cuda:
         torch.cuda.synchronize()
-    inf_s = time.time() - t1
+    t_forward_ms = (time.time() - t_fwd0) * 1000.0
 
+    t_conv0 = time.time()
     out: dict = {}
     out.update(_convert_gaussians_to_splatfacto(gaussians))
     out.update(_convert_pred_cameras(pred))
-    out["voxel_count"] = np.int64(out["means_canonical"].shape[0])
-    out["pixel_to_world_dropped"] = np.bool_(True)
-    out["input_image_paths"] = np.array([str(p) for p in image_paths], dtype=object)
+    t_convert_ms = (time.time() - t_conv0) * 1000.0
 
+    t_save0 = time.time()
+    out["voxel_count"] = int(out["means_canonical"].shape[0])
+    out["pixel_to_world_dropped"] = True
+    out["input_image_paths"] = [str(p) for p in image_paths]
     output_npz.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(output_npz, **out)
+    # Pickle (not np.savez) — np.savez wraps each array in a ZIP entry with a
+    # CRC32, which on the ~54 MB features_rest array costs ~50 ms even on
+    # tmpfs. Pickle is a flat memcpy of the dict-of-ndarrays.
+    import pickle
+    with open(output_npz, "wb") as f:
+        pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
+    t_npz_save_ms = (time.time() - t_save0) * 1000.0
+
     return {
         "status": "ok",
         "output": str(output_npz),
         "n_gaussians": int(out["voxel_count"]),
         "k_views": int(out["pred_extrinsic_c2w"].shape[0]),
-        "inference_s": inf_s,
+        "inference_s": t_forward_ms / 1000.0,  # kept for back-compat
+        "t_images_load_ms": t_images_load_ms,
+        "t_forward_ms": t_forward_ms,
+        "t_convert_ms": t_convert_ms,
+        "t_npz_save_ms": t_npz_save_ms,
     }
 
 
