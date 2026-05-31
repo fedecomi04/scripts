@@ -39,11 +39,15 @@ import torch
 from nerfstudio.cameras.cameras import Cameras, CameraType
 
 
-# Hardcoded data root for live runs. Wiped + recreated at session start by
-# the publisher (`--wipe-live-root`).
-LIVE_ROOT = Path(
-    "/home/mrc-cuhk/Documents/dynamic_gaussian_splat/data_teleoperation/datasets/live"
-)
+# Live data root. Override via DGS_LIVE_ROOT env var (set by
+# scripts/bootstrap_live.sh so a fresh scene gets its own dir without
+# stomping prior recordings). Default kept for back-compat with the
+# legacy hard-coded location. Wiped + recreated at session start by
+# the publisher when --wipe-live-root is passed.
+LIVE_ROOT = Path(os.environ.get(
+    "DGS_LIVE_ROOT",
+    "/home/mrc-cuhk/Documents/dynamic_gaussian_splat/data_teleoperation/datasets/live",
+))
 
 DEFAULT_SHM_NAME = "/dgs_live_shm"
 NUM_SLOTS = 4

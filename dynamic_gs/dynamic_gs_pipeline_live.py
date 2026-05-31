@@ -70,9 +70,13 @@ class LiveDynamicGSPipelineConfig(DynamicGSPipelineBaseConfig):
     """Publisher-side keyframe filter: emit only when the camera has
     rotated at least this much (degrees) since the last published frame."""
 
-    live_wipe_root: bool = True
+    live_wipe_root: bool = False
     """If True, the publisher wipes its live-root directory at startup
-    (clears stale recordings). Set False to inspect previous live data."""
+    -- DESTROYS any recorded frames + post_fusion_state.pt on the way in.
+    Default False so re-runs against a previously-captured scene are
+    non-destructive. Set True only when you actually want a fresh capture
+    (the bootstrap_live.sh script handles fresh captures via
+    live_session.py directly, which has its own wipe logic)."""
 
 
 class LiveDynamicGSPipeline(DynamicGSPipelineBase):
