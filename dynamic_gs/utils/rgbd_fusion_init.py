@@ -301,6 +301,7 @@ def build_tsdf_seed(
         return out_ply
 
     t_all = time.time()
+    timing: dict[str, float] = {}  # phase -> seconds; written to sidecar below
     if verbose:
         print(f"[rgbd-fusion-init] starting ICP + TSDF fusion on {static_dir}")
 
@@ -329,8 +330,9 @@ def build_tsdf_seed(
         depth_u16.append(z16)
         valid.append(v)
         c2w_cv.append(cv_c2w_from_opengl(fr.c2w_opengl))
+    timing["preload_depth_masks"] = time.time() - t
     if verbose:
-        print(f"[rgbd-fusion-init] preload depth+masks: {time.time()-t:.2f}s")
+        print(f"[rgbd-fusion-init] preload depth+masks: {timing['preload_depth_masks']:.2f}s")
 
     # --- Frame-to-model ICP refinement ---
     t = time.time()
@@ -376,8 +378,12 @@ def build_tsdf_seed(
         if verbose and (i % 20 == 0 or i == N - 1):
             print(f"[rgbd-fusion-init]   icp frame {i+1}/{N}  "
                   f"fitness={last_fitness:.2f}  trusted={n_trusted}/{i}")
+    timing["icp_total"] = time.time() - t
+    timing["icp_register_only"] = icp_only
+    timing["icp_trusted_frames"] = float(n_trusted)
+    timing["icp_total_frames"] = float(N - 1)
     if verbose:
-        print(f"[rgbd-fusion-init] icp total: {time.time()-t:.2f}s "
+        print(f"[rgbd-fusion-init] icp total: {timing['icp_total']:.2f}s "
               f"({1000*icp_only/max(N-1,1):.0f} ms/frame avg, "
               f"{n_trusted}/{N-1} trusted)")
 
@@ -413,9 +419,10 @@ def build_tsdf_seed(
         _integrate(rgbvol, rgb_np, depth_img, ext)
         if gradvol is not None:
             _integrate(gradvol, _image_gradient(rgb_np), depth_img, ext)
+    timing["tsdf_integrate"] = time.time() - t
     if verbose:
         n_vols = 2 if gradvol is not None else 1
-        print(f"[rgbd-fusion-init] tsdf integrate ({n_vols} volume(s)): {time.time()-t:.2f}s")
+        print(f"[rgbd-fusion-init] tsdf integrate ({n_vols} volume(s)): {timing['tsdf_integrate']:.2f}s")
 
     # --- Extract + adaptive decimate + SOR ---
     t = time.time()
@@ -450,9 +457,38 @@ def build_tsdf_seed(
     # --- Write (overwrites the naive seed in place) ---
     out_ply.parent.mkdir(parents=True, exist_ok=True)
     o3d.io.write_point_cloud(str(out_ply), seed)
+    timing["sor_and_write"] = time.time() - t  # everything after tsdf integrate
+    timing["total_wall"] = time.time() - t_all
+    timing["final_point_count"] = float(n_final)
     if verbose:
         print(f"[rgbd-fusion-init] wrote {out_ply} ({n_final:,} pts) "
-              f"in {time.time()-t_all:.1f}s total")
+              f"in {timing['total_wall']:.1f}s total")
+
+    # --- Save sidecar timing report next to the seed ---
+    timing_path = out_ply.parent / "init_seed_timing.txt"
+    try:
+        lines = [
+            f"ICP + TSDF fusion timing  ({static_dir})",
+            f"generated:        {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "-" * 60,
+            f"frames:           {N}",
+            f"icp_total:        {timing['icp_total']:>7.2f} s",
+            f"icp_register:     {timing['icp_register_only']:>7.2f} s "
+                f"({1000*timing['icp_register_only']/max(N-1,1):.0f} ms/frame)",
+            f"icp_trusted:      {int(timing['icp_trusted_frames'])}/{int(timing['icp_total_frames'])}",
+            f"tsdf_integrate:   {timing['tsdf_integrate']:>7.2f} s",
+            f"sor_and_write:    {timing['sor_and_write']:>7.2f} s",
+            "-" * 60,
+            f"TOTAL wall:       {timing['total_wall']:>7.2f} s",
+            f"final pts:        {int(timing['final_point_count']):>7d}",
+        ]
+        timing_path.write_text("\n".join(lines) + "\n")
+        if verbose:
+            print(f"[rgbd-fusion-init] timing sidecar -> {timing_path}")
+    except Exception as exc:
+        if verbose:
+            print(f"[rgbd-fusion-init] WARNING: could not write timing sidecar: {exc}")
+
     return out_ply
 
 

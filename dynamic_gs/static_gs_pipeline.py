@@ -102,6 +102,7 @@ class StaticGSPipeline(VanillaPipeline):
         self._timing: defaultdict[str, list] = defaultdict(list)
         self._sam3d_generation_outputs: Optional[dict] = None
         self._phase0b_done: bool = False
+        self._timing_report_written: bool = False
 
         super().__init__(
             config=config,
@@ -111,6 +112,9 @@ class StaticGSPipeline(VanillaPipeline):
             local_rank=local_rank,
             grad_scaler=grad_scaler,
         )
+
+        import atexit as _atexit
+        _atexit.register(self._write_timing_report)
 
         # Phase 0a: SAM3 segmentation + Fast-SAM3D 3D generation.
         # Runs once at construction, BEFORE the trainer starts the loop.
@@ -193,6 +197,72 @@ class StaticGSPipeline(VanillaPipeline):
             )
         else:
             CONSOLE.log("[static-gs] post-fusion cache save failed; see prior error")
+
+    # --------------------------------------------------------------
+    # Timing report (atexit; mirrors dynamic_gs_pipeline_base._write_timing_report)
+    # --------------------------------------------------------------
+
+    def _write_timing_report(self) -> None:
+        """Write ``<data_root>/timing_report_static.txt`` from ``self._timing``.
+
+        Idempotent — atexit may fire twice on Ctrl+C. Distinct filename
+        from the dynamic-gs report so the two don't overwrite each other
+        when both are run on the same dataset."""
+        if self._timing_report_written:
+            return
+        try:
+            datamanager = object.__getattribute__(self, "datamanager")
+        except AttributeError:
+            return
+        if datamanager is None or not hasattr(datamanager, "config"):
+            return
+        timing = self._timing
+        if not timing:
+            return
+        self._timing_report_written = True
+
+        from datetime import datetime
+
+        def _row(key: str, vals) -> str:
+            if not vals:
+                return f"  {key:<42s}        N/A"
+            n = len(vals)
+            avg_ms = float(sum(vals)) / n * 1000.0
+            total = float(sum(vals))
+            mn = min(vals) * 1000.0
+            mx = max(vals) * 1000.0
+            return (
+                f"  {key:<42s} n={n:<6d} avg={avg_ms:>8.1f}ms "
+                f"min={mn:>7.1f}ms max={mx:>8.1f}ms total={total:>7.1f}s"
+            )
+
+        lines: list[str] = []
+        lines.append("=" * 96)
+        lines.append("STATIC-GS TIMING REPORT")
+        lines.append("=" * 96)
+        lines.append(f"Generated:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"Data root:   {datamanager.config.data}")
+        lines.append(f"Num points:  {getattr(self.model, 'num_points', '?')}")
+        lines.append("")
+
+        # Group by prefix (S0. / static_step / etc.) for readability.
+        groups: dict[str, list[str]] = {}
+        for k in sorted(timing.keys()):
+            prefix = k.split(".", 1)[0] if "." in k else k.split("_", 1)[0]
+            groups.setdefault(prefix, []).append(k)
+        for group_name in sorted(groups.keys()):
+            group_keys = groups[group_name]
+            lines.append(f"--- {group_name} ({len(group_keys)} key{'s' if len(group_keys)!=1 else ''}) ---")
+            for k in group_keys:
+                lines.append(_row(k, timing[k]))
+            lines.append("")
+
+        out_path = Path(datamanager.config.data) / "timing_report_static.txt"
+        try:
+            out_path.write_text("\n".join(lines) + "\n")
+            CONSOLE.log(f"[static-gs] timing report written → {out_path}")
+        except Exception as exc:
+            CONSOLE.log(f"[static-gs] failed to write timing report: {exc}")
 
 
 # ============================================================================
