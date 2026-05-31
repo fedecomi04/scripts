@@ -70,6 +70,15 @@ out = run_live_capture_session()
 print(f'\n[bootstrap] capture session complete -> {out}', flush=True)
 "
 
+# Safety net: live_session already runs the ICP+TSDF refinement at the
+# end of capture, but if you reach stage 2 from any other path (manual
+# recording, half-aborted session, legacy dataset without refinement)
+# this idempotent call ensures the seed PLY is the refined version
+# before static-gs reads it.
+echo
+echo "===> [1.5/3] RGBD-FUSION INIT -- ICP-refined TSDF seed (idempotent)"
+"$PY" -u -m dynamic_gs.utils.rgbd_fusion_init "$DATA_DIR"
+
 # ---------------------------------------------------------------- 2/3
 echo
 echo "===> [2/3] FIT -- ns-train static-gs"

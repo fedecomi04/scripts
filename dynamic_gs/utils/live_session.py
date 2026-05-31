@@ -527,6 +527,18 @@ def run_live_capture_session() -> Path:
 
         print(f"[live] building init PLY from {n_static} static views...", flush=True)
         sub.build_static_init_pointcloud()
+        # Refine the just-written naive concat seed with ICP + TSDF fusion.
+        # Same output path (transforms.json's ply_file_path), same world
+        # frame -- Splatfacto's load_3D_points=True picks it up unchanged
+        # and gets a denoised, real-RGB, adaptive-density cloud instead of
+        # the ~N-times-overlaid naive back-projection.
+        try:
+            from .rgbd_fusion_init import build_tsdf_seed
+            print("[live] refining init PLY via ICP + TSDF fusion...", flush=True)
+            build_tsdf_seed(LIVE_ROOT, force=True, verbose=True)
+        except Exception as exc:
+            print(f"[live] WARNING: ICP+TSDF refinement failed ({exc}); "
+                  f"falling back to the naive seed", flush=True)
     finally:
         # PCD build done (or aborted); resume the simulator before
         # static training starts.
