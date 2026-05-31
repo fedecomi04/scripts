@@ -20,5 +20,5 @@ include = ["dynamic_gs*"]
 
 [project.entry-points."nerfstudio.method_configs"]
 dynamic-gs = "dynamic_gs.dynamic_gs_config:DynamicGS"
+dynamic-gs-live = "dynamic_gs.dynamic_gs_config:DynamicGSLive"
 static-gs = "dynamic_gs.dynamic_gs_config:StaticGS"
-dynamic-gs-v2 = "dynamic_gs.dynamic_gs_config:DynamicGSV2"

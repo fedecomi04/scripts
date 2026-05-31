@@ -51,13 +51,26 @@ class PersistentAnysplatWorker:
         if not _WORKER_SCRIPT.exists():
             raise FileNotFoundError(f"AnySplat worker script not found: {_WORKER_SCRIPT}")
 
-        env = os.environ.copy()
         env_prefix = Path.home() / "miniconda3" / "envs" / conda_env
+        env_python = env_prefix / "bin" / "python"
+        if not env_python.exists():
+            raise FileNotFoundError(
+                f"AnySplat env python not found at {env_python}. "
+                f"Expected env '{conda_env}' under {env_prefix.parent}."
+            )
+
+        # Invoke the env's python directly instead of going through ``conda
+        # run`` — same pattern as live_shm_reader._spawn_publisher. This
+        # avoids depending on ``conda`` being on PATH (Bash tool environments
+        # often don't have it) and skips the ~0.5 s ``conda run`` wrapper
+        # overhead. The env's lib dir is prepended to LD_LIBRARY_PATH so the
+        # worker's native extensions (torch_scatter_cuda.so etc.) resolve.
+        env = os.environ.copy()
         env["LD_LIBRARY_PATH"] = (str(env_prefix / "lib") + ":" + env.get("LD_LIBRARY_PATH", "")).rstrip(":")
+        env["PYTHONUNBUFFERED"] = "1"
 
         cmd = [
-            "conda", "run", "-n", conda_env, "--no-capture-output",
-            "python", str(_WORKER_SCRIPT),
+            str(env_python), "-u", str(_WORKER_SCRIPT),
             "--persistent",
             "--anysplat-repo", str(_ANYSPLAT_REPO),
         ]
@@ -175,9 +188,13 @@ def run_anysplat_subprocess(
 
     output_npz.parent.mkdir(parents=True, exist_ok=True)
 
+    env_prefix = Path.home() / "miniconda3" / "envs" / conda_env
+    env_python = env_prefix / "bin" / "python"
+    if not env_python.exists():
+        raise FileNotFoundError(f"AnySplat env python not found at {env_python}")
+
     cmd = [
-        "conda", "run", "-n", conda_env, "--no-capture-output",
-        "python", str(_WORKER_SCRIPT),
+        str(env_python), "-u", str(_WORKER_SCRIPT),
         "--output", str(output_npz),
         "--anysplat-repo", str(_ANYSPLAT_REPO),
     ]
@@ -185,12 +202,11 @@ def run_anysplat_subprocess(
         cmd.extend(["--image", str(p)])
 
     # The worker needs $CONDA_PREFIX/lib on LD_LIBRARY_PATH for its native
-    # torch_scatter build. ``conda run`` sets CONDA_PREFIX; we prepend the
-    # env's lib dir explicitly so torch_scatter_cuda.so resolves.
+    # torch_scatter build. Invoking the env's python directly bypasses
+    # ``conda run`` (avoids depending on conda being on PATH and saves ~0.5 s).
     env = os.environ.copy()
-    env_prefix = Path.home() / "miniconda3" / "envs" / conda_env
-    extra_ld = str(env_prefix / "lib")
-    env["LD_LIBRARY_PATH"] = (extra_ld + ":" + env.get("LD_LIBRARY_PATH", "")).rstrip(":")
+    env["LD_LIBRARY_PATH"] = (str(env_prefix / "lib") + ":" + env.get("LD_LIBRARY_PATH", "")).rstrip(":")
+    env["PYTHONUNBUFFERED"] = "1"
 
     t0 = time.time()
     result = subprocess.run(

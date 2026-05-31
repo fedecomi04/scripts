@@ -290,6 +290,15 @@ class DynamicGSPipelineBase(VanillaPipeline):
         # so we never queue overlapping calls. _cleanup_anysplat_bg waits
         # for it to drain at shutdown.
         self._anysplat_slot_lock = threading.Lock()
+        # Re-entrant model lock — held by every site that mutates model
+        # state (rigid transform, FF cull, FF insert, capture_reference_*)
+        # AND by the viser render thread around every get_outputs. Lives
+        # here (not on the viser server) so it works even when viser is
+        # disabled — otherwise the off-thread FF bg can race the main-
+        # thread render and produce torn (means.shape != quats.shape)
+        # snapshots. RLock so a single thread can re-enter (FF cull +
+        # FF insert both grab it inside the bg run).
+        self._model_lock = threading.RLock()
 
         atexit.register(self._cleanup_viser_direct)
         atexit.register(self._cleanup_anysplat_worker)
@@ -636,20 +645,23 @@ class DynamicGSPipelineBase(VanillaPipeline):
     # ====================================================================
 
     def _viser_lock_ctx(self):
-        """Return the viser-direct render lock as a context manager, or
-        a no-op nullcontext when viser-direct is disabled.
+        """Return the pipeline-owned model lock as a context manager.
 
         Acquired around every model-mutation site (rigid transform, FF
-        insert, FF cull) so the viser render thread, which acquires the
-        same lock around each ``get_outputs`` call, cannot read a
-        torn ``means`` / ``quats`` / ``features_*`` tensor mid-write.
-        Re-entrant — safe to nest.
+        insert, FF cull, capture_reference_object_pose) AND by the viser
+        render thread inside every ``get_outputs`` call. Without this,
+        the off-thread FF bg can reassign ``gauss_params["means"]`` /
+        ``["quats"]`` mid-render and the rasterizer sees a torn (N != M)
+        tensor pair — the error surfaces as
+        ``render for CDN failed: torch.Size([..., 4])`` on the main
+        tracker tick AND ``cannot register a hook on a tensor that
+        doesn't require gradient`` on the bg insert path.
+
+        Lives on the pipeline (not on the viser server) so it's always
+        held regardless of whether viser-direct is enabled. RLock so a
+        single thread can re-enter (FF cull + FF insert both grab it).
         """
-        import contextlib
-        srv = getattr(self, "_viser_direct_server", None)
-        if srv is None:
-            return contextlib.nullcontext()
-        return srv.model_lock
+        return self._model_lock
 
     def _setup_viser_direct(self) -> None:
         """Spin up the standalone viser server + attach the live model.
@@ -675,6 +687,11 @@ class DynamicGSPipelineBase(VanillaPipeline):
             self._viser_direct_server = ViserDirectScene(
                 port=int(self.config.viser_direct_port),
             )
+            # Replace viser's internal lock with the pipeline-owned one so
+            # the render thread shares the same RLock as the FF bg thread
+            # and the tracker tick (rather than racing on two separate
+            # locks).
+            self._viser_direct_server.model_lock = self._model_lock
             self._viser_direct_server.attach_model(self.model, device=self.device)
             CONSOLE.log(
                 f"[viser-direct] server up on port {self.config.viser_direct_port} "
@@ -810,11 +827,16 @@ class DynamicGSPipelineBase(VanillaPipeline):
     @torch.no_grad()
     def _render_from_camera(self, camera):
         """Render from ``camera`` in training mode so we get the
-        training-resolution output."""
+        training-resolution output.
+
+        Takes ``_model_lock`` so a concurrent FF bg insert (which
+        re-allocates ``gauss_params`` Parameters) can't tear the
+        means/quats pair under the rasterizer."""
         was_training = self.model.training
         self.model.train()
         try:
-            return self.model.get_outputs(camera.to(self.model.device))
+            with self._viser_lock_ctx():
+                return self.model.get_outputs(camera.to(self.model.device))
         finally:
             if not was_training:
                 self.model.eval()
