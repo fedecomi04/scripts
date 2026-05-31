@@ -48,10 +48,33 @@ def _add_anysplat_to_path(anysplat_repo: Path) -> None:
 
 def _load_model(device: torch.device):
     from src.model.model.anysplat import AnySplat  # type: ignore
+    # TF32 matmul (Blackwell+) + cuDNN benchmark = free speedup on fp32 ops,
+    # no quality impact for inference. Set BEFORE the model loads so any
+    # weight-conversion or kernel-selection picks the fast path.
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
     model = AnySplat.from_pretrained("lhjiang/anysplat")
     model = model.to(device).eval()
     for p in model.parameters():
         p.requires_grad = False
+
+    # Warm-up forward: absorbs the CUDA JIT + cuDNN benchmark search cost
+    # at startup so the first real FF call is at steady-state latency
+    # (~110 ms, not ~440 ms). Adds ~0.5 s to model-load wall-clock.
+    if device.type == "cuda":
+        with torch.no_grad():
+            dummy = torch.zeros((1, 1, 3, 448, 448), device=device)
+            try:
+                _ = model.inference((dummy + 1) * 0.5)
+                torch.cuda.synchronize()
+            except Exception as e:
+                print(f"[anysplat_worker] warm-up forward failed (non-fatal): {e}",
+                      flush=True, file=sys.stderr)
     return model
 
 
