@@ -1,30 +1,46 @@
-"""Viser-direct visualization for live tracking (Path A — hybrid).
+"""Viser-direct visualization — server-side rasterize + push-image pattern.
 
-Bypasses Nerfstudio's server-side rasterize-and-push viewer path by
-maintaining two ``GaussianSplatHandle`` objects in a standalone Viser
-server:
+History (kept for the reader who comes back to this file):
+The prior implementation used ``viser.GaussianSplatHandle`` per-tick
+``wxyz``/``position`` writes (and a separate handle per feedforward
+insert). Object motion was visible but every property write triggered a
+brief whole-scene flash because viser's GaussianSplatHandle is
+officially flagged "Work-in-progress" across every released version
+(0.2.7 through 1.0.29 as of 2026-05-31) — its WebGL splat renderer
+remounts the canvas on each property write. A version bump to 1.0.29
+made the browser tab crash entirely instead of flashing. See
+``memory/project_viser_path_a_status.md`` for the full post-mortem.
 
-  - ``static_handle``  : all non-tracked Gaussians (``object_flags == 0``).
-                          Holds the original scene + any feedforward
-                          inserts. Re-uploaded whenever the count changes
-                          (after each feedforward call).
-  - ``tracked_handle`` : the moved-object Gaussians (``object_flags == 1``,
-                          excluding feedforward-instance 999). Uploaded
-                          ONCE at the static→dynamic boundary in the D0
-                          reference pose. Each tracker tick pushes
-                          ``handle.position`` + ``handle.wxyz`` with the
-                          world-frame rigid transform that the motion
-                          estimator returned.
+This implementation follows the canonical ecosystem pattern (nerfview,
+GaussianEditor, hwanhuh/2D-GS-Viser-Viewer, leggedrobotics/DiskChunGS):
 
-Browser-side does the WebGL splat rasterization; the training GPU never
-serves a viewer frame, so the live tick rate is no longer capped by
-viewer rerender contention.
+  1. NO native splat handles in the browser. Empty scene.
+  2. A background render thread polls each connected client's camera
+     pose, calls ``model.get_outputs(camera)`` server-side, and pushes
+     the resulting RGB image to that client via
+     ``client.scene.set_background_image(...)``. One atomic full-frame
+     replacement per push — no in-between scene-rebuild state, no flash.
+  3. Browser keeps full 6DoF camera control. We just read
+     ``client.camera.position/.wxyz/.fov`` per render tick.
+  4. A ``model_lock`` (acquired by the pipeline around any tracker write
+     and by the render thread around each ``get_outputs`` call) prevents
+     mid-render races on ``model.means`` etc.
 
-Use with ``--vis=tensorboard`` (no Nerfstudio viewer). Open the printed
-``http://<host>:<port>`` in a browser to see the scene.
+Trade-off vs the deleted Path A: the training GPU now also serves
+viewer frames (~25 ms / get_outputs at 512×512). For N connected
+clients with different camera poses we do N renders per tick.
+
+API surface kept stable so legacy pipeline call sites stay no-op
+compatible: ``setup_handles``, ``push_tracker_transform``,
+``add_ff_insert_chunk``, ``refresh_static_handle``,
+``maybe_flush_ff_handle``, ``flush_pending_ff`` are all retained as
+thin stubs (most do nothing; ``setup_handles`` just records the initial
+camera pose).
 """
 from __future__ import annotations
 
+import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -33,33 +49,32 @@ import torch
 try:
     import viser  # type: ignore
     _HAS_VISER = True
-except Exception:
+except Exception:  # pragma: no cover
     viser = None  # type: ignore
     _HAS_VISER = False
 
 
-# SH C0 coefficient. Splatfacto stores RGB color as ``features_dc`` in
-# SH-DC space; convert back to base RGB with ``0.5 + dc * SH_C0``.
-_SH_C0 = 0.28209479177387814
+# ---------------------------------------------------------------------------
+# Quaternion -> rotation matrix (wxyz)
+# ---------------------------------------------------------------------------
 
-
-def _quat_wxyz_to_rotmat(q: torch.Tensor) -> torch.Tensor:
-    """Normalized wxyz quaternion → (..., 3, 3) rotation matrix."""
-    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    w, x, y, z = q.unbind(-1)
-    R = torch.stack(
-        [
-            torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y)],     dim=-1),
-            torch.stack([2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],     dim=-1),
-            torch.stack([2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)], dim=-1),
-        ],
-        dim=-2,
-    )
+def _quat_wxyz_to_rotmat_np(q: np.ndarray) -> np.ndarray:
+    """(4,) wxyz numpy quaternion -> (3, 3) numpy rotation matrix."""
+    q = np.asarray(q, dtype=np.float64)
+    n = np.linalg.norm(q)
+    if n < 1e-12:
+        return np.eye(3, dtype=np.float32)
+    w, x, y, z = q / n
+    R = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y)],
+        [2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)],
+    ], dtype=np.float32)
     return R
 
 
-def _rotmat_to_wxyz_np(R: np.ndarray) -> np.ndarray:
-    """(3, 3) numpy rotation → (4,) wxyz numpy. Shepperd's method."""
+def _rotmat_to_quat_wxyz_np(R: np.ndarray) -> np.ndarray:
+    """(3, 3) numpy rotation matrix -> (4,) wxyz numpy quaternion (Shepperd's method)."""
     R = np.asarray(R, dtype=np.float64)
     trace = R[0, 0] + R[1, 1] + R[2, 2]
     if trace > 0:
@@ -89,54 +104,95 @@ def _rotmat_to_wxyz_np(R: np.ndarray) -> np.ndarray:
     return np.array([w, x, y, z], dtype=np.float32)
 
 
-def _build_splat_arrays(
-    means: torch.Tensor,
-    quats: torch.Tensor,
-    scales_log: torch.Tensor,
-    features_dc: torch.Tensor,
-    opacities_logit: torch.Tensor,
-) -> dict:
-    """Convert the live model param tensors for a Gaussian subset into the
-    numpy arrays viser's ``_add_gaussian_splats`` wants:
-      centers (N, 3), covariances (N, 3, 3), rgbs (N, 3), opacities (N,).
-    Everything moved to CPU/float32/numpy in a single batch.
+# Viser cameras are OpenCV-convention at the local camera frame (Y-down,
+# Z-forward), even though viser's world frame is +Y up. To convert from
+# viser's R_world_camera to nerfstudio's c2w[:3,:3] (OpenGL: Y-up,
+# Z-back at the camera), multiply by a 180-degree rotation about X.
+# This is exactly what nerfstudio's own viewer does in
+# ``nerfstudio.viewer.viewer.Viewer.get_camera_state``.
+_FLIP_YZ = np.array([
+    [1.0,  0.0,  0.0],
+    [0.0, -1.0,  0.0],
+    [0.0,  0.0, -1.0],
+], dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Build a nerfstudio Cameras object from a viser ClientHandle camera state
+# ---------------------------------------------------------------------------
+
+def _build_camera_from_viser(client_camera, W: int, H: int, device) -> "Cameras":
+    """Convert (position, wxyz, fov) from viser into a nerfstudio Cameras.
+
+    Viser cameras are OpenGL convention: +X right, +Y up, -Z forward, with
+    ``fov`` being the vertical field of view in radians. Nerfstudio
+    ``Cameras`` uses the same OpenGL convention for ``camera_to_worlds``
+    (c2w) when built directly, so the rotation matrix from the quaternion
+    drops in without an extra coordinate flip.
     """
-    with torch.no_grad():
-        scales = torch.exp(scales_log)  # log → linear
-        R = _quat_wxyz_to_rotmat(quats)  # (N, 3, 3)
-        # cov = R @ diag(s^2) @ R.T = (R * s[None,:]) @ (R * s[None,:]).T
-        M = R * scales.unsqueeze(-2)  # multiply column j of R by s_j
-        covariances = M @ M.transpose(-1, -2)
-        rgbs = (0.5 + features_dc * _SH_C0).clamp(0.0, 1.0)
-        # viser expects opacities as (N, 1).
-        if opacities_logit.ndim == 1:
-            opacities = torch.sigmoid(opacities_logit).unsqueeze(-1)
-        else:
-            opacities = torch.sigmoid(opacities_logit)
-    return {
-        "centers":     means.detach().cpu().float().numpy(),
-        "covariances": covariances.detach().cpu().float().numpy(),
-        "rgbs":        rgbs.detach().cpu().float().numpy(),
-        "opacities":   opacities.detach().cpu().float().numpy(),
-    }
+    from nerfstudio.cameras.cameras import Cameras, CameraType
+
+    pos = np.asarray(client_camera.position, dtype=np.float32).reshape(3)
+    wxyz = np.asarray(client_camera.wxyz, dtype=np.float32).reshape(4)
+    fov_v = float(getattr(client_camera, "fov", np.deg2rad(60.0)))
+    R_viser = _quat_wxyz_to_rotmat_np(wxyz)
+    # viser camera (Y-down, Z-forward) -> nerfstudio (Y-up, Z-back)
+    R_nerf = (R_viser @ _FLIP_YZ).astype(np.float32)
+    c2w = np.eye(4, dtype=np.float32)
+    c2w[:3, :3] = R_nerf
+    c2w[:3, 3] = pos
+    c2w_3x4 = torch.from_numpy(c2w[:3, :4]).to(device).unsqueeze(0)  # (1, 3, 4)
+
+    # fy = 0.5 * H / tan(fov_v / 2); fx = fy * (W/H) / aspect — but viser's
+    # aspect is exactly W/H so the (W/H)/aspect factor cancels: fx == fy in
+    # pixel units.
+    fy = 0.5 * H / float(np.tan(fov_v / 2.0))
+    fx = fy
+    cx = 0.5 * W
+    cy = 0.5 * H
+
+    cameras = Cameras(
+        camera_to_worlds=c2w_3x4,
+        fx=torch.tensor([[fx]], device=device, dtype=torch.float32),
+        fy=torch.tensor([[fy]], device=device, dtype=torch.float32),
+        cx=torch.tensor([[cx]], device=device, dtype=torch.float32),
+        cy=torch.tensor([[cy]], device=device, dtype=torch.float32),
+        width=torch.tensor([[W]], device=device, dtype=torch.int32),
+        height=torch.tensor([[H]], device=device, dtype=torch.int32),
+        camera_type=CameraType.PERSPECTIVE,
+    )
+    return cameras
 
 
 class ViserDirectScene:
-    """Wraps a standalone viser server + two splat handles for live mode.
+    """Server-side rasterize + push-image viser viewer.
 
-    Use ``--vis=tensorboard`` so Nerfstudio's viewer is OFF; this server
-    handles all visualization. The training GPU does not render for the
-    viewer — the browser does, via WebGL splatting.
+    Spin up once. Call :meth:`attach_model` once the pipeline's model is
+    loaded (post-warm-cache). The background render thread starts as
+    soon as a model is attached and at least one client is connected.
+
+    Pipeline contract:
+      * Acquire :attr:`model_lock` (a re-entrant lock) around any code
+        path that mutates ``model.means / .quats / .features_dc / ...``
+        (tracker rigid transform, FF inserts, FF deletes). The render
+        thread acquires the same lock before each ``get_outputs`` call.
+      * No other API call is required for per-tick motion / FF updates
+        to appear in the browser. The render loop pulls live model
+        state each iteration; mutations are visible on the next push.
     """
 
-    def __init__(self, port: int = 8081, opacity_floor: float = 0.05,
-                 static_refresh_min_gap_s: float = -1.0,
-                 push_min_gap_s: float = 0.033):
-        """``opacity_floor`` drops splats with sigmoid(opacities) below
-        the threshold. The prior viser dump-tool symptom (white browser)
-        was 95% near-zero-opacity splats overwhelming Chrome WebGL.
-        Default 0.05 typically halves the splat count with no visible
-        difference; set to 0.0 to keep everything."""
+    def __init__(
+        self,
+        port: int = 8081,
+        render_hz: float = 15.0,
+        render_size: tuple[int, int] = (1920, 1080),  # (W, H)
+        jpeg_quality: int = 92,
+        # Legacy kwargs kept so old call sites don't trip — ignored.
+        opacity_floor: float = 0.05,
+        static_refresh_min_gap_s: float = -1.0,
+        push_min_gap_s: float = 0.033,
+        ff_coalesce_gap_s: float = 1.0,
+    ):
         if not _HAS_VISER:
             raise RuntimeError(
                 "viser is not installed in the dynamic_gs env. "
@@ -144,398 +200,344 @@ class ViserDirectScene:
             )
         self.server = viser.ViserServer(port=port)
         self.port = port
-        self.opacity_floor = float(opacity_floor)
-        self.static_refresh_min_gap_s = float(static_refresh_min_gap_s)
-        self._last_static_refresh_t = 0.0
-        self._pending_refresh_count = 0
-        # Per-tick transform push throttle. At 25+ Hz tracker with chunked
-        # tracked-handles, the per-tick push fires many handle.position +
-        # .wxyz writes in rapid succession, which hits a known race in
-        # websockets.legacy.protocol._drain_helper (AssertionError on
-        # `waiter is None or waiter.cancelled()`). Throttling to ~30 Hz
-        # wall-clock (default 33 ms gap) has no visual cost but stops the
-        # drain race. Set to 0 to disable throttling.
-        self.push_min_gap_s = float(push_min_gap_s)
-        self._last_push_t = 0.0
-        # Always-on world axes — diagnostic: if axes show in the browser
-        # but splats don't, the camera is correct and splat-data conversion
-        # is wrong; if even axes don't show, the camera or the WebGL bundle
-        # is broken.
+        self.render_hz = float(render_hz)
+        self.render_size = (int(render_size[0]), int(render_size[1]))
+        self.jpeg_quality = int(jpeg_quality)
+
+        # Pipeline coordination
+        self.model_lock = threading.RLock()
+        self._model = None
+        self._device = None
+        self._initial_c2w: Optional[np.ndarray] = None
+        self._initial_look_at: Optional[np.ndarray] = None
+        self._initial_fov_y: Optional[float] = None  # vertical FOV in radians
+
+        # Render state
+        self._stop_event = threading.Event()
+        # Event-driven render: tracker (or any mutation site) calls
+        # request_render() to set this. The render thread waits on it
+        # rather than polling at fixed Hz, so every tracker tick =>
+        # exactly one render. Also set when a client connects so the
+        # first frame goes out without waiting for a tick.
+        self._render_requested = threading.Event()
+        self._render_thread: Optional[threading.Thread] = None
+        # Per-client display state. We keep the ImageHandle for each
+        # client so we update in place instead of allocating new handles
+        # (atomic single-image replacement = no flash).
+        self._client_state: dict[int, dict] = {}
+        self._client_state_lock = threading.Lock()
+        # Track which client_ids have already been snapped to the initial
+        # camera pose. Each client gets the snap AT MOST ONCE so we never
+        # override a user-controlled move once they've started navigating.
+        self._initial_camera_applied: set[int] = set()
+        # Diagnostics
+        self._render_count = 0
+        self._render_error_count = 0
+        self._last_diag_t = time.time()
+        self._render_window_total_ms = 0.0
+
+        # World axes are useful for orientation when the scene is empty
+        # before the first render lands.
         try:
             self.server.scene.world_axes.visible = True
         except Exception:
             pass
-        # Lazy: handles created when ``setup_handles`` is called (after
-        # Phase 0b fusion finalises the scene).
-        self.static_handle = None        # all non-tracked-object Gaussians
-        self.tracked_handle = None       # the (single) moved object (chunks)
-        self.tracked_root = None         # parent FrameHandle for tracked chunks
-        self.tracked_instance_id: Optional[int] = None
-        self._tracked_count = 0
-        self._static_count = 0
-        # Per-FF-call insert handles: each FF call adds ONE new small
-        # handle here, never re-uploads prior ones. Capped at
-        # ``_ff_handle_cap`` — when exceeded, the oldest handle is
-        # removed to keep the scene-graph bounded.
-        self.ff_handles: list = []
-        self._ff_handle_cap = 500
-        self._ff_call_counter = 0
 
-    # ------------------------------------------------------------------
-    # Handle setup
-    # ------------------------------------------------------------------
-    def setup_handles(self, model, tracked_instance_id: Optional[int] = None,
-                       initial_c2w: Optional[np.ndarray] = None) -> None:
-        """Build the (static, tracked) handles from the current model state.
-
-        Splits ``model.gauss_params`` by ``object_flags`` + ``object_instance_ids``:
-          - ``tracked_handle`` gets Gaussians where ``object_flags > 0.5`` AND
-            ``object_instance_ids != 999`` (real Phase-0b objects, not FF inserts).
-            If ``tracked_instance_id`` is given, restrict further to that ID.
-          - ``static_handle`` gets everything else (background + FF inserts).
-        """
-        with torch.no_grad():
-            flags = model.object_flags.squeeze(-1) > 0.5
-            inst = model.object_instance_ids.squeeze(-1)
-            tracked_mask = flags & (inst != 999)
-            if tracked_instance_id is not None:
-                tracked_mask = tracked_mask & (inst == int(tracked_instance_id))
-            self.tracked_instance_id = tracked_instance_id
-            static_mask = ~tracked_mask
-            mm_all = model.means.detach().cpu().float()
-            bbox_min = mm_all.min(dim=0).values.tolist()
-            bbox_max = mm_all.max(dim=0).values.tolist()
-            if int(tracked_mask.sum().item()) > 0:
-                target = model.means[tracked_mask].detach().cpu().float().median(dim=0).values
-            else:
-                target = mm_all.median(dim=0).values
-        target_np = target.numpy().astype(float)
-
-        # Compute camera pose FIRST (needed for the distance diagnostic).
-        if initial_c2w is not None:
-            # Nerfstudio / OpenGL convention: +X right, +Y up, -Z forward.
-            c2w = np.asarray(initial_c2w, dtype=np.float32)
-            if c2w.shape == (3, 4):
-                c2w = np.concatenate([c2w, np.array([[0, 0, 0, 1]], dtype=np.float32)], axis=0)
-            elif c2w.shape != (4, 4):
-                raise ValueError(f"initial_c2w must be 4x4 or 3x4, got {c2w.shape}")
-            cam_pos = c2w[:3, 3].astype(np.float32)
-            forward = -c2w[:3, 2].astype(np.float32)
-            up = c2w[:3, 1].astype(np.float32)
-            look_at = (cam_pos + forward).astype(np.float32)
-            cam_source = "live_c2w"
-        else:
-            cam_pos = (target_np + np.array([1.5, 0.0, 0.5])).astype(np.float32)
-            look_at = target_np.astype(np.float32)
-            up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-            cam_source = "fallback_target_median"
-
-        # Build handles (cam_pos passed in so distance-from-camera
-        # diagnostic prints inside _add_handle).
-        self.static_handle, n_static_kept, n_static_total = self._add_handle(
-            "/static_scene", model, static_mask, cam_pos=cam_pos,
-        )
-        self._static_count = n_static_kept
-        if int(tracked_mask.sum().item()) > 0:
-            # Parent frame for all tracked-object chunks. Per-tick transform
-            # pushes update THIS frame's wxyz+position; viser propagates the
-            # transform to all children via scene-graph hierarchy. This way
-            # we send 2 attr writes per tick instead of 2 × N_chunks ×
-            # N_clients (which triggered the websockets _drain_helper race).
-            self.tracked_root = self.server.scene.add_frame(
-                name="/tracked_object_root",
-                show_axes=False,
-                wxyz=(1.0, 0.0, 0.0, 0.0),
-                position=(0.0, 0.0, 0.0),
-            )
-            # Chunk names are CHILDREN of the parent frame.
-            self.tracked_handle, n_tr_kept, n_tr_total = self._add_handle(
-                "/tracked_object_root/splats", model, tracked_mask, cam_pos=cam_pos,
-            )
-            self._tracked_count = n_tr_kept
-        else:
-            self.tracked_handle = None
-            self.tracked_root = None
-            self._tracked_count = 0
-            n_tr_kept, n_tr_total = 0, 0
-
-        # Diagnostic: a big red sphere at the look-at point + axes. If the
-        # browser shows the sphere/axes but no splats, splat rendering is
-        # broken (browser WebGL splat extension). If even the sphere is
-        # missing, browser cache or camera frustum issue.
-        try:
-            self.server.scene.add_icosphere(
-                name="/diag_sphere_at_lookat",
-                radius=0.05,
-                color=(255, 0, 0),
-                position=look_at,
-            )
-            self.server.scene.add_frame(
-                name="/diag_lookat_axes", position=look_at, axes_length=0.3, axes_radius=0.005,
-            )
-        except Exception as exc:
-            print(f"[viser-direct] diag sphere add failed: {exc}", flush=True)
-
+        # Wire client connect/disconnect.
         @self.server.on_client_connect
         def _on_connect(client):
-            client.camera.position = cam_pos
-            client.camera.look_at = look_at
-            client.camera.up_direction = up
+            self._on_client_connect(client)
+
+        @self.server.on_client_disconnect
+        def _on_disconnect(client):
+            self._on_client_disconnect(client)
 
         print(
-            f"[viser-direct] handles built: "
-            f"static={n_static_kept}/{n_static_total} splats, "
-            f"tracked={n_tr_kept}/{n_tr_total} splats "
-            f"(instance_id={tracked_instance_id}, opacity_floor={self.opacity_floor})\n"
-            f"[viser-direct] scene bbox: min={[round(v,3) for v in bbox_min]} "
-            f"max={[round(v,3) for v in bbox_max]}\n"
-            f"[viser-direct] camera pre-set on connect ({cam_source}): "
-            f"look_at={[round(float(v),3) for v in look_at]} "
-            f"position={[round(float(v),3) for v in cam_pos]}",
+            f"[viser-direct] server up on port {port} (render_hz={self.render_hz}, "
+            f"render_size={self.render_size[0]}x{self.render_size[1]}) — "
+            f"open http://localhost:{port}",
             flush=True,
         )
 
-    def _add_handle(self, name: str, model, mask: torch.Tensor, cam_pos=None,
-                    max_per_handle: int = 80_000):
-        """Slice ``model.gauss_params`` by ``mask``, apply the opacity
-        floor, drop non-PD covariances, regularize, and upload as one
-        or more splat handles. When the splat count exceeds
-        ``max_per_handle``, the data is chunked into multiple handles
-        ``<name>/chunk_00``, ``<name>/chunk_01``, ... — each handle is
-        one WebSocket message, so chunking is what keeps individual
-        uploads under Chrome's ~16 MB frame limit. At 64 B/splat
-        (centers 12 + cov 36 + rgbs 12 + opac 4), 80k splats ≈ 5 MB.
-
-        Returns ``(handle_or_list, n_kept, n_total)``. For chunked
-        uploads the first element is a list of handles."""
-        with torch.no_grad():
-            n_total = int(mask.sum().item())
-            keep = mask.clone()
-            if self.opacity_floor > 0.0 and n_total > 0:
-                opc = torch.sigmoid(model.opacities.squeeze(-1) if model.opacities.ndim > 1 else model.opacities)
-                keep = keep & (opc > self.opacity_floor)
-            n_after_op = int(keep.sum().item())
-        arrs = _build_splat_arrays(
-            means          = model.means[keep],
-            quats          = model.quats[keep],
-            scales_log     = model.scales[keep],
-            features_dc    = model.features_dc[keep],
-            opacities_logit= model.opacities[keep],
-        )
-        centers, covs, rgbs, opacs = arrs["centers"], arrs["covariances"], arrs["rgbs"], arrs["opacities"]
-
-        # ---- Diagnostics: opacity ----
-        opc_flat = opacs.reshape(-1)
-        print(
-            f"[viser-direct/{name}] opacity range = [{opc_flat.min():.4f}, "
-            f"{opc_flat.max():.4f}] mean={opc_flat.mean():.4f} "
-            f"(>0.5 frac: {(opc_flat > 0.5).mean()*100:.1f}%)",
-            flush=True,
-        )
-        # ---- Diagnostics: RGB ----
-        print(
-            f"[viser-direct/{name}] rgb range per ch = R[{rgbs[:,0].min():.3f},{rgbs[:,0].max():.3f}] "
-            f"G[{rgbs[:,1].min():.3f},{rgbs[:,1].max():.3f}] "
-            f"B[{rgbs[:,2].min():.3f},{rgbs[:,2].max():.3f}] "
-            f"mean={rgbs.mean(axis=0).round(3).tolist()}",
-            flush=True,
-        )
-
-        # ---- Diagnostics + filter: covariance positive-definiteness ----
-        # viser's WebGL splatter does a Cholesky decomp per splat. Degenerate
-        # (≈0 smallest eigenvalue) covariances either silently skip OR break
-        # the whole shader pipeline (white screen). Match what the working
-        # `view_splats_viser.py` does: drop non-PD, regularize the rest.
-        eig_min = np.linalg.eigvalsh(covs.astype(np.float64)).min(axis=-1)
-        pd_keep = eig_min > 1e-9
-        n_drop_pd = int((~pd_keep).sum())
-        if n_drop_pd > 0:
-            print(f"[viser-direct/{name}] dropping {n_drop_pd} non-PD covariances "
-                  f"(min eig <= 1e-9; smallest seen: {eig_min.min():.2e})", flush=True)
-            centers, covs, rgbs, opacs = centers[pd_keep], covs[pd_keep], rgbs[pd_keep], opacs[pd_keep]
-        # Always regularize a tiny epsilon on the diagonal to avoid float32
-        # numerical edge cases inside the shader's Cholesky.
-        covs = covs + np.eye(3, dtype=covs.dtype)[None] * 1e-7
-
-        # ---- Diagnostics: camera-to-splat distances ----
-        if cam_pos is not None and centers.shape[0] > 0:
-            d = np.linalg.norm(centers - np.asarray(cam_pos, dtype=np.float32)[None, :], axis=-1)
-            print(
-                f"[viser-direct/{name}] dist(splat → camera) "
-                f"min={d.min():.3f}m p10={np.percentile(d,10):.3f} "
-                f"median={np.median(d):.3f} p90={np.percentile(d,90):.3f} "
-                f"max={d.max():.3f}m  "
-                f"(any in front (d>0.05)? {int((d > 0.05).sum())}/{len(d)})",
-                flush=True,
-            )
-
-        n_kept = centers.shape[0]
-        if n_kept <= max_per_handle:
-            print(f"[viser-direct/{name}] uploading {n_kept} splats (single)", flush=True)
-            handle = self.server.scene._add_gaussian_splats(
-                name=name,
-                centers=centers,
-                covariances=covs,
-                rgbs=rgbs,
-                opacities=opacs,
-            )
-            return handle, n_kept, n_total
-        # Chunked upload: each handle is one WebSocket message under Chrome's
-        # ~16 MB frame ceiling. Static-scene handles only — tracked-object
-        # handle must stay single so a single per-tick transform applies to
-        # all of it (~7 MB at 200k splats, fits comfortably).
-        n_chunks = (n_kept + max_per_handle - 1) // max_per_handle
-        chunk_size_mb = max_per_handle * 64 / (1024 * 1024)
-        print(
-            f"[viser-direct/{name}] uploading {n_kept} splats in {n_chunks} chunks "
-            f"of ≤{max_per_handle} (~{chunk_size_mb:.1f} MB/chunk)",
-            flush=True,
-        )
-        handles = []
-        for i in range(n_chunks):
-            start = i * max_per_handle
-            end = min(start + max_per_handle, n_kept)
-            chunk_name = f"{name}/chunk_{i:02d}"
-            h = self.server.scene._add_gaussian_splats(
-                name=chunk_name,
-                centers=centers[start:end],
-                covariances=covs[start:end],
-                rgbs=rgbs[start:end],
-                opacities=opacs[start:end],
-            )
-            handles.append(h)
-        return handles, n_kept, n_total
-
     # ------------------------------------------------------------------
-    # Per-tick transform push (cheap — handle stays uploaded; browser
-    # re-rasterizes with the new transform on its own GPU).
+    # Pipeline-facing API
     # ------------------------------------------------------------------
-    def push_tracker_transform(self, R, t) -> None:
-        """Push the latest world-frame rigid (R, t) to the tracked-object
-        parent frame. Children (the splat chunks) inherit the transform
-        via the viser scene graph, so we only emit 2 attribute writes
-        per tick regardless of chunk count or client count. Throttled
-        to ``push_min_gap_s``."""
-        if self.tracked_root is None:
-            return
-        if self.push_min_gap_s > 0.0:
-            import time as _time
-            now = _time.time()
-            if (now - self._last_push_t) < self.push_min_gap_s:
-                return
-            self._last_push_t = now
-        R_np = R.detach().cpu().numpy() if isinstance(R, torch.Tensor) else np.asarray(R)
-        t_np = t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else np.asarray(t)
-        wxyz = _rotmat_to_wxyz_np(R_np[:3, :3])
-        pos = t_np.astype(np.float32).reshape(3)
-        self.tracked_root.wxyz = wxyz
-        self.tracked_root.position = pos
 
-    # ------------------------------------------------------------------
-    # Static-handle refresh (call after FF inserts/deletes)
-    # ------------------------------------------------------------------
-    def refresh_static_handle(self, model) -> None:
-        """Re-upload the static splat handle from the current model state.
-        DISABLED by default (``static_refresh_min_gap_s < 0``) — the
-        remove+re-add cycle for ~428k splats causes the whole static
-        scene to flicker every refresh, which is jarring. When disabled,
-        the browser holds the D0 snapshot of the static scene; FF inserts
-        don't appear in viser (but the tracked-object handle still moves
-        smoothly per tick — that's the whole point of Path A).
+    def attach_model(self, model, device=None) -> None:
+        """Hand the live model to the render thread + start it.
 
-        Set ``static_refresh_min_gap_s > 0`` to enable throttled refresh.
+        Called by the pipeline once the warm cache is loaded. Safe to
+        call multiple times (subsequent calls just swap the reference).
         """
-        if self.static_handle is None:
-            return
-        if self.static_refresh_min_gap_s <= 0:
-            return  # disabled
-        import time as _time
-        self._pending_refresh_count += 1
-        now = _time.time()
-        if (now - self._last_static_refresh_t) < self.static_refresh_min_gap_s:
-            return
-        with torch.no_grad():
-            flags = model.object_flags.squeeze(-1) > 0.5
-            inst = model.object_instance_ids.squeeze(-1)
-            tracked_mask = flags & (inst != 999)
-            if self.tracked_instance_id is not None:
-                tracked_mask = tracked_mask & (inst == int(self.tracked_instance_id))
-            static_mask = ~tracked_mask
-        # Replace the handle(s) entirely — viser doesn't support per-splat
-        # update on this version (0.2.7). ``static_handle`` may be a list
-        # of chunk-handles when the splat count exceeds the 16 MB
-        # per-message limit (see ``_add_handle``).
-        try:
-            old = self.static_handle
-            if isinstance(old, list):
-                for h in old:
-                    try: h.remove()
-                    except Exception: pass
-            else:
-                old.remove()
-        except Exception:
-            pass
-        self.static_handle, n_kept, _ = self._add_handle(
-            "/static_scene", model, static_mask,
-        )
-        self._static_count = n_kept
-        coalesced = self._pending_refresh_count
-        self._pending_refresh_count = 0
-        self._last_static_refresh_t = now
-        print(
-            f"[viser-direct] static refresh ({n_kept} splats, "
-            f"coalesced {coalesced} FF calls)",
-            flush=True,
-        )
-
-    # ------------------------------------------------------------------
-    # Incremental FF-insert visualization
-    # ------------------------------------------------------------------
-    def add_ff_insert_chunk(self, model, inserted_ids) -> None:
-        """Upload JUST the splats freshly inserted by this FF call as a
-        new standalone splat handle. The handle is appended to
-        ``ff_handles``; prior handles are never re-uploaded. Per-call
-        upload is tens to hundreds of KB on the wire.
-
-        ``inserted_ids``: 1-D tensor returned by
-        ``model.insert_inpaint_gaussians`` (the index range of the new
-        splats in the now-resized ``gauss_params`` tensors).
-        """
-        if inserted_ids is None:
-            return
-        try:
-            ids = inserted_ids.detach().cpu().long() if isinstance(inserted_ids, torch.Tensor) else torch.as_tensor(inserted_ids, dtype=torch.long)
-        except Exception:
-            return
-        if ids.numel() == 0:
-            return
-        N = int(model.means.shape[0])
-        mask = torch.zeros(N, dtype=torch.bool, device=model.means.device)
-        valid = ids[(ids >= 0) & (ids < N)]
-        if valid.numel() == 0:
-            return
-        mask[valid] = True
-        chunk_name = f"/ff_inserts/call_{self._ff_call_counter:04d}"
-        self._ff_call_counter += 1
-        try:
-            handle_or_list, n_kept, _ = self._add_handle(chunk_name, model, mask)
-        except Exception as exc:
-            print(f"[viser-direct] add_ff_insert_chunk failed: {exc}", flush=True)
-            return
-        if isinstance(handle_or_list, list):
-            self.ff_handles.extend(handle_or_list)
+        self._model = model
+        if device is not None:
+            self._device = device
         else:
-            self.ff_handles.append(handle_or_list)
-        # Cap scene-graph size — remove the oldest handles past the cap.
-        while len(self.ff_handles) > self._ff_handle_cap:
-            old = self.ff_handles.pop(0)
             try:
-                old.remove()
+                self._device = next(model.parameters()).device
             except Exception:
-                pass
+                self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self._render_thread is None or not self._render_thread.is_alive():
+            self._stop_event.clear()
+            self._render_thread = threading.Thread(
+                target=self._render_loop,
+                name="viser-direct-render",
+                daemon=True,
+            )
+            self._render_thread.start()
+
+    def set_initial_camera(
+        self,
+        c2w_4x4: np.ndarray,
+        look_at: Optional[np.ndarray] = None,
+        fov_y_rad: Optional[float] = None,
+    ) -> None:
+        """Set the camera pose that newly-connected clients land on AND
+        snap any already-connected clients that haven't been snapped yet.
+
+        ``c2w_4x4`` is the dataset c2w (Nerfstudio / OpenGL convention,
+        4×4). ``look_at`` (optional) is a world-space point the camera
+        should orient toward; defaults to ``cam_pos + camera_forward``
+        (handled inside :meth:`_apply_initial_camera`).
+
+        Each client gets at most ONE initial-camera snap per session,
+        tracked by ``_initial_camera_applied``. This way a user who
+        connected pre-D0 (and is currently looking at an arbitrary
+        default viser pose) gets snapped to the dataset's first frame
+        the moment D0 establishes :attr:`_initial_c2w`; but a user who
+        connects, snaps, then orbits the scene with the mouse will
+        NEVER get their navigation undone by a later D0 / re-attach.
+        """
+        c2w = np.asarray(c2w_4x4, dtype=np.float32)
+        if c2w.shape == (3, 4):
+            tmp = np.eye(4, dtype=np.float32)
+            tmp[:3, :4] = c2w
+            c2w = tmp
+        self._initial_c2w = c2w
+        if look_at is not None:
+            self._initial_look_at = np.asarray(look_at, dtype=np.float32).reshape(3)
+        if fov_y_rad is not None:
+            self._initial_fov_y = float(fov_y_rad)
+        # Push the freshly-set camera to any clients that connected
+        # BEFORE this call. They've never been snapped, so do it now.
+        with self._client_state_lock:
+            pending = [
+                (cid, st["client"])
+                for cid, st in self._client_state.items()
+                if cid not in self._initial_camera_applied
+            ]
+        for cid, client in pending:
+            self._apply_initial_camera(client)
+            self._initial_camera_applied.add(cid)
+        if pending:
+            self.request_render()
 
     # ------------------------------------------------------------------
+    # Legacy no-op stubs (kept so old pipeline call sites don't break)
+    # ------------------------------------------------------------------
+
+    def setup_handles(
+        self,
+        model,
+        tracked_instance_id: Optional[int] = None,
+        initial_c2w: Optional[np.ndarray] = None,
+    ) -> None:
+        """Legacy entry point. We no longer build any splat handles; we
+        just attach the model + remember the initial camera pose."""
+        self.attach_model(model)
+        if initial_c2w is not None:
+            self.set_initial_camera(initial_c2w)
+
+    def push_tracker_transform(self, R, t) -> None:
+        """Legacy stub. The render thread reads ``model.means`` directly
+        each tick; per-tick rigid transforms become visible on the next
+        push without any explicit call."""
+        return
+
+    def add_ff_insert_chunk(self, model, inserted_ids) -> None:
+        """Legacy stub. New FF gaussians appear automatically in the
+        next render (since the pipeline appends them to model params
+        under :attr:`model_lock`)."""
+        return
+
+    def maybe_flush_ff_handle(self, model, force: bool = False) -> None:
+        """Legacy stub. No FF handle to flush — see :meth:`add_ff_insert_chunk`."""
+        return
+
+    def flush_pending_ff(self, model) -> None:
+        """Legacy stub. No pending FF state to flush."""
+        return
+
+    def refresh_static_handle(self, model) -> None:
+        """Legacy stub. There is no static handle to refresh."""
+        return
+
+    # ------------------------------------------------------------------
+    # Client lifecycle
+    # ------------------------------------------------------------------
+
+    def _on_client_connect(self, client) -> None:
+        # Pre-allocate the per-client display state with a placeholder
+        # image; the render loop will replace it as soon as the model
+        # is attached.
+        W, H = self.render_size
+        placeholder = np.zeros((H, W, 3), dtype=np.uint8)
+        try:
+            client.scene.set_background_image(placeholder, format="jpeg")
+        except Exception as exc:
+            print(f"[viser-direct] set_background_image (placeholder) failed: {exc}", flush=True)
+        with self._client_state_lock:
+            self._client_state[int(client.client_id)] = {
+                "client": client,
+                "last_pos": None,
+                "last_wxyz": None,
+                "last_fov": None,
+            }
+        # Camera-move trigger: every drag / scroll / pan in the browser
+        # fires this. Without it the render only repaints on tracker
+        # ticks (potentially every 10s+ if FF is slow) -> input lag is
+        # awful. With it the user gets ~60Hz responsive camera control
+        # AND the per-tick model-mutation renders.
+        try:
+            @client.camera.on_update
+            def _on_camera_update(_camera) -> None:
+                self.request_render()
+        except Exception as exc:
+            print(f"[viser-direct] on_camera_update wiring failed: {exc}", flush=True)
+        # If we already have an initial camera (because D0 fired before
+        # the client connected), snap them now and mark them done so the
+        # next set_initial_camera doesn't re-snap them. If _initial_c2w
+        # is still None, set_initial_camera() will snap this client when
+        # it later gets set (also marking them done).
+        if self._initial_c2w is not None:
+            self._apply_initial_camera(client)
+            self._initial_camera_applied.add(int(client.client_id))
+        # Trigger one render so the new client sees the live scene
+        # immediately instead of waiting for the next tracker tick.
+        self.request_render()
+        print(f"[viser-direct] client {client.client_id} connected", flush=True)
+
+    def _on_client_disconnect(self, client) -> None:
+        with self._client_state_lock:
+            self._client_state.pop(int(client.client_id), None)
+        self._initial_camera_applied.discard(int(client.client_id))
+        print(f"[viser-direct] client {client.client_id} disconnected", flush=True)
+
+    def _apply_initial_camera(self, client) -> None:
+        if self._initial_c2w is None:
+            return
+        try:
+            c2w = self._initial_c2w
+            cam_pos = c2w[:3, 3].astype(np.float32)
+            R_nerf = c2w[:3, :3].astype(np.float32)
+            # nerfstudio c2w (Y-up, Z-back at camera) -> viser (Y-down,
+            # Z-forward). _FLIP_YZ is its own inverse, so we multiply on
+            # the right with the same matrix to invert the conversion
+            # done on the read path in ``_build_camera_from_viser``.
+            R_viser = (R_nerf @ _FLIP_YZ).astype(np.float32)
+            wxyz = _rotmat_to_quat_wxyz_np(R_viser)
+            client.camera.position = cam_pos
+            client.camera.wxyz = wxyz
+        except Exception as exc:
+            print(f"[viser-direct] initial camera set failed: {exc}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Render loop (background thread)
+    # ------------------------------------------------------------------
+
+    def request_render(self) -> None:
+        """Wake the render thread for ONE pass. Called by the pipeline
+        from every tracker tick and from every FF insertion site (and
+        on client connect). Decouples render cadence from any fixed
+        polling rate — there's exactly one render per tracker tick, so
+        every per-tick mutation lands in the browser without delay.
+        """
+        self._render_requested.set()
+
+    def _render_loop(self) -> None:
+        """Event-driven render loop. Blocks on ``_render_requested``;
+        wakes once per request, renders for every connected client,
+        sleeps. No polling, no hardcoded Hz cap.
+        """
+        while not self._stop_event.is_set():
+            # Wait for a render request (or a short timeout so we can
+            # exit promptly on stop).
+            triggered = self._render_requested.wait(timeout=1.0)
+            if self._stop_event.is_set():
+                break
+            if not triggered:
+                continue  # spurious wake / no request, keep waiting
+            self._render_requested.clear()
+            try:
+                self._render_once()
+            except Exception as exc:
+                self._render_error_count += 1
+                if self._render_error_count <= 3 or (self._render_error_count % 50) == 0:
+                    print(f"[viser-direct] render error #{self._render_error_count}: {exc}", flush=True)
+            # 1 Hz diagnostic
+            now = time.time()
+            if (now - self._last_diag_t) >= 1.0 and self._render_count > 0:
+                n = max(self._render_count, 1)
+                avg_ms = self._render_window_total_ms / n
+                print(
+                    f"[viser-direct/render] {n} frames in last {now - self._last_diag_t:.1f}s "
+                    f"(avg {avg_ms:.1f} ms, errors={self._render_error_count})",
+                    flush=True,
+                )
+                self._render_count = 0
+                self._render_window_total_ms = 0.0
+                self._last_diag_t = now
+
+    def _render_once(self) -> None:
+        model = self._model
+        if model is None:
+            return
+        # Snapshot the client list quickly to avoid holding the lock
+        # during the (slow) render.
+        with self._client_state_lock:
+            clients = [(cid, st["client"]) for cid, st in self._client_state.items()]
+        if not clients:
+            return
+        W, H = self.render_size
+        for cid, client in clients:
+            try:
+                camera = _build_camera_from_viser(client.camera, W, H, self._device)
+            except Exception as exc:
+                if self._render_error_count <= 3:
+                    print(f"[viser-direct] camera build failed for client {cid}: {exc}", flush=True)
+                continue
+            # Take the model lock briefly around the forward render so a
+            # mid-frame tracker write doesn't corrupt the rasterization.
+            t_render = time.time()
+            try:
+                with self.model_lock, torch.no_grad():
+                    outputs = model.get_outputs(camera)
+                rgb_t = outputs.get("rgb")
+                if rgb_t is None:
+                    continue
+                # rgb is (H, W, 3) float in [0, 1] (Splatfacto convention).
+                rgb_np = (rgb_t.clamp(0.0, 1.0) * 255.0).to(torch.uint8).detach().cpu().numpy()
+            except Exception as exc:
+                if self._render_error_count <= 3:
+                    print(f"[viser-direct] get_outputs failed for client {cid}: {exc}", flush=True)
+                continue
+            render_ms = (time.time() - t_render) * 1000.0
+            self._render_window_total_ms += render_ms
+            try:
+                client.scene.set_background_image(rgb_np, format="jpeg", jpeg_quality=self.jpeg_quality)
+                self._render_count += 1
+            except Exception as exc:
+                if self._render_error_count <= 3:
+                    print(f"[viser-direct] set_background_image failed for client {cid}: {exc}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Teardown
+    # ------------------------------------------------------------------
+
     def close(self) -> None:
+        self._stop_event.set()
+        if self._render_thread is not None and self._render_thread.is_alive():
+            self._render_thread.join(timeout=2.0)
         try:
             self.server.stop()
         except Exception:

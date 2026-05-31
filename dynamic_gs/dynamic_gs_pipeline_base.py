@@ -1,0 +1,1640 @@
+"""Phase 3 base class for the post-static dynamic pipeline.
+
+Architecture (post-rewrite):
+
+  * **static-gs**: trains the scene + runs Phase 0a/0b + writes
+    ``post_fusion_state.pt`` at end-of-training. Owns the static phase
+    entirely.
+  * **dynamic-gs** (= ``RecordedDynamicGSPipeline``, subclass of this
+    base): warm-loads the cache, then iterates the recorded dynamic
+    dataset frame-by-frame, advancing the XFeat tracker and optionally
+    firing the feedforward decoder (rgbd / anysplat). No optimization
+    during dynamic phase; the trainer's ``get_train_loss_dict`` returns
+    a zero-loss dummy.
+  * **dynamic-gs-live** (= ``LiveDynamicGSPipeline``, subclass): same as
+    recorded except the frame source is a ROS shared-memory subscriber
+    and D0 object selection is by 3D-centroid-to-camera distance
+    instead of 2D anchor.
+
+What the rewrite deliberately drops vs the legacy monolith:
+
+  * ``OptimPool`` / ``OptimFrame`` — no dynamic optimization, no need
+    for a multi-frame round-robin queue. The feedforward dispatcher
+    reads :attr:`_latest_tracker_frame` (single variable, replaced the
+    pool).
+  * ``DynamicKeyframeFilter`` on the recorded path — every dataset frame
+    is fed to the tracker. Live keeps an on-the-fly accept/reject in the
+    subclass.
+  * ``depth_loss`` / ``rigid_static_loss`` / scene-opt gradient hooks —
+    no dynamic-phase loss.
+  * ``live: bool`` config field — the split into subclasses replaces it.
+  * ``static_num_steps`` / ``static_convergence_*`` / Phase 0a/0b code —
+    all moved to ``static-gs``. This pipeline REQUIRES a pre-existing
+    ``post_fusion_state.pt`` and fails fast with a clear error if missing.
+
+The 3 abstract hooks the subclass must implement
+-------------------------------------------------
+
+``_tracker_tick(step) -> None``
+    Pull the next frame (from dataset or from the ROS subscriber),
+    advance the XFeat tracker, write the resulting frame metadata onto
+    :attr:`_latest_tracker_frame`, and force a viewer re-render.
+
+``_pick_d0_object(camera, prefused_instance_ids) -> int``
+    Choose which prefused instance to track from the D0 camera. Recorded:
+    2D anchor (W/2, 0.75H) closest to a prefused centroid + CD0
+    validation. Live: 3D-centroid closest to camera position.
+
+``_on_tracker_frame(camera, batch, cdn, is_first) -> None``
+    Post-tick callback. Subclass decides what to do with the captured
+    tracker output (e.g. live runs the feedforward dispatcher per Mode B
+    cadence; recorded writes anchor-pose video frames).
+"""
+
+from __future__ import annotations
+
+import atexit
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal, Optional, Type
+
+import numpy as np
+import torch
+import torch.nn.functional as TF
+from PIL import Image
+
+from nerfstudio.engine.callbacks import TrainingCallbackAttributes
+from nerfstudio.pipelines.base_pipeline import VanillaPipeline, VanillaPipelineConfig
+from nerfstudio.utils.rich_utils import CONSOLE
+
+from .change_detection import ChangeMaskConfig, compute_change_mask
+from .dynamic_gs_datamanager import DynamicGSDataManagerConfig
+from .dynamic_gs_model import DynamicGSModelConfig
+from .persistence import load_post_fusion_state, save_post_fusion_state
+from .utils import dilate_binary_mask
+
+
+# ============================================================================
+# Config
+# ============================================================================
+
+
+@dataclass
+class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
+    """Shared config for both recorded and live dynamic pipelines.
+
+    The dropped legacy fields:
+
+    * ``live: bool`` — the subclass IS the split.
+    * ``static_num_steps``, ``static_convergence_*`` — static-gs owns it.
+    * ``enable_dynamic_keyframe_filter``, ``dynamic_keyframe_*`` —
+      recorded feeds every dataset frame; live filters in the subclass.
+    * ``optim_pool_*``, ``disable_dynamic_optimization`` — no dynamic
+      optimization, no pool.
+    * ``enable_scene_optimization``, ``scene_opt_*`` — same reason.
+    * ``depth_lambda``, ``rigid_*`` — no dynamic-phase loss.
+    * ``feedforward_reuse_static_checkpoint`` — the warm cache is now
+      load-required, not load-optional.
+    * ``save_live_optim_debug*`` — optim is gone.
+    """
+
+    datamanager: DynamicGSDataManagerConfig = field(
+        default_factory=DynamicGSDataManagerConfig
+    )
+    model: DynamicGSModelConfig = field(default_factory=DynamicGSModelConfig)
+
+    # ---- Cache load (required) ----
+    post_fusion_cache_subpath: str = "static_scene/post_fusion_state.pt"
+    """Where to look for the warm-start cache written by ``static-gs``,
+    relative to ``datamanager.data``. The pipeline raises ``FileNotFoundError``
+    on construction if the file is missing — the dynamic pipeline does NOT
+    do its own static training."""
+
+    save_final_snapshot: bool = True
+    """If True, write a final ``post_dynamic_state.pt`` snapshot at exit so
+    the post-feedforward scene can be visualized via
+    ``scripts/dump_post_fusion_to_ply.py`` /
+    ``scripts/dump_post_fusion_to_viser.py``. Same format as the warm-cache
+    that ``static-gs`` writes (model.state_dict + num_points)."""
+    final_snapshot_subpath: str = "dynamic_scene/post_dynamic_state.pt"
+    """Where to write the final snapshot, relative to ``datamanager.data``."""
+
+    # ---- Dynamic-phase pacing ----
+    dynamic_steps_per_frame: int = 1
+    """Trainer steps per tracker frame. For recorded mode this gates how
+    often ``_tracker_tick`` advances to the next dataset frame. Live mode
+    ignores it (the ROS supply is the rate limiter). With no dynamic-phase
+    optimization, the trainer's per-step cost is just the tick + maybe FF;
+    leaving this at 1 minimizes wall-clock overhead per frame."""
+
+    save_debug_images: bool = False
+    """Per-tick PNG dumps + motion logs. Off by default in the rewrite —
+    they were ~600 ms / recorded frame in the legacy monolith and aren't
+    needed for the new tracking-only + feedforward flow."""
+
+    # ---- Viser-direct visualization ----
+    enable_viser_direct: bool = True
+    """Spin up a standalone viser server and push per-object rigid
+    transforms + new feedforward splats each tracker tick. Browser does
+    WebGL splatting so the training GPU never renders for the viewer.
+    Use with ``--vis tensorboard`` so Nerfstudio's render_state_machine
+    stays out of the way."""
+    viser_direct_port: int = 8081
+
+    # ---- Feedforward dispatcher (rgbd or anysplat) ----
+    enable_feedforward_inpaint: Literal["off", "rgbd_decode", "anysplat_decode"] = "rgbd_decode"
+    """``rgbd_decode`` back-projects sensor depth into per-pixel Gaussians
+    (single GPU env, sub-ms). ``anysplat_decode`` calls the AnySplat
+    subprocess worker (separate conda env, ~12 s/call) for multi-view
+    feedforward Gaussian prediction + Umeyama alignment. Both write
+    Gaussians with ``object_flags=1, object_instance_ids=999,
+    inserted_flags=1`` so neither the rigid-transform pass nor any future
+    scene-opt hooks touch them."""
+
+    feedforward_oneshot_step: int = 0
+    """Mode A: fire once at this dynamic-phase step. 0 disables."""
+    feedforward_recurring_every_n_ticks: int = 6
+    """Mode B cadence (>0 enables; 0 disables). Every Nth tracker tick,
+    fire the dispatcher on the current frame."""
+    feedforward_recurring_min_gap_s: float = 0.3
+    """Wall-clock floor between consecutive FF firings, on top of the
+    tick-count cadence. 0 disables (cadence-only)."""
+    feedforward_anysplat_min_gap_s: float = 0.5
+    """Same as above but for anysplat_decode. Overrides the rgbd floor
+    when the active mode is anysplat."""
+
+    feedforward_top_n_components: int = 3
+    """Mode A: at most this many CDN components per call, area-sorted."""
+    feedforward_dominant_area_ratio: float = 0.3
+    """Mode A: drop top-N entries below this fraction of the largest
+    component's area. Mode B sets this to 0.0."""
+
+    feedforward_anchor_frame: Optional[int] = None
+    """Recorded-mode video anchor frame (None = last dataset frame)."""
+    feedforward_video_out: Optional[Path] = None
+    feedforward_video_fps: int = 24
+
+    feedforward_rgbd_opacity: float = 0.99
+    feedforward_rgbd_min_valid_fraction: float = 0.95
+    feedforward_rgbd_normal_smoothing_radius: int = 3
+    feedforward_rgbd_leak_threshold_m: float = 0.01
+    feedforward_rgbd_cliff_threshold_m: float = 0.05
+    feedforward_rgbd_post_cliff_erode_px: int = 1
+    """Pixels of erosion applied after the depth-cliff filter on the
+    decoded component."""
+    feedforward_rgbd_scale_multiplier: float = 1.0
+
+    # ---- Feedforward dispatcher knobs (closed-loop additive mode) ----
+    feedforward_skip_delete: bool = True
+    """When True (closed-loop default), keep all prior Gaussians and just
+    additively insert. The next-tick CDN will be near zero wherever the
+    insert was correct, so the loop self-stabilizes without ever dropping
+    scene content. Set False to restore the legacy delete-in-region path."""
+    feedforward_cull_in_front: bool = True
+    """Drop Gaussians sitting BETWEEN the camera and the real sensor
+    surface in the component's footprint. Without this, leftover artifact
+    Gaussians keep occluding the true geometry and re-triggering CDN
+    every tick. Only touches instance_ids in {0, 999}; tracked objects
+    are never culled."""
+    feedforward_cull_in_front_depth_tol_m: float = 0.002
+    """Per-Gaussian depth tolerance for the cull-in-front filter."""
+    feedforward_object_mask_dilate_px: int = 2
+    """Dilation applied to the rendered object mask before subtracting it
+    from CDN in :meth:`_feedforward_clean_cdn`."""
+
+    feedforward_anysplat_context_frames: int = 2
+    feedforward_anysplat_conda_env: str = "anysplat_dynamic_gs"
+    feedforward_anysplat_worker_timeout_s: float = 300.0
+    feedforward_anysplat_min_opacity: float = 0.05
+    feedforward_anysplat_debug_dump: bool = True
+    feedforward_anysplat_scale_multiplier: float = 5.0
+
+
+# ============================================================================
+# Pipeline base
+# ============================================================================
+
+
+# Type alias documenting what ``_latest_tracker_frame`` carries. Replaces
+# the legacy ``OptimFrame`` (which also carried per-frame optimization
+# state — epochs_used, initial_loss, last_loss — that the rewrite doesn't
+# need because there's no dynamic-phase optimization).
+TrackerFrame = Any
+"""Concrete shape: ``{
+    "frame_idx": int,
+    "camera": Cameras,
+    "cdn": Tensor | None,         # change-detection mask, computed lazily
+    "batch": dict,                # rgb, depth_image, mask (live or dataset batch)
+    "stamp_sec": float | None,    # live-only; ROS frame stamp for dedup
+}``. Subclasses build this from their respective frame sources.
+"""
+
+
+class DynamicGSPipelineBase(VanillaPipeline):
+    """Shared foundation for ``RecordedDynamicGSPipeline`` and
+    ``LiveDynamicGSPipeline``. See module docstring for architecture."""
+
+    config: DynamicGSPipelineBaseConfig
+
+    # ====================================================================
+    # Lifecycle
+    # ====================================================================
+
+    def __init__(
+        self,
+        config: DynamicGSPipelineBaseConfig,
+        device: str,
+        test_mode: Literal["test", "val", "inference"] = "val",
+        world_size: int = 1,
+        local_rank: int = 0,
+        grad_scaler=None,
+    ):
+        # State that subclasses may read in their own __init__ overrides
+        # BEFORE super().__init__ runs.
+        self._timing: defaultdict[str, list] = defaultdict(list)
+        self._motion_estimator = None
+        self._latest_tracker_frame: Optional[TrackerFrame] = None
+        self._global_frame_counter: int = 0
+        self._dynamic_step_counter: int = 0
+        self._tracker_tick_count: int = 0
+        self._feedforward_call_counter: int = 0
+        self._feedforward_oneshot_done: bool = False
+        self._last_feedforward_wall_time: float = 0.0
+        self._d0_selected_instance_id: int = 0
+        self._anysplat_persistent_worker = None
+        self._feedforward_video_writer = None
+        self._viser_direct_server = None
+        self._viser_direct_handles_built: bool = False
+        # Trainer back-ref populated by ``get_training_callbacks``; read by
+        # ``_force_viewer_rerender`` so it must default to None so the
+        # rerender hook is safe to call before training starts.
+        self._trainer = None
+        # Last successful XFeat motion estimate; read by
+        # ``_push_viser_direct_transforms``. None until D1 succeeds.
+        self._last_motion_estimate = None
+        # Per-tick rolling diagnostics for the ``[tracker-rate]`` log
+        # window (mean inliers / correspondences per window).
+        self._last_inlier_count: int = 0
+        self._last_correspondence_count: int = 0
+        self._inlier_window: list[int] = []
+        self._corr_window: list[int] = []
+        # Recorded subclass populates this with kept dataset indices so
+        # the FF anysplat path can resolve context frames. Empty in live.
+        self._accepted_dynamic_frames: list[int] = []
+
+        atexit.register(self._cleanup_viser_direct)
+        atexit.register(self._cleanup_anysplat_worker)
+        atexit.register(self._cleanup_feedforward_video_writer)
+        atexit.register(self._save_final_snapshot_if_enabled)
+        atexit.register(self._write_timing_report)
+        self._final_snapshot_written: bool = False
+        self._timing_report_written: bool = False
+
+        # Build datamanager + model (cold model with SfM-seed Gaussians).
+        super().__init__(
+            config=config,
+            device=device,
+            test_mode=test_mode,
+            world_size=world_size,
+            local_rank=local_rank,
+            grad_scaler=grad_scaler,
+        )
+
+        # Load the static-gs warm cache. This REPLACES the SfM seed
+        # Gaussians with the post-fusion ones (~300k SfM + ~200k SAM3D
+        # inserted), restores the four identity buffers, and skips the
+        # entire Phase 0a/0b path.
+        self._load_warm_cache_or_die()
+
+        # Viser-direct setup (browser-side splatting).
+        if config.enable_viser_direct:
+            self._setup_viser_direct()
+
+        # Eager-spawn the AnySplat persistent worker if AnySplat FF is on.
+        # The worker loads the model ONCE inside its subprocess; every
+        # subsequent _run_feedforward_anysplat() call routes through
+        # worker.inference() (already wired in the dispatcher). Without
+        # this hook, the fallback path (run_anysplat_subprocess) spins
+        # up a fresh subprocess + reloads the model on every FF call,
+        # which is the ~11s/call cost we measured.
+        if str(getattr(config, "enable_feedforward_inpaint", "off")) == "anysplat_decode":
+            self._start_anysplat_persistent_worker()
+
+    def _load_warm_cache_or_die(self) -> None:
+        cache_path = Path(self.config.datamanager.data) / self.config.post_fusion_cache_subpath
+        if not cache_path.is_file():
+            raise FileNotFoundError(
+                f"\n\n[dynamic-gs] Required warm-start cache not found:\n"
+                f"  {cache_path}\n\n"
+                f"The dynamic-gs pipeline is now a stage-2 trainer: it does NOT\n"
+                f"do its own static training. Run static-gs first to produce\n"
+                f"the post-fusion cache:\n\n"
+                f"  ns-train static-gs --data {self.config.datamanager.data}\n"
+            )
+        result = load_post_fusion_state(self.model, cache_path, self.device)
+        if not result.success:
+            raise RuntimeError(
+                f"[dynamic-gs] post-fusion cache load failed: {result.error}\n"
+                f"Delete {cache_path} and re-run static-gs to regenerate."
+            )
+
+        # Bypass Splatfacto's resolution + SH-degree schedules. The trainer
+        # starts at step=0, but the warm-cache scene has already been trained
+        # past the schedule. Without this offset, ``_get_downscale_factor()``
+        # returns 4 for steps < 100 and 2 for steps < 200, so:
+        #   * rendered RGB + depth come back at 1/4 or 1/2 grid size
+        #   * camera.fx/fy/cx/cy stay at full resolution (intrinsics are the
+        #     dataset's, not the model's)
+        #   * decode_component_to_gaussians + _feedforward_cull_in_front
+        #     back-project with full-res intrinsics on the downscaled grid →
+        #     FF inserts land in completely wrong world locations.
+        # Setting _step_offset = 10_000 forces all schedules to report
+        # past-warmup; ``self.step`` becomes ``trainer_step + 10_000`` via
+        # ``DynamicGSModel.step_cb``.
+        try:
+            self.model._step_offset = 10_000
+            CONSOLE.log(
+                f"[dynamic-gs] forced model._step_offset=10000 to bypass "
+                f"Splatfacto's resolution+SH schedules (warm-cache scene is "
+                f"already past warmup)."
+            )
+        except Exception as exc:
+            CONSOLE.log(
+                f"[dynamic-gs] WARNING: could not set _step_offset on model: "
+                f"{exc}. Render+depth may be downscaled, inserts may land "
+                f"in wrong locations until step >= ~200."
+            )
+
+        CONSOLE.log(
+            f"[dynamic-gs] warm-cache loaded: {result.num_points} Gaussians "
+            f"({int(self.model.object_instance_ids.gt(0).any(dim=-1).sum().item())} "
+            f"with non-zero instance_id)"
+        )
+
+    # ---- Cleanup ----
+
+    def _cleanup_viser_direct(self) -> None:
+        srv = getattr(self, "_viser_direct_server", None)
+        if srv is not None:
+            # Force a final FF-handle flush so the post-run scene shows
+            # every FF insert that arrived inside the last coalesce
+            # window. Safe to call even if there's nothing pending.
+            try:
+                if getattr(self, "model", None) is not None:
+                    srv.flush_pending_ff(self.model)
+            except Exception:
+                pass
+            try:
+                srv.close()
+            except Exception:
+                pass
+            self._viser_direct_server = None
+
+    def _cleanup_anysplat_worker(self) -> None:
+        w = getattr(self, "_anysplat_persistent_worker", None)
+        if w is not None:
+            try:
+                w.close()
+            except Exception:
+                pass
+            self._anysplat_persistent_worker = None
+
+    def _save_final_snapshot_if_enabled(self) -> None:
+        """Dump the post-feedforward model state to disk at exit.
+
+        Same format as ``static-gs``'s ``post_fusion_state.pt``, so the
+        existing ``scripts/dump_post_fusion_to_ply.py`` and
+        ``scripts/dump_post_fusion_to_viser.py`` work on it directly.
+        Idempotent — only fires once even if atexit runs multiple times.
+        """
+        if self._final_snapshot_written:
+            return
+        if not getattr(self.config, "save_final_snapshot", True):
+            return
+        try:
+            cache_path = (
+                Path(self.config.datamanager.data) / self.config.final_snapshot_subpath
+            )
+            ok = save_post_fusion_state(self.model, cache_path)
+            self._final_snapshot_written = True
+            if ok:
+                CONSOLE.log(
+                    f"[dynamic-gs] final snapshot written → {cache_path} "
+                    f"(N={int(self.model.num_points)}, "
+                    f"object_flags={int(self.model.object_flags.sum().item())}, "
+                    f"inserted_flags={int(self.model.inserted_flags.sum().item())})"
+                )
+        except Exception as exc:
+            CONSOLE.log(f"[dynamic-gs] final snapshot save failed: {exc}")
+
+    def _cleanup_feedforward_video_writer(self) -> None:
+        w = getattr(self, "_feedforward_video_writer", None)
+        if w is not None:
+            try:
+                w.release()
+            except Exception:
+                pass
+            self._feedforward_video_writer = None
+
+    def _write_timing_report(self) -> None:
+        """Write ``<data_root>/timing_report.txt`` from ``self._timing``.
+
+        Idempotent — atexit may fire twice on Ctrl+C; the
+        ``_timing_report_written`` flag prevents a duplicate write.
+        Covers FF.*, DN.*, S0.*, static_step, dynamic_step, and any
+        other key collected in ``self._timing``.
+        """
+        if getattr(self, "_timing_report_written", False):
+            return
+        # If __init__ failed early, datamanager may not exist; abort.
+        try:
+            datamanager = object.__getattribute__(self, "datamanager")
+        except AttributeError:
+            return
+        if datamanager is None or not hasattr(datamanager, "config"):
+            return
+        timing = getattr(self, "_timing", None)
+        if not timing:
+            return
+        self._timing_report_written = True
+
+        from datetime import datetime
+        from pathlib import Path
+
+        def _avg_ms(vals):
+            if not vals:
+                return 0.0
+            return float(sum(vals)) / float(len(vals)) * 1000.0
+
+        def _row(key: str, vals) -> str:
+            if not vals:
+                return f"  {key:<42s}        N/A"
+            n = len(vals)
+            avg = _avg_ms(vals)
+            total = float(sum(vals))
+            mn = min(vals) * 1000.0
+            mx = max(vals) * 1000.0
+            return (
+                f"  {key:<42s} n={n:<6d} avg={avg:>8.1f}ms "
+                f"min={mn:>7.1f}ms max={mx:>8.1f}ms total={total:>7.1f}s"
+            )
+
+        lines: list[str] = []
+        lines.append("=" * 96)
+        lines.append("DYNAMIC-GS-V2 TIMING REPORT")
+        lines.append("=" * 96)
+        lines.append(f"Generated:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"Data root:   {datamanager.config.data}")
+        ff_mode = str(getattr(self.config, "enable_feedforward_inpaint", "off"))
+        ff_n = int(getattr(self.config, "feedforward_recurring_every_n_ticks", 0) or 0)
+        lines.append(f"FF mode:     {ff_mode} (every {ff_n} ticks)")
+        lines.append(f"Viser:       {'on (port ' + str(getattr(self.config, 'viser_direct_port', '?')) + ')' if getattr(self.config, 'enable_viser_direct', False) else 'off'}")
+        lines.append("")
+
+        # Group keys by prefix for readability.
+        all_keys = sorted(timing.keys())
+        groups: dict[str, list[str]] = {}
+        for k in all_keys:
+            prefix = k.split(".", 1)[0] if "." in k else k.split("_", 1)[0]
+            groups.setdefault(prefix, []).append(k)
+
+        for group_name in sorted(groups.keys()):
+            group_keys = groups[group_name]
+            lines.append(f"--- {group_name} ({len(group_keys)} key{'s' if len(group_keys)!=1 else ''}) ---")
+            for k in group_keys:
+                lines.append(_row(k, timing[k]))
+            lines.append("")
+
+        # AnySplat persistent worker sanity line: did the model load once?
+        worker = getattr(self, "_anysplat_persistent_worker", None)
+        if worker is not None:
+            try:
+                load_s = float(getattr(worker, "load_seconds", 0.0))
+                lines.append(f"AnySplat persistent worker: load={load_s:.1f}s "
+                             f"(then per-call inference only)")
+            except Exception:
+                pass
+        elif ff_mode == "anysplat_decode":
+            lines.append("AnySplat persistent worker: NOT SPAWNED (each FF call "
+                         "reloaded the model via run_anysplat_subprocess — slow path)")
+        lines.append("")
+
+        out_path = Path(datamanager.config.data) / "timing_report.txt"
+        try:
+            out_path.write_text("\n".join(lines) + "\n")
+            CONSOLE.log(f"[dynamic-gs] timing report written: {out_path}")
+        except Exception as exc:
+            CONSOLE.log(f"[dynamic-gs] timing report write failed: {exc}")
+
+    # ====================================================================
+    # Trainer entry — Nerfstudio calls this every step
+    # ====================================================================
+
+    def get_train_loss_dict(self, step: int):
+        """Dynamic-only entry point.
+
+        Each call from the trainer is a dynamic-phase step. Each step:
+
+        1. Run the subclass tick (advance frame source + apply XFeat).
+        2. Maybe fire feedforward (Mode A oneshot, or Mode B via subclass).
+        3. Return a zero-loss dummy.
+        """
+        self._dynamic_step_counter += 1
+        self._tracker_tick(step)
+        if (
+            self.config.feedforward_oneshot_step > 0
+            and step >= self.config.feedforward_oneshot_step
+            and not self._feedforward_oneshot_done
+            and self._latest_tracker_frame is not None
+        ):
+            self._run_feedforward(self._latest_tracker_frame, mode_label="oneshot")
+            self._feedforward_oneshot_done = True
+        zero = torch.zeros((), device=self.device, requires_grad=True)
+        return {}, {"main_loss": zero}, {}
+
+    def get_training_callbacks(self, training_callback_attributes: TrainingCallbackAttributes):
+        """Stash trainer back-ref so the pipeline can force viewer re-renders.
+
+        The legacy monolith additionally set ``trainer.config.max_num_iterations``
+        and ``trainer.config.logging.steps_per_log`` here. Both moves to
+        subclasses (recorded → static_num_steps + N*frames; live → 1e9).
+        Subclasses override and call super().
+        """
+        callbacks = super().get_training_callbacks(training_callback_attributes)
+        self._trainer = training_callback_attributes.trainer
+        return callbacks
+
+    # ====================================================================
+    # Abstract hooks — subclasses MUST implement
+    # ====================================================================
+
+    def _tracker_tick(self, step: int) -> None:
+        """Advance the frame source by one tick, apply XFeat to update
+        object Gaussian pose, write the result to
+        :attr:`_latest_tracker_frame`, and push a viewer re-render."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _tracker_tick"
+        )
+
+    def _pick_d0_object(
+        self,
+        camera,
+        prefused_instance_ids: torch.Tensor,
+    ) -> int:
+        """Select which prefused instance (1..K from Phase 0b) to track."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _pick_d0_object"
+        )
+
+    def _on_tracker_frame(
+        self,
+        camera,
+        batch: dict,
+        cdn: Optional[torch.Tensor],
+        is_first: bool,
+    ) -> None:
+        """Post-tick callback fired by :meth:`_tracker_tick`."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _on_tracker_frame"
+        )
+
+    # ====================================================================
+    # Viser-direct visualization (Path A — hybrid, browser-side splatting)
+    # ====================================================================
+
+    def _viser_lock_ctx(self):
+        """Return the viser-direct render lock as a context manager, or
+        a no-op nullcontext when viser-direct is disabled.
+
+        Acquired around every model-mutation site (rigid transform, FF
+        insert, FF cull) so the viser render thread, which acquires the
+        same lock around each ``get_outputs`` call, cannot read a
+        torn ``means`` / ``quats`` / ``features_*`` tensor mid-write.
+        Re-entrant — safe to nest.
+        """
+        import contextlib
+        srv = getattr(self, "_viser_direct_server", None)
+        if srv is None:
+            return contextlib.nullcontext()
+        return srv.model_lock
+
+    def _setup_viser_direct(self) -> None:
+        """Spin up the standalone viser server + attach the live model.
+
+        Server-side rasterize + push-image pattern: the viser
+        ``ViserDirectScene`` runs a background render thread that, for
+        each connected client, polls the client's camera, calls
+        ``model.get_outputs`` server-side, and pushes the resulting
+        RGB frame via ``client.scene.set_background_image``. We attach
+        the model here (right after warm-cache load) so the render loop
+        has live state from the moment the first client connects.
+
+        Legacy "build splat handles at D0" path is gone — the prior
+        :meth:`_build_viser_direct_handles` call survives as a thin
+        legacy stub that just records the D0 camera pose (so newly
+        connecting clients land on the dataset frame instead of an
+        arbitrary default).
+        """
+        from .utils.viser_direct import ViserDirectScene
+        self._viser_direct_server = None
+        self._viser_direct_handles_built = False
+        try:
+            self._viser_direct_server = ViserDirectScene(
+                port=int(self.config.viser_direct_port),
+            )
+            self._viser_direct_server.attach_model(self.model, device=self.device)
+            CONSOLE.log(
+                f"[viser-direct] server up on port {self.config.viser_direct_port} "
+                f"+ model attached "
+                f"— open http://localhost:{self.config.viser_direct_port}"
+            )
+        except Exception as exc:
+            CONSOLE.log(
+                f"[viser-direct] failed to start: {exc} — "
+                f"falling back to viewer pipeline"
+            )
+            self._viser_direct_server = None
+
+    def _build_viser_direct_handles(self, camera) -> None:
+        """Build the (static, tracked) splat handles ONCE at D0."""
+        if self._viser_direct_server is None:
+            return
+        if self._viser_direct_handles_built:
+            return
+        try:
+            c2w_4x4 = np.eye(4, dtype=np.float32)
+            c2w_4x4[:3, :4] = (
+                camera.camera_to_worlds[0].detach().cpu().numpy().astype(np.float32)
+            )
+            self._viser_direct_server.setup_handles(
+                self.model,
+                tracked_instance_id=getattr(self, "_d0_selected_instance_id", None),
+                initial_c2w=c2w_4x4,
+            )
+            self._viser_direct_handles_built = True
+        except Exception as exc:
+            import traceback as _tb
+            CONSOLE.log(
+                f"[viser-direct] setup_handles failed ({type(exc).__name__}): "
+                f"{exc!r}\n{_tb.format_exc()}"
+            )
+            self._viser_direct_server = None
+
+    def _push_viser_direct_transforms(self) -> None:
+        """Push the latest world-frame rigid (R, t) of the tracked object
+        to the viser server. Called by the subclass each DN tick after
+        :meth:`_apply_motion_estimator` succeeds."""
+        if self._viser_direct_server is None:
+            return
+        est = getattr(self, "_last_motion_estimate", None)
+        if est is None or not getattr(est, "success", False):
+            return
+        try:
+            self._viser_direct_server.push_tracker_transform(
+                est.rotation, est.translation
+            )
+        except Exception as exc:
+            CONSOLE.log(f"[viser-direct] push failed: {exc}")
+
+    def _viser_direct_register_ff_insert(self, inserted_ids) -> None:
+        """Trigger one server-side render after a FF insert. The actual
+        FF gaussians are already in ``model`` (insert_inpaint_gaussians
+        ran under model_lock just before this is called); we only need
+        to wake the render thread so the browser sees them on the next
+        push. The legacy ``add_ff_insert_chunk`` call is preserved as a
+        no-op for backwards compat with the now-deleted Path A handle
+        accounting."""
+        if self._viser_direct_server is None:
+            return
+        try:
+            self._viser_direct_server.add_ff_insert_chunk(self.model, inserted_ids)
+        except Exception as exc:
+            CONSOLE.log(f"[viser-direct] add_ff_insert_chunk failed: {exc}")
+        try:
+            self._viser_direct_server.request_render()
+        except Exception as exc:
+            CONSOLE.log(f"[viser-direct] request_render failed: {exc}")
+
+    def _refresh_viser_direct_after_feedforward(self) -> None:
+        """Re-upload the static splat handle after an FF call."""
+        if self._viser_direct_server is None:
+            return
+        try:
+            self._viser_direct_server.refresh_static_handle(self.model)
+        except Exception as exc:
+            CONSOLE.log(f"[viser-direct] static refresh failed: {exc}")
+
+    def _force_viser_direct_push(self) -> None:
+        """Public alias for the per-tick push (kept for compat with
+        subclass call sites that prefer the descriptive name)."""
+        self._push_viser_direct_transforms()
+
+    # ====================================================================
+    # Viewer re-render (Nerfstudio fallback path)
+    # ====================================================================
+
+    def _force_viewer_rerender(self) -> None:
+        """Trigger an immediate re-render on every connected viser client.
+        Called right after the tracker mutates object Gaussian means so
+        the visual update rate tracks the tracker rate.
+
+        Best-effort: silently no-ops if the viewer isn't ready or the
+        import fails. In the rewrite ``enable_viser_direct=True`` is the
+        primary visualizer; this hook only matters when the Nerfstudio
+        viewer is also up (``--vis viewer`` / ``--vis viewer+tensorboard``).
+        """
+        trainer = getattr(self, "_trainer", None)
+        if trainer is None:
+            return
+        viewer = getattr(trainer, "viewer_state", None)
+        if viewer is None or not getattr(viewer, "ready", False):
+            return
+        statemachines = getattr(viewer, "render_statemachines", None)
+        if not statemachines:
+            return
+        try:
+            from nerfstudio.viewer.render_state_machine import RenderAction
+        except Exception:
+            return
+        for client_id, sm in list(statemachines.items()):
+            try:
+                camera_state = viewer.get_camera_state(sm.client)
+            except Exception:
+                continue
+            if camera_state is None:
+                continue
+            try:
+                sm.state = "low_static"
+                sm.next_action = RenderAction("step", camera_state)
+                sm.render_trigger.set()
+            except Exception:
+                continue
+
+    # ====================================================================
+    # Render + change-mask shims (shared by FF dispatcher + tracker tick)
+    # ====================================================================
+
+    @torch.no_grad()
+    def _render_from_camera(self, camera):
+        """Render from ``camera`` in training mode so we get the
+        training-resolution output."""
+        was_training = self.model.training
+        self.model.train()
+        try:
+            return self.model.get_outputs(camera.to(self.model.device))
+        finally:
+            if not was_training:
+                self.model.eval()
+
+    def _compute_change_mask(
+        self,
+        rendered_rgb,
+        rendered_depth,
+        live_rgb,
+        gt_depth,
+        gripper_mask,
+        object_mask,
+        downsample_factor: int = 1,
+        keep_largest_only: bool = True,
+    ):
+        """Compute change mask between render and live, excluding gripper
+        + object regions. Thin shim over ``change_detection.compute_change_mask``
+        that pulls thresholds + cleanup knobs from ``self.model.config``."""
+        mc = self.model.config
+        cfg = ChangeMaskConfig(
+            depth_threshold=mc.change_mask_depth_threshold,
+            rgb_threshold=mc.change_mask_rgb_threshold,
+            use_rgb=mc.change_mask_use_rgb,
+            blur_kernel_size=mc.change_mask_blur_kernel_size,
+            blur_sigma=mc.change_mask_blur_sigma,
+            filter_radius=mc.change_mask_filter_radius,
+            min_component_size=mc.change_mask_min_component_size,
+            dilate_radius=mc.active_mask_dilate_radius,
+        )
+        return compute_change_mask(
+            rendered_rgb=rendered_rgb,
+            rendered_depth=rendered_depth,
+            live_rgb=live_rgb,
+            gt_depth=gt_depth,
+            gripper_mask=gripper_mask,
+            object_mask=object_mask,
+            config=cfg,
+            downsample_factor=downsample_factor,
+            keep_largest_only=keep_largest_only,
+        )
+
+    # ====================================================================
+    # XFeat motion estimator — D0 seed + per-tick advance
+    # ====================================================================
+
+    def _initialize_motion_estimator(self, rgb, depth, camera, mask) -> None:
+        """Seed the XFeat tracker with the D0 reference frame.
+
+        Samples XFeat keypoints inside the object mask of the D0 image,
+        back-projects them via depth + intrinsics + c2w to get world-frame
+        reference 3D positions. Subsequent :meth:`_apply_motion_estimator`
+        calls extract on the new RGB, match against the anchor via
+        LighterGlue, and run RANSAC-Kabsch to recover ``(R, t)``.
+
+        ``enable_cotracker_rigid_motion`` is the legacy name kept for
+        checkpoint compat — it gates XFeat.
+        """
+        if not self.model.config.enable_cotracker_rigid_motion:
+            return
+        from .utils.xfeat_motion import XFeatMotionEstimator
+        self._motion_estimator = XFeatMotionEstimator(
+            device=self.model.device,
+            top_k=self.model.config.xfeat_top_k,
+            detection_threshold=self.model.config.xfeat_detection_threshold,
+            min_cossim=self.model.config.xfeat_min_cossim,
+            min_track_points=self.model.config.xfeat_min_track_points,
+            ransac_iterations=self.model.config.xfeat_ransac_iterations,
+            ransac_inlier_threshold=self.model.config.xfeat_ransac_inlier_threshold,
+            weights_path=self.model.config.xfeat_weights_path,
+            use_lighterglue=self.model.config.xfeat_use_lighterglue,
+            lighterglue_min_conf=self.model.config.xfeat_lighterglue_min_conf,
+            lighterglue_depth_confidence=self.model.config.xfeat_lighterglue_depth_confidence,
+            object_search_radius_px=self.model.config.xfeat_object_search_radius_px,
+        )
+        seeded = self._motion_estimator.initialize(
+            rgb=rgb, depth=depth, camera=camera, mask=mask,
+        )
+        CONSOLE.log(
+            f"[dynamic-gs] XFeat reference seed on D0 -> "
+            f"fast={self._motion_estimator.last_init_fast_point_count}, "
+            f"sampled={self._motion_estimator.last_init_sampled_count}, "
+            f"depth_valid={self._motion_estimator.last_init_depth_valid_count}, "
+            f"dense_fallback={self._motion_estimator.last_init_used_dense_fallback}, "
+            f"tracks={seeded}, ready={self._motion_estimator.ready}"
+        )
+        if seeded < self._motion_estimator.min_track_points:
+            CONSOLE.log(
+                f"[dynamic-gs] XFeat seeded too few D0 points: "
+                f"{seeded} < min_track_points={self._motion_estimator.min_track_points}"
+            )
+
+    def _apply_motion_estimator(self, camera, batch, current_mask=None) -> None:
+        """Per-tick XFeat advance. Builds the gripper-blue-composited live RGB,
+        runs the estimator's ``estimate_and_advance`` against the cached anchor,
+        and on success calls ``model.apply_rigid_object_transform_from_reference``
+        to move the flagged object Gaussians."""
+        if self._motion_estimator is None:
+            return
+        t = time.time()
+        current_live_rgb = self._build_tracking_rgb(batch)
+        self._timing["DN.3a_get_live_rgb"].append(time.time() - t)
+        t_mask = time.time()
+        current_object_mask = None
+        if current_mask is None:
+            current_mask = self.model._get_batch_mask(batch)
+        self._timing["DN.3j_object_mask_render"].append(time.time() - t_mask)
+        t = time.time()
+        motion_estimate = self._motion_estimator.estimate_and_advance(
+            current_rgb=current_live_rgb,
+            current_depth=batch["depth_image"],
+            current_camera=camera,
+            current_mask=current_mask,
+            current_object_mask=current_object_mask,
+        )
+        self._timing["DN.3_estimate_total"].append(time.time() - t)
+        sub = motion_estimate.timings or {}
+        self._timing["DN.3b_estimator_input_prep"].append(float(sub.get("input_prep", 0.0)))
+        self._timing["DN.3c_predictor_forward"].append(
+            float(sub.get("predictor_forward",
+                          sub.get("xfeat_extract",
+                                  sub.get("klt_forward", 0.0))))
+        )
+        self._timing["DN.3c_xfeat_extract"].append(float(sub.get("xfeat_extract", 0.0)))
+        self._timing["DN.3i_lighterglue_match"].append(
+            float(sub.get("lighterglue_match", 0.0))
+        )
+        self._timing["DN.3d_postprocess"].append(float(sub.get("postprocess", 0.0)))
+        self._timing["DN.3e_ransac_kabsch"].append(float(sub.get("ransac_kabsch", 0.0)))
+        self._timing["DN.3h_resample"].append(float(sub.get("resample", 0.0)))
+        t = time.time()
+        try:
+            frame_name = self.datamanager.get_current_dynamic_frame_name()
+        except Exception:
+            frame_name = f"step_{self._dynamic_step_counter:06d}"
+        if self.config.save_debug_images:
+            self._write_motion_log(frame_name, motion_estimate)
+            self._save_motion_debug(frame_name, motion_estimate)
+        self._timing["DN.3f_debug_io"].append(time.time() - t)
+        if not motion_estimate.success:
+            mean_res_mm = (
+                motion_estimate.mean_residual * 1000.0
+                if motion_estimate.mean_residual != float("inf") else float("inf")
+            )
+            med_res_mm = (
+                motion_estimate.median_residual * 1000.0
+                if motion_estimate.median_residual != float("inf") else float("inf")
+            )
+            CONSOLE.log(
+                f"[dynamic-gs] XFeat rigid motion unavailable for {frame_name}: "
+                f"raw={motion_estimate.raw_visible_count}, "
+                f"mask={motion_estimate.mask_visible_count}, "
+                f"depth={motion_estimate.depth_valid_count}, "
+                f"correspondences={motion_estimate.correspondence_count}, "
+                f"inliers={motion_estimate.inlier_count}, "
+                f"mask_fallback={motion_estimate.used_mask_fallback}, "
+                f"resid_mm(mean/med)={mean_res_mm:.1f}/{med_res_mm:.1f}"
+            )
+            return
+        t = time.time()
+        with self._viser_lock_ctx():
+            moved_count = self.model.apply_rigid_object_transform_from_reference(
+                motion_estimate.rotation, motion_estimate.translation,
+            )
+        self._last_motion_estimate = motion_estimate
+        self._timing["DN.3g_apply_transform"].append(time.time() - t)
+        # Tracker-tick-driven render: the per-tick model mutation just
+        # completed, wake the viser render thread for exactly one push
+        # so the browser sees this tick's motion without waiting on a
+        # polling clock.
+        srv = getattr(self, "_viser_direct_server", None)
+        if srv is not None:
+            srv.request_render()
+        self._last_inlier_count = int(motion_estimate.inlier_count)
+        self._last_correspondence_count = int(motion_estimate.correspondence_count)
+        self._inlier_window.append(self._last_inlier_count)
+        self._corr_window.append(self._last_correspondence_count)
+        if moved_count == 0:
+            CONSOLE.log(
+                f"[dynamic-gs] XFeat estimated motion for {frame_name}, "
+                "but no object Gaussians were moved. Check object_flags/reference pose consistency."
+            )
+
+    # ---- Motion-estimator helpers ----
+
+    def _build_tracking_rgb(self, batch) -> "torch.Tensor":
+        """Live RGB for the tracker, with the dataset mask composited onto
+        the model background. Pixels where ``batch["mask"]`` is 0 (gripper)
+        are replaced with the simulator-background color so the tracker
+        cannot lock onto gripper texture."""
+        rgb = self.model.get_live_rgb(batch, apply_training_downscale=False)
+        mask = batch.get("mask")
+        if mask is None:
+            return rgb
+        if mask.ndim == 2:
+            mask = mask[..., None]
+        mask = mask.float().to(rgb.device)
+        if mask.shape[:2] != rgb.shape[:2]:
+            return rgb
+        background = self.model._get_background_color().to(rgb.device).view(1, 1, -1)
+        return rgb * mask + background * (1.0 - mask)
+
+    def _get_debug_dir(self) -> Path:
+        return Path(self.datamanager.config.data) / self.datamanager.config.dynamic_subdir / "debug"
+
+    def _get_motion_debug_dir(self) -> Path:
+        return self._get_debug_dir() / "tracker_debug"
+
+    def _write_motion_log(self, frame_name: str, motion_estimate) -> None:
+        debug_dir = self._get_debug_dir()
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        log_path = debug_dir / f"{frame_name}_motion.txt"
+        log_lines = [
+            f"success: {motion_estimate.success}",
+            f"ready: {motion_estimate.ready}",
+            f"correspondence_count: {motion_estimate.correspondence_count}",
+            f"inlier_count: {motion_estimate.inlier_count}",
+            f"track_count_before: {motion_estimate.track_count_before}",
+            f"track_count_after: {motion_estimate.track_count_after}",
+            f"raw_visible_count: {motion_estimate.raw_visible_count}",
+            f"mask_visible_count: {motion_estimate.mask_visible_count}",
+            f"depth_valid_count: {motion_estimate.depth_valid_count}",
+            f"used_mask_fallback: {motion_estimate.used_mask_fallback}",
+            f"mean_residual: {motion_estimate.mean_residual}",
+            f"median_residual: {motion_estimate.median_residual}",
+            f"rotation: {motion_estimate.rotation.tolist()}",
+            f"translation: {motion_estimate.translation.tolist()}",
+        ]
+        log_path.write_text("\n".join(log_lines) + "\n")
+
+    def _save_motion_debug(self, frame_name: str, est) -> None:
+        """Side-by-side previous->current frame with tracked points + lines."""
+        if est.previous_points_xy is None or est.current_points_xy is None:
+            return
+        if est.previous_rgb is None or est.current_rgb is None:
+            return
+        prev_img = est.previous_rgb.detach().float().cpu().numpy()
+        curr_img = est.current_rgb.detach().float().cpu().numpy()
+        if prev_img.max() > 1.5:
+            prev_img = prev_img / 255.0
+        if curr_img.max() > 1.5:
+            curr_img = curr_img / 255.0
+        prev_img = prev_img.clip(0, 1)
+        curr_img = curr_img.clip(0, 1)
+        h, w = prev_img.shape[:2]
+        canvas = np.concatenate([prev_img, curr_img], axis=1)
+        canvas = (canvas * 255).astype(np.uint8).copy()
+        prev_pts = est.previous_points_xy
+        curr_pts = est.current_points_xy
+        inlier_mask = est.tracked_inlier_mask
+        n = min(len(prev_pts), len(curr_pts))
+        for i in range(n):
+            px, py = int(prev_pts[i, 0]), int(prev_pts[i, 1])
+            cx, cy = int(curr_pts[i, 0]) + w, int(curr_pts[i, 1])
+            is_inlier = bool(inlier_mask[i]) if inlier_mask is not None and i < len(inlier_mask) else False
+            point_color = [0, 255, 0] if is_inlier else [255, 0, 0]
+            line_color = [0, 180, 0] if is_inlier else [180, 0, 0]
+            steps = max(abs(cx - px), abs(cy - py), 1)
+            for t in range(steps + 1):
+                lx = int(px + (cx - px) * t / steps)
+                ly = int(py + (cy - py) * t / steps)
+                if 0 <= ly < h and 0 <= lx < 2 * w:
+                    canvas[ly, lx] = line_color
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    if 0 <= py + dy < h and 0 <= px + dx < w:
+                        canvas[py + dy, px + dx] = point_color
+                    if 0 <= cy + dy < h and 0 <= cx + dx < 2 * w:
+                        canvas[cy + dy, cx + dx] = point_color
+        dbg = self._get_motion_debug_dir()
+        dbg.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(canvas).save(dbg / f"{frame_name}_tracker.png")
+
+    # ====================================================================
+    # Feedforward dispatcher — rgbd_decode + anysplat_decode
+    # ====================================================================
+
+    def _feedforward_clean_cdn(self, camera, cdn, frame_name: Optional[str] = None, prerendered_obj_mask=None):
+        """Subtract the moving object's rendered Gaussian footprint from CDN.
+        Prevents the decoder from back-projecting the live object's surface
+        as flat Gaussians on top of the tracked 3D object."""
+        if prerendered_obj_mask is not None:
+            obj_mask_now = prerendered_obj_mask
+        else:
+            try:
+                obj_mask_now = self.model.render_object_mask(camera)
+            except Exception as exc:
+                CONSOLE.log(f"[feedforward] render_object_mask failed: {exc}; using raw CDN")
+                return cdn
+        if obj_mask_now is None:
+            return cdn
+        if obj_mask_now.ndim == 2:
+            obj_mask_now = obj_mask_now[..., None]
+        if obj_mask_now.shape != cdn.shape:
+            h, w = cdn.shape[:2]
+            obj_mask_now = TF.interpolate(
+                obj_mask_now.permute(2, 0, 1).unsqueeze(0),
+                size=(h, w),
+                mode="nearest",
+            ).squeeze(0).permute(1, 2, 0)
+        dilate_px = int(self.config.feedforward_object_mask_dilate_px)
+        if dilate_px > 0:
+            obj_mask_now = dilate_binary_mask(obj_mask_now, dilate_px)
+        cleaned = (cdn * (1.0 - obj_mask_now)).detach()
+        return cleaned
+
+    def _run_feedforward(
+        self,
+        target_frame: TrackerFrame,
+        mode_label: Literal["oneshot", "recurring"],
+        *,
+        prerendered_obj_mask=None,
+        prerendered_depth=None,
+    ) -> None:
+        """Dispatcher for feedforward hole-fill at a target tracker frame."""
+        if str(getattr(self.config, "enable_feedforward_inpaint", "off")) == "anysplat_decode":
+            return self._run_feedforward_anysplat(
+                target_frame, mode_label,
+                prerendered_obj_mask=prerendered_obj_mask,
+            )
+
+        from .utils.active_mask import select_top_n_components_filtered
+        from .utils.rgbd_decode import decode_component_to_gaussians
+
+        call_id = self._feedforward_call_counter
+        self._feedforward_call_counter += 1
+
+        t_call0 = time.time()
+        camera = target_frame["camera"]
+        frame_idx = int(target_frame["frame_idx"])
+        cdn = target_frame["cdn"]
+
+        batch = target_frame["batch"]
+        if batch is None:
+            CONSOLE.log(f"[feedforward] frame {frame_idx} has no batch — skip")
+            return
+
+        bg = self.model._get_background_color()
+        live_rgb_full = self.model.composite_with_background(
+            self.model.get_gt_img(batch["image"]), bg
+        )
+        gt_depth = self.model._get_gt_depth(batch)
+        if gt_depth is None:
+            CONSOLE.log(f"[feedforward] frame {frame_idx} has no depth — skip")
+            return
+
+        t0 = time.time()
+        try:
+            frame_name_for_cdn = self.datamanager.get_dynamic_frame_name(frame_idx)
+        except Exception:
+            frame_name_for_cdn = None
+        cdn_clean = self._feedforward_clean_cdn(
+            camera, cdn, frame_name=frame_name_for_cdn,
+            prerendered_obj_mask=prerendered_obj_mask,
+        )
+        self._timing["FF.1_cdn_clean"].append(time.time() - t0)
+
+        t0 = time.time()
+        if mode_label == "oneshot":
+            components = select_top_n_components_filtered(
+                cdn_clean,
+                n=int(self.config.feedforward_top_n_components),
+                area_ratio=float(self.config.feedforward_dominant_area_ratio),
+                min_area=1,
+            )
+        else:
+            components = select_top_n_components_filtered(
+                cdn_clean, n=256, area_ratio=0.0, min_area=1,
+            )
+        self._timing["FF.2_component_select"].append(time.time() - t0)
+
+        if not components:
+            CONSOLE.log(
+                f"[feedforward] {mode_label} call={call_id} step={self._dynamic_step_counter} "
+                f"frame={frame_idx} no components above min_area"
+            )
+            return
+
+        total_inserted = 0
+        total_deleted = 0
+        per_component_diag: list[dict] = []
+        for k, comp_mask in enumerate(components):
+            t0 = time.time()
+            decoded = decode_component_to_gaussians(
+                camera,
+                live_rgb_full,
+                gt_depth,
+                comp_mask,
+                opacity=float(self.config.feedforward_rgbd_opacity),
+                normal_smoothing_radius=int(self.config.feedforward_rgbd_normal_smoothing_radius),
+                min_valid_fraction=float(self.config.feedforward_rgbd_min_valid_fraction),
+                scale_multiplier=float(self.config.feedforward_rgbd_scale_multiplier),
+                cliff_threshold_m=float(self.config.feedforward_rgbd_cliff_threshold_m),
+                post_cliff_erode_px=int(self.config.feedforward_rgbd_post_cliff_erode_px),
+                rendered_depth_m=prerendered_depth,
+                leak_threshold_m=float(self.config.feedforward_rgbd_leak_threshold_m),
+            )
+            self._timing["FF.3_decode"].append(time.time() - t0)
+
+            if decoded is None:
+                CONSOLE.log(
+                    f"[feedforward] {mode_label} call={call_id} comp={k} empty — skipped"
+                )
+                continue
+            if decoded.get("skipped", False):
+                per_component_diag.append({"component": k, **decoded["diagnostics"], "skipped": True})
+                CONSOLE.log(
+                    f"[feedforward] {mode_label} call={call_id} comp={k} skipped "
+                    f"valid_fraction={decoded['diagnostics']['valid_fraction']:.3f}"
+                )
+                continue
+
+            t0 = time.time()
+            if self.device == torch.device("cuda") or self.device.type == "cuda":
+                torch.cuda.synchronize()
+            if not self.config.feedforward_skip_delete:
+                try:
+                    _ = self._render_from_camera(camera)
+                except Exception as exc:
+                    CONSOLE.log(f"[feedforward] pre-delete render failed: {exc}; skip comp")
+                    continue
+                n_deleted = self._feedforward_delete_in_region(camera, comp_mask)
+            else:
+                n_deleted = 0
+
+            n_culled = 0
+            with self._viser_lock_ctx():
+                if self.config.feedforward_cull_in_front:
+                    n_culled = self._feedforward_cull_in_front_of_depth(
+                        camera, comp_mask, gt_depth,
+                        depth_tol_m=float(self.config.feedforward_cull_in_front_depth_tol_m),
+                    )
+            n_deleted += n_culled
+            self._timing["FF.4_crop_and_delete"].append(time.time() - t0)
+
+            t0 = time.time()
+            with self._viser_lock_ctx():
+                inserted_ids = self.model.insert_inpaint_gaussians(
+                    xyz=decoded["xyz"],
+                    features_dc=decoded["features_dc"],
+                    features_rest=decoded["features_rest"],
+                    opacities=decoded["opacities"],
+                    scales=decoded["scales"],
+                    quats=decoded["quats"],
+                    instance_id=999,
+                )
+            self._timing["FF.5_insert"].append(time.time() - t0)
+
+            self._viser_direct_register_ff_insert(inserted_ids)
+
+            n_inserted = int(inserted_ids.numel())
+            total_inserted += n_inserted
+            total_deleted += n_deleted
+            per_component_diag.append({
+                "component": k,
+                "inserted": n_inserted,
+                "deleted": n_deleted,
+                **decoded["diagnostics"],
+            })
+
+        total_per_call = time.time() - t_call0
+        self._timing["FF.6_total_per_call"].append(total_per_call)
+
+        obj_count = int((self.model.object_flags.squeeze(-1) > 0.5).sum().item())
+        ins_count = int((self.model.inserted_flags.squeeze(-1) > 0.5).sum().item())
+        CONSOLE.log(
+            f"[feedforward] {mode_label} call={call_id} step={self._dynamic_step_counter} "
+            f"frame={frame_idx} components={len(per_component_diag)} "
+            f"inserted={total_inserted} deleted={total_deleted} total_ms={total_per_call*1000:.1f} "
+            f"object_flags_count={obj_count} inserted_flags_count={ins_count} "
+            f"total_gauss={self.model.num_points}"
+        )
+
+    # ---- FF dispatcher helpers ----
+
+    @torch.no_grad()
+    def _feedforward_delete_in_region(self, camera, component_mask) -> int:
+        """Delete Gaussians whose 2D footprint overlaps ``component_mask`` AND
+        have ``object_instance_ids ∈ {0, 999}``. Tracked-object Gaussians are
+        never touched. Requires a recent full-scene render."""
+        from .utils.active_mask import build_active_mask, extract_projected_centers_and_radii
+
+        model = self.model
+        if model.num_points == 0:
+            return 0
+        try:
+            centers_2d, radii = extract_projected_centers_and_radii(
+                model.info, model.num_points
+            )
+        except Exception as exc:
+            CONSOLE.log(f"[feedforward] projection failed: {exc}; skipping delete")
+            return 0
+
+        comp = component_mask
+        if comp.ndim == 3 and comp.shape[-1] == 1:
+            comp = comp[..., 0]
+        comp_bool = (comp > 0.5).to(centers_2d.device)
+        active_mask = build_active_mask(comp_bool, centers_2d, radii)
+        in_region = active_mask.to(torch.bool)
+
+        instance_ids = model.object_instance_ids.squeeze(-1)
+        eligible = (instance_ids == 0) | (instance_ids == 999)
+        to_delete = in_region & eligible
+        indices = torch.nonzero(to_delete, as_tuple=False).squeeze(-1)
+        if indices.numel() == 0:
+            return 0
+        return model.delete_gaussian_indices(indices)
+
+    @torch.no_grad()
+    def _feedforward_cull_in_front_of_depth(
+        self, camera, component_mask, gt_depth_m, depth_tol_m: float = 0.005,
+    ) -> int:
+        """Delete Gaussians sitting in front of the real sensor surface.
+
+        For every Gaussian whose 2D projection (centre) lands inside
+        ``component_mask``, compare its camera-space depth to the sensor
+        depth at that pixel. If shallower by more than ``depth_tol_m``,
+        delete (it's an artifact occluding the true geometry). Restricted
+        to ``object_instance_ids ∈ {0, 999}``.
+
+        Direct projection — does NOT require a prior render.
+        """
+        model = self.model
+        if model.num_points == 0:
+            return 0
+
+        def _scalar(x):
+            if isinstance(x, torch.Tensor):
+                return float(x.detach().cpu().reshape(-1)[0].item())
+            return float(x)
+        fx = _scalar(camera.fx); fy = _scalar(camera.fy)
+        cx = _scalar(camera.cx); cy = _scalar(camera.cy)
+        W_cam = int(_scalar(camera.width)); H_cam = int(_scalar(camera.height))
+
+        # Depth and component_mask are at the model's render resolution
+        # (which may be downscaled vs the dataset's native camera resolution
+        # during the resolution-schedule warm-up). Derive grid dims from the
+        # depth tensor itself, then scale intrinsics so projection lands in
+        # the depth grid's coordinate system.
+        depth = gt_depth_m
+        if depth.ndim == 3 and depth.shape[-1] == 1:
+            depth = depth[..., 0]
+        depth = depth.to(model.means.device)
+        H, W = int(depth.shape[0]), int(depth.shape[1])
+        if (H, W) != (H_cam, W_cam):
+            sx = W / float(W_cam)
+            sy = H / float(H_cam)
+            fx *= sx; cx *= sx
+            fy *= sy; cy *= sy
+
+        c2w = camera.camera_to_worlds
+        if c2w.ndim == 3:
+            c2w = c2w[0]
+        c2w = c2w.to(model.means.device, dtype=model.means.dtype)
+        R = c2w[:3, :3]; t = c2w[:3, 3]
+        means_cam = (model.means - t[None, :]) @ R
+        depths_g = -means_cam[:, 2]
+        in_front_of_cam = depths_g > 1e-6
+
+        safe_d = torch.where(in_front_of_cam, depths_g, torch.ones_like(depths_g))
+        u = fx * (means_cam[:, 0] / safe_d) + cx
+        v = fy * (-means_cam[:, 1] / safe_d) + cy
+        u_idx = u.round().long().clamp(0, W - 1)
+        v_idx = v.round().long().clamp(0, H - 1)
+        in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H) & in_front_of_cam
+
+        comp = component_mask
+        if comp.ndim == 3 and comp.shape[-1] == 1:
+            comp = comp[..., 0]
+        comp = (comp > 0.5).to(model.means.device)
+        # Resize comp to the depth grid if it landed at a different scale.
+        if comp.shape[-2:] != (H, W):
+            comp = TF.interpolate(
+                comp.float().unsqueeze(0).unsqueeze(0),
+                size=(H, W), mode="nearest",
+            ).squeeze(0).squeeze(0).to(torch.bool)
+
+        sensor_depth_at = depth[v_idx, u_idx]
+        in_region = comp[v_idx, u_idx] & in_bounds
+        has_valid_depth = sensor_depth_at > 0
+        in_front = depths_g < (sensor_depth_at - float(depth_tol_m))
+
+        instance_ids = model.object_instance_ids.squeeze(-1).to(in_front.device)
+        eligible = (instance_ids == 0) | (instance_ids == 999)
+
+        to_delete = in_region & has_valid_depth & in_front & eligible
+        indices = torch.nonzero(to_delete, as_tuple=False).squeeze(-1)
+        if indices.numel() == 0:
+            return 0
+        return model.delete_gaussian_indices(indices)
+
+    # ---- AnySplat feedforward path ----
+
+    def _start_anysplat_persistent_worker(self) -> None:
+        """Spawn the long-lived AnySplat worker. Called once when the
+        anysplat path is first hit (or at subclass-controlled init time)."""
+        if self._anysplat_persistent_worker is not None:
+            return
+        from .utils.anysplat_decode import PersistentAnysplatWorker
+        try:
+            t0 = time.time()
+            CONSOLE.log("[anysplat] spawning persistent worker (loading model in subprocess)...")
+            self._anysplat_persistent_worker = PersistentAnysplatWorker(
+                conda_env=str(self.config.feedforward_anysplat_conda_env),
+                startup_timeout_s=120.0,
+            )
+            CONSOLE.log(
+                f"[anysplat] persistent worker ready in {time.time()-t0:.1f}s "
+                f"(worker reported load = {self._anysplat_persistent_worker.load_seconds:.1f}s)"
+            )
+        except Exception as exc:
+            CONSOLE.log(f"[anysplat] persistent worker spawn FAILED: {exc}; "
+                        f"will fall back to per-call subprocess spawn")
+            self._anysplat_persistent_worker = None
+
+    def _resolve_anysplat_context_image_paths(self, target_frame_idx: int) -> tuple[list[Path], list[int]]:
+        """Return (image_paths, frame_indices) — target first, then K-1 previous accepted frames.
+
+        TODO(phase-3-stage-D): this reads recorded-mode-only state
+        (``_accepted_dynamic_frames`` + dataset.image_filenames). Live
+        subclass should override (or skip — anysplat in live needs a
+        different context strategy)."""
+        try:
+            ds = self.datamanager.dynamic_manager.train_dataset
+        except AttributeError:
+            return [], []
+        all_filenames = ds.image_filenames
+        K_ctx = max(0, int(getattr(self.config, "feedforward_anysplat_context_frames", 2)))
+
+        target_path = Path(all_filenames[target_frame_idx])
+        out_paths: list[Path] = [target_path]
+        out_idx: list[int] = [int(target_frame_idx)]
+
+        if K_ctx > 0:
+            accepted = list(getattr(self, "_accepted_dynamic_frames", []) or [])
+            if target_frame_idx in accepted:
+                pos = accepted.index(int(target_frame_idx))
+                ctx_indices = accepted[max(0, pos - K_ctx):pos]
+            else:
+                ctx_indices = [i for i in accepted if i < target_frame_idx][-K_ctx:]
+            for fi in ctx_indices:
+                out_paths.append(Path(all_filenames[fi]))
+                out_idx.append(int(fi))
+        return out_paths, out_idx
+
+    def _scene_c2w_for_frame(self, frame_idx: int) -> np.ndarray:
+        """Look up the post-camera-optimizer c2w (4x4) for a recorded dynamic frame.
+
+        TODO(phase-3-stage-D): recorded-only. Live subclass should override."""
+        ds = self.datamanager.dynamic_manager.train_dataset
+        cam = ds.cameras[frame_idx : frame_idx + 1].to(self.device)
+        c2w = cam.camera_to_worlds
+        if c2w.ndim == 3:
+            c2w = c2w[0]
+        if c2w.shape == (3, 4):
+            bottom = torch.tensor([[0.0, 0.0, 0.0, 1.0]], device=c2w.device, dtype=c2w.dtype)
+            c2w = torch.cat([c2w, bottom], dim=0)
+        return c2w.detach().cpu().numpy().astype(np.float32)
+
+    def _run_feedforward_anysplat(self, target_frame: TrackerFrame, mode_label: str,
+                                   prerendered_obj_mask=None) -> None:
+        """AnySplat path: K=1 single-image inference per FF call, then
+        scene-K back-projection. See utils/anysplat_decode.py for canonical
+        reprojection method."""
+        from .utils.active_mask import select_top_n_components_filtered
+        from .utils.anysplat_decode import (
+            reproject_anysplat_to_scene,
+            run_anysplat_subprocess,
+        )
+
+        call_id = self._feedforward_call_counter
+        self._feedforward_call_counter += 1
+
+        t_call0 = time.time()
+        camera = target_frame["camera"]
+        frame_idx = int(target_frame["frame_idx"])
+        cdn = target_frame["cdn"]
+
+        t0 = time.time()
+        try:
+            frame_name_for_cdn = self.datamanager.get_dynamic_frame_name(frame_idx)
+        except Exception:
+            frame_name_for_cdn = None
+        cdn_clean = self._feedforward_clean_cdn(
+            camera, cdn, frame_name=frame_name_for_cdn,
+            prerendered_obj_mask=prerendered_obj_mask,
+        )
+        self._timing["FF.1_cdn_clean"].append(time.time() - t0)
+
+        t0 = time.time()
+        if mode_label == "oneshot":
+            components = select_top_n_components_filtered(
+                cdn_clean,
+                n=int(self.config.feedforward_top_n_components),
+                area_ratio=float(self.config.feedforward_dominant_area_ratio),
+                min_area=1,
+            )
+        else:
+            components = select_top_n_components_filtered(cdn_clean, n=256, area_ratio=0.0, min_area=1)
+        self._timing["FF.2_component_select"].append(time.time() - t0)
+
+        if not components:
+            CONSOLE.log(
+                f"[anysplat] {mode_label} call={call_id} step={self._dynamic_step_counter} "
+                f"frame={frame_idx} no components"
+            )
+            return
+
+        image_paths, _ = self._resolve_anysplat_context_image_paths(frame_idx)
+        if len(image_paths) < 1:
+            CONSOLE.log(f"[anysplat] call={call_id} no target image; skip")
+            return
+        image_paths = [image_paths[0]]
+
+        batch = target_frame["batch"]
+        if batch is None:
+            CONSOLE.log(f"[anysplat] frame {frame_idx} has no batch — skip")
+            return
+        gt_depth = self.model._get_gt_depth(batch)
+        if gt_depth is None:
+            CONSOLE.log(f"[anysplat] frame {frame_idx} has no depth — skip")
+            return
+        sensor_depth_np = gt_depth.detach().cpu().numpy().astype(np.float32)
+        if sensor_depth_np.ndim == 3:
+            sensor_depth_np = sensor_depth_np[..., 0]
+
+        def _scalar(x):
+            return float(x.detach().cpu().reshape(-1)[0].item()) if isinstance(x, torch.Tensor) else float(x)
+        scene_intr = {
+            "w":    int(_scalar(camera.width)),
+            "h":    int(_scalar(camera.height)),
+            "fl_x": _scalar(camera.fx),
+            "fl_y": _scalar(camera.fy),
+            "cx":   _scalar(camera.cx),
+            "cy":   _scalar(camera.cy),
+        }
+        scene_c2w_np = self._scene_c2w_for_frame(frame_idx)
+        if scene_c2w_np.shape == (3, 4):
+            scene_c2w_np = np.vstack([scene_c2w_np, [[0, 0, 0, 1]]]).astype(np.float64)
+        else:
+            scene_c2w_np = scene_c2w_np.astype(np.float64)
+
+        debug_dir = Path(self.datamanager.config.data) / "dynamic_scene" / "debug" / "feedforward_anysplat"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        out_npz = debug_dir / f"call_{call_id:04d}_step_{self._dynamic_step_counter}_frame_{frame_idx}.npz"
+
+        t0 = time.time()
+        try:
+            if self._anysplat_persistent_worker is not None:
+                self._anysplat_persistent_worker.inference(
+                    image_paths, out_npz,
+                    timeout_s=float(self.config.feedforward_anysplat_worker_timeout_s),
+                )
+            else:
+                run_anysplat_subprocess(
+                    image_paths, out_npz,
+                    conda_env=str(self.config.feedforward_anysplat_conda_env),
+                    timeout_s=float(self.config.feedforward_anysplat_worker_timeout_s),
+                )
+        except Exception as exc:
+            CONSOLE.log(f"[anysplat] call={call_id} worker FAILED: {exc}")
+            return
+        self._timing["FF.3a_anysplat_inference"].append(time.time() - t0)
+
+        data = np.load(out_npz, allow_pickle=True)
+        means_can = data["means_canonical"]
+        log_scales = data["log_scales"]
+        quats = data["quats_wxyz"]
+        opacity_logits = data["opacity_logits"]
+        features_dc = data["features_dc"]
+        features_rest = data["features_rest"]
+        pred_c2w_0 = data["pred_extrinsic_c2w"][0]
+        pred_K_norm = data["pred_intrinsic_norm"][0]
+        H_any, W_any = 448, 448
+
+        total_inserted = 0
+        total_culled = 0
+        for k, comp_mask in enumerate(components):
+            t0 = time.time()
+            comp_np = comp_mask.detach().cpu().numpy() if torch.is_tensor(comp_mask) else np.asarray(comp_mask)
+
+            decoded = reproject_anysplat_to_scene(
+                means_canonical=means_can,
+                log_scales=log_scales,
+                quats_wxyz=quats,
+                opacity_logits=opacity_logits,
+                features_dc=features_dc,
+                features_rest=features_rest,
+                pred_c2w_0=pred_c2w_0,
+                pred_K_norm=pred_K_norm,
+                pred_image_hw=(H_any, W_any),
+                sensor_depth_m=sensor_depth_np,
+                scene_c2w=scene_c2w_np,
+                scene_intr=scene_intr,
+                opacity_min=float(self.config.feedforward_anysplat_min_opacity),
+                component_mask=comp_np,
+            )
+            self._timing["FF.3b_anysplat_reproject"].append(time.time() - t0)
+
+            n_in_comp = int(decoded["xyz"].shape[0])
+            if n_in_comp == 0:
+                CONSOLE.log(f"[anysplat] call={call_id} comp={k} empty; skip")
+                continue
+
+            t0 = time.time()
+            n_culled = 0
+            with self._viser_lock_ctx():
+                if self.config.feedforward_cull_in_front:
+                    n_culled = self._feedforward_cull_in_front_of_depth(
+                        camera, comp_mask, gt_depth,
+                        depth_tol_m=float(self.config.feedforward_cull_in_front_depth_tol_m),
+                    )
+            total_culled += int(n_culled)
+            self._timing["FF.4_crop_and_delete"].append(time.time() - t0)
+
+            t0 = time.time()
+            with self._viser_lock_ctx():
+                inserted_ids = self.model.insert_inpaint_gaussians(
+                    xyz=torch.from_numpy(decoded["xyz"]).to(self.device),
+                    features_dc=torch.from_numpy(decoded["features_dc"]).to(self.device),
+                    features_rest=torch.from_numpy(decoded["features_rest"]).to(self.device),
+                    opacities=torch.from_numpy(decoded["opacities"]).to(self.device),
+                    scales=torch.from_numpy(decoded["scales"]).to(self.device),
+                    quats=torch.from_numpy(decoded["quats"]).to(self.device),
+                    instance_id=999,
+                )
+            self._timing["FF.5_insert"].append(time.time() - t0)
+
+            self._viser_direct_register_ff_insert(inserted_ids)
+
+            total_inserted += int(inserted_ids.numel())
+
+        total_per_call = time.time() - t_call0
+        self._timing["FF.6_total_per_call"].append(total_per_call)
+        obj_count = int((self.model.object_flags.squeeze(-1) > 0.5).sum().item())
+        ins_count = int((self.model.inserted_flags.squeeze(-1) > 0.5).sum().item())
+        # Per-call FF breakdown so we don't have to wait for the
+        # end-of-run timing report to see where the time is going. Each
+        # FF.* timing list grows by 1 per call, so [-1] is this call.
+        def _last_ms(key: str) -> float:
+            arr = self._timing.get(key, [])
+            return arr[-1] * 1000.0 if arr else 0.0
+        CONSOLE.log(
+            f"[anysplat] {mode_label} call={call_id} step={self._dynamic_step_counter} "
+            f"frame={frame_idx} components={len(components)} inserted={total_inserted} "
+            f"culled={total_culled} total_ms={total_per_call*1000:.0f} "
+            f"object_flags={obj_count} inserted_flags={ins_count} "
+            f"total_gauss={self.model.num_points} "
+            f"| cdn={_last_ms('FF.1_cdn_clean'):.0f} "
+            f"comp_sel={_last_ms('FF.2_component_select'):.0f} "
+            f"anysplat_inf={_last_ms('FF.3a_anysplat_inference'):.0f} "
+            f"reproj={_last_ms('FF.3b_anysplat_reproject'):.0f} "
+            f"cull={_last_ms('FF.4_crop_and_delete'):.0f} "
+            f"insert={_last_ms('FF.5_insert'):.0f}"
+        )

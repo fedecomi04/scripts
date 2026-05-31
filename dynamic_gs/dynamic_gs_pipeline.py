@@ -33,6 +33,12 @@ from .utils import (
     register_and_fuse_sam3d_object,
     save_point_cloud,
 )
+from .change_detection import (
+    ChangeMaskConfig,
+    compute_change_mask,
+    resolve_downsample_factor,
+)
+from .persistence import load_post_fusion_state, save_post_fusion_state
 from .utils.sam3_segmentation import load_sam3_masks, run_sam3_subprocess
 from .utils.sam3d import (
     get_sam3d_output_paths,
@@ -1250,124 +1256,41 @@ class DynamicGSPipeline(VanillaPipeline):
 
     def _save_post_fusion_cache(self) -> None:
         """Snapshot the post-fusion model so a future warm restart can
-        jump straight to the dynamic phase. Only called from
-        ``_fuse_sam3d_objects_into_scene`` in live mode.
-
-        Writes ``<LIVE_ROOT>/static_scene/post_fusion_state.pt`` with the
-        full ``model.state_dict()`` plus ``num_points``. The next session
-        re-builds the model from the SfM seed PLY (small N), then
-        ``_load_post_fusion_cache`` resizes the gauss_params to the saved
-        N and copies the trained tensors in.
+        jump straight to the dynamic phase. Thin shim over
+        ``persistence.save_post_fusion_state``.
         """
-        try:
-            live_root = Path(self.config.datamanager.data)
-            cache_path = live_root / "static_scene" / "post_fusion_state.pt"
-            torch.save(
-                {
-                    "model_state_dict": self.model.state_dict(),
-                    "num_points": int(self.model.num_points),
-                },
-                cache_path,
-            )
-            CONSOLE.log(
-                f"[live-warm-cache] saved post-fusion state to "
-                f"{cache_path.name} (N={int(self.model.num_points)} Gaussians)"
-            )
-        except Exception as exc:
-            CONSOLE.log(f"[live-warm-cache] could not save snapshot: {exc}")
-        # PROBLEM: the snapshot is not config-tagged. If sh_degree,
-        # background color, or the camera-optimizer mode changes between
-        # save and load, the loaded tensors won't match the rebuilt model
-        # and load_state_dict will raise. Delete the .pt to recover.
+        live_root = Path(self.config.datamanager.data)
+        cache_path = live_root / "static_scene" / "post_fusion_state.pt"
+        save_post_fusion_state(self.model, cache_path)
 
     def _load_post_fusion_cache(self, cache_path: Path) -> bool:
-        """Restore a post-fusion model snapshot from disk.
-
-        The cold-start model was built by ``super().__init__`` from the
-        SfM seed PLY (small N). The snapshot has N_post Gaussians (post
-        Phase-0b insertions), so each ``gauss_params`` Parameter has to
-        be re-allocated at N_post before ``load_state_dict`` can copy
-        values in. The model's own ``load_state_dict`` override handles
-        the persistent buffers (object_flags, object_instance_ids, ...).
-
-        Side effects on success:
-          * sets ``_static_converged_step = 0`` so the next ``_sync_phase``
-            flips current_phase straight to "dynamic"
-          * sets ``_sam3d_inserted = True`` so D0 takes Path A (prefused)
-          * leaves ``_sam3d_generation_outputs = None`` so the
-            static→dynamic transition does not re-run ``_fuse_sam3d_objects_into_scene``
-
-        Returns True on success, False on any failure (caller falls back
-        to the standard static+fusion path).
+        """Restore a post-fusion snapshot. Thin shim over
+        ``persistence.load_post_fusion_state`` plus pipeline-side bookkeeping
+        that tells the dynamic loop fusion already happened.
         """
-        try:
-            blob = torch.load(cache_path, map_location=self.device)
-            state_dict = blob["model_state_dict"]
-            target_n = int(blob["num_points"])
-        except Exception as exc:
-            CONSOLE.log(f"[live-warm-cache] could not read {cache_path.name}: {exc}")
+        result = load_post_fusion_state(self.model, cache_path, self.device)
+        if not result.success:
             return False
 
-        device = self.model.means.device
-        try:
-            # Reallocate each gauss_params Parameter at the saved size.
-            # Mirrors the resize pattern in ``insert_object_gaussians``.
-            for name in ("means", "features_dc", "features_rest", "opacities", "scales", "quats"):
-                sd_key = f"gauss_params.{name}"
-                if sd_key not in state_dict:
-                    CONSOLE.log(f"[live-warm-cache] missing {sd_key}; falling back to static+fusion")
-                    return False
-                old_param = self.model.gauss_params[name]
-                new_tensor = state_dict[sd_key].to(device=device, dtype=old_param.dtype)
-                self.model.gauss_params[name] = torch.nn.Parameter(
-                    new_tensor.clone(),
-                    requires_grad=old_param.requires_grad,
-                )
-
-            # The model's load_state_dict override sees ``object_flags.shape[0]
-            # != target_n`` and rebuilds the persistent buffers at target_n
-            # before copying. strict=False so any new/old keys (e.g. viewer
-            # GUI handles) don't crash the load.
-            self.model.load_state_dict(state_dict, strict=False)
-
-            # The means-grad hook was bound to the old Parameter object; re-bind
-            # to the freshly-allocated one so dynamic-phase gradient masking
-            # fires correctly on object Gaussians.
-            self.model.gauss_params["means"].register_hook(self.model._mask_means_grad)
-        except Exception as exc:
-            CONSOLE.log(f"[live-warm-cache] state_dict load failed: {exc}")
-            return False
-
-        # Tell the dynamic-loop bookkeeping that fusion has already happened.
-        # D0 will go down Path A: pick the closest pre-fused instance to the
-        # camera, set object_flags from object_instance_ids, init the CoTracker.
+        # Pipeline-side state: D0 will go down Path A (prefused), so SAM3D
+        # generation is not re-run, and the static→dynamic phase flip should
+        # fire immediately.
         self._sam3d_inserted = True
         self._sam3d_generation_outputs = None
         self._static_converged_step = 0
 
         # Advance the model's notional step so splatfacto's resolution +
         # SH-degree schedules immediately report full-res / final-SH.
-        # step_cb in DynamicGSModel honors `_step_offset`. Without this,
-        # the first dynamic render is 4× downscaled (200×200) and
-        # build_change_mask raises a tensor-size mismatch against the
-        # live RGB (800×800).
+        # Without this, the first dynamic render is 4× downscaled and
+        # build_change_mask raises a tensor-size mismatch.
         self.model._step_offset = int(self.config.static_num_steps)
 
-        CONSOLE.log(
-            f"[live-warm-cache] loaded {cache_path.name} "
-            f"(N={target_n} Gaussians); skipping static + Phase 0b."
-        )
         print(
-            f"\n==> [live] warm cache hit: jumping straight to dynamic phase "
-            f"(N={target_n} Gaussians). Static training + Phase 0b skipped.\n",
+            f"\n==> [warm-cache] jumping straight to dynamic phase "
+            f"(N={result.num_points} Gaussians). Static training + Phase 0b skipped.\n",
             flush=True,
         )
         return True
-        # PROBLEM: this assumes the saved camera-optimizer offsets still
-        # correspond to the current transforms.json frame ordering. The
-        # Tier 1 cache guarantees same LIVE_ROOT (so same transforms),
-        # but if you manually edit transforms.json between runs, the
-        # per-frame SO3xR3 offsets will load against the wrong indices.
 
     def _backproject_mask_to_world(
         self,
@@ -2046,22 +1969,13 @@ class DynamicGSPipeline(VanillaPipeline):
     def _resolved_cdn_downsample(self, rgb_or_shape) -> int:
         """Resolve the feedforward CDN downsample factor.
 
-        When ``feedforward_cdn_downsample_factor`` is 0 (auto), scale DS
-        with the geometric mean of the frame's (H, W) so the MSSIM compute
-        runs on ~``target_mssim_side * target_mssim_side`` pixels regardless
-        of resolution or aspect ratio. Otherwise return the configured int.
+        Thin shim over ``change_detection.resolve_downsample_factor``.
         """
-        cfg = int(self.config.feedforward_cdn_downsample_factor)
-        if cfg != 0:
-            return max(1, cfg)
-        if hasattr(rgb_or_shape, "shape"):
-            H, W = int(rgb_or_shape.shape[0]), int(rgb_or_shape.shape[1])
-        else:
-            H, W = int(rgb_or_shape[0]), int(rgb_or_shape[1])
-        target = max(1, int(self.config.feedforward_cdn_target_mssim_side))
-        import math as _math
-        ds = int(_math.sqrt(float(H) * float(W)) / float(target))
-        return max(1, ds)
+        return resolve_downsample_factor(
+            rgb_or_shape,
+            configured_factor=int(self.config.feedforward_cdn_downsample_factor),
+            target_side=int(self.config.feedforward_cdn_target_mssim_side),
+        )
 
     def _save_feedforward_debug_pair(self, frame_name: str, rdn_rgb, gt_rgb, cdn,
                                      rendered_obj_mask=None, gripper_mask=None):
@@ -2134,114 +2048,31 @@ class DynamicGSPipeline(VanillaPipeline):
                              downsample_factor: int = 1, keep_largest_only: bool = True):
         """Compute change mask between render and live, excluding gripper + object regions.
 
-        ``downsample_factor`` > 1 bilinearly downsamples (render, live) RGB
-        (and the valid mask) before the MS-SSIM cleanup. The resulting mask
-        is nearest-upsampled back to native resolution at the end. Use to
-        ignore small details (specular shimmer, tracker jitter).
-
-        ``keep_largest_only=False`` keeps every connected component above
-        the min-area threshold (multi-blob output for the feedforward path).
+        Thin shim over ``change_detection.compute_change_mask`` that pulls the
+        thresholds + cleanup knobs from ``self.model.config``.
         """
-        target_h, target_w = rendered_rgb.shape[:2]
-        valid_mask = None
-        if object_mask is not None:
-            obj = object_mask.float()
-            if obj.ndim == 2:
-                obj = obj[..., None]
-            obj = self._resize_mask_to(obj.to(self.model.device), target_h, target_w)
-            valid_mask = 1.0 - obj
-        if gripper_mask is not None:
-            grip = gripper_mask.float().to(self.model.device)
-            if grip.ndim == 2:
-                grip = grip[..., None]
-            grip = self._resize_mask_to(grip, target_h, target_w)
-            valid_mask = grip * valid_mask if valid_mask is not None else grip
-
-        # Optional downsample of inputs for cheaper / less-detail-sensitive MSSIM.
-        # Masked-average pool: invalid pixels (gripper, object) contribute 0 to
-        # both the RGB sum and the count, so the downsampled block colour is
-        # the clean average of only the valid pixels in the block. Without this
-        # the bilinear blend would pull dark gripper pixels into neighbouring
-        # blocks and MSSIM would flag the boundary as a false-positive change.
-        # Strict block validity: a block is only valid if EVERY one of its
-        # DS*DS source pixels is valid; otherwise it's marked invalid for MSSIM
-        # and the final mask is re-clipped against the native-resolution
-        # valid_mask, so behind-gripper change still gets caught next tick
-        # once the gripper has moved.
-        ds = max(1, int(downsample_factor))
-        if ds > 1:
-            def _avg_pool(t, ds):
-                return TF.avg_pool2d(t, kernel_size=ds, stride=ds, ceil_mode=False)
-            def _max_pool(t, ds):
-                return TF.max_pool2d(t, kernel_size=ds, stride=ds, ceil_mode=False)
-            if valid_mask is not None:
-                valid_chw = valid_mask.permute(2, 0, 1).unsqueeze(0)  # (1,1,H,W) in [0,1]
-            else:
-                valid_chw = torch.ones((1, 1, target_h, target_w), device=rendered_rgb.device, dtype=rendered_rgb.dtype)
-
-            def _masked_avg_rgb(rgb):
-                # rgb: (H,W,3) → masked-average downsample to (h', w', 3).
-                rgb_chw = rgb.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
-                num = _avg_pool(rgb_chw * valid_chw, ds)  # (1,3,h',w')
-                den = _avg_pool(valid_chw, ds).clamp(min=1e-8)  # (1,1,h',w')
-                out = num / den
-                return out.squeeze(0).permute(1, 2, 0)
-
-            def _masked_depth(d):
-                if d is None:
-                    return None
-                d_in = d if d.ndim == 3 else d[..., None]
-                d_chw = d_in.permute(2, 0, 1).unsqueeze(0)
-                num = _avg_pool(d_chw * valid_chw, ds)
-                den = _avg_pool(valid_chw, ds).clamp(min=1e-8)
-                out = num / den
-                return out.squeeze(0).permute(1, 2, 0)
-
-            rendered_rgb_use = _masked_avg_rgb(rendered_rgb)
-            live_rgb_use = _masked_avg_rgb(live_rgb)
-            rendered_depth_use = _masked_depth(rendered_depth)
-            gt_depth_use = _masked_depth(gt_depth)
-            # Strict block validity: 1 iff ALL source pixels were valid.
-            # `1 - max_pool(1 - valid)` returns 1 only where every source pixel
-            # was 1 in the block. (max_pool over invalid=1 detects any invalid.)
-            invalid_chw = 1.0 - valid_chw
-            invalid_block = _max_pool(invalid_chw, ds)
-            valid_block = (1.0 - invalid_block).clamp(min=0.0, max=1.0)
-            valid_mask_use = valid_block.squeeze(0).permute(1, 2, 0)
-        else:
-            rendered_rgb_use = rendered_rgb
-            live_rgb_use = live_rgb
-            rendered_depth_use = rendered_depth
-            gt_depth_use = gt_depth
-            valid_mask_use = valid_mask
-
-        change_mask = build_change_mask(
-            rendered_depth_use, gt_depth_use,
-            pred_rgb=rendered_rgb_use, gt_rgb=live_rgb_use,
-            valid_mask=valid_mask_use,
-            depth_threshold=self.model.config.change_mask_depth_threshold,
-            rgb_threshold=self.model.config.change_mask_rgb_threshold,
-            use_rgb=self.model.config.change_mask_use_rgb,
-            blur_kernel_size=self.model.config.change_mask_blur_kernel_size,
-            blur_sigma=self.model.config.change_mask_blur_sigma,
-            filter_radius=self.model.config.change_mask_filter_radius,
-            min_component_size=self.model.config.change_mask_min_component_size,
+        mc = self.model.config
+        cfg = ChangeMaskConfig(
+            depth_threshold=mc.change_mask_depth_threshold,
+            rgb_threshold=mc.change_mask_rgb_threshold,
+            use_rgb=mc.change_mask_use_rgb,
+            blur_kernel_size=mc.change_mask_blur_kernel_size,
+            blur_sigma=mc.change_mask_blur_sigma,
+            filter_radius=mc.change_mask_filter_radius,
+            min_component_size=mc.change_mask_min_component_size,
+            dilate_radius=mc.active_mask_dilate_radius,
+        )
+        return compute_change_mask(
+            rendered_rgb=rendered_rgb,
+            rendered_depth=rendered_depth,
+            live_rgb=live_rgb,
+            gt_depth=gt_depth,
+            gripper_mask=gripper_mask,
+            object_mask=object_mask,
+            config=cfg,
+            downsample_factor=downsample_factor,
             keep_largest_only=keep_largest_only,
         )
-        if ds > 1:
-            # Upsample mask back to native size (nearest — it's binary).
-            m = change_mask
-            if m.ndim == 2:
-                m = m[..., None]
-            change_mask = TF.interpolate(m.permute(2, 0, 1).unsqueeze(0), size=(target_h, target_w),
-                                         mode="nearest").squeeze(0).permute(1, 2, 0)
-        if self.model.config.active_mask_dilate_radius > 0:
-            change_mask = dilate_binary_mask(change_mask, self.model.config.active_mask_dilate_radius)
-        # Re-clip to valid_mask so the dilation cannot bleed back into the
-        # excluded object/gripper regions.
-        if valid_mask is not None:
-            change_mask = change_mask * valid_mask
-        return change_mask
 
     # ---- Feedforward hole-fill helpers (rgbd_decode path) ----
 
