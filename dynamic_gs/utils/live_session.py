@@ -340,24 +340,46 @@ def _seed_dynamic_scene_stub(static_dir: Path, dynamic_dir: Path) -> None:
     # symlinks. Punted — `live/` is a transient working dir.
 
 
-def run_live_capture_session() -> Path:
+def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
     """Drive the full interactive pre-training session.
 
-    Returns LIVE_ROOT (which now contains a populated static_scene/,
-    a stub dynamic_scene/, the SAM3+SAM3D cache, and the SfM init
-    PLY).
+    Args:
+        sam3_prompt_text: SAM3 text prompt. If None or empty, falls
+            back to ``DGS_SAM3_PROMPT`` env var, then to
+            ``DEFAULT_SAM3_PROMPT``. **Never asked interactively** —
+            the bootstrap script passes it on the command line so the
+            user is not re-prompted.
+
+    Flow (per the user's spec, 2026-05-31):
+        1. Wipe LIVE_ROOT, start ROS subscriber, wait for first frame.
+        2. **Start recording immediately.** Tell the user to move the
+           arm toward the object of interest and press Enter when in
+           front of it.
+        3. Single Enter → capture the latest streamed frame as the
+           SAM3 anchor. SAM3 runs **blocking** on that anchor (~1-2s).
+           Recording keeps streaming in parallel.
+        4. **If SAM3 returns 0 masks**: do NOT crash. Print
+           "re-aim and press Enter to retry, or 'q' to abort", loop
+           on Enter, capture a fresh latest frame, re-run SAM3 with
+           the SAME prompt.
+        5. Once SAM3 ≥ 1 mask: continue to Fast-SAM3D + sweep window
+           (recording keeps running). Second Enter ends sweep.
+        6. ICP+TSDF refinement, seed dynamic_scene stub, return.
+
+    Returns LIVE_ROOT.
 
     Warm path: if LIVE_ROOT already holds a complete recording +
-    SAM3 + SAM3D cache from a previous session, the interactive
-    capture is skipped entirely. The ROS publisher still spawns
-    (we need live frames for the dynamic loop), but no prompts,
-    no recording, no SAM3, no SAM3D — the pipeline downstream will
-    reuse the on-disk artifacts via `sam3_reuse_cached=True`.
+    SAM3 + SAM3D cache from a previous session, capture is skipped.
     """
     static_dir = LIVE_ROOT / "static_scene"
     dynamic_dir = LIVE_ROOT / "dynamic_scene"
     debug_dir = dynamic_dir / "initialization_debug"
     artifact_dir = dynamic_dir / "initialization_artifacts"
+
+    # Resolve the SAM3 prompt without ever asking the user — argv > env > default.
+    sam3_text = (sam3_prompt_text or os.environ.get("DGS_SAM3_PROMPT") or DEFAULT_SAM3_PROMPT).strip()
+    if not sam3_text:
+        sam3_text = DEFAULT_SAM3_PROMPT
 
     if _has_complete_recording_cache(LIVE_ROOT):
         post_fusion_cache = LIVE_ROOT / "static_scene" / "post_fusion_state.pt"
@@ -381,67 +403,82 @@ def run_live_capture_session() -> Path:
     # static_scene/ + dynamic_scene/ skeletons. We then mkdir the
     # debug/artifact subdirs that the SAM3/SAM3D workers write to.
     print(
-        "[live] launching ROS publisher subprocess (radiance_ros_4060), "
+        "[live] launching ROS publisher subprocess, "
         "waiting for first synced (rgb, depth, pose) tuple...",
         flush=True,
     )
-    # Subscriber spawns the publisher in the ROS env and blocks until
-    # the publisher reports "ready" on stdout. The publisher itself
-    # waits for /camera_info before signalling ready, so by the time
-    # this returns we have intrinsics.
     sub = LiveShmSubscriber(wipe_live_root=True)
     debug_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     sub.wait_for_first_frame(timeout_s=90.0)
-    print("ready!", flush=True)
+    print(f"[live] ready! SAM3 prompt: {sam3_text!r}", flush=True)
 
-    user_prompt = _prompt_user(
-        f"press enter for default prompt ('{DEFAULT_SAM3_PROMPT}'), "
-        f"or write a specific prompt for SAM3: "
-    ).strip()
-    sam3_text = user_prompt if user_prompt else DEFAULT_SAM3_PROMPT
+    # ------------------------------------------------------------------
+    # Step 2: start recording immediately. The user moves the arm
+    # toward the object while frames stream to disk; when they press
+    # Enter, we grab whatever the latest streamed frame is and feed it
+    # to SAM3. No "press Enter to start" — recording is automatic.
+    # ------------------------------------------------------------------
+    # `capture_anchor` returns the latest synced tuple and is the
+    # canonical "this is the current view" snapshot; `start_recording`
+    # then begins flushing every subsequent synced tuple to disk.
+    # For the live spec we want to begin recording RIGHT NOW so the
+    # operator's approach motion is captured, even before they press
+    # Enter. The anchor we feed to SAM3 will be a FRESH snapshot taken
+    # at the moment of Enter, not this bootstrap anchor.
+    bootstrap_anchor = sub.capture_anchor()
+    sub.start_recording(bootstrap_anchor)
+    # Arm concurrent ICP+TSDF fusion. From here until `stop_recording`,
+    # every newly-written keyframe is consumed by a worker thread and
+    # fused into the TSDF volume. This covers the SAM3 retry loop +
+    # SAM3D wait + post-SAM3D sweep — all wall-clock that was wasted
+    # before. At the second Enter, `stop_and_finalize()` blocks only
+    # for the drain tail + ~0.6 s `finalize()`, then writes the seed
+    # PLY directly. Replaces the old build_static_init_pointcloud +
+    # build_tsdf_seed two-pass post-capture step.
+    from .fusion_runner import ConcurrentFusionRunner
+    fusion_runner = ConcurrentFusionRunner(static_dir, sub.intrinsics)
+    fusion_runner.start()
+    print("[live] recording started — move the arm toward the object of interest.\n"
+          "       press ENTER when the camera is centered on it.", flush=True)
 
-    _prompt_user(
-        "move the robot in front of the object that will be manipulated. "
-        "press enter when you are in front of it: "
-    )
+    # ------------------------------------------------------------------
+    # Step 3 + 4: Enter → capture latest frame → SAM3 blocking → retry
+    # on zero masks. Loop until SAM3 returns ≥ 1 mask (or 'q' to abort).
+    # ------------------------------------------------------------------
+    sam3_objects: list = []
+    sam3_duration: float = 0.0
+    anchor: LiveFrame = bootstrap_anchor  # placeholder, overwritten on Enter
+    anchor_rgb_path: Path = debug_dir / "static0_rgb.png"
+    depth_path: Path = artifact_dir / "static0_full_depth_meters.tiff"
+    intrinsics_path: Path = artifact_dir / "static0_full_intrinsics.json"
 
-    anchor = sub.capture_anchor()
-    sub.start_recording(anchor)
-    anchor_rgb_path = _save_anchor_for_sam3(anchor, debug_dir)
-    depth_path, intrinsics_path = _save_anchor_intrinsics_and_depth(
-        anchor, sub.intrinsics, artifact_dir
-    )
-    print(f"[live] SAM3 input frame captured (seq={anchor.seq})", flush=True)
+    while True:
+        reply = _prompt_user("").strip().lower()
+        if reply in ("q", "quit", "abort"):
+            sub.stop_recording()
+            raise RuntimeError("user aborted SAM3 retry loop")
 
-    # Free any CUDA reservation held by the parent (torch import,
-    # nerfstudio trainer setup, pyrender EGL warmup) so the SAM3
-    # subprocess's first cuBLAS call has clean VRAM.
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        # Grab the latest streamed frame as the SAM3 anchor. We do NOT
+        # call `start_recording` again — recording is already running
+        # and the publisher keeps streaming during SAM3.
+        anchor = sub.capture_anchor()
+        anchor_rgb_path = _save_anchor_for_sam3(anchor, debug_dir)
+        depth_path, intrinsics_path = _save_anchor_intrinsics_and_depth(
+            anchor, sub.intrinsics, artifact_dir
+        )
+        print(f"[live] SAM3 input frame captured (seq={anchor.seq})", flush=True)
 
-    # Launch SAM3 in a background thread so the operator can press
-    # enter to stop recording at any time — even before SAM3 finishes.
-    # Recording (rospy callback thread) keeps writing keyframes to
-    # disk in parallel, gated by the ORB-SLAM filter so we don't
-    # bloat the dataset with near-duplicate views. GPU contention
-    # between SAM3 and the URDF mask renderer is accepted; URDF
-    # render slows down but doesn't fail under shared VRAM.
-    print(f"[live] recording started; SAM3 running in background (prompt: {sam3_text!r}). "
-          "press enter when you are done capturing static views.", flush=True)
-    sam3_slot = {"objects": None, "error": None, "finished": False}
+        # Free any CUDA reservation held by the parent before the
+        # SAM3 subprocess starts its first cuBLAS call.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    def _run_sam3_worker():
-        # Measured here (not in the pipeline) because in live mode the
-        # pipeline's ``_run_sam3_and_sam3d_generation`` only re-checks
-        # the cached SAM3 results and so its S0.1 timer reports ~0s.
-        # The duration captured here is written to a sidecar JSON below
-        # and re-injected into self._timing["S0.1_sam3_segmentation"]
-        # by the pipeline.
+        print(f"[live] running SAM3 (blocking; prompt: {sam3_text!r})...", flush=True)
         t_sam3 = time.time()
         try:
-            sam3_slot["objects"] = run_sam3_subprocess(
+            sam3_objects = run_sam3_subprocess(
                 image_path=anchor_rgb_path,
                 text_prompt=sam3_text,
                 output_dir=debug_dir,
@@ -453,46 +490,33 @@ def run_live_capture_session() -> Path:
                 max_objects=SAM3_CANDIDATE_MAX_OBJECTS,
                 confidence_threshold=SAM3_CONFIDENCE_THRESHOLD,
                 min_score=SAM3_MIN_SCORE,
-            )
+            ) or []
         except Exception as exc:
-            sam3_slot["error"] = exc
-        finally:
-            sam3_slot["duration"] = time.time() - t_sam3
-            sam3_slot["finished"] = True
+            sam3_objects = []
+            print(f"[live] SAM3 subprocess raised: {exc}", flush=True)
+        sam3_duration = time.time() - t_sam3
 
-    sam3_thread = threading.Thread(target=_run_sam3_worker, name="sam3_subprocess", daemon=True)
-    sam3_thread.start()
+        if sam3_objects:
+            print(f"[live] SAM3: found {len(sam3_objects)} graspable masks "
+                  f"({sam3_duration:.1f}s)", flush=True)
+            break
 
-    _prompt_user("")  # Enter to stop recording.
-    sub.stop_recording()
-    n_static = sub.num_recorded_frames()
-    print(f"[live] recording stopped after {n_static} keyframes", flush=True)
+        print(f"[live] SAM3 found 0 objects (took {sam3_duration:.1f}s).\n"
+              f"       re-aim the camera and press ENTER to retry, or 'q' to abort.",
+              flush=True)
 
     # Pause Gazebo physics from here through the end of the init-PLY
-    # build. The window covers SAM3-finish, SAM3D subprocess, and the
-    # depth-back-projection PLY assembly — all of which compete with
-    # gzserver for CPU/GPU. The atexit guard above unpauses if we die
-    # in this stretch; the try/finally below covers normal raises.
+    # build. The window covers SAM3D subprocess and the depth-back-
+    # projection PLY assembly — both compete with gzserver for CPU/GPU.
     pause_gazebo_physics(sub)
     try:
-        if not sam3_slot["finished"]:
-            print("[live] waiting for SAM3 to finish...", flush=True)
-            sam3_thread.join()
-        if sam3_slot["error"] is not None:
-            raise sam3_slot["error"]
-        sam3_objects = sam3_slot["objects"] or []
-        if not sam3_objects:
-            raise RuntimeError("SAM3 found 0 objects — adjust the prompt and retry")
-        print(f"[live] SAM3: found {len(sam3_objects)} graspable masks "
-              f"({sam3_slot['duration']:.1f}s)", flush=True)
         # Persist the measured SAM3 duration to a sidecar JSON. The
         # pipeline reads this in ``_run_sam3_and_sam3d_generation`` and
         # re-injects it into ``self._timing["S0.1_sam3_segmentation"]``
-        # so the timing report shows the real subprocess wall-clock,
-        # not the pipeline's near-zero cached-check.
+        # so the timing report shows the real subprocess wall-clock.
         live_timings_path = artifact_dir / "live_sam3_timings.json"
         live_timings_path.write_text(json.dumps({
-            "S0.1_sam3_segmentation": float(sam3_slot["duration"]),
+            "S0.1_sam3_segmentation": float(sam3_duration),
         }, indent=2) + "\n")
 
         gc.collect()
@@ -525,20 +549,36 @@ def run_live_capture_session() -> Path:
             print(f"[live] SAM3D obj {i}: {'ok' if r else 'failed'}", flush=True)
         print(f"[live] SAM3D done: {n_ok}/{len(sam3_objects)} objects ready", flush=True)
 
-        print(f"[live] building init PLY from {n_static} static views...", flush=True)
-        sub.build_static_init_pointcloud()
-        # Refine the just-written naive concat seed with ICP + TSDF fusion.
-        # Same output path (transforms.json's ply_file_path), same world
-        # frame -- Splatfacto's load_3D_points=True picks it up unchanged
-        # and gets a denoised, real-RGB, adaptive-density cloud instead of
-        # the ~N-times-overlaid naive back-projection.
+        # Sweep window: recording is still running. Let the operator
+        # sweep additional views of the scene to give the static
+        # optimiser more coverage. Press Enter to end the sweep.
+        print("[live] SAM3D complete — sweep the scene to capture more views.\n"
+              "       press ENTER when done capturing static views.", flush=True)
+        _prompt_user("")
+        sub.stop_recording()
+        n_static = sub.num_recorded_frames()
+        print(f"[live] recording stopped after {n_static} keyframes", flush=True)
+
+        # Concurrent ICP+TSDF fusion has been running on a worker thread
+        # since `start_recording`; here we just drain the tail + run
+        # `finalize()` (~0.6 s) and the seed PLY lands at
+        # `<static>/depth_camera_init_points.ply` with transforms.json
+        # `ply_file_path` updated. Replaces the legacy
+        # `build_static_init_pointcloud` (naive back-projection) +
+        # `rgbd_fusion_init.build_tsdf_seed` (post-pass ICP+TSDF refine)
+        # — both passes are subsumed by the streaming runner.
         try:
-            from .rgbd_fusion_init import build_tsdf_seed
-            print("[live] refining init PLY via ICP + TSDF fusion...", flush=True)
-            build_tsdf_seed(LIVE_ROOT, force=True, verbose=True)
+            fusion_runner.stop_and_finalize()
         except Exception as exc:
-            print(f"[live] WARNING: ICP+TSDF refinement failed ({exc}); "
-                  f"falling back to the naive seed", flush=True)
+            print(f"[live] WARNING: concurrent fusion finalize failed ({exc}); "
+                  f"falling back to legacy naive seed + post-pass refine", flush=True)
+            sub.build_static_init_pointcloud()
+            try:
+                from .rgbd_fusion_init import build_tsdf_seed
+                build_tsdf_seed(LIVE_ROOT, force=True, verbose=True)
+            except Exception as exc2:
+                print(f"[live] WARNING: legacy fallback also failed ({exc2}); "
+                      f"seed will be naive only", flush=True)
     finally:
         # PCD build done (or aborted); resume the simulator before
         # static training starts.

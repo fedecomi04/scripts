@@ -59,7 +59,7 @@ StaticGS = MethodSpecification(
             "camera_opt":    {"optimizer": AdamOptimizerConfig(lr=1e-3,         eps=1e-15), "scheduler": None},
         },
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-        vis="tensorboard",
+        vis="tensorboard",  # keeps NS viewer OFF so our viser-direct owns port 8081; the tb-writer disk dump is suppressed by `_suppress_nerfstudio_output_writes` in dynamic_gs/__init__.py
     ),
     description="Static Gaussian Splatting + Phase 0a/0b fusion; writes post_fusion_state.pt for warm-restart into dynamic-gs / dynamic-gs-live.",
 )
@@ -120,7 +120,7 @@ DynamicGS = MethodSpecification(
         ),
         optimizers=_ZERO_LR_OPTIMIZERS,
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-        vis="tensorboard",
+        vis="tensorboard",  # keeps NS viewer OFF so our viser-direct owns port 8081; the tb-writer disk dump is suppressed by `_suppress_nerfstudio_output_writes` in dynamic_gs/__init__.py
     ),
     description="Recorded-mode dynamic-gs: warm-loads static-gs cache, runs XFeat tracker + feedforward decoder on a recorded dataset.",
 )
@@ -162,7 +162,7 @@ DynamicGSLive = MethodSpecification(
         ),
         optimizers=_ZERO_LR_OPTIMIZERS,
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-        vis="tensorboard",
+        vis="tensorboard",  # keeps NS viewer OFF so our viser-direct owns port 8081; the tb-writer disk dump is suppressed by `_suppress_nerfstudio_output_writes` in dynamic_gs/__init__.py
     ),
     description="Live-ROS dynamic-gs: warm-loads static-gs cache, runs XFeat tracker + feedforward decoder against a ROS-fed live SHM stream (publisher auto-spawned).",
 )

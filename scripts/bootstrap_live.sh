@@ -51,6 +51,12 @@ export LD_LIBRARY_PATH="$TRAIN_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 # the hardcoded LIVE_ROOT in dynamic_gs/utils/live_shm_reader.py).
 export DGS_LIVE_ROOT="$DATA_DIR"
 
+# Pass the SAM3 prompt via env so `run_live_capture_session` picks it
+# up without re-asking the user interactively. The same prompt is then
+# passed to the `static-gs` train command below so the pipeline's
+# cached SAM3 re-read uses the matching text.
+export DGS_SAM3_PROMPT="$SAM3_PROMPT"
+
 echo
 echo "============================================================"
 echo " bootstrap_live :: data_dir=$DATA_DIR"
@@ -66,7 +72,7 @@ echo
 "$PY" -u -c "
 import os
 from dynamic_gs.utils.live_session import run_live_capture_session
-out = run_live_capture_session()
+out = run_live_capture_session(sam3_prompt_text=os.environ.get('DGS_SAM3_PROMPT'))
 print(f'\n[bootstrap] capture session complete -> {out}', flush=True)
 "
 

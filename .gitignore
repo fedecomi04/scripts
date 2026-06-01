@@ -1,10 +1,38 @@
+# Python build artifacts
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+
+# Nerfstudio + our pipeline output dirs (we suppress writes but keep this
+# in case something slips through — see dynamic_gs/__init__.py)
 outputs/
-third_party/sam-3d-objects/
-third_party/AnySplat/
+
+# Third-party vendored code: huge, not authored here, install from upstream
+third_party/
+
+# Local checkpoints + IDE state
 checkpoints/
-outputs/feedforward/
+.codex
+.codex/
+
+# One-off visualization HTML / debug PNGs the user generated but didn't intend
+# to commit. Concrete tracked plots go elsewhere (e.g. inside the dataset dir).
+visualization/
+
+# Per-dataset run dirs end up under data_teleoperation/datasets/<name>/ which is
+# outside this repo, but in case anyone symlinks or copies a dataset into the
+# repo root, don't accidentally commit it.
+data_teleoperation/
+
+# Tooling (none currently kept committed)
+.idea/
+.vscode/
+
+# experiments/ — only commit the source .py files; outputs are local-only
+experiments/**/output/
+experiments/**/_*.log
+experiments/**/*.log
+experiments/**/_*.py
+experiments/**/_sam2_video_frames/
