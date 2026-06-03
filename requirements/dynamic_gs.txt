@@ -1,0 +1,42 @@
+# Main env — Python 3.12. Hosts all ns-train methods, XFeat tracker, Open3D
+# GPU TSDF, nerfstudio, gsplat. Build CUDA stack first.
+#
+# Setup (host has CUDA 12.8 toolkit installed):
+#   conda create -n dynamic_gs python=3.12 -y
+#   conda activate dynamic_gs
+#   pip install torch==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements/dynamic_gs.txt
+#   # Then install nerfstudio + this package editable:
+#   pip install -e third_party/nerfstudio
+#   pip install -e .
+
+# Splatting
+gsplat==1.4.0
+
+# Core deps
+nerfstudio==1.1.5
+numpy<3.0
+scipy>=1.17
+opencv-python>=4.10
+opencv-python-headless>=4.10
+pillow>=11.0
+kornia==0.7.2
+
+# Geometry / fusion
+open3d==0.19.0
+
+# Nerfstudio internal
+hydra-core==1.3.2
+omegaconf==2.3.0
+iopath==0.1.10
+tyro>=0.9
+tensorboard>=2.18
+
+# Viewer (Path A handle-based; pin to last 0.x for compatibility — see
+# project_viser_path_a_status memory; 1.x crashes the browser)
+viser==1.0.0
+
+# Misc
+trimesh>=4.0
+websockets>=15
+pyparsing>=3.0

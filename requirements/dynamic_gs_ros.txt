@@ -1,0 +1,16 @@
+# Subprocess env for the live ROS publisher — Python 3.8 to match ros-noetic.
+# Imports rospy from /opt/ros/noetic/lib/python3/dist-packages via
+# `source /opt/ros/noetic/setup.bash`. Set PYTHONNOUSERSITE=1 before
+# spawning to avoid user-local pyrender shadowing the env's.
+#
+# Setup:
+#   conda create -n dynamic_gs_ros python=3.8 -y
+#   conda activate dynamic_gs_ros
+#   pip install -r requirements/dynamic_gs_ros.txt
+#   # ROS itself must come from the system install (ros-noetic-desktop-full)
+
+numpy<2.0  # ros-noetic pkgs link against older numpy
+opencv-python
+pyrender>=0.1
+trimesh
+pyyaml

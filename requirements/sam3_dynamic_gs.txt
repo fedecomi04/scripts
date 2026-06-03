@@ -1,0 +1,25 @@
+# Subprocess env for SAM3 + Fast-SAM3D — Python 3.12, sm_120-native torch.
+# Invoked via `conda run -n sam3_dynamic_gs python ...` from the main env.
+#
+# Setup:
+#   conda create -n sam3_dynamic_gs python=3.12 -y
+#   conda activate sam3_dynamic_gs
+#   pip install torch==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements/sam3_dynamic_gs.txt
+#   pip install -e third_party/sam3
+#   # Optional (for the SAM3D Phase 0b path, only if using static-gs not preseg):
+#   pip install -r third_party/sam-3d-objects/requirements.inference.txt
+#   pip install -e third_party/sam-3d-objects
+
+numpy<3.0
+scipy
+opencv-python
+opencv-python-headless
+pillow
+torch  # pin via wheel-index command above
+torchvision
+hydra-core
+omegaconf
+
+# SAM3 / SAM2 video-predictor
+einops

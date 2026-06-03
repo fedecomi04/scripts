@@ -1,0 +1,8 @@
+# Subprocess env for AnySplat feedforward decoder — Python 3.12.
+# This env's deps come from third_party/AnySplat/requirements.txt verbatim;
+# included here as a thin entry point.
+#
+# Setup:
+#   conda create -n anysplat_dynamic_gs python=3.12 -y
+#   conda activate anysplat_dynamic_gs
+#   pip install -r third_party/AnySplat/requirements.txt
