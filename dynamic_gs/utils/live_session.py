@@ -46,6 +46,7 @@ from .live_shm_reader import (
 )
 from .sam3_segmentation import run_sam3_subprocess
 from .sam3d import run_sam3d_multi_object_subprocess, sam3d_pose_has_rotation
+from .sam_worker import SamWorkerClient
 
 INIT_CLOUD_NAME = "depth_camera_init_points.ply"
 
@@ -147,14 +148,14 @@ atexit.register(_atexit_unpause)
 
 # Hardcoded SAM3 defaults (kept here, not in the model config, because
 # the live workflow expects to override them via the user prompt).
-DEFAULT_SAM3_PROMPT = "the can of coke on the table"
+DEFAULT_SAM3_PROMPT = "oobject table"
 SAM3_CONDA_ENV = "sam3_dynamic_gs"
 SAM3_CANDIDATE_MIN_AREA_RATIO = 0.002
 SAM3_CANDIDATE_MAX_AREA_RATIO = 0.25
 SAM3_CANDIDATE_DEDUP_IOU = 0.6
 SAM3_CANDIDATE_MAX_OBJECTS = 8
 SAM3_CONFIDENCE_THRESHOLD = 0.3
-SAM3_MIN_SCORE = 0.44
+SAM3_MIN_SCORE = 0.2
 
 
 def _wipe_live_root() -> None:
@@ -382,8 +383,13 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
         sam3_text = DEFAULT_SAM3_PROMPT
 
     if _has_complete_recording_cache(LIVE_ROOT):
-        post_fusion_cache = LIVE_ROOT / "static_scene" / "post_fusion_state.pt"
-        tier = "Tier 2 (post-fusion state)" if post_fusion_cache.is_file() else "Tier 1 (SAM3+SAM3D only)"
+        # Prefer the new name; fall back to legacy post_fusion_state.pt.
+        post_fusion_cache = LIVE_ROOT / "static_scene" / "static_state.pt"
+        if not post_fusion_cache.is_file():
+            legacy = LIVE_ROOT / "static_scene" / "post_fusion_state.pt"
+            if legacy.is_file():
+                post_fusion_cache = legacy
+        tier = "Tier 2 (static-state cache)" if post_fusion_cache.is_file() else "Tier 1 (SAM3+SAM3D only)"
         print(
             f"\n==> [live] reusing cached recording + SAM3 + SAM3D from {LIVE_ROOT}\n"
             f"    cache level: {tier} — delete this folder to force a fresh recording.",
@@ -439,6 +445,37 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
     from .fusion_runner import ConcurrentFusionRunner
     fusion_runner = ConcurrentFusionRunner(static_dir, sub.intrinsics)
     fusion_runner.start()
+
+    # Spawn the persistent SAM3+SAM3D worker and kick off SAM3's 6 s weight
+    # load on a background thread. Capture wallclock is typically ≥30 s
+    # (operator-controlled), so by the time the operator centers the camera
+    # and hits Enter, SAM3 is already on the GPU. VRAM during capture is
+    # ~3 GB (TSDF integrate) + 4.5 GB (SAM3 resident) = 7.5 GB on 16 GB.
+    # Safe.
+    sam_worker: SamWorkerClient | None = None
+    _sam3_load_thread: threading.Thread | None = None
+    _sam3_load_err: dict = {"err": None, "seconds": 0.0}
+    try:
+        sam_worker = SamWorkerClient(conda_env=SAM3_CONDA_ENV)
+        print(f"[live] SAM worker spawned ({sam_worker.spawn_seconds:.2f}s)", flush=True)
+
+        def _bg_load_sam3() -> None:
+            try:
+                t0 = time.time()
+                sam_worker.load_sam3(confidence_threshold=SAM3_CONFIDENCE_THRESHOLD)
+                _sam3_load_err["seconds"] = time.time() - t0
+            except Exception as exc:
+                _sam3_load_err["err"] = exc
+
+        _sam3_load_thread = threading.Thread(
+            target=_bg_load_sam3, name="sam3_bg_load", daemon=True,
+        )
+        _sam3_load_thread.start()
+    except Exception as exc:
+        print(f"[live] WARNING: persistent SAM worker spawn failed ({exc}); "
+              f"falling back to per-call subprocess", flush=True)
+        sam_worker = None
+
     print("[live] recording started — move the arm toward the object of interest.\n"
           "       press ENTER when the camera is centered on it.", flush=True)
 
@@ -453,10 +490,31 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
     depth_path: Path = artifact_dir / "static0_full_depth_meters.tiff"
     intrinsics_path: Path = artifact_dir / "static0_full_intrinsics.json"
 
+    # M2: any exit path through this block (SAM3 abort, exception, success)
+    # must still call fusion_runner.stop_and_finalize so the user gets a seed
+    # PLY they can resume from. Set by SAM3-abort or any exception below.
+    _finalize_done = {"value": False}
+
+    def _finalize_safe(reason: str) -> None:
+        if _finalize_done["value"]:
+            return
+        _finalize_done["value"] = True
+        print(f"[live] finalizing fusion ({reason})...", flush=True)
+        try:
+            fusion_runner.stop_and_finalize()
+        except Exception as exc:
+            print(f"[live] WARNING: fusion finalize on '{reason}' failed: {exc}", flush=True)
+
     while True:
         reply = _prompt_user("").strip().lower()
         if reply in ("q", "quit", "abort"):
             sub.stop_recording()
+            if sam_worker is not None:
+                try:
+                    sam_worker.close()
+                except Exception:
+                    pass
+            _finalize_safe("SAM3-abort")
             raise RuntimeError("user aborted SAM3 retry loop")
 
         # Grab the latest streamed frame as the SAM3 anchor. We do NOT
@@ -478,22 +536,41 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
         print(f"[live] running SAM3 (blocking; prompt: {sam3_text!r})...", flush=True)
         t_sam3 = time.time()
         try:
-            sam3_objects = run_sam3_subprocess(
-                image_path=anchor_rgb_path,
-                text_prompt=sam3_text,
-                output_dir=debug_dir,
-                output_stem="static0",
-                sam3_conda_env=SAM3_CONDA_ENV,
-                min_area_ratio=SAM3_CANDIDATE_MIN_AREA_RATIO,
-                max_area_ratio=SAM3_CANDIDATE_MAX_AREA_RATIO,
-                dedup_iou=SAM3_CANDIDATE_DEDUP_IOU,
-                max_objects=SAM3_CANDIDATE_MAX_OBJECTS,
-                confidence_threshold=SAM3_CONFIDENCE_THRESHOLD,
-                min_score=SAM3_MIN_SCORE,
-            ) or []
+            if sam_worker is not None:
+                # Block on the background load (almost always already done
+                # by the time the user pressed Enter).
+                if _sam3_load_thread is not None and _sam3_load_thread.is_alive():
+                    _sam3_load_thread.join()
+                if _sam3_load_err["err"] is not None:
+                    raise _sam3_load_err["err"]
+                sam3_objects = sam_worker.sam3_infer(
+                    image_path=anchor_rgb_path,
+                    text_prompt=sam3_text,
+                    output_dir=debug_dir,
+                    output_stem="static0",
+                    min_area_ratio=SAM3_CANDIDATE_MIN_AREA_RATIO,
+                    max_area_ratio=SAM3_CANDIDATE_MAX_AREA_RATIO,
+                    dedup_iou=SAM3_CANDIDATE_DEDUP_IOU,
+                    max_objects=SAM3_CANDIDATE_MAX_OBJECTS,
+                    min_score=SAM3_MIN_SCORE,
+                ) or []
+            else:
+                sam3_objects = run_sam3_subprocess(
+                    image_path=anchor_rgb_path,
+                    text_prompt=sam3_text,
+                    output_dir=debug_dir,
+                    output_stem="static0",
+                    sam3_conda_env=SAM3_CONDA_ENV,
+                    min_area_ratio=SAM3_CANDIDATE_MIN_AREA_RATIO,
+                    max_area_ratio=SAM3_CANDIDATE_MAX_AREA_RATIO,
+                    dedup_iou=SAM3_CANDIDATE_DEDUP_IOU,
+                    max_objects=SAM3_CANDIDATE_MAX_OBJECTS,
+                    confidence_threshold=SAM3_CONFIDENCE_THRESHOLD,
+                    min_score=SAM3_MIN_SCORE,
+                ) or []
         except Exception as exc:
             sam3_objects = []
-            print(f"[live] SAM3 subprocess raised: {exc}", flush=True)
+            print(f"[live] SAM3 raised: {exc}", flush=True)
         sam3_duration = time.time() - t_sam3
 
         if sam3_objects:
@@ -523,27 +600,77 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        print("[live] running SAM3D (background, ~100s for ~4 objects)", flush=True)
-        sam3d_thread, sam3d_slot = _spawn_sam3d_in_thread(
-            anchor_rgb_path=anchor_rgb_path,
-            sam3_objects=sam3_objects,
-            artifact_dir=artifact_dir,
-            debug_dir=debug_dir,
-            depth_path=depth_path,
-            intrinsics_path=intrinsics_path,
-        )
+        # Swap SAM3 out and SAM3D in. SAM3 (4.5 GB) + SAM3D (13.2 GB) =
+        # 17.7 GB → exceeds 16 GB. So we unload SAM3 first.
+        if sam_worker is not None:
+            try:
+                sam_worker.unload_sam3()
+                print("[live] SAM3 unloaded from worker", flush=True)
+            except Exception as exc:
+                print(f"[live] WARNING: SAM3 unload failed: {exc}", flush=True)
 
-        # Static training cannot share the GPU with SAM3D, so we block here.
-        last_log = time.time()
-        while not sam3d_slot["finished"]:
-            sam3d_thread.join(timeout=5.0)
-            if not sam3d_slot["finished"] and (time.time() - last_log) >= 5.0:
-                print("[live] still waiting for SAM3D...", flush=True)
+        print(f"[live] running SAM3D on {len(sam3_objects)} object(s)", flush=True)
+        sam3d_results: list = [{} for _ in sam3_objects]
+        try:
+            if sam_worker is not None:
+                t_load = time.time()
+                sam_worker.load_sam3d()
+                print(f"[live] SAM3D model loaded ({time.time()-t_load:.1f}s)", flush=True)
+                t_infer = time.time()
+                worker_results = sam_worker.sam3d_infer(
+                    render_image_path=anchor_rgb_path,
+                    object_mask_paths=[Path(obj["mask_path"]) for obj in sam3_objects],
+                    output_stems=[f"static0_obj_{i:02d}_sam3d" for i in range(len(sam3_objects))],
+                    output_dir=artifact_dir,
+                    image_dir=debug_dir,
+                    max_side=518,
+                    depth_path=depth_path,
+                    intrinsics_path=intrinsics_path,
+                )
+                print(f"[live] SAM3D inference {time.time()-t_infer:.1f}s "
+                      f"({len(worker_results)} masks)", flush=True)
+                # Reconstruct the downstream-compatible per-object dict shape:
+                # {ply_path, pose_path, preview_path, ...} when ok, else {}.
+                from .sam3d import get_sam3d_output_paths, resolve_sam3d_pose_path
+                for i, r in enumerate(worker_results):
+                    if not isinstance(r, dict) or r.get("status") != "ok":
+                        sam3d_results[i] = {}
+                        continue
+                    stem = f"static0_obj_{i:02d}_sam3d"
+                    paths = get_sam3d_output_paths(artifact_dir, stem, image_dir=debug_dir)
+                    resolved = resolve_sam3d_pose_path(paths["ply_path"], paths["pose_path"])
+                    if paths["ply_path"].exists() and sam3d_pose_has_rotation(resolved):
+                        if resolved is not None:
+                            paths["pose_path"] = resolved
+                        sam3d_results[i] = paths
+                    else:
+                        sam3d_results[i] = {}
+                # SAM3D fully done — unload before TSDF finalize's 12.3 GB peak.
+                try:
+                    sam_worker.unload_sam3d()
+                except Exception as exc:
+                    print(f"[live] WARNING: SAM3D unload failed: {exc}", flush=True)
+            else:
+                sam3d_thread, sam3d_slot = _spawn_sam3d_in_thread(
+                    anchor_rgb_path=anchor_rgb_path,
+                    sam3_objects=sam3_objects,
+                    artifact_dir=artifact_dir,
+                    debug_dir=debug_dir,
+                    depth_path=depth_path,
+                    intrinsics_path=intrinsics_path,
+                )
                 last_log = time.time()
-        if sam3d_slot["error"] is not None:
-            raise sam3d_slot["error"]
-
-        sam3d_results = sam3d_slot["results"] or [{} for _ in sam3_objects]
+                while not sam3d_slot["finished"]:
+                    sam3d_thread.join(timeout=5.0)
+                    if not sam3d_slot["finished"] and (time.time() - last_log) >= 5.0:
+                        print("[live] still waiting for SAM3D...", flush=True)
+                        last_log = time.time()
+                if sam3d_slot["error"] is not None:
+                    raise sam3d_slot["error"]
+                sam3d_results = sam3d_slot["results"] or [{} for _ in sam3_objects]
+        except Exception as exc:
+            print(f"[live] SAM3D failed: {exc}", flush=True)
+            sam3d_results = [{} for _ in sam3_objects]
         n_ok = sum(1 for r in sam3d_results if r)
         for i, r in enumerate(sam3d_results):
             print(f"[live] SAM3D obj {i}: {'ok' if r else 'failed'}", flush=True)
@@ -568,7 +695,7 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
         # `rgbd_fusion_init.build_tsdf_seed` (post-pass ICP+TSDF refine)
         # — both passes are subsumed by the streaming runner.
         try:
-            fusion_runner.stop_and_finalize()
+            _finalize_safe("happy-path")
         except Exception as exc:
             print(f"[live] WARNING: concurrent fusion finalize failed ({exc}); "
                   f"falling back to legacy naive seed + post-pass refine", flush=True)
@@ -580,6 +707,16 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
                 print(f"[live] WARNING: legacy fallback also failed ({exc2}); "
                       f"seed will be naive only", flush=True)
     finally:
+        # Close the persistent SAM worker BEFORE finalize_safe so its
+        # remaining VRAM (if any) is freed before TSDF's 12.3 GB peak.
+        if sam_worker is not None:
+            try:
+                sam_worker.close()
+            except Exception as exc:
+                print(f"[live] WARNING: SAM worker close failed: {exc}", flush=True)
+        # M2: even if SAM3D or the sweep failed, make sure we left a seed
+        # PLY so the user can resume from a static_scene that has one.
+        _finalize_safe("finally-block")
         # PCD build done (or aborted); resume the simulator before
         # static training starts.
         unpause_gazebo_physics(sub)

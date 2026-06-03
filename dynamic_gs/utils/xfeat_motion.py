@@ -350,19 +350,25 @@ class XFeatMotionEstimator:
         seed_mask_np = (
             self._mask_to_numpy(mask, rgb_t.shape[:2]) if mask is not None else None
         )
-        # Extract XFeat features on the FULL image (NOT pre-masked).
-        # Pre-masking by zeroing pixels outside the mask used to be the seed
-        # path here, but XFeat's descriptors include a local image patch
-        # around each keypoint. At the object boundary that patch would span
-        # half "real pixels" / half "zeros" — completely different from the
-        # per-tick descriptors at the same locations (which have "real
-        # background" in the same patch). LighterGlue then can't match seed
-        # vs per-tick descriptors and returns 0 correspondences (especially
-        # for small objects like a fidget spinner, where most keypoints are
-        # boundary keypoints). After extraction, _restrict_depth_valid_to_image_mask
-        # filters keypoints to those inside the seed mask, so the anchor's
-        # descriptor pool stays object-focused.
+        # D0 seed: extract XFeat keypoints on the FULL image, then keep only
+        # those that land inside the object mask. The descriptors stay clean
+        # (computed on the full image, same as per-tick descriptors), so
+        # LighterGlue matches them correctly without the boundary-descriptor
+        # corruption that a masked-image extract would introduce.
+        # `_restrict_depth_valid_to_image_mask` later applies depth-validity
+        # as a second filter.
         keypoints, descriptors, keypoints_gpu, image_size = self._extract(rgb_t)
+        if seed_mask_np is not None and seed_mask_np.any() and keypoints.shape[0] > 0:
+            H, W = rgb_t.shape[:2]
+            kp_xy_int = np.clip(keypoints.round().astype(np.int32), 0,
+                                np.array([W - 1, H - 1], dtype=np.int32))
+            mask_bool = seed_mask_np.astype(bool) if seed_mask_np.dtype != bool else seed_mask_np
+            inside_obj_mask = mask_bool[kp_xy_int[:, 1], kp_xy_int[:, 0]]
+            survivors = np.where(inside_obj_mask)[0]
+            if survivors.size >= self.min_track_points:
+                keypoints = keypoints[survivors]
+                descriptors = descriptors[torch.from_numpy(survivors).to(descriptors.device).long()]
+                keypoints_gpu = keypoints_gpu[torch.from_numpy(survivors).to(keypoints_gpu.device).long()]
         if keypoints.shape[0] < self.min_track_points:
             self.last_init_fast_point_count = int(keypoints.shape[0])
             self.last_init_sampled_count = int(keypoints.shape[0])

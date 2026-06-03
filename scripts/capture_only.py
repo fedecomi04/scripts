@@ -50,6 +50,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import sys
 import threading
 import time
@@ -168,14 +169,34 @@ def main() -> None:
         keyframe_rotation_deg=args.static_rotation_deg,
         wipe_live_root=True,
     )
-    sub.wait_for_first_frame(timeout_s=90.0)
-    print("[capture] ready!", flush=True)
+
+    # Make absolutely sure the publisher dies on any exit path — Ctrl-C,
+    # exception, normal return. Without this the orphaned publisher keeps
+    # subscribing to /camera_info and the NEXT run's publisher times out
+    # waiting for the first message.
+    def _shutdown(*_unused) -> None:
+        try:
+            sub.close()
+        except Exception:
+            pass
+    signal.signal(signal.SIGINT,  lambda *_: (_shutdown(), sys.exit(130)))
+    signal.signal(signal.SIGTERM, lambda *_: (_shutdown(), sys.exit(143)))
+
+    try:
+        sub.wait_for_first_frame(timeout_s=90.0)
+        print("[capture] ready!", flush=True)
+        _run_capture(sub, args, data_dir)
+    finally:
+        _shutdown()
+
+
+def _run_capture(sub, args, data_dir: Path) -> None:
+    intrinsics = sub.intrinsics
 
     # ------------------------------------------------------------------
     # STATIC phase — publisher dedup + concurrent fusion
     # ------------------------------------------------------------------
     static_dir = data_dir / "static_scene"
-    intrinsics = sub.intrinsics
 
     fusion_runner: ConcurrentFusionRunner | None = None
     if not args.no_fusion:

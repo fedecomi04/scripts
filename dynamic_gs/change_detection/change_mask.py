@@ -32,6 +32,24 @@ class ChangeMaskConfig:
     depth_threshold: float = 0.02
     rgb_threshold: float = 0.07
     use_rgb: bool = False
+    mode: str = "rgb"
+    scene_coverage_threshold: float = 0.5
+    outlier_median_multiplier: float = 10.0
+    """For ``mode='depth_outlier'``: error must exceed this × median to fire."""
+    outlier_min_threshold_m: float = 0.01
+    """For ``mode='depth_outlier'``: absolute error floor (m)."""
+    """Minimum rendered cumulative alpha for a pixel to be 'real scene'. Below
+    this, the rasterizer has no Gaussians covering the pixel and the rendered
+    depth falls back to ``depth_im.detach().max()`` (model.get_outputs line
+    2202), which makes CDN compare junk against the live sensor and fire on
+    every uncovered pixel — this manifests as a huge 'change' band above the
+    object on viewpoints where the camera looks beyond the warm-cache scene.
+    Pixels with ``accumulation < threshold`` are treated as 'don't know' and
+    AND'd out of valid_mask, so CDN never flags them. ``0.0`` disables this
+    gating."""
+    """CDN comparison mode for ``build_change_mask``: 'rgb' (MS-SSIM luminance)
+    or 'depth' (per-pixel |pred-gt| in metres). Mirrors
+    ``DynamicGSModelConfig.change_mask_mode``."""
     blur_kernel_size: int = 5
     blur_sigma: float = 1.0
     filter_radius: int = 1
@@ -82,6 +100,7 @@ def compute_change_mask(
     config: ChangeMaskConfig,
     downsample_factor: int = 1,
     keep_largest_only: bool = True,
+    rendered_alpha: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Render-vs-live change mask, excluding gripper + object regions.
 
@@ -113,6 +132,19 @@ def compute_change_mask(
             grip = grip[..., None]
         grip = _resize_mask_to(grip, target_h, target_w)
         valid_mask = grip * valid_mask if valid_mask is not None else grip
+
+    # Scene-coverage gate: pixels with rendered alpha below threshold are
+    # "uncovered" (the rasterizer fell back to depth_im.max() at line 2202 of
+    # dynamic_gs_model.py), so the depth comparison is junk there. AND them out
+    # of valid_mask so CDN never flags them.
+    cov_thr = float(getattr(config, "scene_coverage_threshold", 0.0))
+    if rendered_alpha is not None and cov_thr > 0.0:
+        cov = rendered_alpha.float().to(device)
+        if cov.ndim == 2:
+            cov = cov[..., None]
+        cov = _resize_mask_to(cov, target_h, target_w)
+        coverage_keep = (cov > cov_thr).float()
+        valid_mask = coverage_keep * valid_mask if valid_mask is not None else coverage_keep
 
     # Optional masked-avg-pool downsample of inputs. Invalid pixels (gripper,
     # object) contribute 0 to both numerator and denominator so the downsampled
@@ -179,6 +211,9 @@ def compute_change_mask(
         filter_radius=config.filter_radius,
         min_component_size=config.min_component_size,
         keep_largest_only=keep_largest_only,
+        mode=config.mode,
+        outlier_median_multiplier=config.outlier_median_multiplier,
+        outlier_min_threshold_m=config.outlier_min_threshold_m,
     )
 
     if ds > 1:

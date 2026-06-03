@@ -412,14 +412,41 @@ def _save_correspondence_plot(
     return out_path
 
 
+# Robust statistics — needed because back-projected SAM3 masks routinely include
+# a few depth-outlier pixels at the mask boundary (sensor noise / hole-fill drift).
+# On a real mug-sized mask, ONE 2.2 m outlier blows up the bbox 10× and the
+# centroid by tens of cm. Use the 5-95 percentile per axis to ignore the tails.
+_ROBUST_PCT_LOW = 5.0
+_ROBUST_PCT_HIGH = 95.0
+_ROBUST_MIN_POINTS = 50  # below this, fall back to plain mean / min-max
+
+
 def _centroid(points: np.ndarray) -> np.ndarray:
-    return points.mean(axis=0) if len(points) > 0 else np.zeros(3, dtype=np.float32)
+    if len(points) == 0:
+        return np.zeros(3, dtype=np.float32)
+    if len(points) < _ROBUST_MIN_POINTS:
+        return points.mean(axis=0)
+    # Trimmed centroid: mean of points whose per-axis values all fall inside the
+    # 5-95 percentile band. Equivalent to mean after rejecting outliers; preserves
+    # the "centre of the bulk" while ignoring isolated stragglers.
+    lo = np.percentile(points, _ROBUST_PCT_LOW, axis=0)
+    hi = np.percentile(points, _ROBUST_PCT_HIGH, axis=0)
+    inside = np.all((points >= lo) & (points <= hi), axis=1)
+    if int(inside.sum()) < _ROBUST_MIN_POINTS:
+        return points.mean(axis=0)
+    return points[inside].mean(axis=0)
 
 
 def _bbox_diagonal(points: np.ndarray) -> float:
     if len(points) == 0:
         return 1e-3
-    extents = points.max(axis=0) - points.min(axis=0)
+    if len(points) < _ROBUST_MIN_POINTS:
+        extents = points.max(axis=0) - points.min(axis=0)
+    else:
+        # Robust extent: 95th - 5th percentile per axis, ignoring tail outliers.
+        hi = np.percentile(points, _ROBUST_PCT_HIGH, axis=0)
+        lo = np.percentile(points, _ROBUST_PCT_LOW, axis=0)
+        extents = hi - lo
     return float(np.linalg.norm(extents).clip(min=1e-6))
 
 
@@ -624,29 +651,94 @@ def _run_icp_polish(
     max_corr_dist_mult: float = 2.0,
     iterations: int = 50,
 ) -> tuple[np.ndarray, dict]:
-    """Point-to-plane ICP polish. Source/target are pre-paired clouds in world coords;
-    init_T is the transform you'd apply to (un-pre-aligned) source to land near target.
+    """Point-to-plane ICP polish, scale-aware and guarded.
 
-    Returns (refined_T, meta). meta has fitness and inlier_rmse from Open3D.
+    ``src_pts``/``tgt_pts`` are the downsampled clouds; ``init_T`` is the full
+    similarity transform (scale + rotation + translation) mapping ``src_pts`` into
+    the target frame, as produced by the upstream TEASER/reproject stages.
+
+    Two robustness properties — both REQUIRED because the upstream transform
+    carries a non-unit scale and Open3D ICP only solves rigid SE(3):
+
+    1. Scale handling. Open3D point-to-plane ICP cannot estimate scale and silently
+       diverges when handed a scaled init (the rigid Jacobian is wrong in a scaled
+       frame). We therefore PRE-APPLY ``init_T`` to the source, then run ICP with an
+       identity init on the already-transformed cloud (a pure rigid residual at
+       unit scale), and compose: ``final = icp_rigid @ init_T``.
+    2. Improvement guard. We measure both correspondence fitness (inlier count
+       ratio) and inlier RMSE of ``init_T`` and of the ICP result at the same
+       threshold, and KEEP ICP only if it strictly increases the inlier count,
+       or ties the count without worsening RMSE. Because Open3D fitness ignores
+       RMSE, a count-only guard could accept a looser (higher-RMSE) fit that
+       merely grazes more points — the classic ICP-sliding mode on a symmetric /
+       low-texture object. The count+RMSE guard makes the stage never reduce
+       either overlap or fit tightness relative to its input.
+
+    Returns ``(final_T, meta)``. ``meta`` reports the pre/post fitness and which
+    transform was accepted so the timing report and smoke test can see the decision.
     """
     o3d = _require_open3d()
-    src = o3d.geometry.PointCloud()
-    src.points = o3d.utility.Vector3dVector(src_pts.astype(np.float64))
+    init_T = init_T.astype(np.float64)
+    max_corr = float(max_corr_dist_mult) * float(voxel_size)
+
     tgt = o3d.geometry.PointCloud()
     tgt.points = o3d.utility.Vector3dVector(tgt_pts.astype(np.float64))
     nrm = o3d.geometry.KDTreeSearchParamHybrid(radius=2.0 * voxel_size, max_nn=30)
-    src.estimate_normals(nrm)
     tgt.estimate_normals(nrm)
+
+    # Pre-apply the (possibly scaled) init to the source so ICP sees a unit-scale
+    # rigid residual. Build the cloud from the already-transformed points.
+    pre_aligned = _transform_points(src_pts, init_T.astype(np.float32)).astype(np.float64)
+    src = o3d.geometry.PointCloud()
+    src.points = o3d.utility.Vector3dVector(pre_aligned)
+    src.estimate_normals(nrm)
+
+    # Fitness of the init itself (identity transform on the pre-aligned cloud).
+    eval_init = o3d.pipelines.registration.evaluate_registration(
+        src, tgt, max_corr, np.eye(4, dtype=np.float64),
+    )
     icp = o3d.pipelines.registration.registration_icp(
         src, tgt,
-        max_correspondence_distance=max_corr_dist_mult * voxel_size,
-        init=init_T.astype(np.float64),
+        max_correspondence_distance=max_corr,
+        init=np.eye(4, dtype=np.float64),
         estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
         criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=iterations),
     )
-    return np.asarray(icp.transformation, dtype=np.float32), {
-        "fitness": float(icp.fitness),
-        "inlier_rmse": float(icp.inlier_rmse),
+
+    init_fitness = float(eval_init.fitness)
+    icp_fitness = float(icp.fitness)
+    init_rmse = float(eval_init.inlier_rmse)
+    icp_rmse = float(icp.inlier_rmse)
+    # Acceptance guard. Open3D fitness = (#inliers within max_corr) / (#source
+    # points) and does NOT account for inlier_rmse, so a count-only guard can
+    # accept a pose that grazes MORE points at a LOOSER (higher-RMSE) fit — the
+    # classic ICP-sliding-on-a-symmetric-surface mode. To honour the documented
+    # "never worse than input" invariant we require ICP to either strictly
+    # increase the inlier count, OR tie the count (fitness is quantized to 1/N
+    # on the small downsampled clouds, so ties are common) without worsening
+    # RMSE. icp_fitness > 0 also rejects the divergence-to-zero case.
+    accepted = icp_fitness > 0.0 and (
+        icp_fitness > init_fitness
+        or (icp_fitness >= init_fitness and icp_rmse <= init_rmse)
+    )
+    if accepted:
+        final_T = (np.asarray(icp.transformation, dtype=np.float64) @ init_T).astype(np.float32)
+        reported_fitness = icp_fitness
+        reported_rmse = icp_rmse
+    else:
+        # ICP did not help (or diverged); fall back to the upstream transform.
+        final_T = init_T.astype(np.float32)
+        reported_fitness = init_fitness
+        reported_rmse = init_rmse
+
+    return final_T, {
+        "fitness": reported_fitness,
+        "inlier_rmse": reported_rmse,
+        "init_fitness": init_fitness,
+        "icp_fitness": icp_fitness,
+        "init_rmse": init_rmse,
+        "icp_rmse": icp_rmse,
+        "accepted": bool(accepted),
         "max_corr_dist_mult": float(max_corr_dist_mult),
         "iterations": int(iterations),
     }
@@ -1073,8 +1165,15 @@ def register_and_fuse_sam3d_object(
     # --- TIMING: D0.3b3 similarity refinement (backend = "cpd" probreg CPD, or "teaser" color-aware FPFH + TEASER++) ---
     _t = time.time()
     similarity_transform = np.eye(4, dtype=np.float32)
+    # The reproject + ICP stages are TEASER-only; left None for the CPD path so
+    # the timing dict reports them as not-run.
+    reproject_meta = None
+    icp_meta = None
+    t_reproject = 0.0
+    t_icp = 0.0
     if registration_backend == "teaser":
         tp = teaser_params or {}
+        # --- Stage 1: FPFH + mutual-NN + TEASER ---
         similarity_transform, similarity_correspondence_count, refinement_meta = _run_teaser_similarity_refinement(
             source_down_points,
             source_down_colors,
@@ -1086,12 +1185,47 @@ def register_and_fuse_sam3d_object(
             max_correspondences=int(tp.get("max_correspondences", 5000)),
             normal_radius_mult=float(tp.get("normal_radius_mult", 2.0)),
             feature_radius_mult=float(tp.get("feature_radius_mult", 5.0)),
-            color_weight=float(tp.get("color_weight", 0.3)),
-            fpfh_max_nn=int(tp.get("fpfh_max_nn", 100)),
+            color_weight=float(tp.get("color_weight", 0.0)),
+            fpfh_max_nn=int(tp.get("fpfh_max_nn", 500)),
             normal_max_nn=int(tp.get("normal_max_nn", 30)),
             ratio_thresh=tp.get("ratio_thresh", None),
+            multi_scale_radii=tp.get("multi_scale_radii", None),
+            normal_filter_deg=tp.get("normal_filter_deg", None),
         )
         refinement_meta_key = "D0.3b3_teaser_meta"
+        t_cpd_refinement = time.time() - _t
+
+        # --- Stage 2: Euclidean-NN reproject + TEASER (composes onto similarity_transform).
+        # This stage and ICP both operate on the SAME downsampled clouds and
+        # thread the transform, mirroring scripts/run_teaser_registration_only.py
+        # exactly. Each helper returns gracefully (empty meta) if teaserpp/open3d
+        # is missing or too few correspondences survive, in which case the
+        # transform passes through unchanged. ---
+        if bool(tp.get("enable_reproject", True)):
+            _tr = time.time()
+            similarity_transform, _reproj_n, reproject_meta = _run_teaser_reproject_refinement(
+                source_down_points,
+                target_down_points,
+                similarity_transform,
+                voxel_size,
+                noise_bound=float(tp.get("reproject_noise_bound", 0.005)),
+                max_corr_dist_mult=float(tp.get("reproject_max_corr_mult", 3.0)),
+                max_correspondences=int(tp.get("max_correspondences", 5000)),
+            )
+            t_reproject = time.time() - _tr
+
+        # --- Stage 3: point-to-plane ICP polish (composes onto similarity_transform) ---
+        if bool(tp.get("enable_post_icp", True)):
+            _ti = time.time()
+            similarity_transform, icp_meta = _run_icp_polish(
+                source_down_points,
+                target_down_points,
+                similarity_transform,
+                voxel_size,
+                max_corr_dist_mult=float(tp.get("post_icp_max_corr_mult", 2.0)),
+                iterations=int(tp.get("post_icp_iterations", 50)),
+            )
+            t_icp = time.time() - _ti
     elif registration_backend == "cpd":
         similarity_transform, similarity_correspondence_count, refinement_meta = _run_probreg_similarity_refinement(
             source_down_points,
@@ -1102,11 +1236,11 @@ def register_and_fuse_sam3d_object(
             voxel_size,
         )
         refinement_meta_key = "D0.3b3_cpd_meta"
+        t_cpd_refinement = time.time() - _t
     else:
         raise ValueError(
             f"Unknown SAM3D registration backend: {registration_backend!r}. Expected 'cpd' or 'teaser'."
         )
-    t_cpd_refinement = time.time() - _t
 
     # --- TIMING: D0.3b4 explicit correspondence building (KD-tree per-point search) ---
     _t = time.time()
@@ -1197,6 +1331,10 @@ def register_and_fuse_sam3d_object(
             "D0.3b3_refinement": t_cpd_refinement,
             "D0.3b3_backend": registration_backend,
             refinement_meta_key: refinement_meta,
+            "D0.3b3_reproject": t_reproject,
+            "D0.3b3_reproject_meta": reproject_meta,
+            "D0.3b3_icp": t_icp,
+            "D0.3b3_icp_meta": icp_meta,
             "D0.3b4_correspondences": t_correspondences,
             "D0.3b5_dedup": t_dedup,
             "D0.3b6_plot_and_save": t_plot_and_save,

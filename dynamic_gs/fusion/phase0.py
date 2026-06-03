@@ -689,6 +689,14 @@ def run_phase0b_fusion(
                 "normal_radius_mult": model.config.sam3d_teaser_fpfh_normal_radius_mult,
                 "feature_radius_mult": model.config.sam3d_teaser_fpfh_feature_radius_mult,
                 "color_weight": model.config.sam3d_teaser_color_weight,
+                "fpfh_max_nn": model.config.sam3d_teaser_fpfh_max_nn,
+                "normal_max_nn": model.config.sam3d_teaser_normal_max_nn,
+                "enable_reproject": model.config.sam3d_teaser_enable_reproject,
+                "reproject_max_corr_mult": model.config.sam3d_teaser_reproject_max_corr_mult,
+                "reproject_noise_bound": model.config.sam3d_teaser_reproject_noise_bound,
+                "enable_post_icp": model.config.sam3d_teaser_enable_post_icp,
+                "post_icp_max_corr_mult": model.config.sam3d_teaser_post_icp_max_corr_mult,
+                "post_icp_iterations": model.config.sam3d_teaser_post_icp_iterations,
             },
         )
         print(
@@ -696,6 +704,34 @@ def run_phase0b_fusion(
             f"(kept {insertion_result.kept_point_count} pts)",
             flush=True,
         )
+        # Surface the TEASER multi-stage breakdown (the generic timing report
+        # only records the S0.3 per-object total; the per-stage detail lives in
+        # insertion_result.timing and is otherwise dropped on the Phase-0b path).
+        if backend == "teaser":
+            _it = insertion_result.timing or {}
+            _tm = _it.get("D0.3b3_teaser_meta") or {}
+            _rm = _it.get("D0.3b3_reproject_meta")
+            _im = _it.get("D0.3b3_icp_meta")
+            _parts = [
+                f"fpfh_corr={_tm.get('fpfh_correspondences', '?')} "
+                f"used={_tm.get('used_correspondences', '?')} "
+                f"scale={_tm.get('scale', float('nan')):.3f} "
+                f"({_it.get('D0.3b3_refinement', 0.0):.2f}s)"
+            ]
+            if _rm is not None:
+                _parts.append(
+                    f"reproject geom_corr={_rm.get('geom_correspondences', '?')} "
+                    f"used={_rm.get('used_correspondences', '?')} "
+                    f"delta_scale={_rm.get('delta_scale', float('nan')):.3f} "
+                    f"({_it.get('D0.3b3_reproject', 0.0):.2f}s)"
+                )
+            if _im is not None:
+                _parts.append(
+                    f"icp fitness={_im.get('fitness', float('nan')):.3f} "
+                    f"rmse={_im.get('inlier_rmse', float('nan')) * 1000.0:.2f}mm "
+                    f"({_it.get('D0.3b3_icp', 0.0):.2f}s)"
+                )
+            print(f"    [phase-0b] TEASER stages: " + " | ".join(_parts), flush=True)
 
         # Cull / flag tunables — see legacy pipeline comments for what
         # each one does. Bumping CULL_STRENGTH or TAU_FLOOR_M removes more

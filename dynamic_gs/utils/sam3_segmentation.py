@@ -74,7 +74,7 @@ def run_sam3_segmentation(
     dedup_iou: float = 0.6,
     max_objects: int = 8,
     confidence_threshold: float = 0.3,
-    min_score: float = 0.44,
+    min_score: float = 0.2,
 ) -> List[Dict]:
     """Run SAM3 text-prompted segmentation and return filtered object masks.
 

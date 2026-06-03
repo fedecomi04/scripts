@@ -12,6 +12,12 @@ OFFICIAL_FILTER_CLOSE_RADIUS = 10
 OFFICIAL_FILTER_OPEN_RADIUS = 3
 OFFICIAL_FILTER_MIN_AREA = 760
 
+# Default per-pixel absolute depth-difference threshold (metres) for the
+# depth-only CDN mode of `build_change_mask`. 2 cm matches the sensor depth
+# noise floor at ~1 m range — pixels exceeding this are genuinely different
+# geometry, not just noise.
+OFFICIAL_DEPTH_DIFF_THRESHOLD_M = 0.02
+
 
 def _to_hw1(mask):
     if mask.ndim == 2:
@@ -328,6 +334,123 @@ def _rgb_msssim_score(pred_rgb, gt_rgb, valid_mask=None, blur_kernel_size=5, blu
     return total
 
 
+def _depth_diff_score(pred_depth, gt_depth, valid_mask=None, blur_kernel_size=5, blur_sigma=1.0):
+    """Per-pixel absolute depth difference in metres.
+
+    Mirrors ``_rgb_msssim_score``'s interface so it slots into the same
+    threshold + cleanup pipeline. Both inputs may be (H, W) or (H, W, 1).
+    Result is (H, W) float metres.
+
+    The Gaussian blur is **mask-weighted via** ``_gaussian_blur_image`` — pixels
+    where ``valid_mask`` is 0 (gripper, robot, tracked object) do NOT contribute
+    to the blurred value of their neighbours, so the gripper's depth
+    discontinuity cannot bleed across the silhouette into adjacent keep-region
+    pixels. This matches what ``_rgb_msssim_score`` already does for RGB.
+
+    Zero-depth pixels (sensor dropouts) get a zero score regardless of mask;
+    the threshold step then re-applies ``valid_mask`` for the final binary.
+    """
+    def _squeeze(d):
+        if d.ndim == 3:
+            d = d[..., 0]
+        return d.float()
+
+    p = _squeeze(pred_depth)
+    g = _squeeze(gt_depth)
+
+    region_mask = None
+    if valid_mask is not None:
+        region_mask = _to_hw1(valid_mask)[..., 0] > 0.5
+
+    if blur_kernel_size and blur_kernel_size > 1:
+        p = _gaussian_blur_image(
+            p, kernel_size=blur_kernel_size, sigma=blur_sigma, valid_mask=region_mask
+        )
+        g = _gaussian_blur_image(
+            g, kernel_size=blur_kernel_size, sigma=blur_sigma, valid_mask=region_mask
+        )
+        if p.ndim == 3:
+            p = p[..., 0]
+        if g.ndim == 3:
+            g = g[..., 0]
+
+    valid_pix = (p > 1e-4) & (g > 1e-4)
+    diff = (p - g).abs()
+    diff = torch.where(valid_pix, diff, torch.zeros_like(diff))
+    return diff
+
+
+def _depth_outlier_score(
+    pred_depth,
+    gt_depth,
+    valid_mask=None,
+    blur_kernel_size=5,
+    blur_sigma=1.0,
+    median_multiplier: float = 10.0,
+    min_threshold_m: float = 0.01,
+):
+    """Robust depth-outlier score, BIDIRECTIONAL (both ``pred > gt`` and
+    ``pred < gt`` fire — we want CDN to catch both "new object in front" and
+    "object moved away leaving a stale splat behind").
+
+    Inspired by GaME (https://github.com/VladimirYugay/GaME,
+    ``src/entities/game.py:_add_gaussians`` lines 574-575):
+
+        depth_error > 40 * depth_error.median()
+
+    GaME uses a one-sided gate (``rendered > sensor``) because they have a
+    separate ``_remove_gaussians`` path for the opposite case. Our pipeline's
+    FF dispatcher handles both via cull-in-front + insert, so we DROP the
+    one-sided gate and fire on absolute error symmetrically.
+
+    The ``median_multiplier`` factor (10× by default — lower than GaME's 40
+    because our ICP-refined poses keep drift below ~5 mm, and we want to
+    detect small-but-real object motion that 40× would miss). It's
+    self-calibrating: whatever median pose-drift / sensor-noise the frame
+    inherently has becomes the baseline, only outliers fire.
+
+    A ``min_threshold_m`` floor (default 1 cm) prevents an extremely
+    noise-free frame (median ≈ 0) from firing on every microscopic
+    discrepancy.
+
+    Returns a float score in [0, +inf): zero where the pixel is NOT a depth
+    outlier, ``|err|`` where it IS. The downstream ``_threshold_mask``
+    thresholds at 0. Caller passes ``depth_threshold=0.0``.
+    """
+    def _squeeze(d):
+        if d.ndim == 3:
+            d = d[..., 0]
+        return d.float()
+
+    p = _squeeze(pred_depth)
+    g = _squeeze(gt_depth)
+
+    region_mask = None
+    if valid_mask is not None:
+        region_mask = _to_hw1(valid_mask)[..., 0] > 0.5
+
+    if blur_kernel_size and blur_kernel_size > 1:
+        p = _gaussian_blur_image(p, kernel_size=blur_kernel_size, sigma=blur_sigma, valid_mask=region_mask)
+        g = _gaussian_blur_image(g, kernel_size=blur_kernel_size, sigma=blur_sigma, valid_mask=region_mask)
+        if p.ndim == 3:
+            p = p[..., 0]
+        if g.ndim == 3:
+            g = g[..., 0]
+
+    valid_pix = (p > 1e-4) & (g > 1e-4)
+    err = (p - g).abs()
+    err = torch.where(valid_pix, err, torch.zeros_like(err))
+    if region_mask is not None:
+        valid_pix = valid_pix & region_mask.to(valid_pix.device)
+    if int(valid_pix.sum()) > 0:
+        med = float(err[valid_pix].median().item())
+    else:
+        med = 0.0
+    outlier_thr = max(float(median_multiplier) * med, float(min_threshold_m))
+    outlier = valid_pix & (err > outlier_thr)
+    return torch.where(outlier, err, torch.zeros_like(err))
+
+
 def _threshold_mask(score, valid_mask, threshold):
     mask = torch.isfinite(score) & (score > threshold)
     if valid_mask is not None:
@@ -367,33 +490,70 @@ def build_change_mask(
     filter_radius=1,
     min_component_size=64,
     keep_largest_only=True,
+    mode="rgb",
+    outlier_median_multiplier=10.0,
+    outlier_min_threshold_m=0.01,
 ):
     """Build the dynamic-gs change mask.
 
-    Uses the RGB MS-SSIM dissimilarity score, thresholds it at ``rgb_threshold``
-    (falls back to ``OFFICIAL_RGB_MSSSIM_THRESHOLD`` = 0.30 when caller passes
-    ``None``), applies the cleanup recipe (c10_o3_a760), then re-applies the
-    dataset image mask from ``batch["mask"]`` as the safety constraint.
+    ``mode="rgb"`` (default): RGB MS-SSIM dissimilarity score, thresholded at
+    ``rgb_threshold`` (falls back to ``OFFICIAL_RGB_MSSSIM_THRESHOLD``).
+    ``mode="depth"``: per-pixel absolute depth diff (metres), thresholded at
+    ``depth_threshold`` (default 2 cm, see ``OFFICIAL_DEPTH_DIFF_THRESHOLD_M``).
+    In both modes the cleanup recipe (c10_o3_a760) and ``valid_mask`` re-apply
+    the same way.
     """
-    del pred_depth, gt_depth, depth_threshold, use_rgb, filter_radius, min_component_size
+    del use_rgb, filter_radius, min_component_size
 
-    if pred_rgb is None or gt_rgb is None:
-        raise ValueError("dynamic-gs change mask requires both pred_rgb and gt_rgb.")
-
-    threshold = (
-        OFFICIAL_RGB_MSSSIM_THRESHOLD if rgb_threshold is None else float(rgb_threshold)
-    )
-    basic_mask = _threshold_mask(
-        _rgb_msssim_score(
+    if mode == "rgb":
+        if pred_rgb is None or gt_rgb is None:
+            raise ValueError("mode='rgb' requires both pred_rgb and gt_rgb.")
+        threshold = (
+            OFFICIAL_RGB_MSSSIM_THRESHOLD if rgb_threshold is None else float(rgb_threshold)
+        )
+        score = _rgb_msssim_score(
             pred_rgb,
             gt_rgb,
             valid_mask=valid_mask,
             blur_kernel_size=blur_kernel_size,
             blur_sigma=blur_sigma,
-        ),
-        valid_mask=valid_mask,
-        threshold=threshold,
-    )
+        )
+    elif mode == "depth":
+        if pred_depth is None or gt_depth is None:
+            raise ValueError("mode='depth' requires both pred_depth and gt_depth.")
+        threshold = (
+            OFFICIAL_DEPTH_DIFF_THRESHOLD_M if depth_threshold is None else float(depth_threshold)
+        )
+        score = _depth_diff_score(
+            pred_depth,
+            gt_depth,
+            valid_mask=valid_mask,
+            blur_kernel_size=blur_kernel_size,
+            blur_sigma=blur_sigma,
+        )
+    elif mode == "depth_outlier":
+        # Robust outlier-based score: self-calibrates against per-frame median
+        # depth error, so bulk pose drift / sensor noise is absorbed and only
+        # statistical outliers fire. Threshold is 0 (any positive score is an
+        # outlier; the gating is inside _depth_outlier_score). Ported from
+        # GaME (https://github.com/VladimirYugay/GaME, src/entities/game.py
+        # lines 574-575: depth_error > 40 * depth_error.median()).
+        if pred_depth is None or gt_depth is None:
+            raise ValueError("mode='depth_outlier' requires both pred_depth and gt_depth.")
+        threshold = 0.0
+        score = _depth_outlier_score(
+            pred_depth,
+            gt_depth,
+            valid_mask=valid_mask,
+            blur_kernel_size=blur_kernel_size,
+            blur_sigma=blur_sigma,
+            median_multiplier=float(outlier_median_multiplier),
+            min_threshold_m=float(outlier_min_threshold_m),
+        )
+    else:
+        raise ValueError(f"build_change_mask: unknown mode '{mode}' (expected 'rgb' / 'depth' / 'depth_outlier')")
+
+    basic_mask = _threshold_mask(score, valid_mask=valid_mask, threshold=threshold)
     filtered_mask = _apply_cleanup_recipe(
         basic_mask,
         valid_mask=valid_mask,

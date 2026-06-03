@@ -1,8 +1,15 @@
-"""Post-fusion model snapshot save/load (warm-cache between sessions).
+"""Static-scene snapshot save/load (warm-cache between sessions).
 
-The snapshot is written at the static→dynamic transition (after Phase 0b
-fuses SAM3D objects into the scene). On a subsequent run, loading it skips
-static training + Phase 0b entirely and jumps straight to dynamic.
+The snapshot is written at the static→dynamic transition (after either
+Phase 0b in ``static-gs`` or the seed-labeled-and-trained pass in
+``static-gs-preseg``). On a subsequent run, loading it skips static
+training entirely and jumps straight to dynamic.
+
+Default filename is ``static_state.pt``; the legacy name
+``post_fusion_state.pt`` (produced by older static-gs runs) is read as a
+fallback by ``load_post_fusion_state`` so existing datasets still warm-start
+cleanly. Function names keep the ``post_fusion`` prefix to preserve the
+public API used by external dump/merge scripts.
 
 Module is intentionally pure-model: it does NOT touch pipeline-level state
 (``_sam3d_inserted``, ``_static_converged_step``, ``_step_offset``, ...).
@@ -32,11 +39,16 @@ class PostFusionLoadResult:
     error: Optional[str] = None
 
 
-def save_post_fusion_state(model, cache_path: Path) -> bool:
-    """Snapshot the post-fusion model so a future run can warm-start.
+_LEGACY_CACHE_NAME = "post_fusion_state.pt"
 
-    Writes ``model.state_dict()`` + ``num_points`` to ``cache_path``.
-    Returns True on success.
+
+def save_post_fusion_state(model, cache_path: Path) -> bool:
+    """Snapshot the trained static model so a future run can warm-start.
+
+    Writes ``model.state_dict()`` + ``num_points`` to ``cache_path``. The
+    default filename is ``static_state.pt`` (configured per-pipeline);
+    the function itself writes wherever ``cache_path`` points. Returns
+    True on success.
     """
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,13 +60,33 @@ def save_post_fusion_state(model, cache_path: Path) -> bool:
             cache_path,
         )
         CONSOLE.log(
-            f"[post-fusion-cache] saved {cache_path.name} "
+            f"[static-cache] saved {cache_path.name} "
             f"(N={int(model.num_points)} Gaussians)"
         )
         return True
     except Exception as exc:
-        CONSOLE.log(f"[post-fusion-cache] save failed: {exc}")
+        CONSOLE.log(f"[static-cache] save failed: {exc}")
         return False
+
+
+def _resolve_cache_path(cache_path: Path) -> Path:
+    """Backward-compat: if ``cache_path`` doesn't exist but a legacy
+    ``post_fusion_state.pt`` sits next to it, return the legacy path.
+    Otherwise return ``cache_path`` unchanged (the caller will see the
+    original FileNotFound). Eases the rename for users with existing
+    cached snapshots.
+    """
+    cache_path = Path(cache_path)
+    if cache_path.exists():
+        return cache_path
+    legacy = cache_path.with_name(_LEGACY_CACHE_NAME)
+    if legacy.exists() and legacy.name != cache_path.name:
+        CONSOLE.log(
+            f"[static-cache] {cache_path.name} missing; reading legacy "
+            f"{legacy.name} (rename it to {cache_path.name} to silence)."
+        )
+        return legacy
+    return cache_path
 
 
 def load_post_fusion_state(model, cache_path: Path, device) -> PostFusionLoadResult:
@@ -73,13 +105,14 @@ def load_post_fusion_state(model, cache_path: Path, device) -> PostFusionLoadRes
     or ``PostFusionLoadResult(success=False, error=...)`` on any failure.
     Callers should treat False as "fall back to standard static + fusion".
     """
+    cache_path = _resolve_cache_path(cache_path)
     try:
         blob = torch.load(cache_path, map_location=device)
         state_dict = blob["model_state_dict"]
         target_n = int(blob["num_points"])
     except Exception as exc:
         msg = f"could not read {cache_path.name}: {exc}"
-        CONSOLE.log(f"[post-fusion-cache] {msg}")
+        CONSOLE.log(f"[static-cache] {msg}")
         return PostFusionLoadResult(success=False, error=msg)
 
     means_device = model.means.device
@@ -89,7 +122,7 @@ def load_post_fusion_state(model, cache_path: Path, device) -> PostFusionLoadRes
             sd_key = f"gauss_params.{name}"
             if sd_key not in state_dict:
                 msg = f"missing {sd_key}; falling back to static+fusion"
-                CONSOLE.log(f"[post-fusion-cache] {msg}")
+                CONSOLE.log(f"[static-cache] {msg}")
                 return PostFusionLoadResult(success=False, error=msg)
             old_param = model.gauss_params[name]
             new_tensor = state_dict[sd_key].to(device=means_device, dtype=old_param.dtype)
@@ -110,11 +143,11 @@ def load_post_fusion_state(model, cache_path: Path, device) -> PostFusionLoadRes
             model.gauss_params["means"].register_hook(model._mask_means_grad)
     except Exception as exc:
         msg = f"state_dict load failed: {exc}"
-        CONSOLE.log(f"[post-fusion-cache] {msg}")
+        CONSOLE.log(f"[static-cache] {msg}")
         return PostFusionLoadResult(success=False, error=msg)
 
     CONSOLE.log(
-        f"[post-fusion-cache] loaded {cache_path.name} "
+        f"[static-cache] loaded {cache_path.name} "
         f"(N={target_n} Gaussians); skipping static + Phase 0b."
     )
     return PostFusionLoadResult(success=True, num_points=target_n)

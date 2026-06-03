@@ -14,7 +14,7 @@ What it does, end-to-end:
 
 3. ``AFTER_TRAIN`` callback  — runs Phase 0b (CPD / TEASER++ registration +
    ``insert_object_gaussians`` + instance-id propagation) on the trained
-   model, then writes ``<data_root>/static_scene/post_fusion_state.pt``.
+   model, then writes ``<data_root>/static_scene/static_state.pt``.
    The future ``dynamic-gs`` / ``dynamic-gs-live`` pipelines warm-start
    from that file via ``persistence.load_post_fusion_state``.
 
@@ -79,7 +79,7 @@ class StaticGSPipelineConfig(VanillaPipelineConfig):
     """Number of Splatfacto training iterations before Phase 0b runs.
     Matches the legacy ``DynamicGSPipelineConfig.static_num_steps``."""
 
-    post_fusion_cache_subpath: str = "static_scene/post_fusion_state.pt"
+    post_fusion_cache_subpath: str = "static_scene/static_state.pt"
     """Where to write the post-fusion model snapshot, relative to
     ``datamanager.data``. The future dynamic-gs pipeline warm-starts from
     this path via ``persistence.load_post_fusion_state``."""

@@ -22,3 +22,4 @@ include = ["dynamic_gs*"]
 dynamic-gs = "dynamic_gs.dynamic_gs_config:DynamicGS"
 dynamic-gs-live = "dynamic_gs.dynamic_gs_config:DynamicGSLive"
 static-gs = "dynamic_gs.dynamic_gs_config:StaticGS"
+static-gs-preseg = "dynamic_gs.dynamic_gs_config:StaticGSPreseg"

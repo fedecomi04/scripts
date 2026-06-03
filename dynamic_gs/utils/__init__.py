@@ -21,7 +21,6 @@ from .esam import (
 from .tracker_common import MotionEstimate as CoTrackerMotionEstimate
 from .keyframe_filter import DynamicKeyframeFilter
 from .no_refine_strategy import NoRefineStrategy
-from .optim_pool import OptimFrame, OptimPool
 from .rigid_regularization import rigid_or_static_loss
 from .sam3_segmentation import load_sam3_masks, run_sam3_subprocess
 from .sam3d import (
@@ -63,8 +62,6 @@ __all__ = [
     "load_sam3_masks",
     "masked_l1_depth_loss",
     "NoRefineStrategy",
-    "OptimFrame",
-    "OptimPool",
     "get_sam3d_output_paths",
     "load_sam3d_pose",
     "query_esam_mask",

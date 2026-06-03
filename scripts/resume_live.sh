@@ -17,11 +17,16 @@ if [[ -z "$DATA_DIR" ]]; then
 fi
 DATA_DIR="$(realpath -m "$DATA_DIR")"
 
-WARM_CACHE="$DATA_DIR/static_scene/post_fusion_state.pt"
+WARM_CACHE="$DATA_DIR/static_scene/static_state.pt"
 if [[ ! -f "$WARM_CACHE" ]]; then
-  echo "no warm cache at $WARM_CACHE" >&2
-  echo "run scripts/bootstrap_live.sh $DATA_DIR  first (or ns-train static-gs)" >&2
-  exit 1
+  LEGACY="$DATA_DIR/static_scene/post_fusion_state.pt"
+  if [[ -f "$LEGACY" ]]; then
+    WARM_CACHE="$LEGACY"
+  else
+    echo "no warm cache at $WARM_CACHE (or legacy $LEGACY)" >&2
+    echo "run scripts/bootstrap_live.sh $DATA_DIR  first (or ns-train static-gs[-preseg])" >&2
+    exit 1
+  fi
 fi
 
 CONDA_ROOT=/home/mrc-cuhk/miniconda3
@@ -34,6 +39,8 @@ export PATH="$TRAIN_PREFIX/bin:$PATH"
 export CONDA_DEFAULT_ENV="$TRAIN_ENV"
 export CONDA_PREFIX="$TRAIN_PREFIX"
 export LD_LIBRARY_PATH="$TRAIN_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export CUDA_HOME="$TRAIN_PREFIX"
+export CPATH="$TRAIN_PREFIX/targets/x86_64-linux/include:${CPATH:-}"
 export DGS_LIVE_ROOT="$DATA_DIR"
 
 echo

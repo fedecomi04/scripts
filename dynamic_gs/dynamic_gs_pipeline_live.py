@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import signal
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -114,6 +115,11 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         # do read `phase`).
         if hasattr(self.datamanager, "set_phase"):
             self.datamanager.set_phase("dynamic")
+        # ALSO switch the model into dynamic phase so _apply_phase_trainability
+        # keeps means.requires_grad=True (otherwise the static-phase branch
+        # would flip it to False and break register_hook on later FF inserts).
+        if hasattr(self.model, "set_phase"):
+            self.model.set_phase("dynamic")
         # Empty accepted-frames list: the FF anysplat path doesn't need
         # one in live mode (we override _resolve_anysplat_context_image_paths).
         self._accepted_dynamic_frames = []
@@ -147,6 +153,35 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         # (atexit is LIFO; the base's worker cleanup is already registered).
         atexit.register(self._cleanup_live_subscriber)
         atexit.register(self._cleanup_live_ff_dump)
+
+        # Explicit signal handlers: atexit doesn't fire reliably on SIGTERM,
+        # and on SIGINT it only fires if the main thread reaches normal
+        # interpreter shutdown — which it doesn't if Nerfstudio's trainer
+        # is mid-iteration in a background thread. Install handlers that
+        # explicitly drop the publisher subprocess, so the NEXT run doesn't
+        # find an orphan holding /camera_info subscriptions.
+        def _on_signal(signum, _frame) -> None:
+            CONSOLE.log(f"[dynamic-gs-live] signal {signum} received — closing publisher")
+            try:
+                self._cleanup_live_subscriber()
+            except Exception:
+                pass
+            try:
+                self._cleanup_live_ff_dump()
+            except Exception:
+                pass
+            # Re-raise to let the normal shutdown finish (KeyboardInterrupt
+            # for SIGINT, SystemExit for SIGTERM).
+            if signum == signal.SIGINT:
+                raise KeyboardInterrupt()
+            sys.exit(128 + signum)
+        try:
+            signal.signal(signal.SIGINT,  _on_signal)
+            signal.signal(signal.SIGTERM, _on_signal)
+        except ValueError:
+            # signal.signal only works from the main thread. If we're not
+            # on it, atexit + Nerfstudio's own handler are the fallback.
+            pass
 
     # ====================================================================
     # Cleanup hooks
@@ -385,7 +420,9 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
 
         if hasattr(self.model, "capture_reference_object_pose"):
             with self._viser_lock_ctx():
-                self.model.capture_reference_object_pose()
+                self.model.capture_reference_object_pose(
+                    instance_id=int(self._d0_selected_instance_id),
+                )
 
         live_rgb = self._build_tracking_rgb(batch)
         depth = batch.get("depth_image")
@@ -405,6 +442,7 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
             return None
         rendered_rgb = outputs.get("rgb")
         rendered_depth = outputs.get("depth")
+        rendered_alpha = outputs.get("accumulation")
         if rendered_rgb is None:
             return None
 
@@ -428,6 +466,7 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
                 gt_depth=gt_depth,
                 gripper_mask=gripper_mask,
                 object_mask=obj_mask,
+                rendered_alpha=rendered_alpha,
             )
             return cdn
         except Exception as exc:

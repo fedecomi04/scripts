@@ -108,11 +108,14 @@ class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
     model: DynamicGSModelConfig = field(default_factory=DynamicGSModelConfig)
 
     # ---- Cache load (required) ----
-    post_fusion_cache_subpath: str = "static_scene/post_fusion_state.pt"
-    """Where to look for the warm-start cache written by ``static-gs``,
-    relative to ``datamanager.data``. The pipeline raises ``FileNotFoundError``
-    on construction if the file is missing — the dynamic pipeline does NOT
-    do its own static training."""
+    post_fusion_cache_subpath: str = "static_scene/static_state.pt"
+    """Where to look for the warm-start cache written by ``static-gs`` or
+    ``static-gs-preseg``, relative to ``datamanager.data``. The pipeline
+    raises ``FileNotFoundError`` on construction if the file is missing —
+    the dynamic pipeline does NOT do its own static training.
+
+    Backward compat: the loader falls back to ``post_fusion_state.pt`` if
+    the configured path is missing, so existing snapshots still warm-start."""
 
     save_final_snapshot: bool = True
     """If True, write a final ``post_dynamic_state.pt`` snapshot at exit so
@@ -209,7 +212,38 @@ class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
     feedforward_anysplat_conda_env: str = "anysplat_dynamic_gs"
     feedforward_anysplat_worker_timeout_s: float = 300.0
     feedforward_anysplat_min_opacity: float = 0.05
-    feedforward_anysplat_scale_multiplier: float = 5.0
+    feedforward_anysplat_scale_multiplier: float = 2.0
+    """Multiplicative enlargement applied to the three per-axis scales of each
+    AnySplat gaussian after world-frame reprojection. The reproject step already
+    preserves image-space footprint; this is an additional bias toward bigger
+    splats. Default 2.0 (= splats twice as wide along each axis vs raw AnySplat)."""
+
+    feedforward_anysplat_min_visible_scene_points: int = 1000
+    """If the per-call frustum cull keeps fewer than this many scene Gaussians,
+    skip the entire FF call (no ICP, no AnySplat reproject, no insert). Triggers
+    when the camera turns away from the captured scene — in that regime AnySplat
+    would back-project whatever random surface the camera is now pointed at
+    into a region with no scene context, polluting the model with floaters that
+    have no spatial relation to the existing reconstruction. Set to 0 to disable."""
+    feedforward_anysplat_voxel_dedup_m: float = 0.002
+    """Voxel size (metres) for the NEAR dedup pass (points within
+    ``feedforward_anysplat_dedup_near_radius_m`` of the current camera position).
+    ``0.0`` disables BOTH near and far dedup. Defaults to 2 mm to match the
+    static-phase TSDF voxel."""
+    feedforward_anysplat_voxel_dedup_far_m: float = 0.010
+    """Voxel size (metres) for the FAR dedup pass (points beyond
+    ``feedforward_anysplat_dedup_near_radius_m``). Coarser than the near voxel
+    so distant background gets aggressively compressed. Default 1 cm."""
+    feedforward_anysplat_dedup_near_radius_m: float = 0.5
+    """Splits AnySplat output into NEAR (||xyz - cam|| <= radius) and FAR
+    (> radius). NEAR uses the fine voxel, FAR uses the coarse voxel."""
+    feedforward_anysplat_icp_refine: bool = True
+    """Run point-to-plane ICP on the scene_c2w pose against the visible subset of
+    the scene cloud before reprojecting AnySplat. Target is frustum-culled in
+    :meth:`_anysplat_bg_run` so ICP only sees points the camera could actually
+    observe — bounds cost AND avoids occluded-point bias."""
+    feedforward_anysplat_icp_max_iters: int = 30
+    feedforward_anysplat_icp_max_dist_m: float = 0.02
 
 
 # ============================================================================
@@ -320,6 +354,17 @@ class DynamicGSPipelineBase(VanillaPipeline):
             grad_scaler=grad_scaler,
         )
 
+        # Share the model lock with the model so its
+        # ``get_outputs_for_camera`` — which the Nerfstudio viewer's render
+        # thread calls — joins the same exclusion zone as the FF bg insert
+        # thread. Without this hook, the viser-direct lock-swap (line ~709)
+        # protects only the viser-direct path, not the NS viewer path; the
+        # NS viewer's render would still race mid-insert Parameter resizes
+        # and CUDA-assert. Must be AFTER super().__init__() because that's
+        # what builds ``self.model``.
+        if hasattr(self.model, "attach_render_lock"):
+            self.model.attach_render_lock(self._viser_lock_ctx)
+
         # Load the static-gs warm cache. This REPLACES the SfM seed
         # Gaussians with the post-fusion ones (~300k SfM + ~200k SAM3D
         # inserted), restores the four identity buffers, and skips the
@@ -343,14 +388,26 @@ class DynamicGSPipelineBase(VanillaPipeline):
     def _load_warm_cache_or_die(self) -> None:
         cache_path = Path(self.config.datamanager.data) / self.config.post_fusion_cache_subpath
         if not cache_path.is_file():
-            raise FileNotFoundError(
-                f"\n\n[dynamic-gs] Required warm-start cache not found:\n"
-                f"  {cache_path}\n\n"
-                f"The dynamic-gs pipeline is now a stage-2 trainer: it does NOT\n"
-                f"do its own static training. Run static-gs first to produce\n"
-                f"the post-fusion cache:\n\n"
-                f"  ns-train static-gs --data {self.config.datamanager.data}\n"
-            )
+            # Backward compat: accept the legacy filename written by older
+            # static-gs runs. (The loader itself already has this fallback,
+            # but the pre-flight existence check fires before the loader.)
+            legacy = cache_path.with_name("post_fusion_state.pt")
+            if legacy.is_file():
+                CONSOLE.log(
+                    f"[dynamic-gs] {cache_path.name} missing; using legacy "
+                    f"{legacy.name} (rename it to silence)."
+                )
+                cache_path = legacy
+            else:
+                raise FileNotFoundError(
+                    f"\n\n[dynamic-gs] Required warm-start cache not found:\n"
+                    f"  {cache_path}\n"
+                    f"  (also checked legacy name: {legacy})\n\n"
+                    f"The dynamic-gs pipeline is now a stage-2 trainer: it does NOT\n"
+                    f"do its own static training. Run a static method first:\n\n"
+                    f"  ns-train static-gs --data {self.config.datamanager.data}\n"
+                    f"  ns-train static-gs-preseg --data {self.config.datamanager.data}\n"
+                )
         result = load_post_fusion_state(self.model, cache_path, self.device)
         if not result.success:
             raise RuntimeError(
@@ -851,20 +908,31 @@ class DynamicGSPipelineBase(VanillaPipeline):
         object_mask,
         downsample_factor: int = 1,
         keep_largest_only: bool = True,
+        rendered_alpha=None,
     ):
         """Compute change mask between render and live, excluding gripper
         + object regions. Thin shim over ``change_detection.compute_change_mask``
-        that pulls thresholds + cleanup knobs from ``self.model.config``."""
+        that pulls thresholds + cleanup knobs from ``self.model.config``.
+
+        ``rendered_alpha`` is the rasterizer's cumulative-alpha map from
+        ``outputs['accumulation']``; below ``scene_coverage_threshold`` the
+        rendered depth is the max-fallback at uncovered pixels and CDN must
+        ignore those (otherwise the camera looking beyond the warm-cache
+        scene generates huge spurious 'change' bands above the object)."""
         mc = self.model.config
         cfg = ChangeMaskConfig(
             depth_threshold=mc.change_mask_depth_threshold,
             rgb_threshold=mc.change_mask_rgb_threshold,
             use_rgb=mc.change_mask_use_rgb,
+            mode=mc.change_mask_mode,
             blur_kernel_size=mc.change_mask_blur_kernel_size,
             blur_sigma=mc.change_mask_blur_sigma,
             filter_radius=mc.change_mask_filter_radius,
             min_component_size=mc.change_mask_min_component_size,
             dilate_radius=mc.active_mask_dilate_radius,
+            scene_coverage_threshold=float(getattr(mc, "change_mask_coverage_threshold", 0.5)),
+            outlier_median_multiplier=float(getattr(mc, "change_mask_outlier_median_multiplier", 10.0)),
+            outlier_min_threshold_m=float(getattr(mc, "change_mask_outlier_min_threshold_m", 0.01)),
         )
         return compute_change_mask(
             rendered_rgb=rendered_rgb,
@@ -876,6 +944,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
             config=cfg,
             downsample_factor=downsample_factor,
             keep_largest_only=keep_largest_only,
+            rendered_alpha=rendered_alpha,
         )
 
     # ====================================================================
@@ -1112,6 +1181,144 @@ class DynamicGSPipelineBase(VanillaPipeline):
     # ====================================================================
     # Feedforward dispatcher — rgbd_decode + anysplat_decode
     # ====================================================================
+
+    def _save_ff_debug_images(
+        self,
+        *,
+        call_id: int,
+        frame_idx: int,
+        camera,
+        cdn_raw,
+        cdn_clean,
+        prerendered_obj_mask,
+        target_frame,
+    ) -> None:
+        """Dump per-FF-call debug PNGs under <data>/dynamic_scene/_ff_debug/.
+
+        Files per call:
+            call_NNNN_frame_NNNNNN_rgb.png         live RGB (linear)
+            call_NNNN_frame_NNNNNN_depth.png       live depth, scaled 0-3 m → 0-255
+            call_NNNN_frame_NNNNNN_gripper.png    dataset mask (gripper=black, keep=white)
+            call_NNNN_frame_NNNNNN_objmask.png    render_object_mask (instance_id==d0 only)
+            call_NNNN_frame_NNNNNN_cdn_raw.png    CDN before object subtract
+            call_NNNN_frame_NNNNNN_cdn_clean.png  CDN after object subtract (== what FF sees)
+
+        Use these to verify:
+            * Is the object mask covering ONLY the tracked instance (no FF inserts)?
+            * Does the CDN still light up under the gripper (issue 1)?
+            * Is the gripper mask polarity what we think (black=0=gripper)?
+        """
+        from pathlib import Path as _Path
+        import cv2 as _cv2
+
+        try:
+            data_root = _Path(self.datamanager.config.data)
+        except Exception:
+            data_root = _Path("/tmp")
+        out_dir = data_root / "dynamic_scene" / "_ff_debug"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        stem = f"call_{call_id:04d}_frame_{frame_idx:06d}"
+
+        def _to_u8(t):
+            import numpy as _np
+            if t is None:
+                return None
+            if isinstance(t, torch.Tensor):
+                t = t.detach().cpu().float().numpy()
+            if t.ndim == 3 and t.shape[-1] == 1:
+                t = t[..., 0]
+            if t.ndim == 3 and t.shape[-1] == 3:
+                return (t.clip(0, 1) * 255).astype(_np.uint8)
+            t = t.astype("float32")
+            tmax = float(t.max()) if t.size else 1.0
+            if tmax <= 1.5:
+                return (t.clip(0, 1) * 255).astype("uint8")
+            return _np.clip(t, 0, 255).astype("uint8")
+
+        try:
+            batch = target_frame.get("batch") if isinstance(target_frame, dict) else None
+
+            # --- RGB ---
+            try:
+                rgb = batch.get("image") if batch is not None else None
+                if rgb is not None:
+                    # Probe one-time so we can see what dtype/range we're actually getting.
+                    if call_id == 0:
+                        try:
+                            _t = rgb.detach().cpu() if isinstance(rgb, torch.Tensor) else rgb
+                            import numpy as _np
+                            arr = _t.numpy() if isinstance(rgb, torch.Tensor) else _np.asarray(_t)
+                            CONSOLE.log(
+                                f"[ff-debug] batch['image'] shape={arr.shape} dtype={arr.dtype} "
+                                f"min={float(arr.min()):.4f} max={float(arr.max()):.4f} "
+                                f"mean={float(arr.mean()):.4f}"
+                            )
+                        except Exception as _exc:
+                            CONSOLE.log(f"[ff-debug] probe failed: {_exc}")
+                    # Convert: explicit per-dtype path, no heuristics.
+                    import numpy as _np
+                    if isinstance(rgb, torch.Tensor):
+                        arr = rgb.detach().cpu().numpy()
+                    else:
+                        arr = _np.asarray(rgb)
+                    if arr.dtype == _np.uint8:
+                        u8 = arr
+                    else:
+                        u8 = _np.clip(arr.astype(_np.float32) * 255.0, 0, 255).astype(_np.uint8)
+                    if u8.ndim == 3 and u8.shape[-1] == 4:
+                        u8 = u8[..., :3]
+                    if u8.ndim == 3 and u8.shape[-1] == 3:
+                        _cv2.imwrite(str(out_dir / f"{stem}_rgb.png"),
+                                     _cv2.cvtColor(u8, _cv2.COLOR_RGB2BGR))
+            except Exception:
+                pass
+
+            # --- Live depth (0..3m → 0..255) ---
+            try:
+                d = batch.get("depth_image") if batch is not None else None
+                if d is not None:
+                    if isinstance(d, torch.Tensor):
+                        d = d.detach().cpu().numpy()
+                    if d.ndim == 3 and d.shape[-1] == 1:
+                        d = d[..., 0]
+                    import numpy as _np
+                    d_vis = _np.clip(d.astype("float32") / 3.0 * 255.0, 0, 255).astype("uint8")
+                    _cv2.imwrite(str(out_dir / f"{stem}_depth.png"), d_vis)
+            except Exception:
+                pass
+
+            # --- Gripper / dataset mask (0=gripper, 255=keep) ---
+            try:
+                gm = batch.get("mask") if batch is not None else None
+                if gm is not None:
+                    gm_u8 = _to_u8(gm)
+                    if gm_u8 is not None:
+                        _cv2.imwrite(str(out_dir / f"{stem}_gripper.png"), gm_u8)
+            except Exception:
+                pass
+
+            # --- Object mask (render of instance_id==d0 only) ---
+            try:
+                if prerendered_obj_mask is not None:
+                    om = prerendered_obj_mask
+                else:
+                    om = self.model.render_object_mask(camera)
+                if om is not None:
+                    _cv2.imwrite(str(out_dir / f"{stem}_objmask.png"), _to_u8(om))
+            except Exception:
+                pass
+
+            # --- CDN raw + cleaned ---
+            try:
+                if cdn_raw is not None:
+                    _cv2.imwrite(str(out_dir / f"{stem}_cdn_raw.png"), _to_u8(cdn_raw))
+                if cdn_clean is not None:
+                    _cv2.imwrite(str(out_dir / f"{stem}_cdn_clean.png"), _to_u8(cdn_clean))
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _feedforward_clean_cdn(self, camera, cdn, frame_name: Optional[str] = None, prerendered_obj_mask=None):
         """Subtract the moving object's rendered Gaussian footprint from CDN.
@@ -1515,6 +1722,20 @@ class DynamicGSPipelineBase(VanillaPipeline):
         )
         self._timing["FF.1_cdn_clean"].append(time.time() - t0)
 
+        # --- Debug-image dump: per-call object_mask + CDN + gripper_mask ---
+        # Writes everything we need to see WHY the tracker is stuck and WHY the
+        # CDN may still include the gripper. Files land under
+        # <data>/dynamic_scene/_ff_debug/call_NNNN_frame_NNNNNN_*.png so they
+        # can be inspected side-by-side.
+        try:
+            self._save_ff_debug_images(
+                call_id=call_id, frame_idx=frame_idx, camera=camera,
+                cdn_raw=cdn, cdn_clean=cdn_clean,
+                prerendered_obj_mask=prerendered_obj_mask, target_frame=target_frame,
+            )
+        except Exception as exc:
+            CONSOLE.log(f"[ff-debug] dump failed call={call_id}: {exc}")
+
         t0 = time.time()
         if mode_label == "oneshot":
             components = select_top_n_components_filtered(
@@ -1603,7 +1824,11 @@ class DynamicGSPipelineBase(VanillaPipeline):
         component (~45 ms), then takes ``model_lock`` briefly to cull + insert.
         Always releases ``_anysplat_slot_lock`` on exit so the next FF call
         can dispatch."""
-        from .utils.anysplat_decode import reproject_anysplat_to_scene, run_anysplat_subprocess
+        from .utils.anysplat_decode import (
+            icp_refine_scene_c2w,
+            reproject_anysplat_to_scene,
+            run_anysplat_subprocess,
+        )
 
         t_call0          = args["t_call0"]
         call_id          = args["call_id"]
@@ -1665,8 +1890,72 @@ class DynamicGSPipelineBase(VanillaPipeline):
             self._timing["FF.3a.npz_load"].append(time.time() - t_load0)
             H_any, W_any = 448, 448
 
+            # --- Frustum-cull scene cloud + ICP-refine scene_c2w (ONCE per FF call, on GPU) ---
+            # The frustum cull and ICP are component-agnostic: align the whole visible
+            # sensor cloud against the whole visible scene cloud. Unchanged regions agree
+            # by definition and pull the pose toward the right answer; changed regions
+            # are too few to bias it.
+            scene_c2w_refined = scene_c2w_np
+            if self.config.feedforward_anysplat_icp_refine:
+                t_fc0 = time.time()
+                with self._viser_lock_ctx():
+                    means_all_t = self.model.gauss_params["means"].detach()  # (N, 3) on device
+                # GPU frustum cull
+                dev = means_all_t.device
+                c2w_t = torch.as_tensor(scene_c2w_np, dtype=means_all_t.dtype, device=dev)
+                R_sc_t = c2w_t[:3, :3]
+                t_sc_t = c2w_t[:3, 3]
+                p_cam_t = (means_all_t - t_sc_t) @ R_sc_t  # equiv to Rᵀ(p - t)
+                z_cam_t = p_cam_t[:, 2]
+                in_front_t = z_cam_t < -1e-3
+                safe_z_t = torch.where(in_front_t, -z_cam_t, torch.ones_like(z_cam_t))
+                fx_sc = float(scene_intr["fl_x"]); fy_sc = float(scene_intr["fl_y"])
+                cx_sc = float(scene_intr["cx"]);   cy_sc = float(scene_intr["cy"])
+                W_sc  = int(scene_intr["w"]);      H_sc  = int(scene_intr["h"])
+                u_t = fx_sc * (p_cam_t[:, 0] / safe_z_t) + cx_sc
+                v_t = fy_sc * (-p_cam_t[:, 1] / safe_z_t) + cy_sc
+                in_image_t = (u_t >= 0) & (u_t < W_sc) & (v_t >= 0) & (v_t < H_sc)
+                visible_t = in_front_t & in_image_t
+                target_xyz_t = means_all_t[visible_t]
+                self._timing["FF.3a.frustum_cull"].append(time.time() - t_fc0)
+
+                # Camera-away-from-scene guard: if too few scene gaussians are
+                # visible from the live camera, the AnySplat output would be
+                # placed in a region with no scene context. Skip the call.
+                n_visible = int(visible_t.sum().item())
+                min_visible = int(self.config.feedforward_anysplat_min_visible_scene_points)
+                if min_visible > 0 and n_visible < min_visible:
+                    CONSOLE.log(
+                        f"[anysplat] call={call_id} skipped: frustum kept "
+                        f"{n_visible}/{int(visible_t.shape[0])} < {min_visible} "
+                        f"(camera turned away from scene)"
+                    )
+                    return
+
+                # ICP runs in Open3D Tensor API on CUDA when available.
+                t_icp0 = time.time()
+                scene_c2w_refined, icp_info = icp_refine_scene_c2w(
+                    sensor_depth_m=sensor_depth_np, scene_c2w=scene_c2w_np,
+                    scene_intr=scene_intr,
+                    target_xyz_gpu=target_xyz_t,  # GPU tensor in
+                    max_iters=int(self.config.feedforward_anysplat_icp_max_iters),
+                    max_dist_m=float(self.config.feedforward_anysplat_icp_max_dist_m),
+                )
+                self._timing["FF.3a.icp_refine"].append(time.time() - t_icp0)
+                CONSOLE.log(
+                    f"[anysplat] call={call_id} frustum kept "
+                    f"{int(visible_t.sum().item())}/{int(visible_t.shape[0])}, "
+                    f"icp ran={icp_info.get('ran', False)} fitness={icp_info.get('fitness', float('nan')):.3f} "
+                    f"rmse={icp_info.get('inlier_rmse', float('nan')):.4f}m "
+                    f"(frustum {(time.time()-t_fc0)*1000-(time.time()-t_icp0)*1000:.1f} ms, "
+                    f"icp {(time.time()-t_icp0)*1000:.1f} ms)"
+                )
+
             total_inserted = 0
             total_culled = 0
+            # Per-component decoded blobs accumulate here so we can voxel-dedup ONCE
+            # across the union, on GPU, after the reprojection loop.
+            per_component_decoded: list[dict] = []
             for k, comp_mask in enumerate(components):
                 t0 = time.time()
                 comp_np = comp_mask.detach().cpu().numpy() if torch.is_tensor(comp_mask) else np.asarray(comp_mask)
@@ -1675,10 +1964,12 @@ class DynamicGSPipelineBase(VanillaPipeline):
                     opacity_logits=opacity_logits, features_dc=features_dc, features_rest=features_rest,
                     pred_c2w_0=pred_c2w_0, pred_K_norm=pred_K_norm,
                     pred_image_hw=(H_any, W_any),
-                    sensor_depth_m=sensor_depth_np, scene_c2w=scene_c2w_np,
+                    sensor_depth_m=sensor_depth_np, scene_c2w=scene_c2w_refined,
                     scene_intr=scene_intr,
                     opacity_min=float(self.config.feedforward_anysplat_min_opacity),
                     component_mask=comp_np,
+                    voxel_dedup_m=None,  # dedup is done ONCE across all components below
+                    scale_multiplier=float(self.config.feedforward_anysplat_scale_multiplier),
                 )
                 self._timing["FF.3b_anysplat_reproject"].append(time.time() - t0)
 
@@ -1698,20 +1989,99 @@ class DynamicGSPipelineBase(VanillaPipeline):
                 total_culled += int(n_culled)
                 self._timing["FF.4_crop_and_delete"].append(time.time() - t0)
 
-                t0 = time.time()
+                per_component_decoded.append(decoded)
+
+            # --- One union-wide voxel dedup on GPU, then one insert ---
+            if per_component_decoded:
+                t_dd0 = time.time()
+                # Concatenate all components into single GPU tensors. From_numpy
+                # + .to(self.device) handles the H2D copy in one fused call per key.
+                def _cat(key: str) -> torch.Tensor:
+                    return torch.cat(
+                        [torch.from_numpy(d[key]).to(self.device, non_blocking=True)
+                         for d in per_component_decoded],
+                        dim=0,
+                    )
+                xyz_g           = _cat("xyz")            # (N, 3)
+                features_dc_g   = _cat("features_dc")
+                features_rest_g = _cat("features_rest")
+                opacities_g     = _cat("opacities")
+                scales_g        = _cat("scales")
+                quats_g         = _cat("quats")
+
+                vdm_near = float(self.config.feedforward_anysplat_voxel_dedup_m)
+                vdm_far  = float(self.config.feedforward_anysplat_voxel_dedup_far_m)
+                near_r   = float(self.config.feedforward_anysplat_dedup_near_radius_m)
+
+                def _voxel_keep_idx(xyz_sub: torch.Tensor, vsize: float) -> torch.Tensor:
+                    """Per-voxel first-index keeper on GPU. Returns indices into xyz_sub."""
+                    if vsize <= 0.0 or xyz_sub.shape[0] == 0:
+                        return torch.arange(xyz_sub.shape[0], device=xyz_sub.device)
+                    cell = torch.floor(xyz_sub / vsize).to(torch.int64)
+                    OFF = 1 << 20  # ±1 km at 1 mm voxels, ±5 km at 5 mm
+                    key64 = ((cell[:, 0] + OFF) << 42) | ((cell[:, 1] + OFF) << 21) | (cell[:, 2] + OFF)
+                    sort_keys, sort_perm = torch.sort(key64, stable=True)
+                    first_mask = torch.ones_like(sort_keys, dtype=torch.bool)
+                    if sort_keys.numel() > 1:
+                        first_mask[1:] = sort_keys[1:] != sort_keys[:-1]
+                    keep = sort_perm[first_mask]
+                    keep, _ = torch.sort(keep)
+                    return keep
+
+                n_before = int(xyz_g.shape[0])
+                if (vdm_near > 0.0 or vdm_far > 0.0) and n_before > 0:
+                    # Split by distance to the (already-ICP-refined) camera centre.
+                    # scene_c2w_refined[:3,3] is the camera world position.
+                    cam_t = torch.as_tensor(scene_c2w_refined[:3, 3], device=xyz_g.device, dtype=xyz_g.dtype)
+                    d2 = ((xyz_g - cam_t[None, :]) ** 2).sum(dim=-1)
+                    is_near = d2 <= (near_r * near_r)
+
+                    near_idx_all = torch.nonzero(is_near, as_tuple=False).squeeze(-1)
+                    far_idx_all  = torch.nonzero(~is_near, as_tuple=False).squeeze(-1)
+
+                    near_keep_local = _voxel_keep_idx(xyz_g[near_idx_all], vdm_near)
+                    far_keep_local  = _voxel_keep_idx(xyz_g[far_idx_all],  vdm_far)
+                    keep_idx = torch.cat([near_idx_all[near_keep_local],
+                                          far_idx_all[far_keep_local]], dim=0)
+                    keep_idx, _ = torch.sort(keep_idx)
+
+                    n_near_in = int(near_idx_all.numel())
+                    n_far_in  = int(far_idx_all.numel())
+                    n_near_out = int(near_keep_local.numel())
+                    n_far_out  = int(far_keep_local.numel())
+
+                    xyz_g           = xyz_g[keep_idx]
+                    features_dc_g   = features_dc_g[keep_idx]
+                    features_rest_g = features_rest_g[keep_idx]
+                    opacities_g     = opacities_g[keep_idx]
+                    scales_g        = scales_g[keep_idx]
+                    quats_g         = quats_g[keep_idx]
+                    n_after = int(xyz_g.shape[0])
+                else:
+                    n_near_in = n_near_out = n_far_in = n_far_out = 0
+                    n_after = n_before
+                self._timing["FF.4b_voxel_dedup"].append(time.time() - t_dd0)
+
+                t_ins0 = time.time()
                 with self._viser_lock_ctx():
                     inserted_ids = self.model.insert_inpaint_gaussians(
-                        xyz=torch.from_numpy(decoded["xyz"]).to(self.device),
-                        features_dc=torch.from_numpy(decoded["features_dc"]).to(self.device),
-                        features_rest=torch.from_numpy(decoded["features_rest"]).to(self.device),
-                        opacities=torch.from_numpy(decoded["opacities"]).to(self.device),
-                        scales=torch.from_numpy(decoded["scales"]).to(self.device),
-                        quats=torch.from_numpy(decoded["quats"]).to(self.device),
+                        xyz=xyz_g,
+                        features_dc=features_dc_g,
+                        features_rest=features_rest_g,
+                        opacities=opacities_g,
+                        scales=scales_g,
+                        quats=quats_g,
                         instance_id=999,
                     )
-                self._timing["FF.5_insert"].append(time.time() - t0)
+                self._timing["FF.5_insert"].append(time.time() - t_ins0)
                 self._viser_direct_register_ff_insert(inserted_ids)
                 total_inserted += int(inserted_ids.numel())
+                CONSOLE.log(
+                    f"[anysplat] call={call_id} dedup {n_before}->{n_after} "
+                    f"(near {n_near_in}->{n_near_out} @ {vdm_near*1000:.1f} mm, "
+                    f"far {n_far_in}->{n_far_out} @ {vdm_far*1000:.1f} mm, "
+                    f"r={near_r:.2f} m, {(time.time()-t_dd0)*1000:.1f} ms gpu)"
+                )
 
             total_per_call = time.time() - t_call0
             self._timing["FF.6_total_per_call"].append(total_per_call)

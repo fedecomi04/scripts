@@ -42,12 +42,12 @@ import open3d as o3d
 # ----------------------------------------------------------------------------
 DATASET_DIR = (
     "/home/mrc-cuhk/Documents/dynamic_gaussian_splat/data_teleoperation/datasets/"
-    "dynamic_gs_test_2026-03-28_19-49-45_w_background/static_scene"
+    "new_env/static_scene"
 )
 OUTPUT_PLY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "online_seed.ply")
 
-TSDF_VOXEL_M = 0.0025        # 2.5 mm  -> dense, fits the 200-300 ms budget (0.002 for max density)
-TSDF_TRUNC_M = 0.010         # ~4 x voxel
+TSDF_VOXEL_M = 0.0015        # 1.5 mm  -> matches current pipeline (dynamic_gs/utils/online_fusion.py)
+TSDF_TRUNC_M = 0.006         # ~4 x voxel -> matches current pipeline
 DEPTH_SCALE = 1000.0         # uint16 mm -> m
 DEPTH_MIN_M, DEPTH_MAX_M = 0.05, 3.0
 
@@ -61,9 +61,16 @@ WITH_COLOR = True            # fuse real RGB (set False for geometry-only -> a b
 
 
 # ----------------------------------------------------------------------------
-# Online fusion engine (reusable: add_frame(...) per stream frame, finalize() at end)
+# Online fusion engine. Mirrors the CURRENT PIPELINE (dynamic_gs/utils/online_fusion.py):
+#   - GPU path: o3d.t.pipelines.slam.Model (VoxelBlockGrid TSDF) + multi_scale_icp on CUDA
+#   - CPU path: legacy ScalableTSDFVolume + registration_icp (fallback)
+#   - OnlineFusion auto-selects GPU when o3d.core.cuda.is_available();
+#     DGS_FUSION_DEVICE=cpu forces the fallback.
+# Same ICP stages / TSDF voxel / fitness gate / dedup as production.
 # ----------------------------------------------------------------------------
-class OnlineFusion:
+class _CpuOnlineFusion:
+    """Legacy ScalableTSDFVolume + registration_icp (CPU fallback)."""
+
     def __init__(self, fx, fy, cx, cy, W, H):
         self.fx, self.fy, self.cx, self.cy, self.W, self.H = fx, fy, cx, cy, W, H
         self.intr_o3d = o3d.camera.PinholeCameraIntrinsic(W, H, fx, fy, cx, cy)
@@ -75,10 +82,6 @@ class OnlineFusion:
         self._pend = []
         self.idx = 0
         self._dummy = o3d.geometry.Image(np.zeros((H, W, 3), np.uint8))
-
-    @staticmethod
-    def _cv_c2w(c2w_opengl):
-        return c2w_opengl @ np.diag([1.0, -1.0, -1.0, 1.0])
 
     def _src_cloud(self, depth_u16, c2w_cv):
         v = (depth_u16 > DEPTH_MIN_M * DEPTH_SCALE) & (depth_u16 < DEPTH_MAX_M * DEPTH_SCALE)
@@ -102,12 +105,9 @@ class OnlineFusion:
             depth_scale=DEPTH_SCALE, depth_trunc=DEPTH_MAX_M, convert_rgb_to_intensity=False)
         self.vol.integrate(rgbd, self.intr_o3d, np.linalg.inv(c2w_cv))
 
-    def add_frame(self, depth_u16, c2w_opengl, rgb_u8=None):
-        """Process one streamed frame. depth_u16: gripper already zeroed (uint16 mm).
-        Returns the ICP-refined camera-to-world (OpenCV convention)."""
-        c2w_cv = self._cv_c2w(np.asarray(c2w_opengl, np.float64))
+    def add_frame(self, depth_u16, c2w_cv, rgb_u8=None):
         src = self._src_cloud(depth_u16, c2w_cv)
-        if self.model is None:                                   # first frame anchors the world
+        if self.model is None:
             self.model = src
             self._integrate(depth_u16, rgb_u8, c2w_cv)
             self.idx += 1
@@ -132,6 +132,119 @@ class OnlineFusion:
 
     def finalize(self):
         return self.vol.extract_point_cloud()
+
+
+class _GpuOnlineFusion:
+    """GPU: o3d.t.pipelines.slam.Model (VoxelBlockGrid TSDF) + multi_scale_icp on CUDA.
+    Mirrors the CPU semantics frame-for-frame (same ICP stages, fitness gate, dedup)."""
+
+    def __init__(self, fx, fy, cx, cy, W, H):
+        import open3d.core as o3c
+        self.fx, self.fy, self.cx, self.cy, self.W, self.H = float(fx), float(fy), float(cx), float(cy), int(W), int(H)
+        self._dev = o3c.Device("CUDA:0")
+        self._intrinsic_t = o3c.Tensor([[self.fx, 0.0, self.cx], [0.0, self.fy, self.cy], [0.0, 0.0, 1.0]],
+                                       dtype=o3c.Dtype.Float64)
+        self._slam = o3d.t.pipelines.slam.Model(TSDF_VOXEL_M, 16, 8000,
+                                                o3c.Tensor(np.eye(4), o3c.Dtype.Float64), self._dev)
+        self._voxel_sizes = o3d.utility.DoubleVector([ICP_VOXEL_M * 2, ICP_VOXEL_M])
+        self._criteria = [o3d.t.pipelines.registration.ICPConvergenceCriteria(max_iteration=ICP_STAGES[0][1]),
+                          o3d.t.pipelines.registration.ICPConvergenceCriteria(max_iteration=ICP_STAGES[1][1])]
+        self._max_corr_dists = o3d.utility.DoubleVector([ICP_STAGES[0][0], ICP_STAGES[1][0]])
+        self._estim = o3d.t.pipelines.registration.TransformationEstimationPointToPlane()
+        self._model_pcd = None
+        self._pend = []
+        self.idx = 0
+
+    def _src_cloud(self, depth_u16, c2w_cv):
+        import open3d.core as o3c
+        depth_img = o3d.t.geometry.Image(o3c.Tensor(depth_u16.astype(np.uint16), device=self._dev))
+        pcd = o3d.t.geometry.PointCloud.create_from_depth_image(
+            depth=depth_img, intrinsics=self._intrinsic_t,
+            extrinsics=o3c.Tensor(np.linalg.inv(c2w_cv).astype(np.float64), o3c.Dtype.Float64),
+            depth_scale=DEPTH_SCALE, depth_max=DEPTH_MAX_M, stride=ICP_SRC_STRIDE)
+        pcd = pcd.voxel_down_sample(ICP_VOXEL_M)
+        pcd.estimate_normals(max_nn=30, radius=NORMAL_RADIUS_M)
+        return pcd
+
+    def _integrate(self, depth_u16, rgb_u8, c2w_cv):
+        import open3d.core as o3c
+        depth_img = o3d.t.geometry.Image(o3c.Tensor(depth_u16.astype(np.uint16), device=self._dev))
+        if WITH_COLOR and rgb_u8 is not None:
+            rgb_img = o3d.t.geometry.Image(o3c.Tensor(np.ascontiguousarray(rgb_u8), device=self._dev))
+        else:
+            rgb_img = o3d.t.geometry.Image(o3c.Tensor(np.zeros((self.H, self.W, 3), np.uint8), device=self._dev))
+        extr_t = o3c.Tensor(np.linalg.inv(c2w_cv), o3c.Dtype.Float64)
+        frustum = self._slam.voxel_grid.compute_unique_block_coordinates(
+            depth_img, self._intrinsic_t, extr_t, DEPTH_SCALE, DEPTH_MAX_M)
+        self._slam.voxel_grid.integrate(frustum, depth_img, rgb_img, self._intrinsic_t, self._intrinsic_t,
+                                        extr_t, DEPTH_SCALE, DEPTH_MAX_M)
+
+    def add_frame(self, depth_u16, c2w_cv, rgb_u8=None):
+        import open3d.core as o3c
+        src = self._src_cloud(depth_u16, c2w_cv)
+        if self._model_pcd is None:
+            self._model_pcd = src.clone()
+            self._integrate(depth_u16, rgb_u8, c2w_cv)
+            self.idx += 1
+            return c2w_cv
+        reg = o3d.t.pipelines.registration.multi_scale_icp(
+            source=src, target=self._model_pcd, voxel_sizes=self._voxel_sizes,
+            criteria_list=self._criteria, max_correspondence_distances=self._max_corr_dists,
+            init_source_to_target=o3c.Tensor(np.eye(4), o3c.Dtype.Float64), estimation_method=self._estim)
+        T = reg.transformation.cpu().numpy()
+        refined = T @ c2w_cv if float(reg.fitness) >= ICP_FITNESS_MIN else c2w_cv
+        self._integrate(depth_u16, rgb_u8, refined)
+        src.transform(o3c.Tensor((refined @ np.linalg.inv(c2w_cv)).astype(np.float64), o3c.Dtype.Float64))
+        self._pend.append(src)
+        self.idx += 1
+        if self.idx % MODEL_REFRESH_EVERY == 0:
+            for s in self._pend:
+                self._model_pcd = self._model_pcd.append(s)
+            self._model_pcd = self._model_pcd.voxel_down_sample(ICP_VOXEL_M)
+            self._model_pcd.estimate_normals(max_nn=30, radius=NORMAL_RADIUS_M)
+            self._pend = []
+        return refined
+
+    def finalize(self):
+        return self._slam.voxel_grid.extract_point_cloud().to_legacy()
+
+
+class OnlineFusion:
+    """Auto-selects GPU (Open3D tensor SLAM pipeline) when CUDA is available;
+    falls back to CPU. DGS_FUSION_DEVICE=cpu forces the CPU path."""
+
+    def __init__(self, fx, fy, cx, cy, W, H):
+        force = os.environ.get("DGS_FUSION_DEVICE", "auto").lower()
+        use_gpu = force == "gpu" or (force == "auto" and o3d.core.cuda.is_available())
+        if use_gpu:
+            try:
+                self._impl = _GpuOnlineFusion(fx, fy, cx, cy, W, H)
+                self.device = "gpu"
+            except Exception as exc:
+                if force == "gpu":
+                    raise
+                print(f"[OnlineFusion] GPU init failed ({exc}); CPU fallback", flush=True)
+                self._impl = _CpuOnlineFusion(fx, fy, cx, cy, W, H)
+                self.device = "cpu"
+        else:
+            self._impl = _CpuOnlineFusion(fx, fy, cx, cy, W, H)
+            self.device = "cpu"
+
+    @staticmethod
+    def _cv_c2w(c2w_opengl):
+        return np.asarray(c2w_opengl, np.float64) @ np.diag([1.0, -1.0, -1.0, 1.0])
+
+    @property
+    def idx(self):
+        return self._impl.idx
+
+    def add_frame(self, depth_u16, c2w_opengl, rgb_u8=None):
+        """Process one streamed frame. depth_u16: gripper already zeroed (uint16 mm).
+        Returns the ICP-refined camera-to-world (OpenCV convention)."""
+        return self._impl.add_frame(depth_u16, self._cv_c2w(c2w_opengl), rgb_u8)
+
+    def finalize(self):
+        return self._impl.finalize()
 
 
 # ----------------------------------------------------------------------------

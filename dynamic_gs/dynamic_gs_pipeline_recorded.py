@@ -85,9 +85,16 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
             world_size=world_size, local_rank=local_rank,
             grad_scaler=grad_scaler,
         )
-        # Switch datamanager to dynamic phase (so next_train pulls dynamic frames).
+        # Switch BOTH datamanager AND model to dynamic phase. The datamanager
+        # switch makes next_train pull dynamic frames; the model switch flips
+        # _apply_phase_trainability into its dynamic branch so means keeps
+        # requires_grad=True. Without the model switch, the static-phase
+        # branch fires and sets means.requires_grad=False, which breaks
+        # register_hook on the next insert_inpaint_gaussians call.
         if hasattr(self.datamanager, "set_phase"):
             self.datamanager.set_phase("dynamic")
+        if hasattr(self.model, "set_phase"):
+            self.model.set_phase("dynamic")
         n_dyn = self.datamanager.get_num_dynamic_frames() if hasattr(
             self.datamanager, "get_num_dynamic_frames"
         ) else 0
@@ -286,9 +293,13 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
             obj_mask = None
 
         # 4) Capture reference object pose so DN deltas apply from this baseline.
+        # Pass the picked instance id so _tracked_object_mask becomes a STRICT
+        # `instance_ids == d0_id` mask — survives FF inserts without count drift.
         if hasattr(self.model, "capture_reference_object_pose"):
             with self._viser_lock_ctx():
-                self.model.capture_reference_object_pose()
+                self.model.capture_reference_object_pose(
+                    instance_id=int(self._d0_selected_instance_id),
+                )
 
         # 5) Seed the XFeat motion estimator.
         live_rgb = self._build_tracking_rgb(batch)
@@ -308,6 +319,7 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
             return None
         rendered_rgb = outputs.get("rgb")
         rendered_depth = outputs.get("depth")
+        rendered_alpha = outputs.get("accumulation")
         if rendered_rgb is None:
             return None
 
@@ -331,6 +343,7 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
                 gt_depth=gt_depth,
                 gripper_mask=gripper_mask,
                 object_mask=obj_mask,
+                rendered_alpha=rendered_alpha,
             )
             return cdn
         except Exception as exc:

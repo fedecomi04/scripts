@@ -20,9 +20,9 @@ What's intentionally not here (vs ``DynamicGSModel``):
   — there is no dynamic phase.
 * ``_mask_means_grad`` and the scene-opt gradient hooks — no gradient
   masking, no per-Gaussian scene-opt gate.
-* ``current_active_mask``, ``scene_opt_active_mask``, ``change_mask_image``
-  (all ``persistent=False`` so they were never in the saved state_dict
-  anyway — dropping the registrations just removes attribute clutter).
+* ``current_active_mask``, ``change_mask_image`` (both ``persistent=False``
+  so they were never in the saved state_dict anyway — dropping the
+  registrations just removes attribute clutter).
 * ``render_object_mask``, ``apply_rigid_object_transform_from_reference``,
   ``capture_reference_object_pose``, ``prepare_dynamic_update``,
   ``initialize_object_from_sam3d``, ESAM lazy load, bilateral grid handling,
@@ -79,7 +79,7 @@ class StaticGSModelConfig(SplatfactoModelConfig):
     sam3_candidate_dedup_iou: float = 0.6
     sam3_candidate_max_objects: int = 8
     sam3_confidence_threshold: float = 0.3
-    sam3_min_score: float = 0.4
+    sam3_min_score: float = 0.2
     sam3_reuse_cached: bool = True
 
     # ---- Phase 0a (Fast-SAM3D 3D generation) + Phase 0b (registration) ----
@@ -87,13 +87,29 @@ class StaticGSModelConfig(SplatfactoModelConfig):
     reuse_sam3d_generated_ply: bool = True
     sam3d_registration_backend: Literal["cpd", "teaser"] = "cpd"
     """``cpd`` = legacy probreg coherent point drift (robust, slow).
-    ``teaser`` = color-aware FPFH + TEASER++ truncated-least-squares
-    (fast, outlier-robust; requires ``teaserpp_python``)."""
+    ``teaser`` = the "v13" 3-stage recipe (FPFH+TEASER -> Euclidean-NN reproject
+    +TEASER -> point-to-plane ICP). Fast, outlier-robust; requires
+    ``teaserpp_python``. Benchmarked to beat CPD on every metric at ~400x speed.
+    Keep this block byte-for-byte in sync with DynamicGSModelConfig — both feed
+    the same ``register_and_fuse_sam3d_object`` via run_phase0b_fusion(model)."""
     sam3d_teaser_noise_bound: float = 0.02
     sam3d_teaser_max_correspondences: int = 5000
     sam3d_teaser_fpfh_normal_radius_mult: float = 2.0
     sam3d_teaser_fpfh_feature_radius_mult: float = 5.0
-    sam3d_teaser_color_weight: float = 0.3
+    # 0.0: SAM3D-decoded colors disagree with the real-camera target; any color
+    # weight degraded matching in benchmarks.
+    sam3d_teaser_color_weight: float = 0.0
+    # fpfh_max_nn=500 unlocks v5+ quality (default 100 silently caps the radius).
+    sam3d_teaser_fpfh_max_nn: int = 500
+    sam3d_teaser_normal_max_nn: int = 30
+    # Stage 2 — Euclidean-NN reproject + TEASER (biggest single quality win).
+    sam3d_teaser_enable_reproject: bool = True
+    sam3d_teaser_reproject_max_corr_mult: float = 3.0
+    sam3d_teaser_reproject_noise_bound: float = 0.005
+    # Stage 3 — point-to-plane ICP polish.
+    sam3d_teaser_enable_post_icp: bool = True
+    sam3d_teaser_post_icp_max_corr_mult: float = 2.0
+    sam3d_teaser_post_icp_iterations: int = 50
 
     # ---- Change-mask knobs (for a future static-convergence early-exit;
     # not consumed yet — kept so the StaticGSModelConfig surface matches

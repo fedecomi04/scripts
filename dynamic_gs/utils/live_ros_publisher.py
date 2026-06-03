@@ -68,6 +68,7 @@ _IPC_OUT = os.fdopen(_IPC_FD, "w", buffering=1)
 
 import argparse
 import atexit
+import signal
 import importlib.util
 import json
 import shutil
@@ -374,15 +375,73 @@ class LivePublisher:
         if not rospy.core.is_initialized():
             rospy.init_node("dynamic_gs_live_pub", disable_signals=True, anonymous=True)
 
-        info_msg = rospy.wait_for_message(CAMERA_INFO_TOPIC, CameraInfo, timeout=10.0)
-        self.intrinsics = CameraIntrinsics(
-            width=int(info_msg.width),
-            height=int(info_msg.height),
-            fx=float(info_msg.K[0]),
-            fy=float(info_msg.K[4]),
-            cx=float(info_msg.K[2]),
-            cy=float(info_msg.K[5]),
-        )
+        # Try ROS first; if Gazebo's camera_info lazy-publish is stuck
+        # (happens after Ctrl-R world-reset or a subscriber crash), fall
+        # back to a cached intrinsics source. The fallback order:
+        #   1. <live_root>/static_scene/transforms.json
+        #   2. <live_root>/dynamic_scene/transforms.json
+        #   3. ~/.cache/dgs_camera_intrinsics.json  (sticky, written on
+        #      every successful resolve so a fresh dataset dir can still
+        #      bootstrap when Gazebo refuses to publish camera_info).
+        #   4. Any transforms.json under the standard datasets root.
+        import json as _json
+        _CACHE_PATH = Path.home() / ".cache" / "dgs_camera_intrinsics.json"
+        _DATASETS_ROOT = Path("/home/mrc-cuhk/Documents/dynamic_gaussian_splat/data_teleoperation/datasets")
+
+        def _write_cache(intr: CameraIntrinsics) -> None:
+            try:
+                _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                _CACHE_PATH.write_text(_json.dumps({
+                    "w": intr.width, "h": intr.height,
+                    "fl_x": intr.fx, "fl_y": intr.fy,
+                    "cx": intr.cx, "cy": intr.cy,
+                }, indent=2))
+            except Exception:
+                pass
+
+        try:
+            info_msg = rospy.wait_for_message(CAMERA_INFO_TOPIC, CameraInfo, timeout=5.0)
+            self.intrinsics = CameraIntrinsics(
+                width=int(info_msg.width),
+                height=int(info_msg.height),
+                fx=float(info_msg.K[0]),
+                fy=float(info_msg.K[4]),
+                cx=float(info_msg.K[2]),
+                cy=float(info_msg.K[5]),
+            )
+            _write_cache(self.intrinsics)  # refresh the sticky fallback
+        except rospy.ROSException:
+            # Build the ordered list of fallback candidates.
+            candidates = [
+                Path(live_root) / "static_scene" / "transforms.json",
+                Path(live_root) / "dynamic_scene" / "transforms.json",
+                _CACHE_PATH,
+            ]
+            # Then any transforms.json under the standard datasets root.
+            try:
+                candidates.extend(sorted(_DATASETS_ROOT.glob("*/static_scene/transforms.json")))
+                candidates.extend(sorted(_DATASETS_ROOT.glob("*/dynamic_scene/transforms.json")))
+            except Exception:
+                pass
+            tj = next((p for p in candidates if p.is_file()), None)
+            if tj is None:
+                raise
+            meta = _json.loads(tj.read_text())
+            self.intrinsics = CameraIntrinsics(
+                width=int(meta["w"]),
+                height=int(meta["h"]),
+                fx=float(meta["fl_x"]),
+                fy=float(meta["fl_y"]),
+                cx=float(meta["cx"]),
+                cy=float(meta["cy"]),
+            )
+            print(
+                f"[publisher] camera_info wait timed out — falling back to "
+                f"intrinsics from {tj} "
+                f"(w={self.intrinsics.width} h={self.intrinsics.height} "
+                f"fx={self.intrinsics.fx:.1f})",
+                flush=True,
+            )
 
         self.live_root = Path(live_root)
         self._joint_state_times_sec = []  # type: List[float]
@@ -415,6 +474,12 @@ class LivePublisher:
         self._record_dir = None        # type: Optional[Path]
         self._record_meta = None       # type: Optional[Dict]
         self._record_frames_written = []  # type: List[Dict]
+        # M3: track in-flight _write_frame_to_disk callbacks so stop_recording
+        # can quiesce them before returning. Without this, a callback that's
+        # already past the _record_active check may still be doing cv2.imwrite
+        # when stop_recording returns; the fusion watcher then misses that frame.
+        self._inflight_writes = 0
+        self._inflight_cv = threading.Condition(self._record_lock)
         self._record_keyframe_filter = _KeyframeFilter(
             translation_thresh_m=keyframe_translation_m,
             rotation_thresh_deg=keyframe_rotation_deg,
@@ -822,8 +887,29 @@ class LivePublisher:
         return 1
 
     def stop_recording(self) -> int:
+        """Flip recording off and wait for any in-flight writes to finish.
+
+        M3: returning before quiesce caused the fusion watcher's final sweep
+        to race against an in-progress _write_frame_to_disk, silently losing
+        the last keyframe. Now we block here (max 2 s) until callbacks past
+        the active-flag check complete their cv2.imwrite + transforms.json swap.
+        """
         with self._record_lock:
             self._record_active = False
+            written = len(self._record_frames_written)
+            deadline_s = 2.0
+            t0 = time.time()
+            while self._inflight_writes > 0:
+                if time.time() - t0 > deadline_s:
+                    rospy.logwarn(
+                        "[publisher] stop_recording: %d in-flight writes did not finish in %.1f s",
+                        self._inflight_writes, deadline_s,
+                    )
+                    break
+                self._inflight_cv.wait(timeout=0.05)
+            # The count after wait may include frames that landed JUST as we
+            # flipped active=False — those are still on disk + in transforms.json,
+            # which is correct; the fusion watcher will pick them up.
             return len(self._record_frames_written)
 
     def _write_frame_to_disk(self, frame: _StoredFrame, stamp) -> None:
@@ -833,31 +919,38 @@ class LivePublisher:
             record_dir = self._record_dir
             meta = self._record_meta
             frame_index = len(self._record_frames_written)
+            self._inflight_writes += 1
+        try:
+            stem = "{}_{:05d}".format(IMAGE_NAME_PREFIX, frame_index)
+            rgb_path = record_dir / "rgb" / "{}.png".format(stem)
+            # uint16 mm depth on disk (matches recorded-mode convention).
+            depth_path = record_dir / "depth" / "{}.tiff".format(stem)
+            mask_path = record_dir / "masks" / "{}.png".format(stem)
 
-        stem = "{}_{:05d}".format(IMAGE_NAME_PREFIX, frame_index)
-        rgb_path = record_dir / "rgb" / "{}.png".format(stem)
-        # uint16 mm depth on disk (matches recorded-mode convention).
-        depth_path = record_dir / "depth" / "{}.tiff".format(stem)
-        mask_path = record_dir / "masks" / "{}.png".format(stem)
+            cv2.imwrite(str(rgb_path), frame.rgb_bgr)
+            depth_mm_u16 = np.clip(frame.depth_m * 1000.0, 0.0, 65535.0).astype(np.uint16)
+            cv2.imwrite(str(depth_path), depth_mm_u16)
+            cv2.imwrite(str(mask_path), frame.mask_keep)
 
-        cv2.imwrite(str(rgb_path), frame.rgb_bgr)
-        depth_mm_u16 = np.clip(frame.depth_m * 1000.0, 0.0, 65535.0).astype(np.uint16)
-        cv2.imwrite(str(depth_path), depth_mm_u16)
-        cv2.imwrite(str(mask_path), frame.mask_keep)
-
-        frame_entry = {
-            "file_path": "./rgb/{}.png".format(stem),
-            "depth_file_path": "./depth/{}.tiff".format(stem),
-            "mask_path": "./masks/{}.png".format(stem),
-            "transform_matrix": frame.c2w_4x4.tolist(),
-        }
-        with self._record_lock:
-            self._record_frames_written.append(frame_entry)
-            meta["frames"] = self._record_frames_written
-            transforms_path = record_dir / "transforms.json"
-            tmp_path = transforms_path.with_name(".{}.tmp".format(transforms_path.name))
-            tmp_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-            os.replace(tmp_path, transforms_path)
+            frame_entry = {
+                "file_path": "./rgb/{}.png".format(stem),
+                "depth_file_path": "./depth/{}.tiff".format(stem),
+                "mask_path": "./masks/{}.png".format(stem),
+                "transform_matrix": frame.c2w_4x4.tolist(),
+            }
+            with self._record_lock:
+                self._record_frames_written.append(frame_entry)
+                meta["frames"] = self._record_frames_written
+                transforms_path = record_dir / "transforms.json"
+                tmp_path = transforms_path.with_name(".{}.tmp".format(transforms_path.name))
+                tmp_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+                os.replace(tmp_path, transforms_path)
+        finally:
+            # M3: decrement and notify so stop_recording's quiesce wakes.
+            with self._record_lock:
+                self._inflight_writes -= 1
+                if self._inflight_writes <= 0:
+                    self._inflight_cv.notify_all()
 
     def num_recorded_frames(self) -> int:
         with self._record_lock:
@@ -1045,6 +1138,17 @@ class LivePublisher:
             self._depth_sub.unregister()
         except Exception:
             pass
+        # Tell rosmaster to drop our node registration. Without this the
+        # node entry stays in `rosnode list` after we exit, and subsequent
+        # publisher subprocesses get unpredictable topic-wiring behaviour
+        # (e.g. "timeout waiting for /camera_info" on a topic that IS being
+        # published). rospy.signal_shutdown is idempotent + thread-safe.
+        try:
+            import rospy as _rospy
+            if not _rospy.is_shutdown():
+                _rospy.signal_shutdown("publisher.shutdown() called")
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1111,6 +1215,23 @@ def _main() -> int:
         except Exception:
             pass
     atexit.register(_atexit_shutdown)
+
+    # SIGINT/SIGTERM from the parent must drop the rospy node registration
+    # so the next publisher run doesn't fight with a zombie /camera_info
+    # subscriber entry in rosmaster. rospy was initialised with
+    # disable_signals=True, so we install our own minimal handler here.
+    def _on_signal(signum, _frame):
+        try:
+            pub.shutdown()
+        finally:
+            os._exit(128 + signum)
+    try:
+        signal.signal(signal.SIGINT,  _on_signal)
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGHUP,  _on_signal)
+    except (ValueError, AttributeError):
+        # signal.signal only works from the main thread; fall back to atexit.
+        pass
 
     for line in sys.stdin:
         line = line.strip()

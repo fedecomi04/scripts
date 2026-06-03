@@ -26,7 +26,6 @@ from .utils import (
     NoRefineStrategy,
     Sam3DInsertionResult,
     build_active_mask,
-    build_active_mask_center_only,
     build_change_mask,
     build_esam_ti,
     combine_object_masks,
@@ -75,10 +74,41 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     change_mask_depth_threshold: float = 0.02
     change_mask_rgb_threshold: float = 0.07
     change_mask_use_rgb: bool = False
+    change_mask_mode: str = "depth_outlier"
+    """CDN comparison mode:
+        'rgb'           — MS-SSIM on luminance
+        'depth'         — per-pixel |pred_depth - gt_depth| in metres,
+                          thresholded at change_mask_depth_threshold (fixed,
+                          NOT robust to bulk pose drift)
+        'depth_outlier' — robust per-frame: a pixel fires only if its abs
+                          depth error exceeds 40 × the frame's median error
+                          AND rendered > sensor (one-sided). Self-calibrates
+                          against pose-drift + sensor-noise baseline; ported
+                          from GaME (https://github.com/VladimirYugay/GaME).
+    Default 'depth_outlier' — fixes the global-pose-drift sensitivity of the
+    plain 'depth' mode while keeping the AnySplat-color-artifact immunity."""
     change_mask_blur_kernel_size: int = 5
     change_mask_blur_sigma: float = 1.0
+    change_mask_outlier_median_multiplier: float = 15.0
+    """For ``mode='depth_outlier'``: a pixel fires only if its |pred-gt|
+    exceeds this × the frame's median |pred-gt|. Higher = stricter (fewer
+    false positives, but small object motion may be missed). GaME uses 40.
+    We default to 15 — calibrated for ICP-refined poses with drift below ~5 mm,
+    suppresses residual FP at the medium-error edge of motion regions."""
+    change_mask_outlier_min_threshold_m: float = 0.01
+    """For ``mode='depth_outlier'``: absolute-error floor (metres). Below
+    this, no pixel can fire regardless of the median-based threshold —
+    prevents an extremely clean frame (median ≈ 0) from firing on sub-mm
+    rasterization noise. Raise to suppress small false positives."""
     change_mask_filter_radius: int = 1
     change_mask_min_component_size: int = 64
+    change_mask_coverage_threshold: float = 0.5
+    """Minimum rendered-alpha at a pixel for the CDN to consider it 'real
+    scene'. Below this, the rasterizer has no Gaussians and rendered_depth
+    falls back to depth.max() — comparing that against gt_depth produces
+    huge false-positive change bands in regions the warm-cache scene
+    doesn't cover. Threading: model config → ChangeMaskConfig.scene_coverage_threshold
+    → compute_change_mask. ``0.0`` disables the gate."""
     rigid_static_lambda: float = 0.1
     rigid_inlier_threshold: float = 1e-4
     use_sam3d_object_init: bool = True
@@ -90,6 +120,13 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     # similarity_transform 4x4 with the same downstream contract.
     sam3d_registration_backend: Literal["cpd", "teaser"] = "cpd"
     # TEASER++ tuning (only consulted when sam3d_registration_backend == "teaser").
+    # The default config reproduces the "v13" 3-stage recipe benchmarked on the
+    # 2026-03-28 teleop dataset (fitness 62%, chamfer 13.3mm, ~1.2s/object — beats
+    # the production CPD baseline on every metric at ~400x the speed). The three
+    # stages run in order inside register_and_fuse_sam3d_object:
+    #   1. FPFH + mutual-NN + TEASER  (color-aware off, fpfh_max_nn=500)
+    #   2. Euclidean-NN reproject + TEASER  (8x more correspondences than FPFH)
+    #   3. point-to-plane ICP polish  (sub-voxel cleanup, ~0.05s)
     # noise_bound is metric meters — the per-correspondence inlier tolerance.
     sam3d_teaser_noise_bound: float = 0.02
     sam3d_teaser_max_correspondences: int = 5000
@@ -97,7 +134,25 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     sam3d_teaser_fpfh_feature_radius_mult: float = 5.0
     # Color weight in the matching descriptor. 0.0 = geometry-only FPFH, 1.0 =
     # color-only. Mid values blend L2-normalised FPFH with normalised RGB.
-    sam3d_teaser_color_weight: float = 0.3
+    # DEFAULT 0.0: SAM3D-decoded source colors disagree with the real-camera
+    # target, so any color weight degraded matching in benchmarks (v1 used 0.3
+    # and underperformed every geometry-only variant).
+    sam3d_teaser_color_weight: float = 0.0
+    # fpfh_max_nn caps how many neighbors FPFH integrates. Open3D uses Hybrid
+    # kNN+radius search, so the default 100 silently capped the radius on dense
+    # clouds and made feature_radius_mult inert. 500 is what unlocked v5+ quality.
+    sam3d_teaser_fpfh_max_nn: int = 500
+    sam3d_teaser_normal_max_nn: int = 30
+    # Stage 2 — Euclidean-NN reproject + TEASER. After the FPFH pass roughly
+    # aligns, rebuild correspondences by 3D nearest-neighbor (8x more pairs than
+    # FPFH on cross-modal clouds) and re-solve. Biggest single quality win.
+    sam3d_teaser_enable_reproject: bool = True
+    sam3d_teaser_reproject_max_corr_mult: float = 3.0
+    sam3d_teaser_reproject_noise_bound: float = 0.005
+    # Stage 3 — point-to-plane ICP polish on the (last) TEASER transform.
+    sam3d_teaser_enable_post_icp: bool = True
+    sam3d_teaser_post_icp_max_corr_mult: float = 2.0
+    sam3d_teaser_post_icp_iterations: int = 50
     enable_dynamic_mean_optimization: bool = False
     # 2D point tracker = XFeat sparse + LighterGlue + Kabsch-RANSAC.
     # The pipeline samples 2D points at D0, back-projects via depth,
@@ -121,7 +176,13 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     # cu128): sparse 1280x720 ~7 ms end-to-end (extract A + extract B +
     # match). Semi-dense (XFeat*) at the same res takes ~12 ms - to try
     # it, swap match_xfeat for match_xfeat_star in xfeat_motion.py.
-    xfeat_top_k: int = 300
+    xfeat_top_k: int = 3000
+    """Number of XFeat keypoints sampled per frame. Higher = more candidates
+    that land inside small-object masks (a 2-3% screwdriver only gets ~8-20
+    keypoints at top_k=300, well below min_track_points=12). 3000 covers the
+    typical 1-10% object-area range comfortably. Cost: detectAndCompute scales
+    with top_k linearly — measured at ~21 ms/tick at top_k=300, expected
+    ~30-40 ms at top_k=3000 (still well under the 100 ms/tick budget)."""
     """Max keypoints per frame. The XFeat top-k is applied AFTER NMS so
     in practice you get fewer keypoints on small/textureless images —
     the value is only a cap. 300 is sized for the worst case where the
@@ -205,27 +266,26 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     motion. Set to 0 to skip the object filter entirely (matches are then
     only gripper-keep filtered)."""
 
-    enable_scene_optimization: bool = True
-    # When False, _refine_eligible (densify + prune + optimizer.state.clear)
-    # never runs, even after enough opt steps. Useful in live mode where
-    # any optimizer-state reset visibly perturbs the whole scene.
-    enable_dynamic_refine: bool = False
-    scene_opt_refine_every: int = 100
-    scene_opt_densify_grad_thresh: float = 0.0002
-    scene_opt_cull_alpha_thresh: float = 0.1
-    # Center-only gating: a Gaussian is "in the change region" iff its
-    # projected 2D center falls inside CDN (optionally dilated by
-    # scene_opt_mask_dilate_px). Replaces the previous footprint-overlap
-    # test (build_active_mask), which was too permissive — Gaussians with
-    # large rendered radii intersected CDN even when their actual 3D
-    # position was far from the change.
-    scene_opt_use_center_only: bool = True
-    # Pixels of morphological dilation applied to CDN before the center
-    # test. ~20 px on 800x800 ≈ "centre is in the mask OR within ~20 px
-    # of its border".
-    scene_opt_mask_dilate_px: int = 20
     esam_prompt_keep_ratio: float = ESAM_PROMPT_KEEP_RATIO
-    object_mask_dilate_px: int = 1
+    object_mask_dilate_px: int = 0
+    """Pixel dilation applied to the rendered tracked-object silhouette in
+    :meth:`DynamicGSModel.render_object_mask`. Default 0 — historically this
+    expanded the mask by 1 px to swallow stray edge pixels but for small
+    objects (screwdriver, etc.) it over-covers the surrounding scene."""
+    object_mask_alpha_threshold: float = 0.5
+    """Per-pixel cumulative-alpha cutoff for :meth:`render_object_mask`. The
+    rasterizer returns an alpha map in [0,1]; pixels above this threshold are
+    declared 'on the object'. Default 0.5 (= 'this pixel is at least 50%
+    object'). Was 0.01 historically, which counted soft-falloff Gaussian tails
+    as part of the object and inflated the mask area ~10x for small objects."""
+    object_mask_scale_shrink: float = 1.0
+    """Multiplier on each Gaussian's per-axis scale applied ONLY inside
+    :meth:`render_object_mask`. ``1.0`` = no change (full splat extent).
+    Values <1 shrink each splat's rasterised footprint, producing a tighter
+    silhouette at the cost of possible holes between adjacent splats (an
+    issue for thin convex objects whose Gaussians are spaced wider than
+    ``shrink × scale``). Stack with ``object_mask_alpha_threshold`` to dial
+    silhouette tightness without affecting the underlying scene render."""
 
     # SAM3 pre-static graspable object prefusion
     use_sam3_graspable_prefusion: bool = True
@@ -236,7 +296,7 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     sam3_candidate_dedup_iou: float = 0.6
     sam3_candidate_max_objects: int = 8
     sam3_confidence_threshold: float = 0.3
-    sam3_min_score: float = 0.4
+    sam3_min_score: float = 0.2
     sam3_reuse_cached: bool = True
 
 
@@ -254,12 +314,9 @@ class DynamicGSModel(SplatfactoModel):
         self._reference_flagged_means = None
         self._reference_object_means = None
         self._reference_object_quats = None
+        self._d0_tracked_instance_id: int | None = None
         self._optimizers_wrapper = None
         self._persistent_object_membership_ready = False
-        self._scene_opt_hooks = []
-        self._grad2d_accum = None
-        self._grad2d_count = None
-        self._opt_step = 0
         super().__init__(config=config, metadata=metadata, **kwargs)
 
     def load_state_dict(self, state_dict, **kwargs):  # type: ignore[override]
@@ -282,11 +339,6 @@ class DynamicGSModel(SplatfactoModel):
                 num_points,
                 dtype=torch.bool,
                 device=self.current_active_mask.device,
-            )
-            self._buffers["scene_opt_active_mask"] = torch.zeros(
-                num_points,
-                dtype=torch.bool,
-                device=self.scene_opt_active_mask.device,
             )
             self._buffers["sam3d_init_target_flags"] = torch.zeros(
                 num_points,
@@ -332,19 +384,6 @@ class DynamicGSModel(SplatfactoModel):
         )
         self.register_buffer(
             "current_active_mask",
-            torch.zeros(num_points, dtype=torch.bool, device=self.means.device),
-            persistent=False,
-        )
-        # Per-Gaussian "scene-opt active" mask: True iff the Gaussian's 2D
-        # footprint overlaps the current change region AND it is not flagged
-        # as belonging to the moved object. Read by `_mask_means_grad` and
-        # the scene-opt parameter hooks to gate gradients during the dynamic
-        # phase, so a Gaussian only gets pushed by the masked loss when its
-        # geometry actually intersects the change region (per-Gaussian gate
-        # on top of the per-pixel loss mask). Refreshed once per dynamic
-        # frame by `update_scene_opt_active_mask` after CDN is computed.
-        self.register_buffer(
-            "scene_opt_active_mask",
             torch.zeros(num_points, dtype=torch.bool, device=self.means.device),
             persistent=False,
         )
@@ -421,25 +460,45 @@ class DynamicGSModel(SplatfactoModel):
         return None
 
     def get_outputs_for_camera(self, camera: Cameras, obb_box: OrientedBox | None = None):
-        self._refresh_viewer_object_options()
-        selection = self.viewer_object_selector.value
-        if selection == "All" or self.training:
-            return super().get_outputs_for_camera(camera, obb_box=obb_box)
+        # Acquire the shared pipeline RLock so the Nerfstudio viewer's render
+        # thread is mutually exclusive with insert_inpaint_gaussians (FF bg
+        # thread). Without this, the viewer can read gauss_params mid-resize
+        # → means.shape[0] != quats.shape[0] → CUDA assert in gsplat. The
+        # lock is set by the pipeline's __init__ via attach_render_lock();
+        # default is a nullcontext so model usage outside the pipeline (tests,
+        # standalone scripts) keeps working.
+        lock_ctx = getattr(self, "_render_lock_ctx", None)
+        if lock_ctx is None:
+            import contextlib
+            lock_ctx = contextlib.nullcontext
+        with lock_ctx():
+            self._refresh_viewer_object_options()
+            selection = self.viewer_object_selector.value
+            if selection == "All" or self.training:
+                return super().get_outputs_for_camera(camera, obb_box=obb_box)
 
-        keep = self._viewer_keep_mask(selection)
-        if keep is None or bool(keep.all()):
-            return super().get_outputs_for_camera(camera, obb_box=obb_box)
+            keep = self._viewer_keep_mask(selection)
+            if keep is None or bool(keep.all()):
+                return super().get_outputs_for_camera(camera, obb_box=obb_box)
 
-        # Hide non-selected Gaussians by driving their opacity to sigmoid(-1e9) ≈ 0.
-        op_param = self.gauss_params["opacities"]
-        with torch.no_grad():
-            saved = op_param.data.clone()
-            op_param.data[~keep] = -1.0e9
-        try:
-            return super().get_outputs_for_camera(camera, obb_box=obb_box)
-        finally:
+            # Hide non-selected Gaussians by driving their opacity to sigmoid(-1e9) ≈ 0.
+            op_param = self.gauss_params["opacities"]
             with torch.no_grad():
-                op_param.data.copy_(saved)
+                saved = op_param.data.clone()
+                op_param.data[~keep] = -1.0e9
+            try:
+                return super().get_outputs_for_camera(camera, obb_box=obb_box)
+            finally:
+                with torch.no_grad():
+                    op_param.data.copy_(saved)
+
+    def attach_render_lock(self, lock_ctx_factory) -> None:
+        """Attach a context-manager factory that ``get_outputs_for_camera``
+        will enter for every render. Used by the pipeline to share its
+        ``_model_lock`` (RLock) with the Nerfstudio viewer's render thread —
+        without this, the FF bg insert thread races the viewer.
+        """
+        self._render_lock_ctx = lock_ctx_factory
 
     def _get_background_color(self):
         if self.config.use_simulator_background:
@@ -486,16 +545,9 @@ class DynamicGSModel(SplatfactoModel):
         self._apply_phase_trainability()
         self._apply_phase_optimizers(reset_means_optimizer=reset_means_optimizer)
         if phase == "static":
-            self._clear_scene_opt_hooks()
             self.reset_dynamic_state()
-        elif phase == "dynamic" and self.config.enable_scene_optimization:
-            self._register_scene_opt_hooks()
 
     def _apply_phase_trainability(self):
-        if self.phase == "dynamic" and self.config.enable_scene_optimization:
-            for name in ["means", "features_dc", "features_rest", "opacities", "scales", "quats"]:
-                self.gauss_params[name].requires_grad_(True)
-            return
         static_phase = self.phase == "static"
         self.gauss_params["means"].requires_grad_(not static_phase)
         for name in ["features_dc", "features_rest", "opacities", "scales", "quats"]:
@@ -505,9 +557,7 @@ class DynamicGSModel(SplatfactoModel):
         if not hasattr(self, "optimizers"):
             return
 
-        if self.phase == "dynamic" and self.config.enable_scene_optimization:
-            active_groups = {"means", "features_dc", "features_rest", "opacities", "scales", "quats"}
-        elif self.phase == "dynamic":
+        if self.phase == "dynamic":
             active_groups = {"means"}
         else:
             active_groups = {"features_dc", "features_rest", "opacities", "scales", "quats"}
@@ -529,18 +579,6 @@ class DynamicGSModel(SplatfactoModel):
     def _mask_means_grad(self, grad):
         if self.phase != "dynamic":
             return grad
-        if self.config.enable_scene_optimization:
-            # Per-Gaussian gate: only Gaussians whose 2D footprint overlaps
-            # the change region AND that are not object-flagged receive
-            # `means` gradients. Without this, every non-object Gaussian
-            # whose footprint extends into a CDN pixel — including ones
-            # geometrically far behind the change region — would get pulled
-            # by the masked loss. The buffer is refreshed once per dynamic
-            # frame by `update_scene_opt_active_mask` after CDN is computed.
-            active = self.scene_opt_active_mask
-            if active.shape[0] != grad.shape[0] or not active.any():
-                return torch.zeros_like(grad)
-            return grad * active.to(device=grad.device, dtype=grad.dtype).unsqueeze(-1)
         if self.config.enable_cotracker_rigid_motion or not self.config.enable_dynamic_mean_optimization:
             return torch.zeros_like(grad)
         mask = self.current_active_mask.to(device=grad.device, dtype=grad.dtype).unsqueeze(-1)
@@ -566,84 +604,6 @@ class DynamicGSModel(SplatfactoModel):
                     mask.permute(2, 0, 1).unsqueeze(0), size=(th, tw), mode="nearest",
                 ).squeeze(0).permute(1, 2, 0)
         return mask
-
-    @torch.no_grad()
-    def update_scene_opt_active_mask(self, change_mask: Tensor) -> int:
-        """Refresh the per-Gaussian scene-opt activation mask from the current CDN.
-
-        A Gaussian is "active for scene optimization" iff its 2D footprint
-        overlaps ``change_mask`` AND it is not flagged as belonging to the
-        moved object. The means/scene-opt gradient hooks read the resulting
-        ``scene_opt_active_mask`` buffer to gate gradients during the dynamic
-        phase, so the masked loss can only push Gaussians whose geometry
-        actually intersects the change region (per-Gaussian gate on top of
-        the per-pixel loss mask).
-
-        Should be called once per dynamic frame, AFTER computing CDN/CD0,
-        using the most recent ``self.info`` (from the RDN/RS00 render that
-        produced the change mask). Returns the number of active Gaussians.
-        """
-        if not self.config.enable_scene_optimization:
-            self.scene_opt_active_mask.zero_()
-            return 0
-        if self.info is None or self.num_points == 0:
-            self.scene_opt_active_mask.zero_()
-            return 0
-        try:
-            centers_2d, radii = extract_projected_centers_and_radii(self.info, self.num_points)
-        except Exception:
-            self.scene_opt_active_mask.zero_()
-            return 0
-
-        mask_2d = change_mask
-        if mask_2d.ndim == 3 and mask_2d.shape[-1] == 1:
-            mask_2d = mask_2d[..., 0]
-        if self.config.scene_opt_use_center_only:
-            in_change = build_active_mask_center_only(
-                mask_2d, centers_2d,
-                dilate_px=int(self.config.scene_opt_mask_dilate_px),
-            )
-        else:
-            in_change = build_active_mask(mask_2d, centers_2d, radii)
-        not_object = ~(self.object_flags.squeeze(-1) > 0.5)
-        active = in_change & not_object
-        if self.scene_opt_active_mask.shape != active.shape:
-            self._buffers["scene_opt_active_mask"] = active.clone()
-        else:
-            self.scene_opt_active_mask.copy_(active)
-        return int(active.sum().item())
-
-    # ---- Scene optimization: frame buffer + support count ----
-
-    def _get_eligible_mask(self) -> Tensor:
-        """All non-object Gaussians are eligible for scene optimization."""
-        return ~(self.object_flags.squeeze(-1) > 0.5)
-
-    def _make_scene_opt_grad_hook(self):
-        def hook(grad):
-            if grad is None:
-                return grad
-            # Same per-Gaussian "in change region AND not object" gate as
-            # `_mask_means_grad`. The buffer `scene_opt_active_mask` is
-            # refreshed once per dynamic frame by the pipeline after CDN.
-            active = self.scene_opt_active_mask
-            if active.shape[0] != grad.shape[0] or not active.any():
-                return torch.zeros_like(grad)
-            return grad * active.to(dtype=grad.dtype).view(-1, *([1] * (grad.ndim - 1)))
-        return hook
-
-    def _register_scene_opt_hooks(self) -> None:
-        self._clear_scene_opt_hooks()
-        for name in ["features_dc", "features_rest", "opacities", "scales", "quats"]:
-            param = self.gauss_params[name]
-            if param.requires_grad:
-                h = param.register_hook(self._make_scene_opt_grad_hook())
-                self._scene_opt_hooks.append(h)
-
-    def _clear_scene_opt_hooks(self) -> None:
-        for h in self._scene_opt_hooks:
-            h.remove()
-        self._scene_opt_hooks.clear()
 
     def get_live_rgb(self, batch, background: Tensor | None = None, apply_training_downscale: bool = True) -> Tensor:
         if background is None:
@@ -734,15 +694,39 @@ class DynamicGSModel(SplatfactoModel):
 
     @torch.no_grad()
     def _tracked_object_mask(self) -> "torch.Tensor":
-        """Mask of Gaussians the rigid tracker should move: ``object_flags=1``
-        AND ``instance_id != 999`` — excludes feedforward-decoded inpaint
-        patches (instance 999) so adding inserts doesn't invalidate the
-        reference-pose count and silently freeze the can."""
-        of = self.object_flags.squeeze(-1) > 0.5
+        """Mask of Gaussians the rigid tracker should move.
+
+        Strict rule: the tracked object is identified by EXACTLY ONE instance id,
+        captured at D0 in ``capture_reference_object_pose(instance_id=...)``. The
+        mask returns ``object_instance_ids == d0_id``, NOTHING ELSE — feedforward
+        inserts (instance_id=999), other objects, and unflagged Gaussians are all
+        excluded by construction. This guarantees ``apply_rigid_object_transform_from_reference``'s
+        count check matches across the entire dynamic phase, regardless of how
+        many FF inserts accumulate.
+
+        If no D0 id has been captured yet (e.g. before D0 ever fires), falls back
+        to the legacy ``object_flags & (id != 999)`` so the prepare-dynamic-update
+        path that runs BEFORE D0 still works.
+        """
+        d0_id = getattr(self, "_d0_tracked_instance_id", None)
         ids = self.object_instance_ids.squeeze(-1)
+        if d0_id is not None and int(d0_id) > 0:
+            return ids == int(d0_id)
+        # Pre-D0 fallback.
+        of = self.object_flags.squeeze(-1) > 0.5
         return of & (ids != 999)
 
-    def capture_reference_object_pose(self) -> int:
+    def capture_reference_object_pose(self, instance_id: int | None = None) -> int:
+        """Snapshot the tracked object's means/quats at D0.
+
+        ``instance_id``: the EXACT instance id of the object being tracked, as picked
+        by the pipeline's ``_pick_d0_object`` (e.g. ``self._d0_selected_instance_id``).
+        We store it on ``self._d0_tracked_instance_id`` so ``_tracked_object_mask``
+        is from that point on a STRICT 'this id only' mask — no other instance,
+        no FF inserts (id=999), no other objects, ever.
+        """
+        if instance_id is not None and int(instance_id) > 0:
+            self._d0_tracked_instance_id = int(instance_id)
         object_mask = self._tracked_object_mask()
         object_count = int(object_mask.sum().item())
         if object_count == 0:
@@ -795,21 +779,17 @@ class DynamicGSModel(SplatfactoModel):
         self._reference_flagged_means = None
         self._reference_object_means = None
         self._reference_object_quats = None
-        self._grad2d_accum = None
-        self._grad2d_count = None
-        self._opt_step = 0
+        self._d0_tracked_instance_id = None
 
     def _resize_dynamic_buffers(self, num_points: int) -> None:
         object_flags = self.object_flags
         current_active = self.current_active_mask
-        scene_opt_active = self.scene_opt_active_mask
         sam3d_init_target_flags = self.sam3d_init_target_flags
         object_instance_ids = self.object_instance_ids
         inserted_flags = self.inserted_flags
         if (
             object_flags.shape[0] == num_points
             and current_active.shape[0] == num_points
-            and scene_opt_active.shape[0] == num_points
             and sam3d_init_target_flags.shape[0] == num_points
             and object_instance_ids.shape[0] == num_points
             and inserted_flags.shape[0] == num_points
@@ -818,7 +798,6 @@ class DynamicGSModel(SplatfactoModel):
 
         new_object_flags = torch.zeros(num_points, 1, dtype=object_flags.dtype, device=object_flags.device)
         new_current_active = torch.zeros(num_points, dtype=torch.bool, device=current_active.device)
-        new_scene_opt_active = torch.zeros(num_points, dtype=torch.bool, device=scene_opt_active.device)
         new_sam3d_init_target_flags = torch.zeros(num_points, 1, dtype=sam3d_init_target_flags.dtype, device=sam3d_init_target_flags.device)
         new_instance_ids = torch.zeros(num_points, 1, dtype=torch.long, device=object_instance_ids.device)
         new_inserted_flags = torch.zeros(num_points, 1, dtype=inserted_flags.dtype, device=inserted_flags.device)
@@ -826,13 +805,11 @@ class DynamicGSModel(SplatfactoModel):
         if keep > 0:
             new_object_flags[:keep] = object_flags[:keep]
             new_current_active[:keep] = current_active[:keep]
-            new_scene_opt_active[:keep] = scene_opt_active[:keep]
             new_sam3d_init_target_flags[:keep] = sam3d_init_target_flags[:keep]
             new_instance_ids[:keep] = object_instance_ids[:keep]
             new_inserted_flags[:keep] = inserted_flags[:keep]
         self._buffers["object_flags"] = new_object_flags
         self._buffers["current_active_mask"] = new_current_active
-        self._buffers["scene_opt_active_mask"] = new_scene_opt_active
         self._buffers["sam3d_init_target_flags"] = new_sam3d_init_target_flags
         self._buffers["object_instance_ids"] = new_instance_ids
         self._buffers["inserted_flags"] = new_inserted_flags
@@ -853,8 +830,6 @@ class DynamicGSModel(SplatfactoModel):
                     self._optimizers_wrapper.parameters[name] = [self.gauss_params[name]]
 
         self.gauss_params["means"].register_hook(self._mask_means_grad)
-        if self.phase == "dynamic" and self.config.enable_scene_optimization:
-            self._register_scene_opt_hooks()
         self._apply_phase_trainability()
         self._apply_phase_optimizers(reset_means_optimizer=reset_means_optimizer)
 
@@ -921,8 +896,6 @@ class DynamicGSModel(SplatfactoModel):
         self._buffers["inserted_flags"] = self.inserted_flags[keep]
         if self.current_active_mask.shape[0] == num_points:
             self._buffers["current_active_mask"] = self.current_active_mask[keep]
-        if self.scene_opt_active_mask.shape[0] == num_points:
-            self._buffers["scene_opt_active_mask"] = self.scene_opt_active_mask[keep]
 
         self._refresh_gaussian_optimizers(reset_means_optimizer=True)
         return n_deleted
@@ -987,9 +960,19 @@ class DynamicGSModel(SplatfactoModel):
             "quats": new_quats,
             "opacities": new_opacities,
         }
+        # PRESERVE requires_grad across the resize. Critical: insert_inpaint_gaussians
+        # is called from inside @torch.no_grad() (the AnySplat bg-decode path).
+        # Inside no_grad, ``torch.nn.Parameter(tensor)`` returns a Parameter with
+        # requires_grad=FALSE despite the constructor's default. We explicitly
+        # restore the old Parameter's requires_grad on the new one, so the
+        # subsequent ``register_hook`` in ``_refresh_gaussian_optimizers`` doesn't
+        # raise. Mirrors the same pattern in ``load_post_fusion_state``.
         for name in ["means", "features_dc", "features_rest", "scales", "quats", "opacities"]:
-            concatenated = torch.cat([self.gauss_params[name].detach(), new_tensors[name]], dim=0)
-            self.gauss_params[name] = torch.nn.Parameter(concatenated)
+            old_param = self.gauss_params[name]
+            concatenated = torch.cat([old_param.detach(), new_tensors[name]], dim=0)
+            self.gauss_params[name] = torch.nn.Parameter(
+                concatenated, requires_grad=old_param.requires_grad
+            )
 
         self._resize_dynamic_buffers(self.num_points)
         self.object_flags[old_num_points:] = 1.0
@@ -1007,9 +990,13 @@ class DynamicGSModel(SplatfactoModel):
 
         new_tensors = self._build_new_gaussian_tensors(new_xyz, new_rgb)
         old_num_points = self.num_points
+        # Preserve requires_grad — see note in insert_inpaint_gaussians.
         for name in ["means", "features_dc", "features_rest", "scales", "quats", "opacities"]:
-            concatenated = torch.cat([self.gauss_params[name].detach(), new_tensors[name]], dim=0)
-            self.gauss_params[name] = torch.nn.Parameter(concatenated)
+            old_param = self.gauss_params[name]
+            concatenated = torch.cat([old_param.detach(), new_tensors[name]], dim=0)
+            self.gauss_params[name] = torch.nn.Parameter(
+                concatenated, requires_grad=old_param.requires_grad
+            )
 
         self._resize_dynamic_buffers(self.num_points)
         if object_flag:
@@ -1488,6 +1475,14 @@ class DynamicGSModel(SplatfactoModel):
                 "normal_radius_mult": self.config.sam3d_teaser_fpfh_normal_radius_mult,
                 "feature_radius_mult": self.config.sam3d_teaser_fpfh_feature_radius_mult,
                 "color_weight": self.config.sam3d_teaser_color_weight,
+                "fpfh_max_nn": self.config.sam3d_teaser_fpfh_max_nn,
+                "normal_max_nn": self.config.sam3d_teaser_normal_max_nn,
+                "enable_reproject": self.config.sam3d_teaser_enable_reproject,
+                "reproject_max_corr_mult": self.config.sam3d_teaser_reproject_max_corr_mult,
+                "reproject_noise_bound": self.config.sam3d_teaser_reproject_noise_bound,
+                "enable_post_icp": self.config.sam3d_teaser_enable_post_icp,
+                "post_icp_max_corr_mult": self.config.sam3d_teaser_post_icp_max_corr_mult,
+                "post_icp_iterations": self.config.sam3d_teaser_post_icp_iterations,
             },
         )
         t_registration = time.time() - _t
@@ -1737,6 +1732,7 @@ class DynamicGSModel(SplatfactoModel):
                 blur_sigma=self.config.change_mask_blur_sigma,
                 filter_radius=self.config.change_mask_filter_radius,
                 min_component_size=self.config.change_mask_min_component_size,
+                mode=self.config.change_mask_mode,
             )
             if self.config.active_mask_dilate_radius > 0:
                 change_mask = dilate_binary_mask(change_mask, self.config.active_mask_dilate_radius)
@@ -1899,16 +1895,17 @@ class DynamicGSModel(SplatfactoModel):
             K = scaled_camera.get_intrinsics_matrices().to(self.device)
             width, height = int(scaled_camera.width.item()), int(scaled_camera.height.item())
 
-            # Tracked-object Gaussians only. Feedforward inserts (instance_id=999)
-            # also carry object_flags=1 but are static patches, not part of the
-            # moving object — including them here makes the object mask grow with
-            # every insert, which corrupts CDN exclusion and the dual debug pair.
+            # Renders ONLY the Gaussians with the tracked object's D0 instance id,
+            # NOTHING ELSE. `_tracked_object_mask()` is `instance_ids == d0_id` after
+            # D0 — strictly excludes feedforward inserts (id=999), other objects, and
+            # unflagged background. This keeps the object mask stable across FF
+            # insertions.
             obj_mask = self._tracked_object_mask()
             if not obj_mask.any():
                 return torch.zeros(height, width, 1, device=self.device)
 
             opacities = torch.sigmoid(self.opacities[obj_mask]).squeeze(-1)
-            scales = torch.exp(self.scales[obj_mask])
+            scales = torch.exp(self.scales[obj_mask]) * float(self.config.object_mask_scale_shrink)
             colors_dc = self.features_dc[obj_mask]
             if self.config.sh_degree > 0:
                 colors = torch.cat((colors_dc[:, None, :], self.features_rest[obj_mask]), dim=1)
@@ -1935,7 +1932,8 @@ class DynamicGSModel(SplatfactoModel):
                 absgrad=False,
                 rasterize_mode=self.config.rasterize_mode,
             )
-            binary = (subset_alpha.squeeze(0) > 0.01).float()
+            alpha_thr = float(self.config.object_mask_alpha_threshold)
+            binary = (subset_alpha.squeeze(0) > alpha_thr).float()
             if binary.ndim == 2:
                 binary = binary[..., None]
             if self.config.object_mask_dilate_px > 0:
@@ -2079,10 +2077,6 @@ class DynamicGSModel(SplatfactoModel):
         if background.shape[0] == 3 and not self.training:
             background = background.expand(height, width, 3)
 
-        if self.training and self.phase == "dynamic" and self.config.enable_scene_optimization:
-            if self.info["means2d"].requires_grad:
-                self.info["means2d"].retain_grad()
-
         return {
             "rgb": rgb.squeeze(0),
             "depth": depth_im,
@@ -2098,7 +2092,6 @@ class DynamicGSModel(SplatfactoModel):
         metrics["active_gaussian_count"] = int(self.current_active_mask.sum().item())
         metrics["object_flag_count"] = int((self.object_flags.squeeze(-1) > 0.5).sum().item())
         metrics["sam3d_init_target_count"] = int((self.sam3d_init_target_flags.squeeze(-1) > 0.5).sum().item())
-        metrics["eligible_gaussian_count"] = int(self._get_eligible_mask().sum().item())
         if self._dynamic_ready:
             metrics["optim_mask_pixels"] = int((self.change_mask_image[..., 0] > 0.5).sum().item())
         return metrics
@@ -2145,104 +2138,5 @@ class DynamicGSModel(SplatfactoModel):
         # from the trainer's step 0. The trainer's raw step (unshifted) is
         # what gets passed in here, so compare against the shifted value.
         assert step == self.step - getattr(self, "_step_offset", 0)
-        if self.phase != "dynamic" or not self.config.enable_scene_optimization:
-            return
-        if not self._dynamic_ready:
-            return
-
-        means2d = self.info.get("means2d") if self.info else None
-        radii_info = self.info.get("radii") if self.info else None
-        # Skip accumulation when ``self.info`` is stale relative to the
-        # current Gaussian count. Stale info can happen on no-op steps
-        # (empty optim pool returning the zero-loss dummy without a fresh
-        # render) after a prior _refine_eligible() prune.
-        info_consistent = (
-            radii_info is not None
-            and radii_info.squeeze(0).shape[0] == self.num_points
-        )
-        if means2d is not None and means2d.grad is not None and info_consistent:
-            with torch.no_grad():
-                grad_norms = means2d.grad.detach().squeeze(0).norm(dim=-1)
-                eligible = self._get_eligible_mask() & (radii_info.squeeze(0) > 0)
-                if self._grad2d_accum is None:
-                    self._grad2d_accum = torch.zeros(self.num_points, device=self.device)
-                    self._grad2d_count = torch.zeros(self.num_points, device=self.device)
-                self._grad2d_accum[eligible] += grad_norms[eligible]
-                self._grad2d_count[eligible] += 1.0
-
-        self._opt_step += 1
-        if (
-            self.config.enable_dynamic_refine
-            and self._opt_step % self.config.scene_opt_refine_every == 0
-        ):
-            self._refine_eligible()
-
-    @torch.no_grad()
-    def _refine_eligible(self) -> None:
-        if self._grad2d_accum is None:
-            return
-        eligible = self._get_eligible_mask()
-        if not eligible.any():
-            self._grad2d_accum.zero_()
-            self._grad2d_count.zero_()
-            return
-
-        changed = False
-
-        # Densify: eligible Gaussians with high 2D gradient
-        avg_grad = self._grad2d_accum / self._grad2d_count.clamp_min(1.0)
-        densify_mask = (avg_grad > self.config.scene_opt_densify_grad_thresh) & eligible
-        n_densified = 0
-        if densify_mask.any():
-            old_n = self.num_points
-            for name in ["means", "features_dc", "features_rest", "scales", "quats", "opacities"]:
-                new_slice = self.gauss_params[name].detach()[densify_mask]
-                self.gauss_params[name] = torch.nn.Parameter(
-                    torch.cat([self.gauss_params[name].detach(), new_slice], dim=0)
-                )
-            n_densified = self.num_points - old_n
-            self._resize_dynamic_buffers(self.num_points)
-            zeros = torch.zeros(n_densified, device=self.device)
-            self._grad2d_accum = torch.cat([self._grad2d_accum[:old_n], zeros])
-            self._grad2d_count = torch.cat([self._grad2d_count[:old_n], zeros])
-            changed = True
-
-        # Prune: eligible low-opacity Gaussians
-        opacities = torch.sigmoid(self.gauss_params["opacities"].detach()).squeeze(-1)
-        eligible = self._get_eligible_mask()
-        prune_mask = eligible & (opacities < self.config.scene_opt_cull_alpha_thresh)
-        n_pruned = 0
-        if prune_mask.any():
-            keep_mask = ~prune_mask
-            n_pruned = int(prune_mask.sum().item())
-            for name in ["means", "features_dc", "features_rest", "scales", "quats", "opacities"]:
-                self.gauss_params[name] = torch.nn.Parameter(self.gauss_params[name].detach()[keep_mask])
-            self._buffers["object_flags"] = self.object_flags[keep_mask]
-            self._buffers["current_active_mask"] = self.current_active_mask[keep_mask]
-            self._buffers["scene_opt_active_mask"] = self.scene_opt_active_mask[keep_mask]
-            self._buffers["sam3d_init_target_flags"] = self.sam3d_init_target_flags[keep_mask]
-            self._buffers["object_instance_ids"] = self.object_instance_ids[keep_mask]
-            self._buffers["inserted_flags"] = self.inserted_flags[keep_mask]
-            if self._grad2d_accum is not None:
-                self._grad2d_accum = self._grad2d_accum[keep_mask]
-                self._grad2d_count = self._grad2d_count[keep_mask]
-            if self._reference_flagged_indices is not None:
-                new_idx = torch.cumsum(keep_mask.long(), dim=0) - 1
-                valid = keep_mask[self._reference_flagged_indices]
-                if valid.any():
-                    self._reference_flagged_indices = new_idx[self._reference_flagged_indices[valid]]
-                    self._reference_flagged_means = self._reference_flagged_means[valid]
-                else:
-                    self._reference_flagged_indices = None
-                    self._reference_flagged_means = None
-            changed = True
-
-        if changed:
-            self._refresh_gaussian_optimizers(reset_means_optimizer=False)
-            CONSOLE.log(
-                f"[dynamic-gs] refine step {self._opt_step}: "
-                f"+{n_densified} densified, -{n_pruned} pruned, total={self.num_points}"
-            )
-
-        self._grad2d_accum.zero_()
-        self._grad2d_count.zero_()
+        # Dynamic phase has all gauss-param LRs zeroed (Design Invariant #4)
+        # so there is no densify/cull bookkeeping to do here.

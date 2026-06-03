@@ -42,7 +42,13 @@ import cv2
 import numpy as np
 import open3d as o3d
 
-from .online_fusion import OnlineFusion, WITH_COLOR
+from .online_fusion import (
+    FAR_VOXEL_M,
+    NEAR_RADIUS_M,
+    OnlineFusion,
+    WITH_COLOR,
+    adaptive_downsample,
+)
 
 INIT_PLY_NAME = "depth_camera_init_points.ply"
 
@@ -210,6 +216,23 @@ class ConcurrentFusionRunner:
         self._watcher.start()
         self._started = True
 
+    def _last_camera_world_xyz(self) -> Optional[np.ndarray]:
+        """Return the world-frame position of the LAST captured frame's
+        camera, read from ``<static_dir>/transforms.json``. Returns
+        ``None`` if the file is missing or has no frames."""
+        tp = self.static_dir / "transforms.json"
+        if not tp.exists():
+            return None
+        try:
+            meta = json.loads(tp.read_text())
+            frames = meta.get("frames", [])
+            if not frames:
+                return None
+            T = np.asarray(frames[-1]["transform_matrix"], dtype=np.float64)
+            return T[:3, 3].copy()
+        except Exception:
+            return None
+
     def stop_and_finalize(self) -> Optional[Path]:
         """Stop the watcher, drain the queue, run ``finalize()``, write
         the PLY, update transforms.json. Returns the PLY path (or None
@@ -226,9 +249,14 @@ class ConcurrentFusionRunner:
         assert self._watcher is not None
         assert self._watcher_stop_evt is not None
 
-        # Stop watcher (it flushes its tail).
+        # Stop watcher (it flushes its tail). M3: unbounded join so a slow
+        # final read can't drop frames silently. If the watcher is genuinely
+        # wedged, a 30 s hard timeout still lets us proceed rather than hang
+        # the user — but we now report it loudly instead of dropping data.
         self._watcher_stop_evt.set()
-        self._watcher.join(timeout=5.0)
+        self._watcher.join(timeout=30.0)
+        if self._watcher.is_alive():
+            print("[fusion] WARNING: watcher thread did not exit within 30 s; final keyframes may be dropped", flush=True)
         # Sentinel to exit worker after queue drains.
         self._q.put(None)
         t_drain = time.time()
@@ -253,13 +281,32 @@ class ConcurrentFusionRunner:
         print(f"[fusion] drained in {drain_s:.1f} s; calling finalize()...", flush=True)
         t_fin = time.time()
         pc = self._fuser.finalize()
-        ply_path = self.static_dir / INIT_PLY_NAME
-        o3d.io.write_point_cloud(str(ply_path), pc)
+        n_full = len(pc.points)
         print(
-            f"[fusion] finalize() {time.time()-t_fin:.1f} s; "
-            f"wrote {len(pc.points):,} pts → {ply_path}",
+            f"[fusion] finalize() {time.time()-t_fin:.1f} s; fused {n_full:,} pts",
             flush=True,
         )
+
+        # Adaptive near/far downsample: keep <NEAR_RADIUS_M of the LAST
+        # camera pose at native TSDF density, voxel-downsample the rest
+        # to FAR_VOXEL_M. Sub-second; shrinks the Splatfacto seed ~9×.
+        last_cam = self._last_camera_world_xyz()
+        if last_cam is not None and n_full > 0:
+            t_ds = time.time()
+            pc = adaptive_downsample(pc, last_cam, NEAR_RADIUS_M, FAR_VOXEL_M)
+            n_out = len(pc.points)
+            print(
+                f"[fusion] adaptive downsample ({time.time()-t_ds:.2f} s): "
+                f"{n_full:,} → {n_out:,}  "
+                f"(near<{NEAR_RADIUS_M:.1f}m full, far→{FAR_VOXEL_M*1000:.1f}mm voxel)",
+                flush=True,
+            )
+        else:
+            print("[fusion] adaptive downsample SKIPPED (no transforms.json / empty cloud)", flush=True)
+
+        ply_path = self.static_dir / INIT_PLY_NAME
+        o3d.io.write_point_cloud(str(ply_path), pc)
+        print(f"[fusion] wrote {len(pc.points):,} pts → {ply_path}", flush=True)
 
         # Point transforms.json at the seed PLY so the Splatfacto
         # dataparser picks it up unchanged.
@@ -270,4 +317,11 @@ class ConcurrentFusionRunner:
             tmp = tp.with_name(f".{tp.name}.tmp")
             tmp.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
             os.replace(tmp, tp)
+            # M1: bump PLY mtime past transforms.json so dynamic_gs.utils.
+            # rgbd_fusion_init._output_is_fresh treats the GPU-generated seed
+            # as up-to-date. Without this, every fresh capture leaves
+            # transforms.json.mtime > out_ply.mtime → the redundant
+            # bootstrap_live.sh re-fusion overwrites the 1.5 mm GPU seed
+            # with a 2.5 mm CPU one.
+            os.utime(ply_path, None)
         return ply_path

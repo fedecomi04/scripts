@@ -355,6 +355,91 @@ def _world_to_image_opengl(
     return uv, in_front & in_image
 
 
+def icp_refine_scene_c2w(
+    *,
+    sensor_depth_m: np.ndarray,        # (H, W) sensor depth in metres
+    scene_c2w: np.ndarray,             # (4, 4) initial scene c2w (OpenGL)
+    scene_intr: dict,                  # {fl_x, fl_y, cx, cy, w, h}
+    target_xyz_gpu: "torch.Tensor",    # (M, 3) GPU tensor, frustum-culled world points
+    max_iters: int = 30,
+    max_dist_m: float = 0.02,
+    stride: int = 4,
+    min_pts: int = 1000,
+) -> tuple[np.ndarray, dict]:
+    """GPU point-to-plane ICP of the live sensor cloud against a caller-supplied
+    (frustum-culled) target tensor on GPU. Component-agnostic.
+
+    Source = sensor depth back-projected through scene intrinsics + scene_c2w.
+    Target = ``target_xyz_gpu``.
+    Both go to Open3D's CUDA tensor API. Returns (refined_c2w, info_dict).
+    """
+    info: dict = {"ran": False, "n_src": 0, "n_tgt": int(target_xyz_gpu.shape[0])}
+    if target_xyz_gpu.shape[0] < min_pts:
+        return scene_c2w.astype(np.float64), info
+
+    import open3d as o3d
+    import open3d.core as o3c
+
+    # --- Build source cloud on GPU ---
+    dev = target_xyz_gpu.device
+    H_s, W_s = sensor_depth_m.shape[:2]
+    fx = float(scene_intr["fl_x"]); fy = float(scene_intr["fl_y"])
+    cx = float(scene_intr["cx"]);   cy = float(scene_intr["cy"])
+
+    depth_t = torch.from_numpy(sensor_depth_m.astype(np.float32)).to(dev)
+    depth_t = depth_t[::stride, ::stride]
+    H_sub, W_sub = depth_t.shape
+    vv_t, uu_t = torch.meshgrid(
+        torch.arange(0, H_sub, device=dev, dtype=torch.float32) * stride,
+        torch.arange(0, W_sub, device=dev, dtype=torch.float32) * stride,
+        indexing="ij",
+    )
+    valid_t = depth_t > 0.01
+    if int(valid_t.sum().item()) < min_pts:
+        return scene_c2w.astype(np.float64), info
+    d_v = depth_t[valid_t]
+    u_v = uu_t[valid_t]
+    v_v = vv_t[valid_t]
+    # OpenGL camera-frame (y up, z back)
+    p_cam_t = torch.stack([
+        d_v * (u_v - cx) / fx,
+        -d_v * (v_v - cy) / fy,
+        -d_v,
+    ], dim=-1)
+    c2w_t = torch.as_tensor(scene_c2w.astype(np.float32), device=dev)
+    R_t = c2w_t[:3, :3]; t_t = c2w_t[:3, 3]
+    src_world_t = p_cam_t @ R_t.T + t_t  # (N_src, 3) on GPU
+    info["n_src"] = int(src_world_t.shape[0])
+
+    # --- Hand off to Open3D Tensor API on CUDA ---
+    cuda_dev = o3c.Device("CUDA:0") if "cuda" in str(dev) else o3c.Device("CPU:0")
+    src_t = o3d.t.geometry.PointCloud(cuda_dev)
+    src_t.point.positions = o3c.Tensor.from_dlpack(torch.utils.dlpack.to_dlpack(src_world_t.contiguous()))
+
+    tgt_t = o3d.t.geometry.PointCloud(cuda_dev)
+    tgt_t.point.positions = o3c.Tensor.from_dlpack(torch.utils.dlpack.to_dlpack(target_xyz_gpu.contiguous().to(torch.float32)))
+    # Estimate normals on the target (point-to-plane needs them)
+    tgt_t.estimate_normals(max_nn=30, radius=0.02)
+
+    init = o3c.Tensor(np.eye(4, dtype=np.float64), o3c.Dtype.Float64, cuda_dev)
+    reg = o3d.t.pipelines.registration.icp(
+        source=src_t,
+        target=tgt_t,
+        max_correspondence_distance=float(max_dist_m),
+        init_source_to_target=init,
+        estimation_method=o3d.t.pipelines.registration.TransformationEstimationPointToPlane(),
+        criteria=o3d.t.pipelines.registration.ICPConvergenceCriteria(max_iteration=int(max_iters)),
+    )
+    T = reg.transformation.cpu().numpy().astype(np.float64)
+    info.update({
+        "ran": True,
+        "fitness": float(reg.fitness),
+        "inlier_rmse": float(reg.inlier_rmse),
+    })
+    refined = (T @ scene_c2w).astype(np.float64)
+    return refined, info
+
+
 def reproject_anysplat_to_scene(
     *,
     means_canonical: np.ndarray,        # (N, 3) AnySplat canonical positions
@@ -375,6 +460,8 @@ def reproject_anysplat_to_scene(
     background_tol: float = 0.08,
     global_s_fallback: Optional[float] = None,
     component_mask: Optional[np.ndarray] = None,   # (H, W) bool, restrict insertion to this mask (any resolution)
+    voxel_dedup_m: Optional[float] = None,         # if set, pick ONE representative per voxel of this size (metres). 0.002 matches static-phase TSDF.
+    scale_multiplier: float = 1.0,                 # additionally enlarges each gaussian's three log-scales by log(scale_multiplier).
 ) -> dict:
     """Canonical AnySplat → scene reprojection (memory: anysplat-reprojection-method).
 
@@ -474,12 +561,31 @@ def reproject_anysplat_to_scene(
     safe_z2 = np.where(z_cam > 1e-6, z_cam, 1.0)
     s_per_gauss = d_per_gauss / safe_z2
     log_scales_world = log_scales + np.log(np.clip(s_per_gauss, 1e-9, None))[:, None].astype(np.float32)
+    if scale_multiplier != 1.0:
+        log_scales_world = log_scales_world + np.float32(np.log(max(float(scale_multiplier), 1e-12)))
 
     # --- Rotation: canonical-CV → scene-GL basis ---
     M_rot = R_scene @ np.diag([1.0, -1.0, -1.0]) @ R_pred.T
     Rg_can = quat_wxyz_to_rotmat(quats_wxyz).astype(np.float64)
     Rg_world = (M_rot[None, :, :] @ Rg_can).astype(np.float32)
     quats_world = rotmat_to_quat_wxyz(Rg_world).astype(np.float32)
+
+    # --- Optional voxel dedup: pick ONE representative per voxel (no averaging) ---
+    # np.unique on the integer voxel index returns the FIRST occurrence per
+    # voxel, which is what we want — no quaternion averaging, no logit
+    # averaging, no SH averaging.  Simplest correct reduction.
+    if voxel_dedup_m is not None and voxel_dedup_m > 0.0 and means_world.shape[0] > 0:
+        voxel_idx = np.floor(means_world / float(voxel_dedup_m)).astype(np.int64)
+        # np.unique on rows of shape (N, 3); return_index gives the FIRST row
+        # per unique voxel.  Sorting cost is O(N log N) — cheap for N ~ 1e5.
+        _, keep_idx = np.unique(voxel_idx, axis=0, return_index=True)
+        keep_idx.sort()  # preserve original order so any later debug print stays stable
+        means_world = means_world[keep_idx]
+        log_scales_world = log_scales_world[keep_idx]
+        quats_world = quats_world[keep_idx]
+        features_dc = features_dc[keep_idx]
+        features_rest = features_rest[keep_idx]
+        opacity_logits = opacity_logits[keep_idx]
 
     return {
         "xyz": means_world.astype(np.float32),
