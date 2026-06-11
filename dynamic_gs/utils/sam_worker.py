@@ -362,7 +362,16 @@ class _SamWorker:
         runtime_config_path = _write_runtime_config()
         Inference = _import_official_api()
         cfg = OmegaConf.load(str(runtime_config_path))
-        inference = Inference(cfg, compile=False)
+        try:
+            inference = Inference(cfg, compile=False)
+        except Exception:
+            # A failed (e.g. OOM) load must NOT leave the worker holding the
+            # partial allocation — that poisons every later call (observed:
+            # ~11 GB stuck → TSDF + at-Enter SAM3D both OOM). Release and re-raise.
+            gc.collect()
+            if self.torch.cuda.is_available():
+                self.torch.cuda.empty_cache()
+            raise
         # Same get_params() / hfer_2d patches the shipped sam3d.py applies.
         # See sam3d.py:660-678 for the rationale (Fast-SAM3D issue #9).
         inference.hfer_2d = 0

@@ -465,11 +465,17 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
     # Spawn the persistent SAM3+SAM3D worker and kick off SAM3's 6 s weight
     # load on a background thread. Capture wallclock is operator-controlled, so
     # by the time the operator centers the camera and hits Enter the segmenter
-    # is already on the GPU. With FastSAM (measured resident 0.85 GB) the trim
-    # also lets us preload SAM3D (7.3 GB) DURING capture, so its ~23 s model-load
-    # (measured) overlaps the sweep instead of blocking after Enter — only the
-    # ~9.8 s SAM3D infer (needs the mask) stays exposed. Capture-window budget:
-    # FastSAM 0.85 + SAM3D-trim 7.3 + TSDF integrate + Gazebo (~2.6) ≈ 13.8/15.8.
+    # is already on the GPU.
+    #
+    # SAM3D-during-capture preload is DISABLED by default (2026-06-11): although
+    # the trim cuts SAM3D *resident* to 7.3 GB, the *load peak* is still ~12 GB
+    # (the generators load fp32, then the trim casts to fp16 AFTER Inference()
+    # returns). 12 GB load peak + TSDF integrate (~1.5) + FastSAM (0.85) + Gazebo
+    # (~2.6) overflows 16 GB → the preload OOMs, AND a failed load left the worker
+    # holding ~11 GB which then OOM'd TSDF integrate (26 frames dropped) and the
+    # at-Enter SAM3D load (0 objects). Net negative. Proven path = FastSAM during
+    # capture + SAM3D at Enter (no contention). Re-enable only after the trim is
+    # moved INTO the load (fp16 ckpt read) via DGS_SAM3D_LOAD_DURING_CAPTURE=1.
     sam_worker: SamWorkerClient | None = None
     _sam3_load_thread: threading.Thread | None = None
     _sam3_load_err: dict = {"err": None, "seconds": 0.0}
@@ -478,7 +484,7 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
     # path loads SAM3D then (the proven sequential fallback).
     _sam3d_preload: dict = {"loaded": False, "seconds": 0.0, "err": None}
     _preload_sam3d = (SEGMENTATION_BACKEND == "fastsam"
-                      and os.environ.get("DGS_SAM3D_LOAD_DURING_CAPTURE", "1") == "1")
+                      and os.environ.get("DGS_SAM3D_LOAD_DURING_CAPTURE", "0") == "1")
     try:
         sam_worker = SamWorkerClient(conda_env=SAM3_CONDA_ENV)
         print(f"[live] SAM worker spawned ({sam_worker.spawn_seconds:.2f}s)", flush=True)
