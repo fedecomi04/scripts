@@ -40,6 +40,28 @@ def _resolve_sam3d_python() -> str:
     return sys.executable
 
 
+def _sam3d_subprocess_env() -> Dict[str, str]:
+    """Env for the SAM3D subprocess, hardened to be launch-independent.
+
+    Fast-SAM3D's notebook/inference.py does ``os.environ["CUDA_HOME"] =
+    os.environ["CONDA_PREFIX"]`` at import, so a subprocess that inherits a
+    parent env WITHOUT ``CONDA_PREFIX`` (e.g. ns-train launched via the env's
+    bare python rather than an activated shell) crashes with KeyError. Pin
+    CONDA_PREFIX/CUDA_HOME to the sam3 env + prepend its lib to LD_LIBRARY_PATH +
+    PYTHONNOUSERSITE=1, mirroring sam3_segmentation / sam_worker.
+    """
+    env = os.environ.copy()
+    if _SAM3D_ENV_PYTHON.exists():
+        env_prefix = str(_SAM3D_ENV_PYTHON.parent.parent)
+        env["CONDA_PREFIX"] = env_prefix
+        env["CUDA_HOME"] = env_prefix
+        env["LD_LIBRARY_PATH"] = (
+            str(_SAM3D_ENV_PYTHON.parent.parent / "lib") + ":" + env.get("LD_LIBRARY_PATH", "")
+        ).rstrip(":")
+        env["PYTHONNOUSERSITE"] = "1"
+    return env
+
+
 def get_sam3d_output_paths(
     output_dir: Path,
     output_stem: str,
@@ -921,7 +943,7 @@ def run_sam3d_multi_object_subprocess(
     completed = subprocess.run(
         command,
         cwd=str(Path(__file__).resolve().parents[2]),
-        env=os.environ.copy(),
+        env=_sam3d_subprocess_env(),
         capture_output=True,
         text=True,
     )
@@ -1002,7 +1024,7 @@ def run_sam3d_single_object_subprocess(
     completed = subprocess.run(
         command,
         cwd=str(Path(__file__).resolve().parents[2]),
-        env=os.environ.copy(),
+        env=_sam3d_subprocess_env(),
         capture_output=True,
         text=True,
     )
