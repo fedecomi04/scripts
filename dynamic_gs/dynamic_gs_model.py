@@ -185,8 +185,13 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     that land inside small-object masks (a 2-3% screwdriver only gets ~8-20
     keypoints at top_k=300, well below min_track_points=12). 3000 covers the
     typical 1-10% object-area range comfortably. Cost: detectAndCompute scales
-    with top_k linearly — measured at ~21 ms/tick at top_k=300, expected
-    ~30-40 ms at top_k=3000 (still well under the 100 ms/tick budget)."""
+    roughly linearly with top_k — verify DN.3c_xfeat_extract in the timing
+    report after changing this; it must stay under the per-tick budget
+    (≈100 ms). Measured on new_env (192 frames, viser on): avg 14.3 ms at 3000,
+    17.4 ms at 6000 — doubling cost only ~22% (extract is image-bound, not
+    purely top_k-bound), but doubling gave no tracking benefit on new_env (the
+    object was lost at the tail because it left the view, not for lack of
+    keypoints), so 3000 stays the default."""
     """Max keypoints per frame. The XFeat top-k is applied AFTER NMS so
     in practice you get fewer keypoints on small/textureless images —
     the value is only a cap. 300 is sized for the worst case where the

@@ -229,6 +229,16 @@ class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
     are never culled."""
     feedforward_cull_in_front_depth_tol_m: float = 0.002
     """Per-Gaussian depth tolerance for the cull-in-front filter."""
+    feedforward_cull_before_decode: bool = True
+    """Run ONE in-front cull over the whole changed (CDN) region BEFORE the
+    decoder, then recompute CDN on the freshly-culled scene. If the cull
+    alone clears the change (cleaned CDN has no components), the decoder /
+    AnySplat is skipped entirely — culling a stale occluder is often the
+    whole fix, so this saves a decode/AnySplat call. The culled set is the
+    same as the per-component cull (instance_ids in {0, 999}: both original
+    point-cloud AND previously-inserted FF Gaussians; tracked objects never).
+    When True, the redundant per-component in-front cull inside the decode
+    loop is skipped (this pass already covered the CDN union)."""
     feedforward_object_mask_dilate_px: int = 2
     """Dilation applied to the rendered object mask before subtracting it
     from CDN in :meth:`_feedforward_clean_cdn`."""
@@ -1919,6 +1929,18 @@ class DynamicGSPipelineBase(VanillaPipeline):
         )
         self._timing["FF.1_cdn_clean"].append(time.time() - t0)
 
+        # Cull-before-decode: drop in-front occluders (original + prior FF
+        # Gaussians) over the CDN region, recompute CDN. If culling alone
+        # cleared the change, the component list below is empty and we skip
+        # the decode loop entirely.
+        t0 = time.time()
+        cdn_clean, n_pre_culled = self._feedforward_cull_then_reclean_cdn(
+            camera, batch, cdn_clean, gt_depth, frame_name=frame_name_for_cdn,
+        )
+        self._timing["FF.1b_cull_before_decode"].append(time.time() - t0)
+        if n_pre_culled > 0:
+            self._refresh_viser_direct_after_feedforward()
+
         t0 = time.time()
         if mode_label == "oneshot":
             components = select_top_n_components_filtered(
@@ -1936,7 +1958,8 @@ class DynamicGSPipelineBase(VanillaPipeline):
         if not components:
             CONSOLE.log(
                 f"[feedforward] {mode_label} call={call_id} step={self._dynamic_step_counter} "
-                f"frame={frame_idx} no components above min_area"
+                f"frame={frame_idx} no components above min_area "
+                f"(pre-decode cull removed {n_pre_culled}; decode skipped)"
             )
             return
 
@@ -1987,9 +2010,12 @@ class DynamicGSPipelineBase(VanillaPipeline):
             else:
                 n_deleted = 0
 
+            # Per-component in-front cull. Redundant when the pre-decode cull
+            # already swept the CDN union (feedforward_cull_before_decode), so
+            # only run it on the legacy path where that pass is disabled.
             n_culled = 0
-            with self._viser_lock_ctx():
-                if self.config.feedforward_cull_in_front:
+            if self.config.feedforward_cull_in_front and not self.config.feedforward_cull_before_decode:
+                with self._viser_lock_ctx():
                     n_culled = self._feedforward_cull_in_front_of_depth(
                         camera, comp_mask, gt_depth,
                         depth_tol_m=float(self.config.feedforward_cull_in_front_depth_tol_m),
@@ -2153,6 +2179,45 @@ class DynamicGSPipelineBase(VanillaPipeline):
             return 0
         return model.delete_gaussian_indices(indices)
 
+    @torch.no_grad()
+    def _feedforward_cull_then_reclean_cdn(
+        self, camera, batch, cdn_clean, gt_depth, *, frame_name=None,
+    ):
+        """Cull-before-decode: delete every eligible Gaussian sitting in front
+        of the true sensor surface within the changed (CDN) region, then
+        recompute CDN on the freshly-culled scene.
+
+        Eligible = ``object_instance_ids in {0, 999}`` — both the original
+        point-cloud (0) AND previously-inserted feedforward Gaussians (999);
+        tracked objects are never touched. This is the SAME test the
+        per-component cull runs, applied once over the union CDN region so a
+        stale FF occluder is removed regardless of which component it sits in.
+
+        Returns ``(cdn_clean, n_culled)``. When ``n_culled > 0`` the returned
+        CDN is freshly recomputed + re-cleaned (the cull may have cleared the
+        change, in which case the caller skips the decoder). When nothing was
+        culled the input ``cdn_clean`` is returned unchanged.
+        """
+        if not self.config.feedforward_cull_before_decode:
+            return cdn_clean, 0
+        n_culled = 0
+        with self._viser_lock_ctx():
+            n_culled = self._feedforward_cull_in_front_of_depth(
+                camera, cdn_clean, gt_depth,
+                depth_tol_m=float(self.config.feedforward_cull_in_front_depth_tol_m),
+            )
+        if n_culled <= 0:
+            return cdn_clean, 0
+        # The cull mutated the scene — re-render CDN so it reflects the
+        # freshly-removed occluders, then re-subtract the object footprint.
+        cdn_new = self._compute_tick_cdn(camera, batch)
+        if cdn_new is None:
+            return cdn_clean, n_culled
+        cdn_clean_new = self._feedforward_clean_cdn(
+            camera, cdn_new, frame_name=frame_name,
+        )
+        return cdn_clean_new, n_culled
+
     # ---- AnySplat feedforward path ----
 
     def _start_anysplat_persistent_worker(self) -> None:
@@ -2241,6 +2306,29 @@ class DynamicGSPipelineBase(VanillaPipeline):
         )
         self._timing["FF.1_cdn_clean"].append(time.time() - t0)
 
+        # Need depth + batch up-front for the cull-before-decode pass (the
+        # later AnySplat block reuses them).
+        batch = target_frame["batch"]
+        if batch is None:
+            CONSOLE.log(f"[anysplat] frame {frame_idx} has no batch — skip")
+            return
+        gt_depth = self.model._get_gt_depth(batch)
+        if gt_depth is None:
+            CONSOLE.log(f"[anysplat] frame {frame_idx} has no depth — skip")
+            return
+
+        # Cull-before-decode: drop in-front occluders (original + prior FF
+        # Gaussians) over the CDN region, recompute CDN. If culling alone
+        # clears the change, components below is empty and we skip the
+        # (expensive) AnySplat forward + reproject entirely.
+        t0 = time.time()
+        cdn_clean, n_pre_culled = self._feedforward_cull_then_reclean_cdn(
+            camera, batch, cdn_clean, gt_depth, frame_name=frame_name_for_cdn,
+        )
+        self._timing["FF.1b_cull_before_decode"].append(time.time() - t0)
+        if n_pre_culled > 0:
+            self._refresh_viser_direct_after_feedforward()
+
         # --- Debug-image dump: per-call object_mask + CDN + gripper_mask ---
         # Writes everything we need to see WHY the tracker is stuck and WHY the
         # CDN may still include the gripper. Files land under
@@ -2270,7 +2358,8 @@ class DynamicGSPipelineBase(VanillaPipeline):
         if not components:
             CONSOLE.log(
                 f"[anysplat] {mode_label} call={call_id} step={self._dynamic_step_counter} "
-                f"frame={frame_idx} no components"
+                f"frame={frame_idx} no components "
+                f"(pre-decode cull removed {n_pre_culled}; AnySplat skipped)"
             )
             return
 
@@ -2280,14 +2369,6 @@ class DynamicGSPipelineBase(VanillaPipeline):
             return
         image_paths = [image_paths[0]]
 
-        batch = target_frame["batch"]
-        if batch is None:
-            CONSOLE.log(f"[anysplat] frame {frame_idx} has no batch — skip")
-            return
-        gt_depth = self.model._get_gt_depth(batch)
-        if gt_depth is None:
-            CONSOLE.log(f"[anysplat] frame {frame_idx} has no depth — skip")
-            return
         sensor_depth_np = gt_depth.detach().cpu().numpy().astype(np.float32)
         if sensor_depth_np.ndim == 3:
             sensor_depth_np = sensor_depth_np[..., 0]
@@ -2497,10 +2578,14 @@ class DynamicGSPipelineBase(VanillaPipeline):
                     CONSOLE.log(f"[anysplat] call={call_id} comp={k} empty; skip")
                     continue
 
+                # Per-component in-front cull. Redundant when the pre-decode
+                # cull already swept the CDN union (and ran on the main tick
+                # thread, not here on the bg thread), so only run it on the
+                # legacy path where that pass is disabled.
                 t0 = time.time()
                 n_culled = 0
-                with self._viser_lock_ctx():
-                    if self.config.feedforward_cull_in_front:
+                if self.config.feedforward_cull_in_front and not self.config.feedforward_cull_before_decode:
+                    with self._viser_lock_ctx():
                         n_culled = self._feedforward_cull_in_front_of_depth(
                             camera, comp_mask, gt_depth,
                             depth_tol_m=float(self.config.feedforward_cull_in_front_depth_tol_m),
@@ -2616,6 +2701,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
                 f"object_flags={obj_count} inserted_flags={ins_count} "
                 f"total_gauss={self.model.num_points} "
                 f"| cdn={_last_ms('FF.1_cdn_clean'):.0f} "
+                f"precull={_last_ms('FF.1b_cull_before_decode'):.0f} "
                 f"comp_sel={_last_ms('FF.2_component_select'):.0f} "
                 f"anysplat_inf={_last_ms('FF.3a_anysplat_inference'):.0f} "
                 f"reproj={_last_ms('FF.3b_anysplat_reproject'):.0f} "
