@@ -25,6 +25,7 @@ segment so the arm starts at the same home pose the recording started from.
 from __future__ import print_function
 import argparse
 import bisect
+import os
 import time
 
 import rospy
@@ -101,6 +102,13 @@ def main():
     setstate = rospy.ServiceProxy("/gazebo/set_model_state", SetModelState)
     jpub = rospy.Publisher("/joint_states", JointState, queue_size=10) if args.republish_joints else None
 
+    # Ground-truth trajectory log for tracker-smoothness analysis: the forced
+    # pose of the FIRST object, wall-time stamped (same clock as the pipeline's
+    # DGS_TRACK_TRAJ_LOG). Columns: wall_t, x,y,z.
+    gt_log = os.environ.get("DGS_REPLAY_GT_LOG")
+    gt_f = open(gt_log, "w") if (gt_log and object_models) else None
+    gt_obj = object_models[0] if object_models else None
+
     t_wall0 = time.time()
     r = rospy.Rate(args.rate)
     n = 0
@@ -135,11 +143,17 @@ def main():
                     setstate(ms)
                 except Exception:
                     pass
+                if gt_f is not None and om == gt_obj:
+                    p = os_[1].position
+                    gt_f.write("%.6f,%.6f,%.6f,%.6f\n" % (time.time(), p.x, p.y, p.z))
         n += 1
         if e - last_log >= 5.0:
             print("[replay] t=+%.1fs (bag %.1fs), %d forces" % (e, bt, n), flush=True)
             last_log = e
         r.sleep()
+    if gt_f is not None:
+        gt_f.close()
+        print("[replay] GT trajectory written -> %s" % gt_log, flush=True)
     print("[replay] done: %d forces over %.1fs" % (n, time.time() - t_wall0), flush=True)
     return 0
 

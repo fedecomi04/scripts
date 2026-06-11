@@ -1662,6 +1662,24 @@ class DynamicGSPipelineBase(VanillaPipeline):
                 motion_estimate.rotation, motion_estimate.translation,
             )
         self._last_motion_estimate = motion_estimate
+        # Trajectory log for smoothness analysis (DGS_TRACK_TRAJ_LOG=<csv>).
+        # Object centroid c(t)=R·c0+T from the FIXED D0 reference means, so it's
+        # immune to FF inserts. Columns: wall_t, cx,cy,cz, rvx,rvy,rvz, inliers, corr.
+        _tj = os.environ.get("DGS_TRACK_TRAJ_LOG")
+        _ref = getattr(self.model, "_reference_object_means", None)
+        if _tj and _ref is not None:
+            try:
+                import cv2 as _cv2
+                _R = torch.as_tensor(motion_estimate.rotation, device=_ref.device, dtype=_ref.dtype).reshape(3, 3)
+                _T = torch.as_tensor(motion_estimate.translation, device=_ref.device, dtype=_ref.dtype).reshape(3)
+                _ct = (_R @ _ref.mean(0) + _T).detach().cpu().numpy()
+                _rv = _cv2.Rodrigues(np.ascontiguousarray(motion_estimate.rotation, dtype=np.float64))[0].ravel()
+                with open(_tj, "a") as _f:
+                    _f.write(f"{time.time():.6f},{_ct[0]:.6f},{_ct[1]:.6f},{_ct[2]:.6f},"
+                             f"{_rv[0]:.6f},{_rv[1]:.6f},{_rv[2]:.6f},"
+                             f"{int(motion_estimate.inlier_count)},{int(motion_estimate.correspondence_count)}\n")
+            except Exception:
+                pass
         self._timing["DN.3g_apply_transform"].append(time.time() - t)
         # Tracker-tick-driven render: the per-tick model mutation just
         # completed, wake the viser render thread for exactly one push
