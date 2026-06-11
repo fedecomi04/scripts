@@ -358,8 +358,8 @@ class StaticGSPipeline(VanillaPipeline):
 # straight to Phase 0b. Set the loss to 0 (or DGS_STATIC_EARLY_STOP=0) to
 # disable and always run the full max_num_iterations budget.
 STATIC_EARLY_STOP_ENABLED = os.environ.get("DGS_STATIC_EARLY_STOP", "1") != "0"
-STATIC_EARLY_STOP_LOSS = float(os.environ.get("DGS_STATIC_EARLY_STOP_LOSS", "0.02"))
-STATIC_EARLY_STOP_PATIENCE = int(os.environ.get("DGS_STATIC_EARLY_STOP_PATIENCE", "10"))
+STATIC_EARLY_STOP_LOSS = float(os.environ.get("DGS_STATIC_EARLY_STOP_LOSS", "0.09"))
+STATIC_EARLY_STOP_PATIENCE = int(os.environ.get("DGS_STATIC_EARLY_STOP_PATIENCE", "8"))
 STATIC_EARLY_STOP_MIN_STEPS = int(os.environ.get("DGS_STATIC_EARLY_STOP_MIN_STEPS", "100"))
 
 
@@ -381,20 +381,42 @@ class StaticGSTrainer(NoSaveTrainer):
 
         main = loss_dict.get("main_loss")
         main_val = float(main.detach()) if main is not None else None
-        if main_val is not None and step % 50 == 0:
-            CONSOLE.log(f"[static-gs] step {step} main_loss={main_val:.4f}")
+        if main_val is not None:
+            import time as _t
+            now = _t.time()
+            if getattr(self, "_loss_t0", None) is None:
+                self._loss_t0 = now
+                self._loss_last = -1.0
+                self._loss_ema = main_val
+            self._loss_ema = 0.9 * self._loss_ema + 0.1 * main_val
+            el = now - self._loss_t0
+            # log once per wall-second so the curve is "time to convergence"
+            if el - self._loss_last >= 1.0:
+                mcfg = self.pipeline.model.config
+                nd = getattr(mcfg, "num_downscales", 2)
+                rs = getattr(mcfg, "resolution_schedule", 100)
+                ds = 2 ** max(nd - step // max(rs, 1), 0)
+                CONSOLE.log(f"static-gs| t={el:4.1f}s step={step:4d} res=1/{ds} "
+                            f"loss={main_val:.4f} ema={self._loss_ema:.4f}")
+                self._loss_last = el
 
         if STATIC_EARLY_STOP_ENABLED and STATIC_EARLY_STOP_LOSS > 0:
+            # Fire on the EMA (not the per-image loss, which oscillates ~0.05-0.15
+            # and never gives a stable 10-in-a-row near the plateau). The full-res
+            # main_loss EMA plateaus at ~0.08 (the 500-step "perfect" value); the
+            # threshold is that plateau's lower bound. Requires full-res early
+            # (num_downscales=0) or the EMA stays ~0.10 until the schedule reaches
+            # full res. See DGS_STATIC_EARLY_STOP_LOSS.
             if main_val is not None and step >= STATIC_EARLY_STOP_MIN_STEPS:
-                if main_val < STATIC_EARLY_STOP_LOSS:
+                if self._loss_ema < STATIC_EARLY_STOP_LOSS:
                     self._early_stop_hits += 1
                 else:
                     self._early_stop_hits = 0
                 if self._early_stop_hits >= STATIC_EARLY_STOP_PATIENCE:
                     CONSOLE.log(
-                        f"[static-gs] early-stop: main_loss={main_val:.4f} < "
+                        f"static-gs| early-stop: loss_ema={self._loss_ema:.4f} < "
                         f"{STATIC_EARLY_STOP_LOSS} for {STATIC_EARLY_STOP_PATIENCE} "
-                        f"consecutive steps at step {step}; ending static training. "
+                        f"steps at step {step}; ending static training. "
                         f"(disable via DGS_STATIC_EARLY_STOP=0)"
                     )
                     # The Trainer.train() loop checks self.stop_training at the

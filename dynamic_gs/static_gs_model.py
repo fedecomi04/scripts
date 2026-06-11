@@ -69,6 +69,12 @@ class StaticGSModelConfig(SplatfactoModelConfig):
     output_depth_during_training: bool = True
     sh_degree_interval: int = 500
     resolution_schedule: int = 100
+    # Full-res from step 0 (no coarse-to-fine downscale). With the short
+    # early-stopped budget, the schedule's 1/4→1/2→1/1 ramp meant the loss
+    # never reached the full-res plateau before stopping; full-res-from-0 lets
+    # the EMA early-stop (main_loss~0.09) fire at ~step 100 / ~2.6s. Measured
+    # 2026-06-11: 21.4s→2.6s, PSNR 20.10→19.08 dB (~1 dB for ~19s).
+    num_downscales: int = 0
 
     # ---- Phase 0a (SAM3 text-prompted segmentation) ----
     use_sam3_graspable_prefusion: bool = True
