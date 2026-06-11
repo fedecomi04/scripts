@@ -409,6 +409,15 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     sam3_min_score: float = 0.2
     sam3_reuse_cached: bool = True
 
+    # ---- Segmentation backend (SAM3 vs FastSAM) — kept in sync with
+    #      StaticGSModelConfig; see that file for the rationale + quality gate.
+    segmentation_backend: Literal["sam3", "fastsam"] = "fastsam"
+    fastsam_weights: str = "FastSAM-x.pt"
+    fastsam_clip_model: str = "ViT-B-32-quickgelu"
+    fastsam_clip_pretrained: str = "openai"
+    fastsam_conf: float = 0.4
+    fastsam_iou: float = 0.9
+
 
 class DynamicGSModel(SplatfactoModel):
     config: DynamicGSModelConfig

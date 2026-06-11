@@ -39,6 +39,7 @@ from ..utils import (
     register_and_fuse_sam3d_object,
 )
 from ..utils.sam3_segmentation import load_sam3_masks, run_sam3_subprocess
+from ..utils.fastsam_segmentation import run_fastsam_subprocess
 from ..utils.sam3d import (
     get_sam3d_output_paths,
     resolve_sam3d_pose_path,
@@ -406,6 +407,21 @@ def run_phase0a_sam3_and_sam3d(
 
     results_json = debug_dir / "static0_sam3_results.json"
     sam3_cached = model_cfg.sam3_reuse_cached and results_json.exists()
+    # Invalidate the cache when the configured backend differs from the one that
+    # produced it (the summary tags "segmentation_backend"; SAM3's legacy JSON
+    # omits it → treated as "sam3"). Prevents a SAM3 cache from being served to
+    # a FastSAM run and vice versa after a backend switch.
+    if sam3_cached:
+        try:
+            _cached_backend = json.loads(results_json.read_text()).get("segmentation_backend", "sam3")
+        except Exception:
+            _cached_backend = "sam3"
+        if _cached_backend != getattr(model_cfg, "segmentation_backend", "sam3"):
+            CONSOLE.log(
+                f"[phase-0] cached SAM3 results are from backend '{_cached_backend}' but config "
+                f"requests '{getattr(model_cfg, 'segmentation_backend', 'sam3')}' — re-running segmentation"
+            )
+            sam3_cached = False
 
     run_device = torch.device(model.means.device)
     if not sam3_cached:
@@ -433,19 +449,40 @@ def run_phase0a_sam3_and_sam3d(
             sam3_objects = load_sam3_masks(results_json)
             CONSOLE.log(f"[phase-0] reusing cached SAM3 results: {len(sam3_objects)} objects")
         else:
-            sam3_objects = run_sam3_subprocess(
-                image_path=static_image_path,
-                text_prompt=model_cfg.sam3_prompt_text,
-                output_dir=debug_dir,
-                output_stem="static0",
-                sam3_conda_env=model_cfg.sam3_conda_env_name,
-                min_area_ratio=model_cfg.sam3_candidate_min_area_ratio,
-                max_area_ratio=model_cfg.sam3_candidate_max_area_ratio,
-                dedup_iou=model_cfg.sam3_candidate_dedup_iou,
-                max_objects=model_cfg.sam3_candidate_max_objects,
-                confidence_threshold=model_cfg.sam3_confidence_threshold,
-                min_score=model_cfg.sam3_min_score,
-            )
+            backend = getattr(model_cfg, "segmentation_backend", "sam3")
+            if backend == "fastsam":
+                CONSOLE.log("[phase-0] segmentation backend = FastSAM+CLIP")
+                sam3_objects = run_fastsam_subprocess(
+                    image_path=static_image_path,
+                    text_prompt=model_cfg.sam3_prompt_text,
+                    output_dir=debug_dir,
+                    output_stem="static0",
+                    sam3_conda_env=model_cfg.sam3_conda_env_name,
+                    min_area_ratio=model_cfg.sam3_candidate_min_area_ratio,
+                    max_area_ratio=model_cfg.sam3_candidate_max_area_ratio,
+                    dedup_iou=model_cfg.sam3_candidate_dedup_iou,
+                    max_objects=model_cfg.sam3_candidate_max_objects,
+                    min_score=model_cfg.sam3_min_score,
+                    fastsam_conf=getattr(model_cfg, "fastsam_conf", 0.4),
+                    fastsam_iou=getattr(model_cfg, "fastsam_iou", 0.9),
+                    clip_model=getattr(model_cfg, "fastsam_clip_model", "ViT-B-32-quickgelu"),
+                    clip_pretrained=getattr(model_cfg, "fastsam_clip_pretrained", "openai"),
+                    fastsam_weights=getattr(model_cfg, "fastsam_weights", "FastSAM-x.pt"),
+                )
+            else:
+                sam3_objects = run_sam3_subprocess(
+                    image_path=static_image_path,
+                    text_prompt=model_cfg.sam3_prompt_text,
+                    output_dir=debug_dir,
+                    output_stem="static0",
+                    sam3_conda_env=model_cfg.sam3_conda_env_name,
+                    min_area_ratio=model_cfg.sam3_candidate_min_area_ratio,
+                    max_area_ratio=model_cfg.sam3_candidate_max_area_ratio,
+                    dedup_iou=model_cfg.sam3_candidate_dedup_iou,
+                    max_objects=model_cfg.sam3_candidate_max_objects,
+                    confidence_threshold=model_cfg.sam3_confidence_threshold,
+                    min_score=model_cfg.sam3_min_score,
+                )
         timing.setdefault("S0.1_sam3_segmentation", []).append(time.time() - t_sam3)
 
         # In live mode the real SAM3 subprocess ran in a separate helper

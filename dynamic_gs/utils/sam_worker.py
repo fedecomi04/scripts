@@ -16,20 +16,29 @@ once per SAM3 call and once per SAM3D call. Profile breakdown for SAM3 (see
 Every per-call subprocess pays the first ~9 s. A persistent worker pays it
 once at startup. Subsequent inferences cost the 0.12 s warm-floor.
 
-VRAM budget on a 16 GB GPU:
+VRAM budget on a 16 GB GPU (MEASURED 2026-06-11 on RTX 5070 Ti, 15842 MiB total;
+nvidia-smi per-pid resident / peak — supersedes old eyeballed comments):
 
-    SAM3 resident ....... 4.5 GB
-    SAM3D resident ...... 13.2 GB
-    TSDF integrate ...... ~3 GB during capture
-    TSDF.finalize() ..... 12.3 GB peak (after capture stops)
+    SAM3 ............ resident 3772  peak 4522 MiB
+    SAM3D ........... resident 12042 peak 13006 MiB  (fp32 generators dominate)
+    FastSAM+CLIP .... resident  854  peak 1930 MiB   (~4.4x lighter than SAM3)
+    splatfacto step . peak ~1110 MiB (572k gs, 800x800; far below old 5-8 GB note)
+    TSDF integrate .. ~3 GB during capture       (comment-derived; re-measure)
+    TSDF.finalize() . ~12.3 GB peak              (comment-derived; re-measure)
 
-SAM3 + SAM3D = 17.7 GB → does NOT fit together. So the worker exposes
-explicit ``load_*`` / ``unload_*`` commands and we load them sequentially:
+SAM3 + SAM3D = 17.7 GB → does NOT fit. FastSAM + SAM3D = ~15 GB → DOES fit, which
+is why FastSAM replaces SAM3 as the default segmentation backend: it lets SAM3D
+load from the start and (trimmed) run parallel to splatfacto. The worker still
+exposes explicit ``load_*`` / ``unload_*`` so callers sequence by VRAM budget:
 
-    capture starts → worker boots → load_sam3 (parallel with TSDF integrate)
-    user Enter → sam3_infer (0.12 s warm) → unload_sam3
+    capture starts → worker boots → load_fastsam (parallel with TSDF integrate)
+    user Enter → fastsam_infer (warm) → unload_fastsam
     load_sam3d → sam3d_infer → unload_sam3d → shutdown
-    fusion_runner.stop_and_finalize() (TSDF spikes to 12.3 GB, alone on GPU)
+    fusion_runner.stop_and_finalize() (TSDF spikes alone on GPU)
+
+Every ``load_*`` / ``*_infer`` response carries ``gpu_resident_mb`` /
+``gpu_peak_mb`` (torch allocator) so the orchestration budget can be re-checked
+from real numbers at runtime.
 
 Protocol. JSON-over-stdin/stdout, one request per line. Client writes one
 JSON object; worker writes exactly one JSON response per request. Stderr is
@@ -97,10 +106,26 @@ class _SamWorker:
         self.sam3_processor = None
         self.sam3d_inference = None
         self.sam3d_runtime_cfg = None
+        self.fastsam_seg = None
         # Lazy import torch once at startup — re-importing inside handlers is
         # free but the first ``import torch`` costs 0.7 s.
         import torch
         self.torch = torch
+
+    def _gpu_mem(self) -> Dict[str, float]:
+        """Current torch allocator resident + peak (MiB). Permanent
+        instrumentation so the orchestration budget is checkable from real
+        numbers in every load/infer response."""
+        if not self.torch.cuda.is_available():
+            return {"gpu_resident_mb": 0.0, "gpu_peak_mb": 0.0}
+        return {
+            "gpu_resident_mb": round(self.torch.cuda.memory_allocated() / 2**20, 1),
+            "gpu_peak_mb": round(self.torch.cuda.max_memory_allocated() / 2**20, 1),
+        }
+
+    def _reset_peak(self) -> None:
+        if self.torch.cuda.is_available():
+            self.torch.cuda.reset_peak_memory_stats()
 
     # -------- SAM3 --------------------------------------------------------
 
@@ -110,10 +135,11 @@ class _SamWorker:
         from sam3.model_builder import build_sam3_image_model  # type: ignore
         from sam3.model.sam3_image_processor import Sam3Processor  # type: ignore
         t0 = time.perf_counter()
+        self._reset_peak()
         self.sam3_model = build_sam3_image_model()
         self.sam3_processor = Sam3Processor(self.sam3_model, confidence_threshold=confidence_threshold)
         elapsed = time.perf_counter() - t0
-        return {"status": "ok", "load_seconds": elapsed}
+        return {"status": "ok", "load_seconds": elapsed, **self._gpu_mem()}
 
     def unload_sam3(self) -> Dict[str, Any]:
         if self.sam3_processor is None:
@@ -354,7 +380,7 @@ class _SamWorker:
         self.sam3d_inference = inference
         self.sam3d_runtime_cfg = cfg
         elapsed = time.perf_counter() - t0
-        return {"status": "ok", "load_seconds": elapsed}
+        return {"status": "ok", "load_seconds": elapsed, **self._gpu_mem()}
 
     def unload_sam3d(self) -> Dict[str, Any]:
         if self.sam3d_inference is None:
@@ -531,7 +557,82 @@ class _SamWorker:
             "status": "ok",
             "results": all_results,
             "total_seconds": time.perf_counter() - t_total,
+            **self._gpu_mem(),
         }
+
+    # -------- FastSAM (lightweight SAM3 alternative) ----------------------
+
+    def load_fastsam(self, *,
+                     fastsam_weights: str = "FastSAM-x.pt",
+                     clip_model: str = "ViT-B-32-quickgelu",
+                     clip_pretrained: str = "openai") -> Dict[str, Any]:
+        if self.fastsam_seg is not None:
+            return {"status": "ok", "already_loaded": True, **self._gpu_mem()}
+        _fs = _load_sibling_module("fastsam_segmentation")
+        self._reset_peak()
+        t0 = time.perf_counter()
+        self.fastsam_seg = _fs.FastSamTextSegmenter(
+            weights=fastsam_weights, clip_model=clip_model, clip_pretrained=clip_pretrained,
+        )
+        return {"status": "ok", "load_seconds": time.perf_counter() - t0, **self._gpu_mem()}
+
+    def unload_fastsam(self) -> Dict[str, Any]:
+        if self.fastsam_seg is None:
+            return {"status": "ok", "already_unloaded": True}
+        self.fastsam_seg = None
+        gc.collect()
+        if self.torch.cuda.is_available():
+            self.torch.cuda.empty_cache()
+        return {"status": "ok", **self._gpu_mem()}
+
+    def fastsam_infer(self, *,
+                      image_path: str,
+                      text_prompt: str,
+                      output_dir: str,
+                      output_stem: str,
+                      min_area_ratio: float = 0.002,
+                      max_area_ratio: float = 0.25,
+                      dedup_iou: float = 0.6,
+                      max_objects: int = 8,
+                      min_score: float = 0.2,
+                      fastsam_conf: float = 0.4,
+                      fastsam_iou: float = 0.9,
+                      imgsz: int = 1024) -> Dict[str, Any]:
+        if self.fastsam_seg is None:
+            raise RuntimeError("FastSAM not loaded; call load_fastsam first")
+        self._reset_peak()
+        t0 = time.perf_counter()
+        objects = self.fastsam_seg.infer(
+            image_path=image_path, text_prompt=text_prompt,
+            output_dir=output_dir, output_stem=output_stem,
+            min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio,
+            dedup_iou=dedup_iou, max_objects=max_objects, min_score=min_score,
+            fastsam_conf=fastsam_conf, fastsam_iou=fastsam_iou, imgsz=imgsz,
+        )
+        return {"status": "ok", "objects": objects,
+                "infer_seconds": time.perf_counter() - t0, **self._gpu_mem()}
+
+    def fastsam_infer_raw(self, *,
+                          image_path: str,
+                          text_prompt: str,
+                          output_dir: str,
+                          output_stem: str,
+                          min_score: float = 0.0,
+                          fastsam_conf: float = 0.4,
+                          fastsam_iou: float = 0.9,
+                          imgsz: int = 1024) -> Dict[str, Any]:
+        if self.fastsam_seg is None:
+            raise RuntimeError("FastSAM not loaded; call load_fastsam first")
+        self._reset_peak()
+        t0 = time.perf_counter()
+        res = self.fastsam_seg.infer_raw(
+            image_path=image_path, text_prompt=text_prompt,
+            output_dir=output_dir, output_stem=output_stem, min_score=min_score,
+            fastsam_conf=fastsam_conf, fastsam_iou=fastsam_iou, imgsz=imgsz,
+        )
+        return {"status": "ok", "masks_path": res["masks_path"],
+                "num_masks": res["num_masks"],
+                "infer_seconds": time.perf_counter() - t0, **self._gpu_mem()}
 
 
 def _worker_main() -> int:
@@ -577,6 +678,10 @@ def _worker_main() -> int:
             "load_sam3d": w.load_sam3d,
             "unload_sam3d": w.unload_sam3d,
             "sam3d_infer": w.sam3d_infer,
+            "load_fastsam": w.load_fastsam,
+            "unload_fastsam": w.unload_fastsam,
+            "fastsam_infer": w.fastsam_infer,
+            "fastsam_infer_raw": w.fastsam_infer_raw,
         }
         h = handler_map.get(cmd)
         if h is None:
@@ -782,6 +887,74 @@ class SamWorkerClient:
             intrinsics_path=str(intrinsics_path) if intrinsics_path else None,
         )
         return resp.get("results", [])
+
+    # -- FastSAM ------------------------------------------------------------
+
+    def load_fastsam(self,
+                     fastsam_weights: str = "FastSAM-x.pt",
+                     clip_model: str = "ViT-B-32-quickgelu",
+                     clip_pretrained: str = "openai",
+                     timeout_s: float = 120.0) -> float:
+        """Block on FastSAM+CLIP load. Returns model-load seconds.
+
+        ``timeout_s`` allows for first-run weight downloads (FastSAM-x ~140 MB +
+        CLIP ViT-B-32). Once cached, load is ~few s."""
+        resp = self._request("load_fastsam", timeout_s=timeout_s,
+                             fastsam_weights=fastsam_weights,
+                             clip_model=clip_model, clip_pretrained=clip_pretrained)
+        return float(resp.get("load_seconds", 0.0))
+
+    def unload_fastsam(self, timeout_s: float = 15.0) -> None:
+        self._request("unload_fastsam", timeout_s=timeout_s)
+
+    def fastsam_infer(self,
+                      *,
+                      image_path: Path,
+                      text_prompt: str,
+                      output_dir: Path,
+                      output_stem: str,
+                      min_area_ratio: float = 0.002,
+                      max_area_ratio: float = 0.25,
+                      dedup_iou: float = 0.6,
+                      max_objects: int = 8,
+                      min_score: float = 0.2,
+                      fastsam_conf: float = 0.4,
+                      fastsam_iou: float = 0.9,
+                      imgsz: int = 1024,
+                      timeout_s: float = 60.0) -> List[Dict[str, Any]]:
+        resp = self._request(
+            "fastsam_infer", timeout_s=timeout_s,
+            image_path=str(image_path), text_prompt=text_prompt,
+            output_dir=str(output_dir), output_stem=output_stem,
+            min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio,
+            dedup_iou=dedup_iou, max_objects=max_objects, min_score=min_score,
+            fastsam_conf=fastsam_conf, fastsam_iou=fastsam_iou, imgsz=imgsz,
+        )
+        return resp.get("objects", [])
+
+    def fastsam_infer_raw(self,
+                          *,
+                          image_path: Path,
+                          text_prompt: str,
+                          output_dir: Path,
+                          output_stem: str,
+                          min_score: float = 0.0,
+                          fastsam_conf: float = 0.4,
+                          fastsam_iou: float = 0.9,
+                          imgsz: int = 1024,
+                          timeout_s: float = 60.0) -> dict:
+        """Returns {"masks_path": Path, "num_masks": int, "infer_seconds": float}."""
+        resp = self._request(
+            "fastsam_infer_raw", timeout_s=timeout_s,
+            image_path=str(image_path), text_prompt=text_prompt,
+            output_dir=str(output_dir), output_stem=output_stem, min_score=min_score,
+            fastsam_conf=fastsam_conf, fastsam_iou=fastsam_iou, imgsz=imgsz,
+        )
+        return {
+            "masks_path": Path(resp["masks_path"]),
+            "num_masks": int(resp.get("num_masks", 0)),
+            "infer_seconds": float(resp.get("infer_seconds", 0.0)),
+        }
 
     # -- lifecycle ----------------------------------------------------------
 

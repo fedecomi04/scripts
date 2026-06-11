@@ -24,12 +24,23 @@ the parent (dynamic_gs) side is cheap.
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
+
+_CONDA_ROOT = Path(os.environ.get("DYNAMIC_GS_CONDA_ROOT", str(Path.home() / "miniconda3")))
+
+
+def _resolve_env_python(conda_env: str):
+    py = _CONDA_ROOT / "envs" / conda_env / "bin" / "python"
+    return py if py.exists() else None
 
 
 # --- mask filter helpers (inlined to avoid importing the package __init__,
@@ -277,3 +288,116 @@ class FastSamTextSegmenter:
         masks_path = out_dir / f"{output_stem}_raw_masks.npz"
         np.savez(str(masks_path), masks=kept_masks, scores=kept_scores, boxes=kept_boxes)
         return {"masks_path": str(masks_path), "num_masks": int(kept_masks.shape[0])}
+
+
+# ---------------------------------------------------------------------------
+# Subprocess launcher (runs in the training env; spawns the sam3 env) +  CLI.
+# Mirrors sam3_segmentation.run_sam3_subprocess so phase0a can branch backends
+# with a one-line swap. The persistent SamWorkerClient path is preferred for
+# the live/orchestrated flow (FastSAM + SAM3D co-resident); this subprocess is
+# the simple recorded-flow path and the no-worker fallback.
+# ---------------------------------------------------------------------------
+
+
+def run_fastsam_subprocess(
+    image_path: Path,
+    text_prompt: str,
+    output_dir: Path,
+    output_stem: str,
+    sam3_conda_env: str = "sam3_dynamic_gs",
+    **filter_kwargs,
+) -> List[Dict]:
+    """Launch FastSAM+CLIP segmentation in the sam3 env. Returns the same
+    ``{mask_path, score, bbox, mask_area, object_index}`` contract as SAM3."""
+    image_path = Path(image_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    env_python = _resolve_env_python(sam3_conda_env)
+    if env_python is not None:
+        command = [str(env_python), str(Path(__file__).resolve())]
+    else:
+        command = ["conda", "run", "--no-capture-output", "-n", sam3_conda_env,
+                   "python", str(Path(__file__).resolve())]
+    command += [
+        "--image", str(image_path),
+        "--text-prompt", text_prompt,
+        "--output-dir", str(output_dir),
+        "--output-stem", output_stem,
+    ]
+    # Only forward kwargs the CLI understands (drop SAM3-only keys like
+    # confidence_threshold so the same phase0a call site works for both).
+    _cli_keys = {"min_area_ratio", "max_area_ratio", "dedup_iou", "max_objects",
+                 "min_score", "fastsam_conf", "fastsam_iou", "imgsz",
+                 "fastsam_weights", "clip_model", "clip_pretrained"}
+    for key, value in filter_kwargs.items():
+        if key not in _cli_keys:
+            continue
+        command.extend([f"--{key.replace('_', '-')}", str(value)])
+
+    sub_env = os.environ.copy()
+    if env_python is not None:
+        env_lib = str(env_python.parent.parent / "lib")
+        sub_env["LD_LIBRARY_PATH"] = (env_lib + ":" + sub_env.get("LD_LIBRARY_PATH", "")).rstrip(":")
+        sub_env["PYTHONNOUSERSITE"] = "1"
+        sub_env.setdefault("CONDA_PREFIX", str(env_python.parent.parent))
+
+    completed = subprocess.run(
+        command, cwd=str(Path(__file__).resolve().parents[2]),
+        env=sub_env, capture_output=True, text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "FastSAM subprocess failed.\n"
+            f"Command: {' '.join(command)}\n"
+            f"STDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
+    summary_path = output_dir / f"{output_stem}_sam3_results.json"
+    if not summary_path.exists():
+        raise RuntimeError(f"FastSAM subprocess completed but results JSON not found: {summary_path}")
+    return json.loads(summary_path.read_text()).get("objects", [])
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="FastSAM+CLIP text-prompted segmentation worker")
+    p.add_argument("--image", type=Path, required=True)
+    p.add_argument("--text-prompt", type=str, required=True)
+    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--output-stem", type=str, required=True)
+    p.add_argument("--min-area-ratio", type=float, default=0.002)
+    p.add_argument("--max-area-ratio", type=float, default=0.25)
+    p.add_argument("--dedup-iou", type=float, default=0.6)
+    p.add_argument("--max-objects", type=int, default=8)
+    p.add_argument("--min-score", type=float, default=0.2)
+    p.add_argument("--fastsam-conf", type=float, default=0.4)
+    p.add_argument("--fastsam-iou", type=float, default=0.9)
+    p.add_argument("--imgsz", type=int, default=1024)
+    p.add_argument("--fastsam-weights", type=str, default="FastSAM-x.pt")
+    p.add_argument("--clip-model", type=str, default="ViT-B-32-quickgelu")
+    p.add_argument("--clip-pretrained", type=str, default="openai")
+    return p.parse_args()
+
+
+def _main() -> int:
+    a = _parse_args()
+    try:
+        seg = FastSamTextSegmenter(weights=a.fastsam_weights, clip_model=a.clip_model,
+                                   clip_pretrained=a.clip_pretrained)
+        seg.infer(
+            image_path=str(a.image), text_prompt=a.text_prompt,
+            output_dir=str(a.output_dir), output_stem=a.output_stem,
+            min_area_ratio=a.min_area_ratio, max_area_ratio=a.max_area_ratio,
+            dedup_iou=a.dedup_iou, max_objects=a.max_objects, min_score=a.min_score,
+            fastsam_conf=a.fastsam_conf, fastsam_iou=a.fastsam_iou, imgsz=a.imgsz,
+        )
+        return 0
+    except Exception as exc:
+        import traceback
+        print(f"FastSAM worker failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

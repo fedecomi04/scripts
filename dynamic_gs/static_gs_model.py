@@ -82,6 +82,20 @@ class StaticGSModelConfig(SplatfactoModelConfig):
     sam3_min_score: float = 0.2
     sam3_reuse_cached: bool = True
 
+    # ---- Segmentation backend (SAM3 vs FastSAM) ----
+    segmentation_backend: Literal["sam3", "fastsam"] = "fastsam"
+    """Which text-prompted segmenter feeds Phase 0a. ``fastsam`` (DEFAULT) =
+    FastSAM-x + CLIP, ~0.85 GB resident vs SAM3's ~3.8 GB — light enough to
+    co-reside with SAM3D (~12 GB) so SAM3D can load from the start. ``sam3`` =
+    the original Meta SAM3 grounding model (heavier, slightly tighter masks).
+    Quality gate (screwdriver, recording_15fps): top-1 IoU 0.79 fastsam-vs-sam3.
+    Both run in the ``sam3_dynamic_gs`` env via SamWorkerClient."""
+    fastsam_weights: str = "FastSAM-x.pt"
+    fastsam_clip_model: str = "ViT-B-32-quickgelu"
+    fastsam_clip_pretrained: str = "openai"
+    fastsam_conf: float = 0.4
+    fastsam_iou: float = 0.9
+
     # ---- Phase 0a (Fast-SAM3D 3D generation) + Phase 0b (registration) ----
     use_sam3d_object_init: bool = True
     reuse_sam3d_generated_ply: bool = True
