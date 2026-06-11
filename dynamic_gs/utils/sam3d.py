@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import ModuleType
 from typing import Dict, List
@@ -717,6 +718,7 @@ def run_sam3d_multi_object(
             depth_m = np.array(depth_pil, dtype=np.float32)
         pointmap_full = _build_pytorch3d_pointmap(depth_m, intrinsics)  # (H, W, 3) float32
 
+    _t_imp0 = time.time()
     runtime_config_path = _write_runtime_config()
     Inference = _import_official_api()
 
@@ -725,16 +727,19 @@ def run_sam3d_multi_object(
     # API accepted a path string. Load via OmegaConf so the same call works.
     from omegaconf import OmegaConf as _OmegaConf
     runtime_config_obj = _OmegaConf.load(str(runtime_config_path))
+    print(f"[sam3d-timing] import+config: {time.time()-_t_imp0:.1f}s", file=sys.stderr)
 
     # Load model once
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     inference = None
+    _t_load0 = time.time()
     try:
         inference = Inference(runtime_config_obj, compile=False)
     except Exception as exc:
         raise RuntimeError(f"Failed to load SAM3D model: {exc}") from exc
+    print(f"[sam3d-timing] model load (Inference ctor): {time.time()-_t_load0:.1f}s", file=sys.stderr)
 
     # Fast-SAM3D's inference_pipeline_pointmap.run() reads `self.hfer_2d`
     # without checking if it was set. Issue #9 in the upstream repo confirms
@@ -810,11 +815,14 @@ def run_sam3d_multi_object(
                         pm_t = torch.nn.functional.interpolate(pm_t, size=(th, tw), mode="nearest")
                         resized_pointmap = pm_t.squeeze(0).permute(1, 2, 0).contiguous()
                 try:
+                    _t_inf0 = time.time()
                     if resized_pointmap is not None:
                         output = inference(cur_image, cur_mask, seed=42, pointmap=resized_pointmap)
                     else:
                         output = inference(cur_image, cur_mask, seed=42)
                     used_shape = tuple(cur_image.shape)
+                    print(f"[sam3d-timing] infer mask {i} @{candidate_size}: {time.time()-_t_inf0:.1f}s",
+                          file=sys.stderr)
                     break
                 except torch.cuda.OutOfMemoryError:
                     gc.collect()
