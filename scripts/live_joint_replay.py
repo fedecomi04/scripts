@@ -144,8 +144,9 @@ def main():
                 except Exception:
                     pass
                 if gt_f is not None and om == gt_obj:
-                    p = os_[1].position
-                    gt_f.write("%.6f,%.6f,%.6f,%.6f\n" % (time.time(), p.x, p.y, p.z))
+                    p, q = os_[1].position, os_[1].orientation
+                    gt_f.write("%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n"
+                               % (time.time(), p.x, p.y, p.z, q.x, q.y, q.z, q.w))
         n += 1
         if e - last_log >= 5.0:
             print("[replay] t=+%.1fs (bag %.1fs), %d forces" % (e, bt, n), flush=True)

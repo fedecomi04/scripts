@@ -117,6 +117,9 @@ def _write_frame_dynamic(frame: LiveFrame, dyn_dir: Path, meta: dict, written: l
         "depth_file_path": f"./depth/{stem}.tiff",
         "mask_path": f"./masks/{stem}.png",
         "transform_matrix": frame.c2w_4x4.tolist(),
+        # wall-clock at reader poll (~capture +- one frame): joins offline
+        # tracker output to the replay's wall-stamped GT log per-frame.
+        "stamp_wall": time.time(),
     })
     meta["frames"] = written
     tp = dyn_dir / "transforms.json"

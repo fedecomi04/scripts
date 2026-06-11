@@ -26,6 +26,7 @@ keeps those working without code changes.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
@@ -541,7 +542,10 @@ def estimate_rigid_transform_ransac(
     if source_points.shape != target_points.shape or source_points.shape[0] < max(min_inliers, 3):
         return None
 
-    rng = np.random.default_rng(12345)
+    # Fixed seed per call → RANSAC is deterministic for a given match set (the
+    # only tick-to-tick stochasticity is the match set itself). DGS_RANSAC_SEED
+    # overrides for seed-ensemble experiments (measuring sampling variance).
+    rng = np.random.default_rng(int(os.environ.get("DGS_RANSAC_SEED", "12345")))
     best_rotation = None
     best_translation = None
     best_inlier_mask = None

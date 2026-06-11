@@ -1677,7 +1677,8 @@ class DynamicGSPipelineBase(VanillaPipeline):
                 with open(_tj, "a") as _f:
                     _f.write(f"{time.time():.6f},{_ct[0]:.6f},{_ct[1]:.6f},{_ct[2]:.6f},"
                              f"{_rv[0]:.6f},{_rv[1]:.6f},{_rv[2]:.6f},"
-                             f"{int(motion_estimate.inlier_count)},{int(motion_estimate.correspondence_count)}\n")
+                             f"{int(motion_estimate.inlier_count)},{int(motion_estimate.correspondence_count)},"
+                             f"{frame_name}\n")
             except Exception:
                 pass
         self._timing["DN.3g_apply_transform"].append(time.time() - t)
