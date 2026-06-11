@@ -222,6 +222,28 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     xfeat_weights_path: str = ""
     """Absolute path to xfeat.pt. Empty falls back to
     third_party/xfeat/weights/xfeat.pt."""
+    xfeat_use_semi_dense: bool = False
+    """Use XFeat* (semi-dense) instead of the default sparse detectAndCompute.
+    Extracts dual-scale descriptors on a coarse grid (up to 2*top_k keypoints,
+    top_k from each scale) and feeds them straight into LighterGlue — the
+    descriptor head is the same 64-D L2-normalised output from the same
+    xfeat.pt weights, so LighterGlue consumes them unchanged.
+    Trade-offs:
+      * +keypoint coverage: ~2x more candidates spread across the image
+        (less reliance on corner-like detector responses), so the rigid
+        fit usually has more inliers when the object's textured area is
+        small — that's the main reason to try this for jittery tracking.
+      * -accuracy per kp: keypoints are coarse-grid, not sub-pixel; depth-
+        backproject Kabsch picks up ~1-2 px of geometric noise vs sparse.
+        With more inliers the rigid fit variance still usually wins.
+      * +cost: ~12 ms vs ~7 ms sparse at 800x800 per upstream's bench,
+        plus LighterGlue's transformer scales ~linearly in keypoint count,
+        so per-tick match time roughly 2x.
+      * Out-of-distribution for LighterGlue: the matcher was trained on
+        sparse XFeat keypoints; semi-dense -> LighterGlue is mechanically
+        compatible but not validated by upstream. If matches degrade,
+        switching to MNN (xfeat_use_lighterglue=False) is the fallback —
+        that's the path upstream's official ``match_xfeat_star`` uses."""
     xfeat_use_lighterglue: bool = True
     """Use LighterGlue (XFeat-author-trained slim LightGlue) instead of MNN
     over the descriptors. LighterGlue's attention rejects ambiguous
@@ -242,6 +264,34 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     when the underlying object is stationary. Leave at -1 unless you can
     show the shake is harmless for your downstream consumer (e.g. when
     the consumer applies its own temporal smoothing)."""
+    xfeat_pose_filter_enabled: bool = True
+    """Smooth the tracker's output pose with a constant-velocity SE(3)
+    Kalman filter (``tracker_common.PoseKalmanFilter``). Targets the
+    stationary-object jiggle caused by per-tick match-set variance
+    (different LighterGlue subsets -> slightly different Kabsch poses).
+    Filters ONLY the pose returned to the pipeline; the tracker's
+    internal cumulative pose (anchor selection / creation / next-tick
+    prediction) stays raw, so smoothing lag can never destabilize
+    tracking itself."""
+    xfeat_pose_filter_accel_sigma: float = 0.05
+    """Process noise: white translational acceleration 1-sigma (m/s^2).
+    Lower = smoother + more lag after sudden jerks; higher = follows the
+    raw RANSAC pose more closely. Bench (synthetic, 3 mm / 0.5 deg
+    measurement noise at 20 Hz): 0.05 attenuates stationary jitter
+    ~2.1x and settles a worst-case instantaneous 5 cm jump in 4 ticks
+    (~200 ms); 0.02 gives ~2.5x but 7-tick settle; 0.5 gives ~1.4x with
+    2-tick settle. Smooth (constant-velocity-ish) motion tracks BETTER
+    at lower sigmas because the filter's velocity state models it."""
+    xfeat_pose_filter_alpha_sigma: float = 0.25
+    """Process noise: white angular acceleration 1-sigma (rad/s^2). Same
+    trade-off as the translational sigma, for rotation."""
+    xfeat_pose_filter_meas_trans_sigma_m: float = 0.003
+    """Measurement noise: assumed 1-sigma of the RANSAC translation
+    (metres). Raise if the stationary jiggle is still visible (trusts
+    each measurement less); lower if motion lags."""
+    xfeat_pose_filter_meas_rot_sigma_deg: float = 0.5
+    """Measurement noise: assumed 1-sigma of the RANSAC rotation
+    (degrees). Same trade-off as the translation sigma."""
     xfeat_object_mask_cache_ticks: int = 3
     """Re-render the splat-rasterized object mask only every Nth tracker
     tick; reuse the cached mask otherwise. ``render_object_mask`` costs
@@ -258,6 +308,29 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     the legacy filtered behavior. The filtered version drops too much area for
     thin/gripped objects (e.g. a fidget spinner being held), leaving only a
     sliver of pixels which then can't produce matchable XFeat descriptors."""
+    xfeat_crop_to_object_bbox: bool = True
+    """Crop the live RGB+depth to a tight bbox around the tracked object's
+    projected Gaussian centres before XFeat extract. The bbox is computed
+    from ``means[object_instance_ids == d0_id]`` at the camera's current
+    c2w (per tick), padded by ``xfeat_crop_padding_px``, and clamped to
+    image bounds. After cropping, every one of XFeat's ``top_k`` keypoints
+    lands inside the object region rather than being spent on the static
+    background — critical for small objects (screwdriver, fidget spinner)
+    where the post-extract mask filter would otherwise drop ~95% of
+    keypoints and leave too few survivors to match against the D0 anchor.
+    Compared to a black-out / mask-multiply approach this avoids the
+    boundary-descriptor corruption that breaks LighterGlue (CNN trained
+    on natural images, sees a sharp pixel↔black transition as a fake
+    edge). Camera intrinsics (cx, cy, width, height) are adjusted so
+    depth backprojection stays metric. Set False to revert to full-image
+    extract + post-match gripper-keep filter."""
+    xfeat_crop_padding_px: int = 60
+    """Padding (pixels) around the projected-bbox crop used by
+    ``xfeat_crop_to_object_bbox``. Wide enough that fast tick-to-tick
+    motion still keeps the actual object inside the crop (the bbox lags
+    the true object by one tick of motion). 60 px tolerates ~60 px of
+    per-tick displacement at 800x800. Raise for faster motion, lower for
+    tighter focus."""
     xfeat_object_search_radius_px: int = 80
     """Dilation radius (pixels) applied to the rendered object mask before
     using it as the per-frame post-match filter on the current frame. The

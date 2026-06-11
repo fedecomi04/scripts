@@ -148,6 +148,30 @@ class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
     stays out of the way."""
     viser_direct_port: int = 8081
 
+    # ---- Interactive object selection (default OFF) ----
+    interactive_object_selection: bool = False
+    """When True, the operator picks the tracked object via a viser GUI panel
+    (the SAM3 input image with each object's mask overlaid + numbered, a
+    button-group of object ids, and a Done button) instead of the heuristic.
+    A persistent "Change object" button reopens the picker mid-run so the
+    operator can switch objects after finishing one. Default False keeps
+    headless/CI runs on the existing ``d0_force_instance_id`` / anchor-centroid
+    heuristic. The picked id == SAM3 mask number + 1 == ``object_instance_ids``
+    (true in both static-gs and static-gs-preseg as of the 2026-06-10 preseg
+    id-order fix)."""
+    object_selection_jpeg_quality: int = 85
+    """JPEG quality for the overlay image pushed into the picker panel."""
+    object_selection_timeout_s: float = 120.0
+    """If ``interactive_object_selection`` is True but no Done click arrives
+    within this many seconds (e.g. no viser client connected), fall back to
+    ``d0_force_instance_id`` / the heuristic and log it. Checked on the trainer
+    thread via a wall-clock comparison — never blocks."""
+
+    d0_force_instance_id: Optional[int] = None
+    """Force D0 to track this exact prefused ``object_instance_id``, bypassing
+    the per-subclass anchor/centroid heuristic. Shared by both subclasses and
+    used as the headless/timeout fallback when interactive selection is on."""
+
     # ---- Feedforward dispatcher (rgbd or anysplat) ----
     enable_feedforward_inpaint: Literal["off", "rgbd_decode", "anysplat_decode"] = "rgbd_decode"
     """``rgbd_decode`` back-projects sensor depth into per-pixel Gaussians
@@ -297,6 +321,33 @@ class DynamicGSPipelineBase(VanillaPipeline):
         self._feedforward_oneshot_done: bool = False
         self._last_feedforward_wall_time: float = 0.0
         self._d0_selected_instance_id: int = 0
+        # cudnn benchmark mode OFF for the dynamic phase. ns-train sets
+        # torch.backends.cudnn.benchmark=True globally (nerfstudio/scripts/
+        # train.py:71), which makes cudnn run an exhaustive conv-algorithm
+        # autotune for every NEW input shape — and the XFeat crop
+        # (_crop_for_xfeat) presents a new H×W almost every tick. Measured on
+        # new_env (192 frames, viser on + client, FF rgbd): DN.3c_xfeat_extract
+        # avg 754.4 ms / max 5711.7 ms with benchmark=True vs avg 14.3 ms /
+        # max 29.7 ms with it off (53×) — this was the visible per-tick object
+        # freeze. Benchmark mode only pays off with FIXED shapes (static
+        # training); the dynamic phase is shape-varying, so it's strictly
+        # harmful here. gsplat (custom CUDA) and LighterGlue (matmul/cublas)
+        # are unaffected by this flag.
+        torch.backends.cudnn.benchmark = False
+        # Interactive object-picker state machine (non-blocking; the viser
+        # GUI callbacks run on viser's thread pool and only set these flags,
+        # while the trainer-thread tick polls them). All inert unless
+        # ``config.interactive_object_selection`` is True.
+        self._selection_state: str = "IDLE"  # "IDLE" | "AWAITING_SELECTION"
+        self._pending_selected_id: Optional[int] = None
+        self._selection_event = threading.Event()
+        self._selection_request_t: float = 0.0
+        self._selection_gui_folder = None       # GuiFolderHandle (remove() clears)
+        self._selection_dropdown = None         # GuiDropdownHandle (current pick)
+        self._change_object_button = None       # persistent GuiButtonHandle
+        self._reselect_requested: bool = False  # set by Change-object / stdin Enter
+        self._initial_selection_done: bool = False  # first pick happened?
+        self._sam3_objects = None               # cached (overlay_rgb, [ObjEntry])
         self._anysplat_persistent_worker = None
         self._feedforward_video_writer = None
         self._viser_direct_server = None
@@ -698,6 +749,302 @@ class DynamicGSPipelineBase(VanillaPipeline):
         )
 
     # ====================================================================
+    # Object (re)selection — shared by D0 first-pick + interactive switching
+    # ====================================================================
+
+    def _reset_d0_guard(self) -> None:
+        """Reset the per-subclass 'D0 already happened' guard so the next tick
+        treats the (re)selected object as a fresh D0. Base default resets the
+        tick counter; live overrides to also flip ``_d0_completed``."""
+        self._tracker_tick_count = 0
+
+    @torch.no_grad()
+    def _reseed_tracked_object(self, new_id: int, camera, batch) -> bool:
+        """Switch the tracked object to ``new_id``. Returns True on success.
+
+        Single entry point for BOTH the D0 first-pick and every interactive
+        re-selection. Performs the full reset surface, then re-runs steps 2-5
+        of the D0 bootstrap (object_flags + reference pose + object mask +
+        XFeat anchor seed) for the new instance. ``object_instance_ids`` is the
+        stable per-Gaussian identity; ``inserted_flags`` (FF, id 999) and
+        ``sam3d_init_target_flags`` are intentionally untouched. Object A simply
+        freezes at its last applied pose once B becomes the active object.
+
+        On a failed XFeat seed the D0 guard is NOT reset, so the caller (live
+        defer loop) can retry on a later frame instead of marking D0 done."""
+        new_id = int(new_id)
+        # --- reset surface (pipeline side) ---
+        self._motion_estimator = None
+        self._last_motion_estimate = None
+        self._viser_direct_handles_built = False
+        self._d0_selected_instance_id = new_id
+
+        ids_buf = self.model.object_instance_ids
+        ids = ids_buf.squeeze(-1) if ids_buf.ndim > 1 else ids_buf
+        # --- step 2 (object_flags) + step 4 (reference pose) under the lock ---
+        with self._viser_lock_ctx():
+            self.model.object_flags.copy_((ids == new_id).float().unsqueeze(-1))
+            if hasattr(self.model, "capture_reference_object_pose"):
+                self.model.capture_reference_object_pose(instance_id=new_id)
+        n_flagged = int((self.model.object_flags.squeeze(-1) > 0.5).sum().item())
+
+        # --- step 3 (object mask) ---
+        try:
+            obj_mask = self.model.render_object_mask(camera)
+        except Exception as exc:
+            CONSOLE.log(f"[dynamic-gs] reseed render_object_mask failed: {exc}")
+            obj_mask = None
+
+        # --- step 5 (XFeat anchor seed on the NEW object) ---
+        live_rgb = self._build_tracking_rgb(batch)
+        depth = batch.get("depth_image")
+        try:
+            self._initialize_motion_estimator(live_rgb, depth, camera, obj_mask)
+        except Exception as exc:
+            CONSOLE.log(f"[dynamic-gs] reseed _initialize_motion_estimator failed: {exc}")
+            return False
+
+        self._reset_d0_guard()
+        CONSOLE.log(
+            f"[dynamic-gs] reseeded tracked object -> instance_id={new_id} "
+            f"({n_flagged} Gaussians flagged)"
+        )
+        return True
+
+    # ---- Interactive picker (viser GUI, non-blocking state machine) ----
+
+    def _present_object_ids(self) -> set:
+        """Set of prefused object ids currently present in the buffer (>0)."""
+        ids = self.model.object_instance_ids
+        ids = ids.squeeze(-1) if ids.ndim > 1 else ids
+        return {int(i) for i in torch.unique(ids[ids > 0]).tolist()}
+
+    def _selection_fallback_id(self, camera) -> int:
+        """Headless/timeout fallback: forced id if valid, else the heuristic."""
+        forced = getattr(self.config, "d0_force_instance_id", None)
+        if forced is not None and int(forced) in self._present_object_ids():
+            return int(forced)
+        try:
+            return int(self._pick_d0_object(camera, self.model.object_instance_ids))
+        except Exception:
+            return 0
+
+    def _open_picker_panel(self, camera, batch) -> None:
+        """Build the viser picker GUI (SAM3 overlay + id button-group + Done).
+
+        Non-blocking: returns immediately after constructing the panel; the
+        trainer-thread tick polls :meth:`_poll_selection`. If no viser server
+        is up, route straight to the fallback (caller reseeds + stays IDLE)."""
+        import time as _time
+        srv = getattr(self, "_viser_direct_server", None)
+        if srv is None or getattr(srv, "server", None) is None:
+            # No viser → immediate fallback (no AWAITING state).
+            fb = self._selection_fallback_id(camera)
+            CONSOLE.log(
+                f"[picker] no viser client surface; falling back to "
+                f"instance_id={fb}"
+            )
+            if fb > 0:
+                self._reseed_tracked_object(fb, camera, batch)
+            self._selection_state = "IDLE"
+            return
+        server = srv.server
+
+        # Load + cache the SAM3 objects/overlay once per process.
+        if self._sam3_objects is None:
+            try:
+                from .utils.object_picker import (
+                    load_sam3_objects,
+                    render_picker_overlay,
+                )
+                data_dir = Path(self.config.datamanager.data)
+                loaded = load_sam3_objects(data_dir)
+                if loaded is None:
+                    raise RuntimeError("no SAM3 artifacts on disk")
+                img, entries = loaded
+                overlay = render_picker_overlay(img, entries)
+                self._sam3_objects = (overlay, entries)
+            except Exception as exc:
+                fb = self._selection_fallback_id(camera)
+                CONSOLE.log(
+                    f"[picker] could not load SAM3 objects ({exc}); falling "
+                    f"back to instance_id={fb}"
+                )
+                if fb > 0:
+                    self._reseed_tracked_object(fb, camera, batch)
+                self._selection_state = "IDLE"
+                return
+
+        overlay, entries = self._sam3_objects
+        present = self._present_object_ids()
+        # Offer only ids that exist in the buffer (intersection with SAM3 list).
+        options = [str(e.instance_id) for e in entries
+                   if e.instance_id in present] or [str(i) for i in sorted(present)]
+
+        # Tear down any prior panel folder.
+        if self._selection_gui_folder is not None:
+            try:
+                self._selection_gui_folder.remove()
+            except Exception:
+                pass
+            self._selection_gui_folder = None
+        self._selection_event.clear()
+        self._pending_selected_id = None
+
+        try:
+            with server.gui.add_folder("Pick object to track") as folder:
+                server.gui.add_markdown(
+                    "Pick the object's number from the dropdown "
+                    "(matches the labels on the image), then click **Done**."
+                )
+                server.gui.add_image(
+                    overlay, label="SAM3 objects", format="jpeg",
+                    jpeg_quality=int(self.config.object_selection_jpeg_quality),
+                )
+                # Dropdown (NOT button_group): a dropdown has a PERSISTENT,
+                # single-select ``.value`` that updates on click — a
+                # button_group is momentary and its ``.value`` doesn't track
+                # the click, so Done would always read the default.
+                dd = server.gui.add_dropdown("Object id", options)
+                done = server.gui.add_button("Done", color="green")
+            self._selection_gui_folder = folder
+            self._selection_dropdown = dd
+        except Exception as exc:
+            fb = self._selection_fallback_id(camera)
+            CONSOLE.log(f"[picker] GUI build failed ({exc}); falling back to {fb}")
+            if fb > 0:
+                self._reseed_tracked_object(fb, camera, batch)
+            self._selection_state = "IDLE"
+            return
+
+        @done.on_click
+        def _on_done(_evt) -> None:
+            # viser thread pool — only set flags. Ignore unless awaiting.
+            if self._selection_state != "AWAITING_SELECTION":
+                return
+            try:
+                self._pending_selected_id = int(dd.value)
+            except Exception:
+                self._pending_selected_id = None
+            CONSOLE.log(
+                f"[picker] Done clicked -> selected id={self._pending_selected_id}"
+            )
+            self._selection_event.set()
+
+        self._selection_state = "AWAITING_SELECTION"
+        self._selection_request_t = _time.time()
+        CONSOLE.log(
+            f"[picker] awaiting object selection in viser "
+            f"(options={options}); pick from the dropdown + click Done"
+        )
+
+    def _close_picker_panel(self) -> None:
+        if self._selection_gui_folder is not None:
+            try:
+                self._selection_gui_folder.remove()
+            except Exception:
+                pass
+            self._selection_gui_folder = None
+        self._selection_event.clear()
+        self._pending_selected_id = None
+
+    def _ensure_change_object_button(self) -> None:
+        """Add the persistent 'Change object' button once (reopens the picker)."""
+        srv = getattr(self, "_viser_direct_server", None)
+        if srv is None or getattr(srv, "server", None) is None:
+            return
+        if self._change_object_button is not None:
+            return
+        try:
+            btn = srv.server.gui.add_button("Change object")
+
+            @btn.on_click
+            def _on_change(_evt) -> None:
+                # viser thread pool — flag only; the tick reopens the panel.
+                self._reselect_requested = True
+
+            self._change_object_button = btn
+        except Exception as exc:
+            CONSOLE.log(f"[picker] could not add Change-object button: {exc}")
+
+    def _tick_interactive_selection(self, camera, batch, is_first: bool) -> str:
+        """Drive the interactive picker for one tick. Shared by both subclasses.
+
+        Returns one of:
+          * ``"seeded"`` — a selection was applied via reseed (the caller must
+            SKIP its own D0/DN dispatch — the object is already seeded — but may
+            still run CDN/publish so viser updates).
+          * ``"none"``   — no picker active this tick; proceed normally
+            (heuristic D0 or DN).
+
+        Opens the picker for the FIRST selection (``not _initial_selection_done``)
+        or whenever a ``Change object`` / stdin re-select was requested, then
+        **blocks this tick** until the operator clicks Done (or the wall-clock
+        timeout fires → fallback id). Blocking is safe: the viser render thread
+        is independent (keeps the browser live) and the Done callback runs on
+        viser's thread pool. We block deliberately so the trainer's step counter
+        does NOT advance toward ``max_num_iterations`` while waiting — otherwise
+        a recorded run blows through all its steps in seconds and the panel
+        vanishes before the operator can click.
+
+        Note: gating on ``_initial_selection_done`` rather than ``is_first`` is
+        deliberate — ``_reseed_tracked_object`` resets the D0 guard
+        (``_tracker_tick_count = 0``), which would make ``is_first`` True again
+        on the very next tick and re-open the picker in a loop."""
+        need_open = self._selection_state == "IDLE" and (
+            not self._initial_selection_done or self._reselect_requested
+        )
+        if not need_open and self._selection_state != "AWAITING_SELECTION":
+            return "none"
+
+        if need_open:
+            self._reselect_requested = False
+            self._open_picker_panel(camera, batch)
+            if self._selection_state != "AWAITING_SELECTION":
+                # _open_picker_panel hit the no-viser / no-artifacts fallback
+                # and already reseeded inline.
+                self._initial_selection_done = True
+                return "seeded"
+
+        # Block (bounded) until the operator selects or the timeout fires.
+        chosen = self._wait_for_selection(camera)
+        if chosen is not None and int(chosen) > 0:
+            self._reseed_tracked_object(int(chosen), camera, batch)
+        self._selection_state = "IDLE"
+        self._initial_selection_done = True
+        return "seeded"
+
+    def _wait_for_selection(self, camera) -> Optional[int]:
+        """Block the trainer thread until the operator clicks Done (returns the
+        chosen id) or ``object_selection_timeout_s`` elapses (returns the
+        fallback id, or None if none). Polls the Event in 0.25 s slices so a
+        ``stop`` / process kill is still responsive."""
+        import time as _time
+        timeout = float(getattr(self.config, "object_selection_timeout_s", 120.0))
+        deadline = (self._selection_request_t + timeout) if timeout > 0 else None
+        while True:
+            if getattr(self, "_live_stop_requested", False):
+                self._close_picker_panel()
+                return None
+            if self._selection_event.wait(timeout=0.25):
+                chosen = self._pending_selected_id
+                if chosen is not None and int(chosen) in self._present_object_ids():
+                    self._close_picker_panel()
+                    return int(chosen)
+                # Bad/stale pick — re-arm and keep the panel open.
+                self._selection_event.clear()
+                self._pending_selected_id = None
+                continue
+            if deadline is not None and _time.time() > deadline:
+                fb = self._selection_fallback_id(camera)
+                CONSOLE.log(
+                    f"[picker] selection timed out after {timeout:.0f}s; "
+                    f"falling back to instance_id={fb}"
+                )
+                self._close_picker_panel()
+                return fb if fb > 0 else None
+
+    # ====================================================================
     # Viser-direct visualization (Path A — hybrid, browser-side splatting)
     # ====================================================================
 
@@ -755,6 +1102,8 @@ class DynamicGSPipelineBase(VanillaPipeline):
                 f"+ model attached "
                 f"— open http://localhost:{self.config.viser_direct_port}"
             )
+            if getattr(self.config, "interactive_object_selection", False):
+                self._ensure_change_object_button()
         except Exception as exc:
             CONSOLE.log(
                 f"[viser-direct] failed to start: {exc} — "
@@ -803,6 +1152,40 @@ class DynamicGSPipelineBase(VanillaPipeline):
         except Exception as exc:
             CONSOLE.log(f"[viser-direct] push failed: {exc}")
 
+    def _push_viser_camera_feed(self, camera, batch) -> None:
+        """Push the current tracked frame's RGB (side-panel feed thumbnail) and
+        its camera c2w (for the 'Follow tracked frame' toggle) to viser. Shared
+        by recorded + live ticks; cheap reference swaps — the JPEG encode /
+        camera snap happen render-side only when a client is connected."""
+        srv = self._viser_direct_server
+        if srv is None:
+            return
+        # --- live RGB for the feed thumbnail (uint8 HWC RGB) ---
+        try:
+            rgb = batch.get("image")
+            if rgb is not None:
+                import torch as _torch
+                if isinstance(rgb, _torch.Tensor):
+                    arr = rgb.detach()
+                    if arr.dtype != _torch.uint8:
+                        arr = (arr.clamp(0.0, 1.0) * 255.0).to(_torch.uint8)
+                    rgb_np = arr.cpu().numpy()
+                else:
+                    rgb_np = np.asarray(rgb)
+                    if rgb_np.dtype != np.uint8:
+                        rgb_np = (np.clip(rgb_np, 0.0, 1.0) * 255.0).astype(np.uint8)
+                if rgb_np.ndim == 3 and rgb_np.shape[2] >= 3:
+                    srv.update_camera_feed(np.ascontiguousarray(rgb_np[:, :, :3]))
+        except Exception as exc:
+            CONSOLE.log(f"[viser-direct] camera-feed push failed: {exc}")
+        # --- tracked frame camera c2w for the follow-pose toggle ---
+        try:
+            c2w = camera.camera_to_worlds
+            c2w = c2w[0] if c2w.ndim == 3 else c2w
+            srv.update_tracked_camera(c2w.detach().cpu().numpy())
+        except Exception as exc:
+            CONSOLE.log(f"[viser-direct] tracked-camera push failed: {exc}")
+
     def _viser_direct_register_ff_insert(self, inserted_ids) -> None:
         """Trigger one server-side render after a FF insert. The actual
         FF gaussians are already in ``model`` (insert_inpaint_gaussians
@@ -812,6 +1195,12 @@ class DynamicGSPipelineBase(VanillaPipeline):
         no-op for backwards compat with the now-deleted Path A handle
         accounting."""
         if self._viser_direct_server is None:
+            return
+        # Skip the push if the server is tearing down — a late bg-thread call
+        # here would submit onto a shutting-down executor and raise
+        # "cannot schedule new futures after shutdown" (which previously aborted
+        # the FF video finalize at "Training Finished").
+        if getattr(self._viser_direct_server, "is_closing", False):
             return
         try:
             self._viser_direct_server.add_ff_insert_chunk(self.model, inserted_ids)
@@ -951,6 +1340,102 @@ class DynamicGSPipelineBase(VanillaPipeline):
     # XFeat motion estimator — D0 seed + per-tick advance
     # ====================================================================
 
+    @torch.no_grad()
+    def _object_crop_bbox(self, camera, padding_px: int):
+        """Compute a screen-space bbox covering the tracked object's
+        projected Gaussian centres, padded and clamped to image bounds.
+
+        Returns ``(x0, y0, x1, y1)`` (Python ints) or ``None`` if no
+        tracked-object Gaussian centre is visible (camera looking away,
+        or tracker has nothing to track yet) — caller falls back to the
+        full image.
+        """
+        model = self.model
+        obj_mask = model._tracked_object_mask()
+        if not obj_mask.any():
+            return None
+        # Per-Gaussian buffers can drift out-of-sync with means after some
+        # FF delete/insert sequences (separate bug). Guard so the tick
+        # doesn't crash — return None and the caller falls back to the
+        # full image.
+        n_means = int(model.means.shape[0])
+        if int(obj_mask.shape[0]) != n_means:
+            return None
+        means_obj = model.means[obj_mask]
+
+        def _scalar(x):
+            if isinstance(x, torch.Tensor):
+                return float(x.detach().cpu().reshape(-1)[0].item())
+            return float(x)
+        fx = _scalar(camera.fx); fy = _scalar(camera.fy)
+        cx = _scalar(camera.cx); cy = _scalar(camera.cy)
+        W = int(_scalar(camera.width)); H = int(_scalar(camera.height))
+
+        c2w = camera.camera_to_worlds
+        if c2w.ndim == 3:
+            c2w = c2w[0]
+        c2w = c2w.to(means_obj.device, dtype=means_obj.dtype)
+        R = c2w[:3, :3]; t = c2w[:3, 3]
+        means_cam = (means_obj - t[None, :]) @ R
+        depths = -means_cam[:, 2]
+        in_front = depths > 1e-6
+        safe_d = torch.where(in_front, depths, torch.ones_like(depths))
+        u = fx * (means_cam[:, 0] / safe_d) + cx
+        v = fy * (-means_cam[:, 1] / safe_d) + cy
+        visible = in_front & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        if not visible.any():
+            return None
+        u_v = u[visible]; v_v = v[visible]
+        x0 = max(0, int(u_v.min().item()) - int(padding_px))
+        y0 = max(0, int(v_v.min().item()) - int(padding_px))
+        x1 = min(W, int(u_v.max().item()) + int(padding_px) + 1)
+        y1 = min(H, int(v_v.max().item()) + int(padding_px) + 1)
+        if (x1 - x0) < 16 or (y1 - y0) < 16:
+            return None
+        return (x0, y0, x1, y1)
+
+    @torch.no_grad()
+    def _crop_for_xfeat(self, rgb, depth, camera, mask, bbox):
+        """Crop ``rgb`` (H,W,3), ``depth`` (H,W) or (H,W,1), and ``mask``
+        (H,W) or None to ``bbox = (x0, y0, x1, y1)``, and rebuild a single-
+        camera ``Cameras`` with cx/cy shifted by (x0, y0) and width/height
+        replaced. Depth backprojection inside the estimator stays metric
+        because (fx, fy) are unchanged."""
+        from nerfstudio.cameras.cameras import Cameras, CameraType
+        x0, y0, x1, y1 = bbox
+        if rgb.ndim == 3:
+            rgb_c = rgb[y0:y1, x0:x1, :].contiguous()
+        else:
+            rgb_c = rgb[y0:y1, x0:x1].contiguous()
+        if depth.ndim == 3:
+            depth_c = depth[y0:y1, x0:x1, :].contiguous()
+        else:
+            depth_c = depth[y0:y1, x0:x1].contiguous()
+        mask_c = None
+        if mask is not None:
+            if mask.ndim == 2:
+                mask_c = mask[y0:y1, x0:x1].contiguous()
+            else:
+                mask_c = mask[y0:y1, x0:x1, ...].contiguous()
+
+        def _scalar(x):
+            if isinstance(x, torch.Tensor):
+                return float(x.detach().cpu().reshape(-1)[0].item())
+            return float(x)
+        fx = _scalar(camera.fx); fy = _scalar(camera.fy)
+        cx = _scalar(camera.cx) - x0
+        cy = _scalar(camera.cy) - y0
+        c2w = camera.camera_to_worlds
+        if c2w.ndim == 3:
+            c2w = c2w[0]
+        camera_c = Cameras(
+            camera_to_worlds=c2w.unsqueeze(0).cpu(),
+            fx=fx, fy=fy, cx=cx, cy=cy,
+            width=int(x1 - x0), height=int(y1 - y0),
+            camera_type=CameraType.PERSPECTIVE,
+        ).to(rgb.device)
+        return rgb_c, depth_c, camera_c, mask_c
+
     def _initialize_motion_estimator(self, rgb, depth, camera, mask) -> None:
         """Seed the XFeat tracker with the D0 reference frame.
 
@@ -979,7 +1464,25 @@ class DynamicGSPipelineBase(VanillaPipeline):
             lighterglue_min_conf=self.model.config.xfeat_lighterglue_min_conf,
             lighterglue_depth_confidence=self.model.config.xfeat_lighterglue_depth_confidence,
             object_search_radius_px=self.model.config.xfeat_object_search_radius_px,
+            use_semi_dense=self.model.config.xfeat_use_semi_dense,
+            pose_filter_enabled=self.model.config.xfeat_pose_filter_enabled,
+            pose_filter_accel_sigma=self.model.config.xfeat_pose_filter_accel_sigma,
+            pose_filter_alpha_sigma=self.model.config.xfeat_pose_filter_alpha_sigma,
+            pose_filter_meas_trans_sigma_m=self.model.config.xfeat_pose_filter_meas_trans_sigma_m,
+            pose_filter_meas_rot_sigma_deg=self.model.config.xfeat_pose_filter_meas_rot_sigma_deg,
         )
+        if getattr(self.model.config, "xfeat_crop_to_object_bbox", False):
+            bbox = self._object_crop_bbox(
+                camera, padding_px=int(self.model.config.xfeat_crop_padding_px),
+            )
+            if bbox is not None:
+                CONSOLE.log(
+                    f"[dynamic-gs] D0 crop bbox=({bbox[0]},{bbox[1]})-"
+                    f"({bbox[2]},{bbox[3]}) [{bbox[2]-bbox[0]}x{bbox[3]-bbox[1]}]"
+                )
+                rgb, depth, camera, mask = self._crop_for_xfeat(
+                    rgb, depth, camera, mask, bbox,
+                )
         seeded = self._motion_estimator.initialize(
             rgb=rgb, depth=depth, camera=camera, mask=mask,
         )
@@ -1012,11 +1515,26 @@ class DynamicGSPipelineBase(VanillaPipeline):
         if current_mask is None:
             current_mask = self.model._get_batch_mask(batch)
         self._timing["DN.3j_object_mask_render"].append(time.time() - t_mask)
+        # Optional: crop rgb+depth+camera+mask to the tracked object's
+        # projected bbox so XFeat's top_k keypoints all land on the object
+        # instead of being spent on background. Critical for small objects.
+        current_depth = batch["depth_image"]
+        current_camera = camera
+        if getattr(self.model.config, "xfeat_crop_to_object_bbox", False):
+            bbox = self._object_crop_bbox(
+                camera, padding_px=int(self.model.config.xfeat_crop_padding_px),
+            )
+            if bbox is not None:
+                current_live_rgb, current_depth, current_camera, current_mask = (
+                    self._crop_for_xfeat(
+                        current_live_rgb, current_depth, camera, current_mask, bbox,
+                    )
+                )
         t = time.time()
         motion_estimate = self._motion_estimator.estimate_and_advance(
             current_rgb=current_live_rgb,
-            current_depth=batch["depth_image"],
-            current_camera=camera,
+            current_depth=current_depth,
+            current_camera=current_camera,
             current_mask=current_mask,
             current_object_mask=current_object_mask,
         )
@@ -1029,6 +1547,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
                                   sub.get("klt_forward", 0.0))))
         )
         self._timing["DN.3c_xfeat_extract"].append(float(sub.get("xfeat_extract", 0.0)))
+        self._timing["DN.3c0_gpu_queue_wait"].append(float(sub.get("gpu_queue_wait", 0.0)))
         self._timing["DN.3i_lighterglue_match"].append(
             float(sub.get("lighterglue_match", 0.0))
         )

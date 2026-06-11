@@ -318,6 +318,182 @@ def backproject_to_world(
     return (camera_points @ rotation.T + translation[None, :]).astype(np.float32)
 
 
+def _so3_exp(w: np.ndarray) -> np.ndarray:
+    """Rotation vector (3,) -> rotation matrix (3, 3)."""
+    R, _ = cv2.Rodrigues(np.asarray(w, dtype=np.float64).reshape(3, 1))
+    return R
+
+
+def _so3_log(R: np.ndarray) -> np.ndarray:
+    """Rotation matrix (3, 3) -> rotation vector (3,)."""
+    w, _ = cv2.Rodrigues(np.asarray(R, dtype=np.float64))
+    return w.flatten()
+
+
+class PoseKalmanFilter:
+    """Constant-velocity error-state Kalman filter on SE(3).
+
+    Smooths the per-tick (R, t) pose measurements coming out of
+    RANSAC+Kabsch. The dominant noise source is per-tick match-set
+    variance (different LighterGlue match subsets -> slightly different
+    Kabsch solutions), which is approximately zero-mean — exactly what a
+    KF removes. A constant-velocity motion model keeps lag low during
+    real object motion while strongly attenuating stationary jitter.
+
+    State (12,): [position (3), velocity (3), rotation-error (3),
+    angular velocity (3)]. Rotation is kept as a nominal matrix
+    ``_R_nom`` with a small-angle error state that is injected and
+    zeroed after every update (standard ESKF). Angular velocity is
+    expressed in the world frame and composed on the left.
+
+    All units are metres / radians / seconds. Cost is a handful of
+    12x12 numpy ops per tick (<0.05 ms).
+    """
+
+    def __init__(
+        self,
+        accel_sigma: float = 0.05,
+        alpha_sigma: float = 0.25,
+        meas_trans_sigma: float = 0.003,
+        meas_rot_sigma: float = 0.009,
+        snap_trans_m: float = 0.05,
+        snap_rot_rad: float = 0.1745,  # 10 deg
+    ) -> None:
+        # Process noise: white translational acceleration (m/s^2) and
+        # white angular acceleration (rad/s^2). Larger = trusts the
+        # measurements more = less smoothing, less lag.
+        self._accel_sigma = float(accel_sigma)
+        self._alpha_sigma = float(alpha_sigma)
+        # Measurement noise: 1-sigma of the RANSAC pose estimate
+        # (metres, radians). Larger = smoother output, more lag.
+        self._meas_trans_var = float(meas_trans_sigma) ** 2
+        self._meas_rot_var = float(meas_rot_sigma) ** 2
+        # Innovation gate: a per-tick pose jump larger than this cannot
+        # come from continuous motion (at 20+ Hz it would mean >1 m/s /
+        # >200 deg/s) — it is a reacquisition after tracking loss or an
+        # anchor-pool discontinuity. Smoothing through it causes
+        # overshoot (the step kicks the velocity state), so snap-reset
+        # to the measurement instead.
+        self._snap_trans_m = float(snap_trans_m)
+        self._snap_rot_rad = float(snap_rot_rad)
+        self.reset()
+
+    def reset(self) -> None:
+        self._initialized = False
+        self._t_nom = np.zeros(3, dtype=np.float64)
+        self._R_nom = np.eye(3, dtype=np.float64)
+        self._x = np.zeros(12, dtype=np.float64)   # error/velocity state
+        self._P = np.eye(12, dtype=np.float64)
+        self._last_time: float = 0.0
+
+    @property
+    def initialized(self) -> bool:
+        return self._initialized
+
+    def current(self) -> tuple[np.ndarray, np.ndarray]:
+        """Latest filtered pose (R (3,3), t (3,)) as float32."""
+        return (
+            self._R_nom.astype(np.float32),
+            self._t_nom.astype(np.float32),
+        )
+
+    def filter(
+        self, R_meas: np.ndarray, t_meas: np.ndarray, timestamp: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Predict + update with one RANSAC pose measurement.
+
+        Returns the filtered (R, t). The first call initializes the
+        state to the measurement and returns it unchanged.
+        """
+        R_meas64 = np.asarray(R_meas, dtype=np.float64).reshape(3, 3)
+        t_meas64 = np.asarray(t_meas, dtype=np.float64).reshape(3)
+
+        if not self._initialized:
+            self._t_nom = t_meas64.copy()
+            self._R_nom = R_meas64.copy()
+            self._x[:] = 0.0
+            # Position/rotation start at measurement uncertainty;
+            # velocities start uncertain so the first few ticks adapt fast.
+            self._P = np.diag(
+                [self._meas_trans_var] * 3 + [1.0] * 3
+                + [self._meas_rot_var] * 3 + [10.0] * 3
+            )
+            self._last_time = float(timestamp)
+            self._initialized = True
+            return self.current()
+
+        dt = float(timestamp) - self._last_time
+        self._last_time = float(timestamp)
+        if not (0.0 < dt < 0.5):
+            dt = 1.0 / 20.0  # tick-rate fallback for clock hiccups
+
+        # --- Predict (constant velocity) ---
+        self._t_nom = self._t_nom + self._x[3:6] * dt
+        self._R_nom = _so3_exp(self._x[9:12] * dt) @ self._R_nom
+        F = np.eye(12)
+        F[0:3, 3:6] = np.eye(3) * dt
+        F[6:9, 9:12] = np.eye(3) * dt
+        # Piecewise-constant white-acceleration noise per axis.
+        q_p = self._accel_sigma ** 2
+        q_r = self._alpha_sigma ** 2
+        dt2, dt3, dt4 = dt * dt, dt ** 3, dt ** 4
+        Q = np.zeros((12, 12))
+        for i in range(3):
+            Q[i, i] = q_p * dt4 / 4.0
+            Q[i, i + 3] = Q[i + 3, i] = q_p * dt3 / 2.0
+            Q[i + 3, i + 3] = q_p * dt2
+            j = i + 6
+            Q[j, j] = q_r * dt4 / 4.0
+            Q[j, j + 3] = Q[j + 3, j] = q_r * dt3 / 2.0
+            Q[j + 3, j + 3] = q_r * dt2
+        self._P = F @ self._P @ F.T + Q
+
+        # --- Update ---
+        # Innovation: translation residual + rotation residual on the
+        # SO(3) tangent (world frame, left convention).
+        y = np.concatenate([
+            t_meas64 - self._t_nom,
+            _so3_log(R_meas64 @ self._R_nom.T),
+        ])
+
+        # Innovation gate: discontinuity (reacquisition after the object
+        # left the view, or an anchor-pool jump) — snap to the
+        # measurement and restart the velocity estimate instead of
+        # smoothing through it (which would overshoot).
+        if (
+            np.linalg.norm(y[0:3]) > self._snap_trans_m
+            or np.linalg.norm(y[3:6]) > self._snap_rot_rad
+        ):
+            self._t_nom = t_meas64.copy()
+            self._R_nom = R_meas64.copy()
+            self._x[:] = 0.0
+            self._P = np.diag(
+                [self._meas_trans_var] * 3 + [1.0] * 3
+                + [self._meas_rot_var] * 3 + [10.0] * 3
+            )
+            return self.current()
+
+        H = np.zeros((6, 12))
+        H[0:3, 0:3] = np.eye(3)
+        H[3:6, 6:9] = np.eye(3)
+        R_noise = np.diag([self._meas_trans_var] * 3 + [self._meas_rot_var] * 3)
+        S = H @ self._P @ H.T + R_noise
+        K = self._P @ H.T @ np.linalg.solve(S, np.eye(6))
+        dx = K @ y
+        self._P = (np.eye(12) - K @ H) @ self._P
+
+        # Inject: position error folds into the nominal directly (the
+        # position block of x doubles as the error state pre-injection).
+        self._t_nom = self._t_nom + dx[0:3]
+        self._x[3:6] += dx[3:6]
+        self._R_nom = _so3_exp(dx[6:9]) @ self._R_nom
+        self._x[9:12] += dx[9:12]
+        # Error states are zeroed after injection (x[0:3]/x[6:9] never
+        # accumulate — they live only inside dx).
+
+        return self.current()
+
+
 def estimate_rigid_transform(
     source_points: np.ndarray,
     target_points: np.ndarray,

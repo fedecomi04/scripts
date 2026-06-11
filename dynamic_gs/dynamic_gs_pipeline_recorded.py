@@ -20,6 +20,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Type
 
+import os
+import time
+
 import numpy as np
 import torch
 
@@ -47,6 +50,11 @@ class RecordedDynamicGSPipelineConfig(DynamicGSPipelineBaseConfig):
     d0_anchor_y_ratio: float = 0.75
     """Vertical anchor position. 0.75 = lower-third — matches the
     typical position of a gripper-held object in teleop datasets."""
+
+    # NOTE: ``d0_force_instance_id`` was promoted to the base config
+    # (DynamicGSPipelineBaseConfig) so both recorded + live share it and the
+    # interactive picker can use it as the headless/timeout fallback. The
+    # recorded ``_pick_d0_object`` still honors it via self.config.
 
 
 class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
@@ -127,14 +135,33 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         self.datamanager.set_dynamic_frame_idx(frame_idx)
         camera, batch = self.datamanager.get_current_dynamic_train_batch()
 
+        # Interactive object picker: when active, this BLOCKS the tick until the
+        # operator selects in viser (or the timeout fires), then reseeds. The
+        # block deliberately pauses the trainer so replay/steps don't advance
+        # while the panel is open.
+        sel_status = "none"
+        if self.config.interactive_object_selection:
+            sel_status = self._tick_interactive_selection(camera, batch, is_first)
+
         # D0 bootstrap: pick the moved object, init XFeat anchor.
-        if is_first:
+        # Skip when the interactive picker just reseeded ("seeded") — the
+        # object is already set up and the guard was reset.
+        if sel_status == "seeded":
+            pass
+        elif is_first:
             self._bootstrap_d0(camera, batch)
         else:
             self._apply_motion_estimator(camera, batch)
 
-        # Render + CDN for downstream feedforward.
+        # Render + CDN for downstream feedforward. DGS_DIAG_SYNC=1 adds a
+        # cuda.synchronize inside the timer so DN.2 reports the true GPU cost
+        # of the render (otherwise it's CPU enqueue time only and the GPU work
+        # gets absorbed by the NEXT tick's xfeat sync — see DN.3c0).
+        t_cdn = time.time()
         cdn = self._compute_tick_cdn(camera, batch)
+        if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
 
         # Publish to latest tracker frame.
         self._latest_tracker_frame = {
@@ -150,6 +177,7 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         # Visualization: push to viser-direct, also kick the Nerfstudio viewer.
         self._build_viser_direct_handles(camera)
         self._push_viser_direct_transforms()
+        self._push_viser_camera_feed(camera, batch)
         self._force_viewer_rerender()
 
         # Subclass / Mode B hook.
@@ -169,6 +197,19 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         unique_ids = torch.unique(ids[ids > 0]).tolist()
         if not unique_ids:
             return 0
+
+        forced = self.config.d0_force_instance_id
+        if forced is not None:
+            if int(forced) in unique_ids:
+                CONSOLE.log(
+                    f"[dynamic-gs-recorded] D0 forced instance_id={int(forced)} "
+                    f"(d0_force_instance_id set; anchor heuristic bypassed)"
+                )
+                return int(forced)
+            CONSOLE.log(
+                f"[dynamic-gs-recorded] WARNING: d0_force_instance_id={int(forced)} "
+                f"not in prefused instances {unique_ids}; falling back to anchor heuristic."
+            )
 
         def _scalar(x):
             return float(x.detach().cpu().reshape(-1)[0].item()) if isinstance(x, torch.Tensor) else float(x)
@@ -265,8 +306,8 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         # 1) Pick the moved-object instance from prefused candidates.
         instance_ids_buf = self.model.object_instance_ids
         picked = self._pick_d0_object(camera, instance_ids_buf)
-        self._d0_selected_instance_id = int(picked)
         if picked == 0:
+            self._d0_selected_instance_id = 0
             CONSOLE.log(
                 "[dynamic-gs-recorded] WARNING: no prefused instance picked at D0. "
                 "Tracker will be disabled (no object to follow)."
@@ -274,40 +315,9 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
             return
 
         CONSOLE.log(f"[dynamic-gs-recorded] D0 picked instance_id={picked}")
-
-        # 2) Write object_flags = (instance_ids == picked).
-        ids = instance_ids_buf.squeeze(-1) if instance_ids_buf.ndim > 1 else instance_ids_buf
-        new_flags = (ids == picked).float().unsqueeze(-1)
-        self.model.object_flags.copy_(new_flags)
-        n_picked = int((self.model.object_flags.squeeze(-1) > 0.5).sum().item())
-        CONSOLE.log(
-            f"[dynamic-gs-recorded] object_flags written: {n_picked} Gaussians "
-            f"flagged for instance_id={picked}"
-        )
-
-        # 3) Render the object mask (the picked instance's projected silhouette).
-        try:
-            obj_mask = self.model.render_object_mask(camera)
-        except Exception as exc:
-            CONSOLE.log(f"[dynamic-gs-recorded] render_object_mask failed at D0: {exc}")
-            obj_mask = None
-
-        # 4) Capture reference object pose so DN deltas apply from this baseline.
-        # Pass the picked instance id so _tracked_object_mask becomes a STRICT
-        # `instance_ids == d0_id` mask — survives FF inserts without count drift.
-        if hasattr(self.model, "capture_reference_object_pose"):
-            with self._viser_lock_ctx():
-                self.model.capture_reference_object_pose(
-                    instance_id=int(self._d0_selected_instance_id),
-                )
-
-        # 5) Seed the XFeat motion estimator.
-        live_rgb = self._build_tracking_rgb(batch)
-        depth = batch.get("depth_image")
-        try:
-            self._initialize_motion_estimator(live_rgb, depth, camera, obj_mask)
-        except Exception as exc:
-            CONSOLE.log(f"[dynamic-gs-recorded] _initialize_motion_estimator failed: {exc}")
+        # 2-5) Shared reseed: object_flags + reference pose + object mask +
+        # XFeat anchor seed. (Same path used by every interactive switch.)
+        self._reseed_tracked_object(int(picked), camera, batch)
 
     @torch.no_grad()
     def _compute_tick_cdn(self, camera, batch):

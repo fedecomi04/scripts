@@ -46,6 +46,66 @@ These are hard rules the pipeline depends on. If a change appears to require bre
 
 ## Notes
 
+### Dynamic-phase tracker freeze root cause: cudnn.benchmark autotune (2026-06-11)
+
+The per-tick object freeze (~0.5 s hitches, multi-second worst case) was **`torch.backends.cudnn.benchmark = True`** — set globally by `nerfstudio/scripts/train.py:71` — combined with the XFeat crop (`_crop_for_xfeat`) presenting a **new conv input shape almost every tick**. Benchmark mode runs an exhaustive cudnn conv-algorithm autotune per new shape (100s of ms to seconds).
+
+* **Fix:** `DynamicGSPipelineBase.__init__` unconditionally sets `torch.backends.cudnn.benchmark = False` for the dynamic phase. Static training (fixed 800×800 shapes) keeps nerfstudio's default. gsplat (custom CUDA) and LighterGlue (cublas matmul) are unaffected by the flag.
+* **Measured (new_env, 192 frames, viser on + connected client, FF rgbd):** `DN.3c_xfeat_extract` avg 754.4 ms / max 5711.7 ms → **avg 14.3 ms / max 29.7 ms** (53×); `DN.3_estimate_total` 763.4 → 22.2 ms — back at the documented 17–30 Hz sweet spot.
+* **Ruled out by measurement first** (don't re-suspect these): viser server-side rendering (viser-OFF run was *slower*, 685 ms avg) and GPU queue backlog (new `DN.3c0_gpu_queue_wait` sync-split key measured 0.1 ms avg — queue was empty; the extract call itself was slow).
+* New permanent timing keys: `DN.3c0_gpu_queue_wait` (sync before extract — splits queue-wait from compute) and `DN.2_cdn_render` (per-tick CDN render wall; `DGS_DIAG_SYNC=1` makes it sync inside the timer for true GPU cost).
+
+### Interactive object picker + preseg id-order fix (2026-06-11)
+
+Operator now picks the tracked object in viser instead of the anchor heuristic, and can switch objects mid-run.
+
+* **Picker** (`interactive_object_selection: bool = False` on `DynamicGSPipelineBaseConfig`): at D0 a viser GUI folder shows the SAM3 input image with every object's mask colored + numbered ([`utils/object_picker.py`](dynamic_gs/utils/object_picker.py) auto-detects preseg vs SAM3D artifacts), an **`add_dropdown`** of object ids (NOT `add_button_group` — button groups are momentary, their `.value` doesn't persist the click) and a **Done** button. The tick **blocks** (`_wait_for_selection`, 0.25 s Event slices) until Done or `object_selection_timeout_s` — deliberately, so the trainer's step counter doesn't race to `max_num_iterations` while the panel is open (a recorded run otherwise burns all 5000 steps in ~6 s and the panel vanishes). The viser render thread is independent, so the browser stays live during the block. A persistent **"Change object"** button (+ bare-Enter on stdin in live mode) sets `_reselect_requested`; the tick reopens the picker; old object freezes at its last pose. Selection funnels through the shared `_reseed_tracked_object(new_id, camera, batch)` on the base (reset surface + object_flags + `capture_reference_object_pose` + XFeat re-seed) — also used by both subclasses' `_bootstrap_d0`. Headless/timeout fallback: `d0_force_instance_id` (promoted to the base config) → per-subclass heuristic.
+* **Invariant the picker relies on: SAM3 mask number i ⇔ `object_instance_ids == i+1`, in BOTH init paths.** SAM3D path already did this (`phase0.py` `instance_id = obj_idx + 1`). The preseg path **violated it** (the AMG coverage-merge compacted ids via `sorted(groups)` + positional `enumerate`, silently renumbering whenever a SAM3 mask had no AMG coverage — on new_env this merged the two androids into one id). Fixed in [`preseg_seed.py`](dynamic_gs/utils/preseg_seed.py): `_assign_and_merge` returns `(sam3_index, mask)` pairs and `_propagate` seeds SAM2-video `obj_id = sam3_index + 1`. Additionally a SAM3 mask with **no** AMG coverage now falls back to the raw SAM3 mask instead of being dropped (the AMG step is stochastic; a run lost 2 of 9 objects before this). **Datasets labeled before 2026-06-11 carry stale ids — re-run `static-gs-preseg` (`--pipeline.reuse-sidecar-if-present False`) before trusting picker ids.** new_env regenerated + verified (9 ids, androids 8/9 separate, projection purity 99–100 %).
+* Teardown noise: `RuntimeError: cannot schedule new futures after shutdown` at "Training Finished" is viser's own inbound-websocket handler racing interpreter exit when a browser tab is still open — cosmetic. Our outbound pushes are guarded (`ViserDirectScene.is_closing` + guards in `request_render` / `_render_once` / `_viser_direct_register_ff_insert`). Note `feedforward_video_out` is currently declared but **no writer is implemented** — no mp4 is produced by the dynamic pipelines.
+
+### Anchor keyframe gate: relative camera↔object orientation (2026-06-11)
+
+The XFeat multi-anchor pool now captures a new keyframe (fresh object features) when the object's orientation **as seen from the camera** moves >`ROTATION_GATE_DEG` (22.5°) from every existing anchor — **not** the object's absolute world rotation as before. Relative orientation = `R_rel = R_cam_world^T @ R_object_world` ([`_relative_object_rotation`](dynamic_gs/utils/xfeat_motion.py)); the gate ([`_min_anchor_relative_distance_deg`](dynamic_gs/utils/xfeat_motion.py)) and anchor selection ([`_select_nearest_anchor_by_rotation`](dynamic_gs/utils/xfeat_motion.py)) both compare relative-to-relative.
+
+* **Why:** XFeat/LighterGlue match on *appearance from a viewpoint*. The old absolute-object gate never fired when the **camera** moved while the object was still (or both moved together), so no fresh features were captured even though the view changed → match degradation / tracking loss. The relative gate fires on object-only, camera-only, or combined motion.
+* Each `_Anchor` now stores `camera_rotation` (`camera_to_world[:3,:3]` at capture); the c2w was already passed to `_build_anchor` (used only for back-projection) — now retained. The output pose contract is **unchanged**: `_cumulative_*` (object D0→current world pose), the Kabsch composition, the Kalman filter, and the returned `MotionEstimate` are untouched — this is purely an internal keyframing-policy change.
+* **Verified:** unit cases — object +30°/cam still → 30°; **cam +30°/object still → 30°** (was ~0° before, the bug); both +30° together → 0° (no spurious anchor). Recorded + live runs grow the pool via `[xfeat-anchor] … rel-view rot from nearest = …` as the arm camera orbits a static object; extract steady ~13–15 ms.
+
+### Viser tracker-view features (2026-06-11)
+
+Two additive controls in viser-direct (`ViserDirectScene`, shared by recorded + live; a **"Tracker view"** GUI folder), pushed each tick from the base via `_push_viser_camera_feed(camera, batch)`:
+
+* **Live camera-feed thumbnail** ("Show camera feed", on by default): `gui.add_image` side-panel showing the current tracked frame's RGB (`batch["image"]`), refreshed in place each render (~ms JPEG encode, render-side only when a client is connected).
+* **Follow-tracked-frame toggle** ("Follow tracked frame", off by default): snaps the viewer camera to the tracked frame's c2w each render so the splat view matches the feed. MUST use the same `R_viser = R_nerf @ _FLIP_YZ` nerfstudio→viser conversion as `_apply_initial_camera` — omitting the flip misaligns every frame except the initial one (the bug that surfaced + was fixed on first use).
+
+### Tracker pose Kalman filter (2026-06-10)
+
+*Validated 2026-06-11: user confirmed tracking looks clearly better with the filter ON (less stationary jiggle) than the raw-pose run (`xfeat_pose_filter_enabled False`); ON stays the default.*
+
+
+Output-side SE(3) constant-velocity error-state Kalman filter on the XFeat/RANSAC pose, targeting stationary-object jiggle (root cause per the 2026-05-26 notes: per-tick match-set variance → different Kabsch subsets).
+
+* [`tracker_common.PoseKalmanFilter`](dynamic_gs/utils/tracker_common.py) — 12-state ESKF (pos, vel, rot-err, ang-vel), `cv2.Rodrigues` exp/log, ~31 µs/call.
+* **Filters ONLY the `MotionEstimate.rotation/translation` returned to the pipeline.** The tracker's internal `_cumulative_*` pose (anchor selection, anchor creation, next-tick prediction) stays raw — smoothing lag can never destabilize tracking. Failure ticks hold the last filtered pose (cosmetic; pipeline only applies on `success`).
+* Knobs: `xfeat_pose_filter_*` in `DynamicGSModelConfig` (enabled by default). Defaults `accel_sigma=0.05 m/s²`, `alpha_sigma=0.25 rad/s²`, meas sigma 3 mm / 0.5°.
+* **Synthetic bench** (3 mm / 0.5° measurement noise, 20 Hz): stationary jitter 5.22→2.48 mm, 0.844→0.406° (~2.1×); smooth motion (0.2 m/s, 30°/s) tracks at 2.27 mm mean (better than raw — velocity state models it); worst-case instantaneous 5 cm step settles to <5 mm in 4 ticks (~200 ms). Lower `accel_sigma` = more smoothing + slower step response.
+* **Innovation gate (snap-reset):** per-tick pose jumps > 5 cm or > 10° (filter ctor defaults `snap_trans_m` / `snap_rot_rad`) cannot come from continuous motion — they are reacquisitions (object left the view and came back moved) or anchor-pool discontinuities. The filter snaps to the measurement and restarts the velocity estimate instead of smoothing through (which would overshoot — the step kicks the velocity state). Tracking-loss gaps are also safe by construction: failure ticks never call `filter()`, so no velocity extrapolation during the gap, and the reacquire `dt` is clamped to 50 ms.
+* **Reacquire bench** (after 5 s gap): unmoved → noise floor in 1 tick; moved 2 cm/3° (below gate) → ~4 ticks; moved 30 cm/45° (gate fires) → noise floor in 1 tick. The actual reacquisition risk is UPSTREAM, not the KF: if the object rotated far from every stored anchor viewpoint while unseen, LighterGlue has no appearance match and tracking stays lost (new anchors are only created on success).
+* Not yet validated on a live run — if jiggle persists at default settings, drop `accel_sigma` to 0.02 / `alpha_sigma` to 0.1 (~2.5×, 7-tick settle) before suspecting a different root cause (e.g. anchor-switch pose jumps, which the KF spreads over a few ticks rather than removes — an 8 mm jump takes ~6 ticks to converge).
+
+### Phase 0b registration: NDP non-rigid + post-fusion cull (2026-06-10)
+
+Replaced the rigid-only CPD/TEASER++ similarity fit as the **default** Phase-0b SAM3D registration with **NDP (Neural Deformation Pyramid)** non-rigid registration. CPD and TEASER++ are **not removed** — both remain selectable fallbacks via config.
+
+* **Why:** the SAM3D model is a complete-but-approximate object; the masked-depth back-projection is a partial-but-metrically-accurate scan of the same object. A single rigid+scale fit can't conform the approximate model to the real geometry. NDP non-rigidly deforms the complete cloud onto the accurate partial scan.
+* **Backend switch:** `sam3d_registration_backend: Literal["ndp", "cpd", "teaser"] = "ndp"` in BOTH [`StaticGSModelConfig`](dynamic_gs/static_gs_model.py) and [`DynamicGSModelConfig`](dynamic_gs/dynamic_gs_model.py) (kept byte-for-byte in sync). The `"ndp"` branch in [`register_and_fuse_sam3d_object`](dynamic_gs/utils/sam3d_fusion.py) reuses the existing rigid init (SAM3D-rotation + bbox-scale + centroid translate) as NDP's initialization, then non-rigidly deforms onto the target; `aligned_points`/`kept_points` become the warped cloud (NDP is non-linear → `similarity_transform` stays identity, `canonical_to_world_4x4` carries only the rigid-init approximation — fine since FoundationPose is no longer wired in).
+* **Vendored NDP:** [`dynamic_gs/utils/ndp/`](dynamic_gs/utils/ndp/) (`nets.py` + `rigid_body.py`, pure-torch, **no pytorch3d**) + the wrapper [`dynamic_gs/utils/ndp_register.py`](dynamic_gs/utils/ndp_register.py) (`deform_source_to_target`). Runs in-process on GPU in the main `dynamic_gs` env. No checkpoint (no-learned optimization): model construct ≈ **3.8 ms**, solve ≈ **2.0 s/object** (hierarchical Sim3, 9 levels, 500 iters/level, 6000-pt subsample, full-cloud warp). Config defaults mirror `DeformationPyramid/shape_transfer.py`. The no-learned NDP hyperparameters (m=9, Sim3 motion, w_reg=0) were tuned by eye on the banana and screwdriver scenes to land on these values.
+* **Post-fusion cull (two stages, in [`run_phase0b_fusion`](dynamic_gs/fusion/phase0.py)):** the inserted SAM3D points are culled against the trusted real surface so the accurate scan owns the visible side and SAM3D only fills the occluded back:
+  1. **Proximity de-dup** (existing, tuned, ON by default): cull points within `tau = max(spacing(E)·1.3, 3 mm)` of the existing visible-surface Gaussians. NOTE: 3D-distance based → on **thin** parts it also removes the occluded back (the back sits within `tau` of the front). Known tradeoff.
+  2. **In-front (occlusion) cull** (NEW, band = 0): [`cull_points_in_front`](dynamic_gs/fusion/phase0.py) drops any inserted point closer to the camera than the back-projected real front surface (depth-buffer test, inverse of `backproject_mask_to_world`, 2 px dilation). Keeps everything at-or-behind the front, including thin-part backs.
+* **Prototype + tuning bench:** [`scripts/experiments/nonrigid_bench/`](experiments/nonrigid_bench/) — standalone NDP-vs-(SPARE/SyNoRiM) benchmark on a single SAM3 → SAM3D → back-project pair, with `02_run_ndp.py` (the reference deform+cull driver) and `view_results.py`. Cull knobs there: `NRB_CULL_PROXIMITY` (default on), `NRB_CULL_BAND_M` (default 0), `NRB_CULL_STRENGTH`/`NRB_CULL_TAU_FLOOR_M`.
+* **Verified:** NDP branch through `register_and_fuse_sam3d_object` (65 888 kept pts, 2.0 s) + `cull_points_in_front` with a real `Cameras` (removed in-front pts). Full `ns-train static-gs` end-to-end run not yet re-run on this change.
+
 ### Static-phase init seed: online ICP+TSDF fusion (2026-06-01)
 
 Replaced the naive per-frame back-projection + post-pass refine with **one streaming pass** that runs concurrent with capture.
@@ -314,13 +374,13 @@ The codebase was rewritten 2026-05-30 → 2026-06-01. The historical monolith (`
 pip install -e .   # from scripts/
 ```
 
-ns-train auto-discovers our methods via the `nerfstudio.method_configs` entry-point in `pyproject.toml`. Method names registered: `static-gs`, `dynamic-gs`, `dynamic-gs-live`.
+ns-train auto-discovers our methods via the `nerfstudio.method_configs` entry-point in `pyproject.toml`. Method names registered: `static-gs`, `static-gs-preseg`, `dynamic-gs`, `dynamic-gs-live`.
 
 ## Conda Environments
 
 | Env | Python | torch | sm_120 native | Role |
 |---|---|---|---|---|
-| `dynamic_gs` | 3.12 | 2.11+cu128 | ✅ | Main env: hosts all three ns-train methods, XFeat tracker, Open3D 0.19 (TSDF on GPU), nerfstudio, gsplat. |
+| `dynamic_gs` | 3.12 | 2.11+cu128 | ✅ | Main env: hosts all four ns-train methods, XFeat tracker, Open3D 0.19 (TSDF on GPU), nerfstudio, gsplat. |
 | `sam3_dynamic_gs` | 3.12 | 2.11+cu128 | ✅ | SAM3 + Fast-SAM3D subprocess env. Invoked via `conda run -n sam3_dynamic_gs python ...` from `utils/sam3d.py` and `utils/sam3_segmentation.py`. |
 | `dynamic_gs_ros` | 3.8 | none | n/a | Minimal ROS Noetic env for the live publisher subprocess. ROS bindings come from `/opt/ros/noetic/lib/python3/dist-packages` via `source /opt/ros/noetic/setup.bash`. The publisher spawn wrapper sets `PYTHONNOUSERSITE=1` — without it, user-local pyrender shadows the env's. |
 | `anysplat_dynamic_gs` | 3.12 | — | ✅ | AnySplat feedforward decoder env (persistent worker; see `utils/anysplat_decode.py`). |
@@ -345,6 +405,7 @@ scripts/resume_live.sh <data_dir>
 Direct method invocations also work:
 ```bash
 ns-train static-gs        --data <data_dir> --pipeline.model.sam3_prompt_text "..."
+ns-train static-gs-preseg --data <data_dir> --pipeline.text-prompts "..."   # per-Gaussian SAM IDs, no SAM3D/CPD
 ns-train dynamic-gs       --data <data_dir>   # recorded dataset
 ns-train dynamic-gs-live  --data <data_dir>   # live SHM stream
 ```
@@ -363,8 +424,8 @@ DynamicGSPipelineBase            (dynamic_gs_pipeline_base.py)
 StaticGSPipeline                 (static_gs_pipeline.py)
 ```
 
-* **`StaticGSPipeline`** — fits Splatfacto on the static dataset, then runs Phase 0a (SAM3 + Fast-SAM3D, in `fusion/phase0.py`) and Phase 0b (CPD or TEASER++ registration + insertion). Writes the warm-cache snapshot `<data>/static_scene/post_fusion_state.pt`.
-* **`DynamicGSPipelineBase`** — shared dynamic-phase logic: XFeat tracker tick, optim pool, feedforward dispatcher (`rgbd_decode` or `anysplat_decode`), viser-direct push, persistent per-object identity buffers.
+* **`StaticGSPipeline`** — fits Splatfacto on the static dataset, then runs Phase 0a (SAM3 + Fast-SAM3D, in `fusion/phase0.py`) and Phase 0b (NDP non-rigid registration by default — CPD/TEASER++ still selectable — + insertion + post-fusion cull). Writes the warm-cache snapshot `<data>/static_scene/post_fusion_state.pt`.
+* **`DynamicGSPipelineBase`** — shared dynamic-phase logic: XFeat tracker tick, feedforward dispatcher (`rgbd_decode` or `anysplat_decode`), viser-direct push, persistent per-object identity buffers.
 * **`RecordedDynamicGSPipeline`** — feeds the base from a recorded `dynamic_scene/`.
 * **`LiveDynamicGSPipeline`** — feeds the base from a `LiveShmSubscriber` polling the ROS publisher's shared memory.
 
@@ -400,7 +461,8 @@ The PLY at `<data>/static_scene/depth_camera_init_points.ply` is what Splatfacto
 | `live_shm_reader.py` | Reader-side wrapper: spawns the publisher, polls SHM, gives `peek_latest()`. |
 | `live_session.py` | The bootstrap-time interactive capture flow (SAM3 retry loop, SAM3D, fusion). |
 | `keyframe_filter.py` | ORB-SLAM-style greedy 2 cm/20° pose dedup; shared between recorded + live. |
-| `sam3_segmentation.py`, `sam3d.py`, `sam3d_fusion.py` | SAM3 + Fast-SAM3D subprocess wrappers + CPD/TEASER++ fusion. |
+| `sam3_segmentation.py`, `sam3d.py`, `sam3d_fusion.py` | SAM3 + Fast-SAM3D subprocess wrappers + Phase-0b registration & fusion (NDP default; CPD/TEASER++ fallbacks). |
+| `ndp_register.py`, `ndp/` | Vendored NDP non-rigid deformation (`deform_source_to_target`) — the default Phase-0b backend. Pure-torch, no pytorch3d, in-process GPU. |
 | `esam.py` | ESAM interactive object-mask query (D0 bootstrap). |
 | `optim_pool.py` | Dynamic-phase optimization pool (capacity 15, FIFO). |
 | `active_mask.py` | `build_change_mask`, `select_top_n_components_filtered`, projection helpers. |
@@ -413,7 +475,7 @@ The PLY at `<data>/static_scene/depth_camera_init_points.ply` is what Splatfacto
 
 ### Three-phase training (overview)
 
-**Phase 0 (Static)** — `static-gs`. Splatfacto fit on the SfM/TSDF seed for `static_num_steps` (default 1000). Densification OFF, means LR = 0, camera-pose optimizer = `SO3xR3`. At end: Phase 0a SAM3 + Fast-SAM3D, then Phase 0b CPD/TEASER++ registration + insertion. Writes `post_fusion_state.pt`.
+**Phase 0 (Static)** — `static-gs`. Splatfacto fit on the SfM/TSDF seed for `static_num_steps` (default 1000). Densification OFF, means LR = 0, camera-pose optimizer = `SO3xR3`. At end: Phase 0a SAM3 + Fast-SAM3D, then Phase 0b NDP non-rigid registration (default; CPD/TEASER++ selectable) + insertion + post-fusion cull (proximity de-dup + in-front occlusion). Writes `post_fusion_state.pt`.
 
 **Phase 1 (Dynamic)** — `dynamic-gs` / `dynamic-gs-live`. Warm-load from `.pt`. Per tracker tick: XFeat motion estimation → `apply_rigid_object_transform_from_reference` → viser-direct push. Optionally feedforward-decode CDN regions (rgbd or anysplat) into the scene.
 
@@ -471,7 +533,8 @@ Required: `dynaarm_with_gripper_for_gazebo_only_no_wrist_collision.urdf` must de
 * **SAM3** ([facebookresearch/sam3](https://github.com/facebookresearch/sam3)) — text-prompted segmentation. Invoked via `conda run -n sam3_dynamic_gs python`.
 * **ESAM** — interactive segmentation, D0 bootstrap.
 * **AnySplat** — feedforward decoder, persistent subprocess in `anysplat_dynamic_gs`.
-* **PROBREG / Open3D** — `utils/sam3d_fusion.py` CPD path; TEASER++ is the fast alternative.
+* **NDP (Neural Deformation Pyramid)** — vendored in `utils/ndp/` (`nets.py` + `rigid_body.py`); the default non-rigid Phase-0b backend via `utils/ndp_register.py`. Upstream: github.com/rabbityl/DeformationPyramid (no-learned path, no checkpoint).
+* **PROBREG / Open3D** — `utils/sam3d_fusion.py` CPD fallback; TEASER++ the rigid alternative (both still selectable, no longer the default).
 * **XFeat / LighterGlue** — vendored under `dynamic_gs/utils/xfeat_motion.py`'s dependencies.
 * **FoundationPose** — `third_party/FoundationPose/` kept on disk but no longer wired into the runtime (XFeat purge 2026-05-26).
 

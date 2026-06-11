@@ -30,9 +30,7 @@ data_teleoperation/
 .idea/
 .vscode/
 
-# experiments/ — only commit the source .py files; outputs are local-only
-experiments/**/output/
-experiments/**/_*.log
-experiments/**/*.log
-experiments/**/_*.py
-experiments/**/_sam2_video_frames/
+# experiments/ — local-only scratch (prototypes, benches, large PLY/weight
+# outputs). Not version-controlled; previously-tracked scripts were untracked
+# via `git rm --cached`.
+experiments/

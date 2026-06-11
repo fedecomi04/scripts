@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import time
 import signal
 import sys
 import threading
@@ -102,6 +103,8 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         self._latest_live_rgb_bgr: Optional[np.ndarray] = None
         self._live_stop_requested: bool = False
         self._shm_sub = None  # set below
+        self._d0_completed: bool = False
+        self._d0_defer_attempts: int = 0
 
         super().__init__(
             config=config, device=device, test_mode=test_mode,
@@ -207,16 +210,24 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
             pass
 
     def _start_stdin_stop_watcher(self) -> None:
-        """Daemon thread that watches stdin for 'stop' to end the live
-        session. Non-blocking; if stdin is not a TTY (CI / nohup) it
-        simply never fires and the user has to Ctrl+C."""
+        """Daemon thread watching stdin for control input. Non-blocking; if
+        stdin is not a TTY (CI / nohup) it simply never fires.
+
+        * ``stop`` / ``quit`` / ``exit`` — end the live session (returns).
+        * bare Enter (empty line) — when ``interactive_object_selection`` is on,
+          reopen the object picker so the operator can switch objects. The
+          watcher keeps running so further Enters / ``stop`` are still caught."""
         def _watch() -> None:
             try:
                 for line in sys.stdin:
-                    if line.strip().lower() in ("stop", "quit", "exit"):
+                    s = line.strip().lower()
+                    if s in ("stop", "quit", "exit"):
                         CONSOLE.log("[dynamic-gs-live] 'stop' received on stdin -- ending session")
                         self._live_stop_requested = True
                         return
+                    if s == "" and self.config.interactive_object_selection:
+                        CONSOLE.log("[dynamic-gs-live] bare-Enter -> reopening object picker")
+                        self._reselect_requested = True
             except Exception:
                 pass  # stdin closed; that's fine
         threading.Thread(target=_watch, daemon=True, name="dgs-live-stop-watcher").start()
@@ -235,9 +246,19 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         latest = self._shm_sub.peek_latest()
         if latest is None:
             return  # publisher hasn't emitted a new frame yet
-        if (self._last_processed_stamp_sec is not None
-                and latest.stamp_sec <= self._last_processed_stamp_sec):
-            return  # we already processed this (or older) frame
+        if self._last_processed_stamp_sec is not None:
+            # Sim-clock reset detection: if the new stamp is more than 1 s
+            # behind the last, Gazebo's /clock was reset and the dedup gate
+            # would otherwise drop every subsequent frame forever. Re-arm.
+            if latest.stamp_sec < self._last_processed_stamp_sec - 1.0:
+                CONSOLE.log(
+                    f"[dynamic-gs-live] sim clock reset detected "
+                    f"(last={self._last_processed_stamp_sec:.3f}s -> "
+                    f"new={latest.stamp_sec:.3f}s); re-arming stamp gate"
+                )
+                self._last_processed_stamp_sec = None
+            elif latest.stamp_sec <= self._last_processed_stamp_sec:
+                return  # we already processed this (or older) frame
         self._last_processed_stamp_sec = float(latest.stamp_sec)
 
         # Build Nerfstudio Cameras + a Splatfacto-shaped batch dict.
@@ -248,14 +269,37 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
 
         frame_idx = self._next_live_frame_counter
         self._next_live_frame_counter += 1
-        is_first = self._tracker_tick_count == 0
+        is_first = not self._d0_completed
 
-        if is_first:
+        # Interactive object picker (live): when active, this BLOCKS the tick
+        # until the operator selects in viser (or the timeout fires), then
+        # reseeds + marks D0 complete via the live _reset_d0_guard. SHM frames
+        # are dropped-oldest during the block (acceptable: nothing is being
+        # tracked yet / the prior object is frozen while choosing the next).
+        sel_status = "none"
+        if self.config.interactive_object_selection:
+            sel_status = self._tick_interactive_selection(camera, batch, is_first)
+
+        if sel_status == "seeded":
+            # Picker already reseeded + marked D0 complete; nothing more to do
+            # at the D0 stage. Fall through to CDN / publish.
+            pass
+        elif is_first:
             self._bootstrap_d0(camera, batch)
+            if not self._d0_completed:
+                # D0 deferred (no object visible enough this frame). Don't
+                # advance _tracker_tick_count so the next frame re-enters
+                # the bootstrap branch — and don't run CDN / FF either,
+                # there's nothing to compare against yet.
+                return
         else:
             self._apply_motion_estimator(camera, batch)
 
+        t_cdn = time.time()
         cdn = self._compute_tick_cdn(camera, batch)
+        if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
 
         # Cache the latest BGR frame for FF AnySplat dump (see
         # _resolve_anysplat_context_image_paths).
@@ -273,39 +317,80 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
 
         self._build_viser_direct_handles(camera)
         self._push_viser_direct_transforms()
+        self._push_viser_camera_feed(camera, batch)
         self._force_viewer_rerender()
 
         self._on_tracker_frame(camera, batch, cdn, is_first)
+
+    _D0_MIN_VISIBLE_GAUSSIANS = 200
+    """At D0, the picked instance must project at least this many of its
+    Gaussian centres into the camera frustum before we accept the seed.
+    Below this the camera isn't pointing at the object well enough — defer
+    D0 to a later frame instead of seeding the XFeat anchor on background."""
 
     def _pick_d0_object(
         self,
         camera,
         prefused_instance_ids: torch.Tensor,
     ) -> int:
-        """Live D0: pick the prefused instance whose 3D centroid is closest
-        to the camera position. Robust without any pixel anchor because in
-        live use the teleoperated object is by construction near the gripper."""
+        """Live D0: of the prefused instances with ``visible_gauss >=
+        _D0_MIN_VISIBLE_GAUSSIANS`` in the current camera frustum, pick
+        the one whose centroid is closest to the camera. Visibility is a
+        gate (the object must actually be on screen, not behind the camera
+        or out of frame); distance is the ranking. Returns 0 if no instance
+        passes the visibility gate — D0 is then deferred."""
         ids = prefused_instance_ids.squeeze(-1) if prefused_instance_ids.ndim > 1 else prefused_instance_ids
         unique_ids = torch.unique(ids[ids > 0]).tolist()
         if not unique_ids:
             return 0
 
+        # Build the projection once for ALL means; per-instance counts are
+        # then a cheap boolean count on the already-projected tensor.
         c2w = camera.camera_to_worlds
         if c2w.ndim == 3:
             c2w = c2w[0]
-        cam_pos = c2w[:3, 3].to(self.model.means.device, dtype=self.model.means.dtype)
+        device = self.model.means.device
+        dtype = self.model.means.dtype
+        c2w = c2w.to(device=device, dtype=dtype)
+        R = c2w[:3, :3]
+        t = c2w[:3, 3]
 
-        best_id, best_dist = 0, float("inf")
+        def _scalar(x):
+            if isinstance(x, torch.Tensor):
+                return float(x.detach().cpu().reshape(-1)[0].item())
+            return float(x)
+        fx = _scalar(camera.fx); fy = _scalar(camera.fy)
+        cx = _scalar(camera.cx); cy = _scalar(camera.cy)
+        W = int(_scalar(camera.width)); H = int(_scalar(camera.height))
+
+        means_cam = (self.model.means - t[None, :]) @ R  # camera-space
+        depths = -means_cam[:, 2]
+        in_front = depths > 1e-6
+        safe_d = torch.where(in_front, depths, torch.ones_like(depths))
+        u = fx * (means_cam[:, 0] / safe_d) + cx
+        v = fy * (-means_cam[:, 1] / safe_d) + cy
+        visible = in_front & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+
+        cam_pos = t
+
+        best_id = 0
+        best_dist = float("inf")
         for iid in unique_ids:
-            mask = (ids == iid)
-            if not mask.any():
+            inst_mask = (ids == iid)
+            if not inst_mask.any():
                 continue
-            centroid = self.model.means[mask].mean(dim=0)
+            n_visible = int((visible & inst_mask).sum().item())
+            centroid = self.model.means[inst_mask].mean(dim=0)
             d = float((centroid - cam_pos).norm())
             CONSOLE.log(
                 f"[dynamic-gs-live] D0 candidate instance_id={int(iid)} "
-                f"3D dist to camera = {d:.3f} m"
+                f"visible_gauss={n_visible} dist_to_cam={d:.3f} m"
             )
+            if n_visible < self._D0_MIN_VISIBLE_GAUSSIANS:
+                continue
+            # Closest centroid among instances that pass the visibility
+            # gate. Distance is the ranking — visibility only ensures the
+            # object is actually on screen.
             if d < best_dist:
                 best_dist = d
                 best_id = int(iid)
@@ -393,43 +478,34 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         which :meth:`_pick_d0_object` overload runs (3D vs 2D)."""
         instance_ids_buf = self.model.object_instance_ids
         picked = self._pick_d0_object(camera, instance_ids_buf)
-        self._d0_selected_instance_id = int(picked)
         if picked == 0:
-            CONSOLE.log(
-                "[dynamic-gs-live] WARNING: no prefused instance picked at D0. "
-                "Tracker will be disabled (no object to follow)."
-            )
+            # Defer D0: no instance has enough visible Gaussians in this
+            # frame's frustum. Stay quiet after the first few attempts —
+            # the user just needs to point the camera at the object.
+            self._d0_defer_attempts += 1
+            if self._d0_defer_attempts in (1, 5, 25, 125):
+                CONSOLE.log(
+                    f"[dynamic-gs-live] D0 deferred (attempt "
+                    f"#{self._d0_defer_attempts}): no prefused instance has "
+                    f">={self._D0_MIN_VISIBLE_GAUSSIANS} centres in the current "
+                    f"camera frustum. Point the camera at the object."
+                )
             return
 
-        CONSOLE.log(f"[dynamic-gs-live] D0 picked instance_id={picked}")
-
-        ids = instance_ids_buf.squeeze(-1) if instance_ids_buf.ndim > 1 else instance_ids_buf
-        new_flags = (ids == picked).float().unsqueeze(-1)
-        self.model.object_flags.copy_(new_flags)
-        n_picked = int((self.model.object_flags.squeeze(-1) > 0.5).sum().item())
         CONSOLE.log(
-            f"[dynamic-gs-live] object_flags written: {n_picked} Gaussians "
-            f"flagged for instance_id={picked}"
+            f"[dynamic-gs-live] D0 picked instance_id={picked} "
+            f"after {self._d0_defer_attempts} deferred attempt(s)"
         )
+        # Shared reseed (object_flags + reference pose + object mask + XFeat
+        # anchor seed). The live ``_reset_d0_guard`` override sets
+        # ``_d0_completed = True`` at the end, so the next tick runs DN.
+        self._reseed_tracked_object(int(picked), camera, batch)
 
-        try:
-            obj_mask = self.model.render_object_mask(camera)
-        except Exception as exc:
-            CONSOLE.log(f"[dynamic-gs-live] render_object_mask failed at D0: {exc}")
-            obj_mask = None
-
-        if hasattr(self.model, "capture_reference_object_pose"):
-            with self._viser_lock_ctx():
-                self.model.capture_reference_object_pose(
-                    instance_id=int(self._d0_selected_instance_id),
-                )
-
-        live_rgb = self._build_tracking_rgb(batch)
-        depth = batch.get("depth_image")
-        try:
-            self._initialize_motion_estimator(live_rgb, depth, camera, obj_mask)
-        except Exception as exc:
-            CONSOLE.log(f"[dynamic-gs-live] _initialize_motion_estimator failed: {exc}")
+    def _reset_d0_guard(self) -> None:
+        """Live override: D0 is complete once a reseed succeeds. Also resets the
+        tick counter so the new object is treated as a fresh D0 by DN gating."""
+        self._tracker_tick_count = 0
+        self._d0_completed = True
 
     @torch.no_grad()
     def _compute_tick_cdn(self, camera, batch):

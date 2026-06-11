@@ -111,8 +111,15 @@ class _Anchor:
     world_3d: np.ndarray       # (N, 3) float32 world-frame points at capture
     keypoints: np.ndarray      # (N, 2) float32 image pixels (debug + filtering)
     image_size: tuple[int, int]  # (W, H) — LighterGlue positional encoding scale
-    rotation: np.ndarray       # (3, 3) float32 — D0→anchor rotation
+    rotation: np.ndarray       # (3, 3) float32 — D0→anchor rotation (object, world frame)
     translation: np.ndarray    # (3,) float32 — D0→anchor translation
+    camera_rotation: np.ndarray  # (3, 3) float32 — R_cam_world of the anchor's
+                                 # camera (camera_to_world[:3,:3]). Used to gate /
+                                 # select anchors on the object's orientation AS
+                                 # SEEN FROM THE CAMERA (relative orientation), so
+                                 # a new anchor is captured when the viewpoint of
+                                 # the object changes — covering camera-only and
+                                 # object-only motion alike.
     rgb: Optional[Tensor] = None      # (H, W, 3) float tensor on GPU, 0..255 range
     mask: Optional[Tensor] = None     # (H, W, 1) bool/float — region used to filter
                                       # this anchor's keypoints (for debug overlay)
@@ -129,13 +136,30 @@ def _rotation_distance_deg(rotation_a: np.ndarray, rotation_b: np.ndarray) -> fl
     return float(np.degrees(np.arccos(cos_angle)))
 
 
+def _relative_object_rotation(
+    object_rotation_world: np.ndarray, camera_rotation_world: np.ndarray,
+) -> np.ndarray:
+    """Object orientation AS SEEN FROM THE CAMERA: ``R_cam_world^T @ R_obj_world``.
+
+    Both inputs are world-frame rotations (object D0→current, and the camera's
+    ``camera_to_world[:3,:3]``). The result lives in the camera frame, so two
+    relative rotations are directly comparable via :func:`_rotation_distance_deg`
+    regardless of how the camera moved. This is what XFeat/LighterGlue actually
+    match on — appearance from a viewpoint — so anchoring on it captures a new
+    keyframe whenever the *view* of the object changes (object moves, camera
+    moves, or both)."""
+    return camera_rotation_world.T @ object_rotation_world
+
+
 def _select_nearest_anchor_by_rotation(
     anchors: List[_Anchor],
-    predicted_rotation: np.ndarray,
+    predicted_relative_rotation: np.ndarray,
     *,
     exclude: Optional[Set[int]] = None,
 ) -> int:
-    """Index of the anchor whose rotation is closest to ``predicted_rotation``.
+    """Index of the anchor whose RELATIVE (object-in-camera) rotation is closest
+    to ``predicted_relative_rotation`` — i.e. the anchor whose stored viewpoint
+    of the object is most similar to the current viewpoint (easiest to match).
 
     ``exclude`` is an optional set of indices to skip (used to retry against
     the 2nd-nearest anchor when the 1st gave too few inliers). Returns -1 if
@@ -146,20 +170,29 @@ def _select_nearest_anchor_by_rotation(
     for i, anchor in enumerate(anchors):
         if i in excluded:
             continue
-        dist = _rotation_distance_deg(predicted_rotation, anchor.rotation)
+        anchor_rel = _relative_object_rotation(anchor.rotation, anchor.camera_rotation)
+        dist = _rotation_distance_deg(predicted_relative_rotation, anchor_rel)
         if dist < best_dist:
             best_dist, best_idx = dist, i
     return best_idx
 
 
-def _min_anchor_rotation_distance_deg(
-    anchors: List[_Anchor], rotation: np.ndarray,
+def _min_anchor_relative_distance_deg(
+    anchors: List[_Anchor], relative_rotation: np.ndarray,
 ) -> float:
-    """Smallest geodesic distance (deg) from ``rotation`` to any anchor's
-    stored rotation. Used to gate new-anchor creation."""
+    """Smallest geodesic distance (deg) from ``relative_rotation`` (the current
+    object-in-camera orientation) to any anchor's relative orientation. Gates
+    new-anchor creation: a new anchor is captured when the current viewpoint of
+    the object is >gate degrees from every stored anchor's viewpoint."""
     if not anchors:
         return float("inf")
-    return min(_rotation_distance_deg(rotation, a.rotation) for a in anchors)
+    return min(
+        _rotation_distance_deg(
+            relative_rotation,
+            _relative_object_rotation(a.rotation, a.camera_rotation),
+        )
+        for a in anchors
+    )
 
 
 def _ensure_repo_on_path() -> None:
@@ -189,6 +222,12 @@ class XFeatMotionEstimator:
         lighterglue_min_conf: float = 0.1,
         lighterglue_depth_confidence: float = 0.95,
         object_search_radius_px: int = 80,
+        use_semi_dense: bool = False,
+        pose_filter_enabled: bool = True,
+        pose_filter_accel_sigma: float = 0.05,
+        pose_filter_alpha_sigma: float = 0.25,
+        pose_filter_meas_trans_sigma_m: float = 0.003,
+        pose_filter_meas_rot_sigma_deg: float = 0.5,
     ) -> None:
         self.device = torch.device(device)
         self.top_k = max(int(top_k), 8)
@@ -205,6 +244,7 @@ class XFeatMotionEstimator:
         self._lighterglue_min_conf = float(lighterglue_min_conf)
         self._lighterglue_depth_confidence = float(lighterglue_depth_confidence)
         self._object_search_radius_px = max(int(object_search_radius_px), 0)
+        self._use_semi_dense = bool(use_semi_dense)
 
         _ensure_repo_on_path()
         from modules.xfeat import XFeat  # type: ignore
@@ -273,6 +313,20 @@ class XFeatMotionEstimator:
         self._cumulative_R: np.ndarray = np.eye(3, dtype=np.float32)
         self._cumulative_t: np.ndarray = np.zeros((3,), dtype=np.float32)
 
+        # Output-side pose Kalman filter (SE(3) constant-velocity ESKF).
+        # Smooths ONLY the (rotation, translation) returned to the
+        # pipeline; the raw ``_cumulative_*`` pose stays unfiltered so
+        # anchor selection / anchor creation / next-tick prediction are
+        # never contaminated by smoothing lag.
+        self._pose_filter: Optional[_tc.PoseKalmanFilter] = None
+        if pose_filter_enabled:
+            self._pose_filter = _tc.PoseKalmanFilter(
+                accel_sigma=float(pose_filter_accel_sigma),
+                alpha_sigma=float(pose_filter_alpha_sigma),
+                meas_trans_sigma=float(pose_filter_meas_trans_sigma_m),
+                meas_rot_sigma=float(np.radians(pose_filter_meas_rot_sigma_deg)),
+            )
+
         # Last-tick diagnostics (cleared by each call to estimate_and_advance).
         self.last_anchor_idx_used: int = -1
         self.last_used_fallback_anchor: bool = False
@@ -328,6 +382,8 @@ class XFeatMotionEstimator:
         self._cumulative_R = np.eye(3, dtype=np.float32)
         self._cumulative_t = np.zeros((3,), dtype=np.float32)
         self._anchors = []
+        if self._pose_filter is not None:
+            self._pose_filter.reset()
 
         rgb_t = self._prepare_rgb_gpu(rgb)
         depth_np = _tc.prepare_depth_image(depth)
@@ -487,6 +543,18 @@ class XFeatMotionEstimator:
         keep_region = gripper_keep_np
         current_rgb_for_extract = current_rgb_prepared
 
+        # --- Sub-timing: GPU queue drain (diagnostic) ---
+        # The extract below ends in a ``.cpu()`` pull, which is a sync point:
+        # its wall time absorbs ALL GPU work enqueued earlier (CDN render, FF
+        # inserts, viser render — possibly from other threads on the same
+        # default stream). Syncing here first splits that wait out, so
+        # ``xfeat_extract`` below measures the extract itself. Moving the sync
+        # earlier only re-attributes time; it adds no work.
+        t_sync = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        timings["gpu_queue_wait"] = time.time() - t_sync
+
         # --- Sub-timing: XFeat extract on the current frame ---
         # Reports as ``xfeat_extract`` (sparse XFeat NN forward + .cpu() pull of
         # keypoints). The lumped legacy key ``klt_forward`` is also written so
@@ -538,7 +606,12 @@ class XFeatMotionEstimator:
         # Try the rotation-nearest anchor first. If it gives fewer inliers
         # than the configured floor, retry against the 2nd-nearest. Keep the
         # better of the two results (more inliers wins).
-        predicted_R = self._cumulative_R
+        # Select on RELATIVE (object-in-camera) orientation: the current
+        # object-world pose viewed from the current camera. This picks the
+        # anchor whose stored viewpoint of the object is closest to the current
+        # one (easiest LighterGlue match), correctly handling camera motion.
+        current_cam_R = np.asarray(current_camera_to_world, dtype=np.float32)[:3, :3]
+        predicted_R_rel = _relative_object_rotation(self._cumulative_R, current_cam_R)
         excluded: Set[int] = set()
         primary_result: Optional[dict] = None
         primary_anchor_idx: int = -1
@@ -555,7 +628,7 @@ class XFeatMotionEstimator:
 
         for attempt in range(2):
             anchor_idx = _select_nearest_anchor_by_rotation(
-                self._anchors, predicted_R, exclude=excluded,
+                self._anchors, predicted_R_rel, exclude=excluded,
             )
             if anchor_idx < 0:
                 break  # no more anchors to try
@@ -629,14 +702,33 @@ class XFeatMotionEstimator:
         self.last_anchor_idx_used = primary_anchor_idx
         self.last_inlier_count = inlier_count
 
-        rotation_out = self._cumulative_R.copy()
-        translation_out = self._cumulative_t.copy()
+        # Output pose: feed the raw RANSAC pose through the Kalman filter
+        # (success ticks only — failures produce no new measurement, so
+        # the filter just holds its last estimate). Internals above keep
+        # using the raw ``_cumulative_*``.
+        if self._pose_filter is not None:
+            if success:
+                rotation_out, translation_out = self._pose_filter.filter(
+                    self._cumulative_R, self._cumulative_t, time.time(),
+                )
+            elif self._pose_filter.initialized:
+                rotation_out, translation_out = self._pose_filter.current()
+            else:
+                rotation_out = self._cumulative_R.copy()
+                translation_out = self._cumulative_t.copy()
+        else:
+            rotation_out = self._cumulative_R.copy()
+            translation_out = self._cumulative_t.copy()
 
-        # Anchor-creation gate: if the current rotation is further than the
-        # gate from every existing anchor, create a new one. Translation is
-        # never used.
+        # Anchor-creation gate: if the current RELATIVE (object-in-camera)
+        # orientation is further than the gate from every existing anchor's
+        # relative orientation, create a new one — i.e. capture fresh features
+        # whenever the VIEW of the object has changed enough, whether the
+        # object rotated, the camera moved, or both. Translation is never used.
         if success:
-            min_dist_deg = _min_anchor_rotation_distance_deg(self._anchors, self._cumulative_R)
+            min_dist_deg = _min_anchor_relative_distance_deg(
+                self._anchors, predicted_R_rel,
+            )
             if min_dist_deg > self._anchor_rotation_gate_deg:
                 # Filter the new anchor's keypoints to (object ∩ gripper-keep)
                 # at the time of creation. We CAN use the rendered object
@@ -695,7 +787,7 @@ class XFeatMotionEstimator:
                     self.last_pool_size = len(self._anchors)
                     print(
                         f"[xfeat-anchor] pool size: {len(self._anchors)} "
-                        f"(added; rot from nearest = {min_dist_deg:.1f} deg, "
+                        f"(added; rel-view rot from nearest = {min_dist_deg:.1f} deg, "
                         f"{new_anchor.descriptors.shape[0]} keypoints)"
                     )
         timings["resample"] = 0.0
@@ -750,12 +842,21 @@ class XFeatMotionEstimator:
             inp = rgb_hwc.to(self._xfeat.dev, non_blocking=True).float()
         h, w = int(inp.shape[-2]), int(inp.shape[-1])
         self._maybe_warmup((h, w))
-        # detectAndCompute returns a list-per-batch of dicts.
-        out_list = self._xfeat.detectAndCompute(inp, top_k=self.top_k)
-        out = out_list[0]
-        kp_gpu = out["keypoints"].detach()
+        if self._use_semi_dense:
+            # detectAndComputeDense returns a SINGLE dict with batched tensors:
+            #   keypoints   (B, top_k, 2)   coarse, integer-pixel
+            #   descriptors (B, top_k, 64)  L2-normalised
+            # (`scales` is also returned with multiscale=True but we don't use it.)
+            out = self._xfeat.detectAndComputeDense(inp, top_k=self.top_k, multiscale=True)
+            kp_gpu = out["keypoints"][0].detach().float()
+            desc = out["descriptors"][0].detach()
+        else:
+            # detectAndCompute returns a list-per-batch of dicts; sparse path.
+            out_list = self._xfeat.detectAndCompute(inp, top_k=self.top_k)
+            out = out_list[0]
+            kp_gpu = out["keypoints"].detach()
+            desc = out["descriptors"].detach()
         kp = kp_gpu.cpu().numpy().astype(np.float32)
-        desc = out["descriptors"].detach()
         return kp, desc, kp_gpu, (w, h)
 
     @staticmethod
@@ -872,6 +973,7 @@ class XFeatMotionEstimator:
             image_size=image_size,
             rotation=rotation.astype(np.float32),
             translation=translation.astype(np.float32),
+            camera_rotation=np.asarray(camera_to_world, dtype=np.float32)[:3, :3].copy(),
             rgb=rgb_stored,
             mask=mask_stored,
         )
@@ -1126,8 +1228,15 @@ class XFeatMotionEstimator:
         H, W = target
         x = torch.randn(1, 3, H, W, device=self._xfeat.dev).float().mul(80).add(120).clamp(0, 255)
         with torch.inference_mode():
-            for _ in range(2):
-                out_list = self._xfeat.detectAndCompute(x, top_k=self.top_k)
+            if self._use_semi_dense:
+                for _ in range(2):
+                    out_d = self._xfeat.detectAndComputeDense(x, top_k=self.top_k, multiscale=True)
+                # Massage into the same (list-of-dict-shaped) shape the LighterGlue
+                # warmup branch below expects.
+                out_list = [{"keypoints": out_d["keypoints"][0], "descriptors": out_d["descriptors"][0]}]
+            else:
+                for _ in range(2):
+                    out_list = self._xfeat.detectAndCompute(x, top_k=self.top_k)
             if self._lighterglue is not None and out_list and out_list[0]["keypoints"].shape[0] >= 8:
                 kp0 = out_list[0]["keypoints"]
                 desc0 = out_list[0]["descriptors"]

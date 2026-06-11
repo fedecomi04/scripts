@@ -191,16 +191,37 @@ def _assign_and_merge(
     for i, t in enumerate(target):
         if t is not None:
             groups[t].append(i)
-    merged = []
-    for t in sorted(groups):
-        m = np.zeros_like(amg_masks[0], bool)
-        for j in groups[t]:
-            m |= amg_masks[j]
-        merged.append(m)
+    # IMPORTANT: keep each merged object tagged with its ORIGINAL SAM3 instance
+    # index `t` (sorted only for deterministic iteration order). Downstream the
+    # SAM2-video `obj_id` is seeded as `t + 1`, so the final per-Gaussian
+    # `object_instance_ids` equals the SAM3 mask number + 1 — the invariant the
+    # interactive object picker relies on. (Previously this compacted to
+    # 1..len(merged) via positional enumerate, silently renumbering instances
+    # whenever a SAM3 mask had no AMG coverage.)
+    T = sam3_masks.shape[0]
+    merged: list[tuple[int, np.ndarray]] = []
+    fallback_ts: list[int] = []
+    for t in range(T):
+        if t in groups:
+            # AMG-refined boundary: union of the AMG masks assigned to this
+            # SAM3 instance.
+            m = np.zeros_like(amg_masks[0], bool)
+            for j in groups[t]:
+                m |= amg_masks[j]
+        else:
+            # No AMG mask cleared the coverage threshold for this SAM3
+            # instance — DON'T drop it (that loses a whole object + leaves a
+            # gap in the id sequence the picker exposes). Fall back to the raw
+            # SAM3 mask: it's complete and clean, just not AMG-edge-tight.
+            m = sam3_masks[t].astype(bool)
+            fallback_ts.append(t)
+        merged.append((t, m))
     n_drop = sum(1 for t in target if t is None)
     _log(
         f"merge: {len(amg_masks)} AMG masks -> {len(merged)} objects "
-        f"(SAM3-backed); dropped {n_drop} background/table fragments"
+        f"(SAM3-backed, ids preserved); dropped {n_drop} background/table "
+        f"fragments; {len(fallback_ts)} SAM3 mask(s) used raw (no AMG coverage): "
+        f"{[t + 1 for t in fallback_ts]}"
     )
     return merged, target
 
@@ -224,13 +245,19 @@ def _write_video_frames(
 
 
 def _propagate(
-    seed_masks: Sequence[np.ndarray],
+    seed_masks: Sequence[tuple[int, np.ndarray]],
     num_frames: int,
     H: int,
     W: int,
     video_frames_dir: Path,
     sam2_hf_model: str,
 ) -> np.ndarray:
+    """Propagate the seeded objects across the video.
+
+    ``seed_masks`` is a list of ``(sam3_index, mask)`` pairs. Each object is
+    seeded with ``obj_id = sam3_index + 1`` so the propagated label (and thus
+    the final per-Gaussian instance id) equals the SAM3 mask number + 1.
+    """
     from sam2.build_sam import build_sam2_video_predictor_hf
 
     _log(f"loading SAM2 video predictor ({sam2_hf_model}) ...")
@@ -242,8 +269,10 @@ def _propagate(
             offload_video_to_cpu=_OFFLOAD_VIDEO_TO_CPU,
             offload_state_to_cpu=_OFFLOAD_STATE_TO_CPU,
         )
-        for k, mask in enumerate(seed_masks, start=1):
-            predictor.add_new_mask(state, frame_idx=0, obj_id=k, mask=mask)
+        for sam3_index, mask in seed_masks:
+            predictor.add_new_mask(
+                state, frame_idx=0, obj_id=int(sam3_index) + 1, mask=mask
+            )
         _log(f"seeded {len(seed_masks)} merged objects; propagating ...")
         t = time.time()
         for fidx, obj_ids, mask_logits in predictor.propagate_in_video(state):
@@ -424,6 +453,35 @@ def build_labeled_seed(
         sam3_masks = sam3_masks[None]
     _log(f"SAM3 returned {sam3_masks.shape[0]} instance(s) across "
          f"{len(text_prompts)} prompt(s)")
+
+    # Save a human-readable SAM3 overlay PNG (input image + per-instance
+    # colored masks). Lands BOTH in preseg_artifacts/ and at the static_scene
+    # root so it's obvious to anyone opening the dataset folder.
+    try:
+        overlay_paths = [
+            out_dir / "sam3_overlay.png",
+            out_dir.parent / "sam3_overlay.png",
+        ]
+        rgb = frame0.copy().astype(np.float32)
+        K = int(sam3_masks.shape[0])
+        # Distinct, evenly-spaced hues (HSV->BGR) so adjacent instance ids
+        # always look distinguishable, regardless of K.
+        hues = np.linspace(0, 179, max(K, 1), endpoint=False).astype(np.uint8)
+        for i in range(K):
+            hsv = np.zeros((1, 1, 3), dtype=np.uint8)
+            hsv[0, 0] = (hues[i], 220, 255)
+            color_bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
+            color_rgb = color_bgr[::-1].astype(np.float32)
+            m = sam3_masks[i].astype(bool)
+            # 0.55 mask alpha keeps the underlying texture readable while
+            # making colours unmistakable.
+            rgb[m] = 0.45 * rgb[m] + 0.55 * color_rgb[None, :]
+        overlay = np.clip(rgb, 0, 255).astype(np.uint8)
+        for p in overlay_paths:
+            cv2.imwrite(str(p), overlay[:, :, ::-1])
+        _log(f"SAM3 overlay -> {overlay_paths[1]} (and a copy in preseg_artifacts/)")
+    except Exception as exc:
+        _log(f"WARNING: failed to write SAM3 overlay: {exc}")
 
     # Steps 3+4: coverage-merge.
     merged, _target = _assign_and_merge(amg_masks, sam3_masks, coverage_threshold)

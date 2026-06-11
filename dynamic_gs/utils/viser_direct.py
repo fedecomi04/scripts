@@ -236,12 +236,33 @@ class ViserDirectScene:
         self._last_diag_t = time.time()
         self._render_window_total_ms = 0.0
 
+        # --- Live camera feed (side-panel thumbnail) ---
+        # The pipeline pushes the current tracked frame's RGB here each tick via
+        # update_camera_feed(); the render loop refreshes the GUI image in place.
+        self._feed_rgb: Optional[np.ndarray] = None       # (H, W, 3) uint8 RGB
+        self._feed_dirty: bool = False
+        self._feed_lock = threading.Lock()
+        self._feed_gui_image = None                        # server.gui image handle
+        # --- Follow-tracked-frame pose ---
+        # When the GUI toggle is on, the render loop snaps each connected
+        # client's camera to the tracked frame's c2w (set via
+        # update_tracked_camera()) before rendering — so the splat view matches
+        # the camera the tracker is seeing.
+        self._follow_c2w: Optional[np.ndarray] = None      # (3,4) or (4,4) c2w
+        self._follow_lock = threading.Lock()
+        self._follow_toggle = None                         # server.gui checkbox handle
+        self._feed_toggle = None                           # server.gui checkbox handle
+        self._gui_built: bool = False
+
         # World axes are useful for orientation when the scene is empty
         # before the first render lands.
         try:
             self.server.scene.world_axes.visible = True
         except Exception:
             pass
+
+        # Camera-feed + follow-pose GUI (shared across all clients).
+        self._build_gui()
 
         # Wire client connect/disconnect.
         @self.server.on_client_connect
@@ -258,6 +279,103 @@ class ViserDirectScene:
             f"open http://localhost:{port}",
             flush=True,
         )
+
+    # ------------------------------------------------------------------
+    # Camera-feed + follow-pose GUI
+    # ------------------------------------------------------------------
+
+    def _build_gui(self) -> None:
+        """Add the shared GUI controls once: a 'Camera feed' folder with the
+        live-feed thumbnail + a show/hide checkbox, and a 'Follow tracked
+        frame' checkbox. All server-level so every client sees them."""
+        if self._gui_built:
+            return
+        try:
+            with self.server.gui.add_folder("Tracker view"):
+                self._feed_toggle = self.server.gui.add_checkbox(
+                    "Show camera feed", initial_value=True,
+                )
+                self._follow_toggle = self.server.gui.add_checkbox(
+                    "Follow tracked frame", initial_value=False,
+                )
+            self._gui_built = True
+        except Exception as exc:
+            print(f"[viser-direct] GUI build failed: {exc}", flush=True)
+
+    def update_camera_feed(self, rgb: np.ndarray) -> None:
+        """Pipeline hook: stash the current tracked frame's RGB (H,W,3 uint8)
+        to be shown as the side-panel feed thumbnail on the next render. Cheap
+        (just a reference swap under a lock); the JPEG encode happens in the
+        render loop only when a client is connected."""
+        if rgb is None:
+            return
+        with self._feed_lock:
+            self._feed_rgb = rgb
+            self._feed_dirty = True
+
+    def update_tracked_camera(self, camera_to_world: np.ndarray) -> None:
+        """Pipeline hook: stash the tracked frame's camera c2w (3x4 or 4x4).
+        When the 'Follow tracked frame' toggle is on, the render loop snaps the
+        viewer camera to this pose before rendering."""
+        if camera_to_world is None:
+            return
+        with self._follow_lock:
+            self._follow_c2w = np.asarray(camera_to_world, dtype=np.float32)
+
+    def _refresh_feed_image(self) -> None:
+        """Render-thread side: update the GUI feed thumbnail in place if a new
+        frame arrived and the toggle is on. Adds the image handle lazily."""
+        toggle_on = self._feed_toggle is None or bool(self._feed_toggle.value)
+        with self._feed_lock:
+            rgb = self._feed_rgb if self._feed_dirty else None
+            self._feed_dirty = False
+        if not toggle_on:
+            if self._feed_gui_image is not None:
+                try:
+                    self._feed_gui_image.visible = False
+                except Exception:
+                    pass
+            return
+        if rgb is None:
+            return
+        try:
+            if self._feed_gui_image is None:
+                self._feed_gui_image = self.server.gui.add_image(
+                    rgb, label="camera feed", format="jpeg", jpeg_quality=70,
+                )
+            else:
+                self._feed_gui_image.image = rgb
+                self._feed_gui_image.visible = True
+        except Exception as exc:
+            if self._render_error_count <= 3:
+                print(f"[viser-direct] feed image update failed: {exc}", flush=True)
+
+    def _apply_follow_pose(self, client) -> None:
+        """Render-thread side: if 'Follow tracked frame' is on, snap this
+        client's camera to the latest tracked c2w.
+
+        MUST use the same nerfstudio(Y-up,Z-back) -> viser(Y-down,Z-forward)
+        conversion as :meth:`_apply_initial_camera`: ``R_viser = R_nerf @
+        _FLIP_YZ`` (the inverse of the ``@ _FLIP_YZ`` applied on the read path
+        in ``_build_camera_from_viser``). Omitting the flip feeds a wrong-handed
+        rotation to viser and the followed view is misaligned (only the initial
+        frame, which goes through the correct path, looked right)."""
+        if self._follow_toggle is None or not bool(self._follow_toggle.value):
+            return
+        with self._follow_lock:
+            c2w = self._follow_c2w
+        if c2w is None:
+            return
+        try:
+            c2w = np.asarray(c2w, dtype=np.float32)
+            R_nerf = c2w[:3, :3]
+            pos = c2w[:3, 3]
+            R_viser = (R_nerf @ _FLIP_YZ).astype(np.float32)
+            client.camera.position = pos
+            client.camera.wxyz = _rotmat_to_quat_wxyz_np(R_viser)
+        except Exception as exc:
+            if self._render_error_count <= 3:
+                print(f"[viser-direct] follow-pose snap failed: {exc}", flush=True)
 
     # ------------------------------------------------------------------
     # Pipeline-facing API
@@ -445,13 +563,25 @@ class ViserDirectScene:
     # Render loop (background thread)
     # ------------------------------------------------------------------
 
+    @property
+    def is_closing(self) -> bool:
+        """True once :meth:`close` has begun tearing the server down. Off-thread
+        callers (e.g. the AnySplat FF bg thread) check this before pushing to
+        viser so they don't ``submit`` onto an executor that's already shutting
+        down at interpreter exit (``cannot schedule new futures after shutdown``)."""
+        return self._stop_event.is_set()
+
     def request_render(self) -> None:
         """Wake the render thread for ONE pass. Called by the pipeline
         from every tracker tick and from every FF insertion site (and
         on client connect). Decouples render cadence from any fixed
         polling rate — there's exactly one render per tracker tick, so
         every per-tick mutation lands in the browser without delay.
-        """
+
+        No-op once the server is closing — a late bg push after teardown
+        would otherwise raise ``cannot schedule new futures after shutdown``."""
+        if self._stop_event.is_set():
+            return
         self._render_requested.set()
 
     def _render_loop(self) -> None:
@@ -489,6 +619,8 @@ class ViserDirectScene:
                 self._last_diag_t = now
 
     def _render_once(self) -> None:
+        if self._stop_event.is_set():
+            return  # server tearing down — don't push onto a closing executor
         model = self._model
         if model is None:
             return
@@ -498,9 +630,16 @@ class ViserDirectScene:
             clients = [(cid, st["client"]) for cid, st in self._client_state.items()]
         if not clients:
             return
+        # Refresh the side-panel camera-feed thumbnail once per render (shared
+        # GUI element, not per-client).
+        self._refresh_feed_image()
         W, H = self.render_size
         for cid, client in clients:
             try:
+                # If 'Follow tracked frame' is on, snap this client's camera to
+                # the tracked frame's pose BEFORE reading it back to render —
+                # so the splat view matches the tracker's camera.
+                self._apply_follow_pose(client)
                 camera = _build_camera_from_viser(client.camera, W, H, self._device)
             except Exception as exc:
                 if self._render_error_count <= 3:
