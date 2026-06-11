@@ -1428,6 +1428,20 @@ class DynamicGSPipelineBase(VanillaPipeline):
         if int(obj_mask.shape[0]) != n_means:
             return None
         means_obj = model.means[obj_mask]
+        # Use the tracker's RAW cumulative pose for the crop, not the live
+        # (Kalman-FILTERED) means: the filtered pose lags/diverges under
+        # smoothing, dragging the crop window off the true object -> match
+        # death (measured: KF defaults reproducibly lost tracking at frame
+        # ~626 on the fixture while KF-off survived). Raw pose keeps the
+        # tracking loop self-consistent; the filter stays display-only.
+        est = getattr(self, "_motion_estimator", None)
+        ref = getattr(model, "_reference_object_means", None)
+        if (est is not None and ref is not None
+                and getattr(est, "_cumulative_R", None) is not None
+                and ref.shape[0] == int(obj_mask.sum().item())):
+            R_raw = torch.as_tensor(est._cumulative_R, device=ref.device, dtype=ref.dtype)
+            t_raw = torch.as_tensor(est._cumulative_t, device=ref.device, dtype=ref.dtype)
+            means_obj = ref @ R_raw.T + t_raw[None, :]
 
         def _scalar(x):
             if isinstance(x, torch.Tensor):
