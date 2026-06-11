@@ -482,6 +482,17 @@ class PoseKalmanFilter:
         # this tick) -> the update leans on the velocity model -> spike
         # suppression without adding lag on healthy ticks.
         _ms2 = max(float(meas_scale), 1.0) ** 2
+        # Robust update (innovation-adaptive R): a medium-large innovation —
+        # well above measurement noise but below the snap gate — is a spike
+        # (degenerate match set), not real motion the velocity state missed.
+        # Inflate R quadratically past 3 sigma so the filter coasts through it.
+        # Spikes measured at 8+ sigma carried 36% of jitter RMS on the fixture.
+        _sig_t = max(self._meas_trans_var ** 0.5, 1e-9)
+        _sig_r = max(self._meas_rot_var ** 0.5, 1e-9)
+        _nt = float(np.linalg.norm(y[0:3])) / (3.0 * _sig_t)
+        _nr = float(np.linalg.norm(y[3:6])) / (3.0 * _sig_r)
+        _rob = max(1.0, max(_nt, _nr)) ** 2
+        _ms2 = _ms2 * _rob
         R_noise = np.diag([self._meas_trans_var * _ms2] * 3 + [self._meas_rot_var * _ms2] * 3)
         S = H @ self._P @ H.T + R_noise
         K = self._P @ H.T @ np.linalg.solve(S, np.eye(6))

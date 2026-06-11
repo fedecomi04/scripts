@@ -687,6 +687,31 @@ class XFeatMotionEstimator:
         if primary_result is not None:
             inlier_count = int(primary_result["inlier_mask"].sum())
             success = inlier_count >= self.min_track_points
+            # Relative spike gate: a tick whose inlier count collapses below
+            # 45% of the recent-success rolling median is a degenerate match
+            # set (measured: spike frames carry 36% of jitter RMS with ~half
+            # the inliers). Reject it (hold last pose) instead of applying a
+            # bad pose. Relative -> adapts to scene difficulty; a FIXED high
+            # threshold (min_track_points=45) killed tracking permanently.
+            # DGS_SPIKE_GATE_FRAC=0 disables.
+            if success:
+                _hist = getattr(self, "_inlier_hist", None)
+                if _hist is None:
+                    _hist = self._inlier_hist = []
+                _frac = float(os.environ.get("DGS_SPIKE_GATE_FRAC", "0"))  # off by default: cost longevity on the fixture
+                if _frac > 0 and len(_hist) >= 8:
+                    _med = float(np.median(_hist))
+                    if inlier_count < _frac * _med:
+                        success = False
+                # Append on gate-rejected ticks too: a SUSTAINED inlier drop
+                # (regime change: motion onset, new viewpoint) must lower the
+                # median within ~8 ticks so tracking resumes — otherwise the
+                # gate deadlocks at the easy-segment median and rejects
+                # forever (measured: permanent death at the motion onset).
+                # Transient spikes (1-3 ticks) barely move the median.
+                _hist.append(inlier_count)
+                if len(_hist) > 30:
+                    del _hist[0]
             mean_residual = float(primary_result["mean_residual"])
             median_residual = float(primary_result["median_residual"])
             if success:
@@ -713,8 +738,18 @@ class XFeatMotionEstimator:
                 # measurement noise as inliers drop below the healthy norm.
                 _inl = max(int(inlier_count), 1)
                 _scale = min(4.0, max(1.0, (80.0 / _inl) ** 0.5))
+                # Offline replays process ticks much slower than live (~0.4s
+                # vs ~50ms): wall-clock dt makes process noise dominate and
+                # the KF barely smooths. DGS_KF_SYNTHETIC_FPS feeds the filter
+                # frame-cadence timestamps so offline == live filter behavior.
+                _sfps = os.environ.get("DGS_KF_SYNTHETIC_FPS")
+                if _sfps:
+                    self._kf_tick = getattr(self, "_kf_tick", 0) + 1
+                    _ts = self._kf_tick / float(_sfps)
+                else:
+                    _ts = time.time()
                 rotation_out, translation_out = self._pose_filter.filter(
-                    self._cumulative_R, self._cumulative_t, time.time(),
+                    self._cumulative_R, self._cumulative_t, _ts,
                     meas_scale=_scale,
                 )
             elif self._pose_filter.initialized:
