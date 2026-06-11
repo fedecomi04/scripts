@@ -452,14 +452,22 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
     fusion_runner.start()
 
     # Spawn the persistent SAM3+SAM3D worker and kick off SAM3's 6 s weight
-    # load on a background thread. Capture wallclock is typically ≥30 s
-    # (operator-controlled), so by the time the operator centers the camera
-    # and hits Enter, SAM3 is already on the GPU. VRAM during capture is
-    # ~3 GB (TSDF integrate) + 4.5 GB (SAM3 resident) = 7.5 GB on 16 GB.
-    # Safe.
+    # load on a background thread. Capture wallclock is operator-controlled, so
+    # by the time the operator centers the camera and hits Enter the segmenter
+    # is already on the GPU. With FastSAM (measured resident 0.85 GB) the trim
+    # also lets us preload SAM3D (7.3 GB) DURING capture, so its ~23 s model-load
+    # (measured) overlaps the sweep instead of blocking after Enter — only the
+    # ~9.8 s SAM3D infer (needs the mask) stays exposed. Capture-window budget:
+    # FastSAM 0.85 + SAM3D-trim 7.3 + TSDF integrate + Gazebo (~2.6) ≈ 13.8/15.8.
     sam_worker: SamWorkerClient | None = None
     _sam3_load_thread: threading.Thread | None = None
     _sam3_load_err: dict = {"err": None, "seconds": 0.0}
+    # SAM3D-during-capture preload state (fastsam backend only; SAM3 4.5 + SAM3D
+    # don't co-fit). Best-effort: any failure leaves loaded=False and the Enter
+    # path loads SAM3D then (the proven sequential fallback).
+    _sam3d_preload: dict = {"loaded": False, "seconds": 0.0, "err": None}
+    _preload_sam3d = (SEGMENTATION_BACKEND == "fastsam"
+                      and os.environ.get("DGS_SAM3D_LOAD_DURING_CAPTURE", "1") == "1")
     try:
         sam_worker = SamWorkerClient(conda_env=SAM3_CONDA_ENV)
         print(f"[live] SAM worker spawned ({sam_worker.spawn_seconds:.2f}s)", flush=True)
@@ -472,6 +480,22 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
                 else:
                     sam_worker.load_sam3(confidence_threshold=SAM3_CONFIDENCE_THRESHOLD)
                 _sam3_load_err["seconds"] = time.time() - t0
+                # Preload SAM3D during capture so its model-load hides behind the
+                # sweep. Best-effort — on OOM/any error we fall back to loading it
+                # at Enter (see the load_sam3d call site).
+                if _preload_sam3d:
+                    try:
+                        ts = time.time()
+                        sam_worker.load_sam3d()
+                        _sam3d_preload["loaded"] = True
+                        _sam3d_preload["seconds"] = time.time() - ts
+                        print(f"[live] SAM3D preloaded during capture "
+                              f"({_sam3d_preload['seconds']:.1f}s) — its load now hides behind the sweep",
+                              flush=True)
+                    except Exception as exc:
+                        _sam3d_preload["err"] = exc
+                        print(f"[live] SAM3D preload-during-capture failed ({exc}); "
+                              f"will load at Enter instead", flush=True)
             except Exception as exc:
                 _sam3_load_err["err"] = exc
 
@@ -644,8 +668,14 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
         try:
             if sam_worker is not None:
                 t_load = time.time()
-                sam_worker.load_sam3d()
-                print(f"[live] SAM3D model loaded ({time.time()-t_load:.1f}s)", flush=True)
+                if _sam3d_preload["loaded"]:
+                    # Already resident from the capture-window preload — the
+                    # ~23 s model-load is fully hidden; nothing to wait for.
+                    print(f"[live] SAM3D already resident (preloaded during capture, "
+                          f"{_sam3d_preload['seconds']:.1f}s) — skipping load", flush=True)
+                else:
+                    sam_worker.load_sam3d()
+                    print(f"[live] SAM3D model loaded ({time.time()-t_load:.1f}s)", flush=True)
                 t_infer = time.time()
                 worker_results = sam_worker.sam3d_infer(
                     render_image_path=anchor_rgb_path,
