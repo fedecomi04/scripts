@@ -839,25 +839,37 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
         # — both passes are subsumed by the streaming runner.
         if _defer_tsdf:
             # Deferred path: SAM3D + FastSAM are unloaded, so the GPU is free
-            # for the batch ICP+TSDF. build_tsdf_seed writes the seed PLY; we
-            # then register ply_file_path (it doesn't) so Splatfacto inits from
-            # the seed. No concurrent VBG ever collided with SAM3D.
+            # for the batch ICP+TSDF. fuse_recorded_dataset runs the GPU
+            # OnlineFusion (auto-CUDA, ~5s vs ~48s for the CPU build_tsdf_seed)
+            # AND writes ply_file_path into transforms.json itself, so Splatfacto
+            # inits from the seed. No concurrent VBG ever collided with SAM3D.
+            # We then bump the seed PLY mtime PAST the transforms.json rewrite so
+            # bootstrap stage 1.5's _output_is_fresh check sees the seed as fresh
+            # and skips the (previously ~45s) redundant rebuild.
             try:
-                from .rgbd_fusion_init import build_tsdf_seed
+                from .online_fusion import fuse_recorded_dataset
                 t_fin = time.time()
-                build_tsdf_seed(LIVE_ROOT, force=True, verbose=True)
-                _register_seed_ply_path(static_dir)
-                _tl.record(LIVE_ROOT, "pointcloud_fusion", "TSDF batch seed",
+                seed_ply = fuse_recorded_dataset(static_dir)
+                seed_ply.touch()
+                _tl.record(LIVE_ROOT, "pointcloud_fusion", "TSDF batch seed (GPU)",
                            "fusion", t_fin, time.time())
-                print("[live] deferred batch TSDF seed built + ply_file_path registered",
+                print("[live] deferred GPU TSDF seed built + ply_file_path registered",
                       flush=True)
             except Exception as exc:
-                print(f"[live] WARNING: deferred batch TSDF failed ({exc}); "
-                      f"falling back to naive back-projected seed", flush=True)
+                print(f"[live] WARNING: deferred GPU TSDF failed ({exc}); "
+                      f"trying CPU build_tsdf_seed", flush=True)
                 try:
-                    sub.build_static_init_pointcloud()
+                    from .rgbd_fusion_init import build_tsdf_seed
+                    cpu_ply = build_tsdf_seed(LIVE_ROOT, force=True, verbose=True)
+                    _register_seed_ply_path(static_dir)
+                    cpu_ply.touch()
                 except Exception as exc2:
-                    print(f"[live] WARNING: naive seed fallback also failed ({exc2})", flush=True)
+                    print(f"[live] WARNING: CPU TSDF also failed ({exc2}); "
+                          f"falling back to naive back-projected seed", flush=True)
+                    try:
+                        sub.build_static_init_pointcloud()
+                    except Exception as exc3:
+                        print(f"[live] WARNING: naive seed fallback also failed ({exc3})", flush=True)
         else:
             try:
                 _finalize_safe("happy-path")
