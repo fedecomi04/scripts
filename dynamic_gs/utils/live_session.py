@@ -301,6 +301,28 @@ def _spawn_sam3d_in_thread(
     # the trainer's first forward pass collides with SAM3D.
 
 
+def _register_seed_ply_path(static_dir: Path) -> None:
+    """Write ``ply_file_path`` into static_scene/transforms.json so the
+    dataparser inits Splatfacto from the seed PLY (Design Invariant #1: means
+    locked on the TSDF seed). ``build_tsdf_seed`` writes the PLY but NOT this
+    key — without it nerfstudio silently falls back to random init. The
+    concurrent runner's stop_and_finalize writes it; the deferred batch path
+    must do it here. Atomic write, idempotent."""
+    tp = static_dir / "transforms.json"
+    if not tp.exists():
+        return
+    try:
+        meta = json.loads(tp.read_text())
+    except Exception:
+        return
+    if meta.get("ply_file_path") == INIT_CLOUD_NAME:
+        return
+    meta["ply_file_path"] = INIT_CLOUD_NAME
+    tmp = tp.with_name(f".{tp.name}.tmp")
+    tmp.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, tp)
+
+
 def _seed_dynamic_scene_stub(static_dir: Path, dynamic_dir: Path) -> None:
     """Nerfstudio refuses an empty `dynamic_scene/`. Symlink the first
     static frame into `dynamic_scene/` so the dataparser builds.
@@ -450,7 +472,20 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
     # build_tsdf_seed two-pass post-capture step.
     from .fusion_runner import ConcurrentFusionRunner
     fusion_runner = ConcurrentFusionRunner(static_dir, sub.intrinsics)
-    fusion_runner.start()
+    # DEFER the concurrent TSDF (default ON): building the TSDF volume during
+    # capture grows it to ~7 GB, which collides with SAM3D's ~12 GB load at
+    # Enter (+ Gazebo 2.6) → OOM on a 16 GB GPU. Instead, skip concurrent
+    # fusion; after SAM3D unloads (Enter), build the seed with the batch
+    # ICP+TSDF pass (build_tsdf_seed) when the GPU is free of SAM3D. The
+    # constructor is kept (allocates zero GPU) so _finalize_safe stays valid
+    # (its stop_and_finalize() is a no-op when .start() was never called).
+    _defer_tsdf = os.environ.get("DGS_LIVE_DEFER_TSDF", "1") == "1"
+    if not _defer_tsdf:
+        fusion_runner.start()
+    else:
+        print("[live] concurrent TSDF DEFERRED (DGS_LIVE_DEFER_TSDF=1) — seed "
+              "built by batch ICP+TSDF after SAM3D unloads (no VRAM collision)",
+              flush=True)
 
     # Fresh timing ledger — capture is the true start of the live flow. The
     # capture/segmentation/3d-gen/fusion rows recorded here are rendered to
@@ -802,18 +837,40 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
         # `build_static_init_pointcloud` (naive back-projection) +
         # `rgbd_fusion_init.build_tsdf_seed` (post-pass ICP+TSDF refine)
         # — both passes are subsumed by the streaming runner.
-        try:
-            _finalize_safe("happy-path")
-        except Exception as exc:
-            print(f"[live] WARNING: concurrent fusion finalize failed ({exc}); "
-                  f"falling back to legacy naive seed + post-pass refine", flush=True)
-            sub.build_static_init_pointcloud()
+        if _defer_tsdf:
+            # Deferred path: SAM3D + FastSAM are unloaded, so the GPU is free
+            # for the batch ICP+TSDF. build_tsdf_seed writes the seed PLY; we
+            # then register ply_file_path (it doesn't) so Splatfacto inits from
+            # the seed. No concurrent VBG ever collided with SAM3D.
             try:
                 from .rgbd_fusion_init import build_tsdf_seed
+                t_fin = time.time()
                 build_tsdf_seed(LIVE_ROOT, force=True, verbose=True)
-            except Exception as exc2:
-                print(f"[live] WARNING: legacy fallback also failed ({exc2}); "
-                      f"seed will be naive only", flush=True)
+                _register_seed_ply_path(static_dir)
+                _tl.record(LIVE_ROOT, "pointcloud_fusion", "TSDF batch seed",
+                           "fusion", t_fin, time.time())
+                print("[live] deferred batch TSDF seed built + ply_file_path registered",
+                      flush=True)
+            except Exception as exc:
+                print(f"[live] WARNING: deferred batch TSDF failed ({exc}); "
+                      f"falling back to naive back-projected seed", flush=True)
+                try:
+                    sub.build_static_init_pointcloud()
+                except Exception as exc2:
+                    print(f"[live] WARNING: naive seed fallback also failed ({exc2})", flush=True)
+        else:
+            try:
+                _finalize_safe("happy-path")
+            except Exception as exc:
+                print(f"[live] WARNING: concurrent fusion finalize failed ({exc}); "
+                      f"falling back to legacy naive seed + post-pass refine", flush=True)
+                sub.build_static_init_pointcloud()
+                try:
+                    from .rgbd_fusion_init import build_tsdf_seed
+                    build_tsdf_seed(LIVE_ROOT, force=True, verbose=True)
+                except Exception as exc2:
+                    print(f"[live] WARNING: legacy fallback also failed ({exc2}); "
+                          f"seed will be naive only", flush=True)
     finally:
         # Close the persistent SAM worker BEFORE finalize_safe so its
         # remaining VRAM (if any) is freed before TSDF's 12.3 GB peak.
