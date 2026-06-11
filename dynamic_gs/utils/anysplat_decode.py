@@ -79,6 +79,11 @@ class PersistentAnysplatWorker:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
+        # Generalized IPC handles — pipe mode here; ``adopt()`` builds an
+        # instance whose handles are FIFOs and whose ``_proc`` is None.
+        self._send_f = self._proc.stdin
+        self._recv_f = self._proc.stdout
+        self._adopted_pid: int | None = None
         # Wait for the "ready" sentinel on stdout (model loaded into VRAM).
         t0 = time.time()
         while True:
@@ -103,6 +108,73 @@ class PersistentAnysplatWorker:
     def load_seconds(self) -> float:
         return getattr(self, "_load_s", 0.0)
 
+    def _alive(self) -> bool:
+        if self._proc is not None:
+            return self._proc.poll() is None
+        if self._adopted_pid is not None:
+            return _pid_is_anysplat_worker(self._adopted_pid)
+        return False
+
+    @classmethod
+    def adopt(cls, fifo_dir: Path, wait_ready_timeout_s: float = 60.0) -> "PersistentAnysplatWorker | None":
+        """Adopt a worker pre-spawned by :func:`spawn_detached_anysplat_worker`
+        in an earlier process (e.g. live capture pre-spawned it right after
+        SAM3D so its ~17 s model load overlaps static training).
+
+        Returns None (caller should spawn fresh) when: no spawn record exists,
+        the spawned pid died, or ready.json doesn't appear within
+        ``wait_ready_timeout_s`` (clock starts only if the pid is alive but
+        still loading). Never blocks when there is nothing to wait for.
+        """
+        import json as _json
+        fifo_dir = Path(fifo_dir)
+        spawn_file = fifo_dir / "spawn.json"
+        ready_file = fifo_dir / "ready.json"
+        if not spawn_file.exists():
+            return None
+        try:
+            spawn_info = _json.loads(spawn_file.read_text())
+            pid = int(spawn_info["pid"])
+        except Exception:
+            return None
+
+        # Wait for ready.json while (and only while) the worker pid is alive.
+        t0 = time.time()
+        while not ready_file.exists():
+            if not _pid_is_anysplat_worker(pid):
+                return None  # worker died during load (or pid recycled)
+            if time.time() - t0 > wait_ready_timeout_s:
+                return None
+            time.sleep(0.25)
+
+        try:
+            ready = _json.loads(ready_file.read_text())
+            if int(ready.get("pid", -1)) != pid:
+                return None  # stale ready.json from an older worker
+        except Exception:
+            return None
+        if not _pid_is_anysplat_worker(pid):
+            return None
+
+        # Connect. Open-order protocol mirrors the worker: cmd first, then
+        # res. The worker blocks in open(cmd, 'r'); our open(cmd, 'w')
+        # completes the rendezvous, then both sides open res.
+        cmd_fifo = fifo_dir / "cmd.fifo"
+        res_fifo = fifo_dir / "res.fifo"
+        try:
+            send_f = open(cmd_fifo, "w", buffering=1)
+            recv_f = open(res_fifo, "r")
+        except OSError:
+            return None
+
+        w = cls.__new__(cls)
+        w._proc = None
+        w._send_f = send_f
+        w._recv_f = recv_f
+        w._adopted_pid = pid
+        w._load_s = float(ready.get("load_seconds", 0.0))
+        return w
+
     def inference(self, image_paths: list[Path], output_npz: Path, timeout_s: float = 60.0) -> dict:
         """Run one inference. Returns a dict with the output .npz path plus per-phase
         timing breakdown:
@@ -118,14 +190,14 @@ class PersistentAnysplatWorker:
         because the JSON write itself and Python overhead are unmeasured.
         Raises on worker error."""
         import json as _json
-        if self._proc.poll() is not None:
+        if not self._alive():
             raise RuntimeError("AnySplat persistent worker is no longer running")
         output_npz.parent.mkdir(parents=True, exist_ok=True)
         req = {"images": [str(p) for p in image_paths], "output": str(output_npz)}
 
         t_send0 = time.time()
-        self._proc.stdin.write(_json.dumps(req) + "\n")
-        self._proc.stdin.flush()
+        self._send_f.write(_json.dumps(req) + "\n")
+        self._send_f.flush()
         t_ipc_send_ms = (time.time() - t_send0) * 1000.0
 
         t_wait0 = time.time()
@@ -133,10 +205,12 @@ class PersistentAnysplatWorker:
         while True:
             if time.time() - t0 > timeout_s:
                 raise TimeoutError(f"AnySplat inference exceeded {timeout_s}s")
-            line = self._proc.stdout.readline()
+            line = self._recv_f.readline()
             if not line:
-                if self._proc.poll() is not None:
-                    stderr_tail = (self._proc.stderr.read() or "")[-1500:] if self._proc.stderr else ""
+                if not self._alive():
+                    stderr_tail = ""
+                    if self._proc is not None and self._proc.stderr:
+                        stderr_tail = (self._proc.stderr.read() or "")[-1500:]
                     raise RuntimeError(f"AnySplat worker died: {stderr_tail}")
                 continue
             try:
@@ -158,18 +232,111 @@ class PersistentAnysplatWorker:
                 raise RuntimeError(f"AnySplat worker error: {resp.get('msg')}")
 
     def close(self) -> None:
-        if self._proc.poll() is not None:
+        if not self._alive():
             return
         try:
             import json as _json
-            self._proc.stdin.write(_json.dumps({"cmd": "quit"}) + "\n")
-            self._proc.stdin.flush()
-            self._proc.wait(timeout=5.0)
+            self._send_f.write(_json.dumps({"cmd": "quit"}) + "\n")
+            self._send_f.flush()
+            if self._proc is not None:
+                self._proc.wait(timeout=5.0)
+            elif self._adopted_pid is not None:
+                # Detached worker: give the quit a moment to land, then
+                # targeted-kill the verified pid if it lingers (NEVER a
+                # pattern kill — verify cmdline first via _alive()).
+                t0 = time.time()
+                while time.time() - t0 < 5.0 and self._alive():
+                    time.sleep(0.2)
+                if self._alive():
+                    os.kill(self._adopted_pid, 9)
         except Exception:
             try:
-                self._proc.kill()
+                if self._proc is not None:
+                    self._proc.kill()
+                elif self._adopted_pid is not None and self._alive():
+                    os.kill(self._adopted_pid, 9)
             except Exception:
                 pass
+        finally:
+            for f in (self._send_f, self._recv_f):
+                try:
+                    f.close()
+                except Exception:
+                    pass
+
+
+def _pid_is_anysplat_worker(pid: int) -> bool:
+    """True iff ``pid`` is alive AND its cmdline is our anysplat worker
+    script. The cmdline check prevents acting on a recycled pid."""
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode()
+    except OSError:
+        return False
+    return "anysplat_worker.py" in cmdline
+
+
+def spawn_detached_anysplat_worker(
+    fifo_dir: Path,
+    conda_env: str = "anysplat_dynamic_gs",
+) -> int:
+    """Fire-and-forget spawn of the FIFO-mode AnySplat worker.
+
+    Called by the live capture session right after SAM3D finishes so the
+    worker's model load (measured 16.9 s / 3.5 GB VRAM on this machine)
+    overlaps the operator sweep + static training instead of stalling the
+    dynamic pipeline's startup. The dynamic pipeline adopts it via
+    :meth:`PersistentAnysplatWorker.adopt`.
+
+    Returns the worker pid immediately; the load completes in the background
+    and ``<fifo_dir>/ready.json`` appears when it's done. Any previous worker
+    recorded in this dir is closed first (verified by cmdline, then killed).
+    """
+    fifo_dir = Path(fifo_dir)
+    fifo_dir.mkdir(parents=True, exist_ok=True)
+
+    import json as _json
+    # Replace a stale/previous worker for this dataset dir.
+    spawn_file = fifo_dir / "spawn.json"
+    if spawn_file.exists():
+        try:
+            old_pid = int(_json.loads(spawn_file.read_text()).get("pid", -1))
+            if _pid_is_anysplat_worker(old_pid):
+                os.kill(old_pid, 9)
+        except Exception:
+            pass
+    for name in ("ready.json", "spawn.json"):
+        try:
+            (fifo_dir / name).unlink()
+        except OSError:
+            pass
+    for name in ("cmd.fifo", "res.fifo"):
+        p = fifo_dir / name
+        if not p.exists():
+            os.mkfifo(p)
+
+    env_prefix = Path.home() / "miniconda3" / "envs" / conda_env
+    env_python = env_prefix / "bin" / "python"
+    if not env_python.exists():
+        raise FileNotFoundError(f"AnySplat env python not found at {env_python}")
+    if not _WORKER_SCRIPT.exists():
+        raise FileNotFoundError(f"AnySplat worker script not found: {_WORKER_SCRIPT}")
+
+    env = os.environ.copy()
+    env["LD_LIBRARY_PATH"] = (str(env_prefix / "lib") + ":" + env.get("LD_LIBRARY_PATH", "")).rstrip(":")
+    env["PYTHONUNBUFFERED"] = "1"
+
+    log_f = open(fifo_dir / "worker.log", "a")
+    proc = subprocess.Popen(
+        [str(env_python), "-u", str(_WORKER_SCRIPT),
+         "--fifo-dir", str(fifo_dir),
+         "--anysplat-repo", str(_ANYSPLAT_REPO)],
+        env=env,
+        stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
+        start_new_session=True,  # survives the spawning process
+    )
+    log_f.close()  # child holds its own fd
+    spawn_file.write_text(_json.dumps({"pid": proc.pid, "ts": time.time()}))
+    return proc.pid
 
 
 def run_anysplat_subprocess(

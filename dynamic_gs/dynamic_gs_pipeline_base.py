@@ -2221,11 +2221,33 @@ class DynamicGSPipelineBase(VanillaPipeline):
     # ---- AnySplat feedforward path ----
 
     def _start_anysplat_persistent_worker(self) -> None:
-        """Spawn the long-lived AnySplat worker. Called once when the
-        anysplat path is first hit (or at subclass-controlled init time)."""
+        """Acquire the long-lived AnySplat worker. Called once when the
+        anysplat path is first hit (or at subclass-controlled init time).
+
+        Adopt-first: the live capture session (bootstrap_live.sh with
+        DGS_EAGER_ANYSPLAT=1) pre-spawns a detached FIFO-mode worker right
+        after SAM3D finishes, so its ~17 s model load overlaps static
+        training. If that worker is alive (or still loading — we wait), we
+        adopt it for ~0 s startup; otherwise spawn fresh as before."""
         if self._anysplat_persistent_worker is not None:
             return
         from .utils.anysplat_decode import PersistentAnysplatWorker
+
+        fifo_dir = Path(self.config.datamanager.data) / ".anysplat_worker"
+        try:
+            t0 = time.time()
+            adopted = PersistentAnysplatWorker.adopt(fifo_dir, wait_ready_timeout_s=60.0)
+        except Exception as exc:
+            CONSOLE.log(f"[anysplat] adoption attempt failed: {exc}; spawning fresh")
+            adopted = None
+        if adopted is not None:
+            self._anysplat_persistent_worker = adopted
+            CONSOLE.log(
+                f"[anysplat] ADOPTED pre-spawned worker in {time.time()-t0:.1f}s "
+                f"(its load of {adopted.load_seconds:.1f}s already ran during capture/training)"
+            )
+            return
+
         try:
             t0 = time.time()
             CONSOLE.log("[anysplat] spawning persistent worker (loading model in subprocess)...")

@@ -676,6 +676,22 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
             print(f"[live] SAM3D obj {i}: {'ok' if r else 'failed'}", flush=True)
         print(f"[live] SAM3D done: {n_ok}/{len(sam3_objects)} objects ready", flush=True)
 
+        # Eager AnySplat pre-spawn (DGS_EAGER_ANYSPLAT=1, set by
+        # bootstrap_live.sh): fire-and-forget a detached FIFO-mode worker NOW
+        # so its model load (~17 s, ~3.5 GB VRAM) overlaps the sweep + static
+        # training. Stage 3 (dynamic-gs-live) adopts it instead of paying the
+        # load at go-live time. SAM3D just unloaded, so its VRAM slot is free.
+        if os.environ.get("DGS_EAGER_ANYSPLAT") == "1":
+            try:
+                from .anysplat_decode import spawn_detached_anysplat_worker
+                _as_pid = spawn_detached_anysplat_worker(LIVE_ROOT / ".anysplat_worker")
+                print(f"[live] AnySplat worker pre-spawned (pid={_as_pid}); "
+                      f"model loads in background, dynamic-gs-live will adopt it",
+                      flush=True)
+            except Exception as exc:
+                print(f"[live] WARNING: eager AnySplat pre-spawn failed: {exc} "
+                      f"(go-live will load it as usual)", flush=True)
+
         # Sweep window: recording is still running. Let the operator
         # sweep additional views of the scene to give the static
         # optimiser more coverage. Press Enter to end the sweep.

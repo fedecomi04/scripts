@@ -170,6 +170,34 @@ def _run_one(model, image_paths: list[Path], output_npz: Path, device: torch.dev
     }
 
 
+def _dispatch_request(model, device: torch.device, line: str, respond) -> bool:
+    """Handle one JSON request line; call ``respond(dict)`` with the reply.
+    Returns False when the request was ``quit`` (caller should stop)."""
+    import json
+    line = line.strip()
+    if not line:
+        return True
+    try:
+        req = json.loads(line)
+    except Exception as e:
+        respond({"status": "error", "msg": f"bad json: {e}"})
+        return True
+    if req.get("cmd") == "quit":
+        respond({"status": "bye"})
+        return False
+    try:
+        image_paths = [Path(p) for p in req["images"]]
+        for p in image_paths:
+            if not p.exists():
+                raise FileNotFoundError(f"image not found: {p}")
+        output_npz = Path(req["output"])
+        result = _run_one(model, image_paths, output_npz, device)
+        respond(result)
+    except Exception as e:
+        respond({"status": "error", "msg": str(e)})
+    return True
+
+
 def _persistent_loop(model, device: torch.device) -> None:
     """Read JSON requests from stdin, write JSON responses to stdout.
 
@@ -179,28 +207,59 @@ def _persistent_loop(model, device: torch.device) -> None:
     """
     import json
     print(json.dumps({"status": "ready"}), flush=True)
+
+    def respond(obj: dict) -> None:
+        print(json.dumps(obj), flush=True)
+
     for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except Exception as e:
-            print(json.dumps({"status": "error", "msg": f"bad json: {e}"}), flush=True)
-            continue
-        if req.get("cmd") == "quit":
-            print(json.dumps({"status": "bye"}), flush=True)
+        if not _dispatch_request(model, device, line, respond):
             break
-        try:
-            image_paths = [Path(p) for p in req["images"]]
-            for p in image_paths:
-                if not p.exists():
-                    raise FileNotFoundError(f"image not found: {p}")
-            output_npz = Path(req["output"])
-            result = _run_one(model, image_paths, output_npz, device)
-            print(json.dumps(result), flush=True)
-        except Exception as e:
-            print(json.dumps({"status": "error", "msg": str(e)}), flush=True)
+
+
+def _persistent_loop_fifo(model, device: torch.device, fifo_dir: Path,
+                          load_seconds: float) -> None:
+    """FIFO server variant of :func:`_persistent_loop` for cross-process handoff.
+
+    The spawner creates ``<fifo_dir>/cmd.fifo`` + ``<fifo_dir>/res.fifo`` and
+    launches this worker detached. After the model loads we write
+    ``<fifo_dir>/ready.json`` (the adoption handshake), then serve clients in
+    a loop: block on opening cmd.fifo for read (a client connecting opens it
+    for write), open res.fifo for write (the client already holds the read
+    end), dispatch request lines until the client closes (EOF), then loop
+    back and wait for the next client. A ``{"cmd": "quit"}`` request exits
+    for good and removes ready.json.
+
+    Open-order protocol (deadlock-free): BOTH sides open cmd first, then res.
+    """
+    import json
+    cmd_fifo = fifo_dir / "cmd.fifo"
+    res_fifo = fifo_dir / "res.fifo"
+
+    ready = {"pid": os.getpid(), "load_seconds": load_seconds}
+    tmp = fifo_dir / "ready.json.tmp"
+    tmp.write_text(json.dumps(ready))
+    tmp.rename(fifo_dir / "ready.json")
+    print(f"[anysplat_worker] fifo server ready at {fifo_dir}", flush=True, file=sys.stderr)
+
+    quit_requested = False
+    while not quit_requested:
+        with open(cmd_fifo, "r") as fr:
+            with open(res_fifo, "w") as fw:
+
+                def respond(obj: dict) -> None:
+                    fw.write(json.dumps(obj) + "\n")
+                    fw.flush()
+
+                for line in fr:
+                    if not _dispatch_request(model, device, line, respond):
+                        quit_requested = True
+                        break
+                # EOF without quit: client detached; loop back for the next one.
+
+    try:
+        (fifo_dir / "ready.json").unlink()
+    except OSError:
+        pass
 
 
 def main() -> None:
@@ -210,17 +269,26 @@ def main() -> None:
     ap.add_argument("--anysplat-repo", type=Path, default=Path(__file__).parent / "third_party" / "AnySplat")
     ap.add_argument("--persistent", action="store_true",
                     help="Persistent mode: load model once, then handle JSON inference requests from stdin.")
+    ap.add_argument("--fifo-dir", type=Path, default=None,
+                    help="FIFO server mode (implies persistent): serve JSON requests over "
+                         "<dir>/cmd.fifo + <dir>/res.fifo and write <dir>/ready.json once "
+                         "loaded. Survives the spawning process; a later process adopts it.")
     args = ap.parse_args()
 
     _add_anysplat_to_path(args.anysplat_repo)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    persistent = args.persistent or args.fifo_dir is not None
     t0 = time.time()
-    print(f"[anysplat_worker] loading model on {device}...", flush=True, file=sys.stderr if args.persistent else sys.stdout)
+    print(f"[anysplat_worker] loading model on {device}...", flush=True, file=sys.stderr if persistent else sys.stdout)
     model = _load_model(device)
-    print(f"[anysplat_worker]   loaded in {time.time()-t0:.1f}s", flush=True,
-          file=sys.stderr if args.persistent else sys.stdout)
+    load_seconds = time.time() - t0
+    print(f"[anysplat_worker]   loaded in {load_seconds:.1f}s", flush=True,
+          file=sys.stderr if persistent else sys.stdout)
 
+    if args.fifo_dir is not None:
+        _persistent_loop_fifo(model, device, args.fifo_dir, load_seconds)
+        return
     if args.persistent:
         _persistent_loop(model, device)
         return

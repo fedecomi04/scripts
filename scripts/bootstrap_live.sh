@@ -57,6 +57,12 @@ export DGS_LIVE_ROOT="$DATA_DIR"
 # cached SAM3 re-read uses the matching text.
 export DGS_SAM3_PROMPT="$SAM3_PROMPT"
 
+# Eager AnySplat: stage 1 pre-spawns the detached AnySplat worker right
+# after SAM3D finishes, so its ~17 s model load overlaps the sweep +
+# static training. Stage 3 (dynamic-gs-live, anysplat FF) adopts it
+# instead of paying the load at go-live.
+export DGS_EAGER_ANYSPLAT=1
+
 echo
 echo "============================================================"
 echo " bootstrap_live :: data_dir=$DATA_DIR"

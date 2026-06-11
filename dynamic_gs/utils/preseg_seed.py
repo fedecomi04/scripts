@@ -125,14 +125,27 @@ def _load_depth_m(base: Path, fr: dict, depth_unit_scale: float) -> np.ndarray:
 # ----------------------------------------------------------------------------
 # Step 1: SAM2 automatic masks on frame 0 (edge-tight)
 # ----------------------------------------------------------------------------
-def _sam2_amg_frame0(frame0_rgb: np.ndarray, cfg: AmgConfig):
-    from sam2.build_sam import build_sam2_hf
+def _load_sam2_predictor(sam2_hf_model: str):
+    """Load the SAM2 video predictor ONCE. It is a strict superset of the
+    image model (``SAM2VideoPredictor`` subclasses ``SAM2Base``), so the same
+    instance serves both the frame-0 AMG and the video propagation — loading
+    ``build_sam2_hf`` separately for AMG would put the identical hiera-large
+    weights on the GPU twice in sequence."""
+    from sam2.build_sam import build_sam2_video_predictor_hf
+
+    _log(f"loading SAM2 ({sam2_hf_model}) — shared by AMG + propagation ...")
+    t0 = time.time()
+    predictor = build_sam2_video_predictor_hf(sam2_hf_model, device=_DEVICE)
+    _log(f"SAM2 loaded in {time.time() - t0:.1f}s")
+    return predictor
+
+
+def _sam2_amg_frame0(frame0_rgb: np.ndarray, cfg: AmgConfig, sam2_model):
     from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
     _log("SAM2 automatic mask generation on frame 0 ...")
-    image_model = build_sam2_hf(cfg.sam2_hf_model, device=_DEVICE)
     amg = SAM2AutomaticMaskGenerator(
-        image_model,
+        sam2_model,
         points_per_side=cfg.points_per_side,
         min_mask_region_area=cfg.min_area_px,
         output_mode="binary_mask",
@@ -160,7 +173,7 @@ def _sam2_amg_frame0(frame0_rgb: np.ndarray, cfg: AmgConfig):
     for k, m in enumerate(masks, start=1):
         seg0[m] = k
 
-    del amg, image_model
+    del amg  # the shared sam2_model stays loaded for video propagation
     torch.cuda.empty_cache()
     return masks, seg0
 
@@ -250,18 +263,17 @@ def _propagate(
     H: int,
     W: int,
     video_frames_dir: Path,
-    sam2_hf_model: str,
+    predictor,
 ) -> np.ndarray:
     """Propagate the seeded objects across the video.
 
     ``seed_masks`` is a list of ``(sam3_index, mask)`` pairs. Each object is
     seeded with ``obj_id = sam3_index + 1`` so the propagated label (and thus
     the final per-Gaussian instance id) equals the SAM3 mask number + 1.
-    """
-    from sam2.build_sam import build_sam2_video_predictor_hf
 
-    _log(f"loading SAM2 video predictor ({sam2_hf_model}) ...")
-    predictor = build_sam2_video_predictor_hf(sam2_hf_model, device=_DEVICE)
+    ``predictor`` is the shared SAM2 video predictor from
+    :func:`_load_sam2_predictor` (also used by the frame-0 AMG).
+    """
     seg_ids = np.zeros((num_frames, H, W), np.uint8)
     with torch.inference_mode(), torch.autocast(_DEVICE, dtype=torch.bfloat16):
         state = predictor.init_state(
@@ -294,7 +306,8 @@ def _propagate(
             f"propagation {dt:.1f}s | {1000 * dt / max(num_frames, 1):.0f} ms/frame "
             f"({len(seed_masks)} objects)"
         )
-    del predictor
+    # Ownership of the shared predictor stays with the caller
+    # (build_labeled_seed), which frees it after this returns.
     torch.cuda.empty_cache()
     return seg_ids
 
@@ -411,8 +424,12 @@ def build_labeled_seed(
     frame0_png = out_dir / "_frame0_input.png"
     cv2.imwrite(str(frame0_png), frame0[:, :, ::-1])
 
+    # SAM2 loads ONCE — the video predictor serves both the frame-0 AMG
+    # (step 1) and the propagation (step 5).
+    sam2_predictor = _load_sam2_predictor(amg_cfg.sam2_hf_model)
+
     # Step 1: SAM2-AMG on frame 0.
-    amg_masks, _seg0 = _sam2_amg_frame0(frame0, amg_cfg)
+    amg_masks, _seg0 = _sam2_amg_frame0(frame0, amg_cfg, sam2_predictor)
     if not amg_masks:
         raise RuntimeError(
             "SAM2-AMG returned 0 masks on frame 0; lower min_area_px or check input."
@@ -495,8 +512,10 @@ def build_labeled_seed(
     video_frames_dir = out_dir / "_video_frames"
     _write_video_frames(frames, base, amg_cfg.black_out_gripper, video_frames_dir)
     seg_ids = _propagate(
-        merged, len(frames), H, W, video_frames_dir, amg_cfg.sam2_hf_model
+        merged, len(frames), H, W, video_frames_dir, sam2_predictor
     )
+    del sam2_predictor
+    torch.cuda.empty_cache()
     seg_ids_path = out_dir / "seg_ids.npz"
     np.savez_compressed(seg_ids_path, seg_ids=seg_ids)
     _log(f"seg_ids -> {seg_ids_path}")
