@@ -194,6 +194,11 @@ def _spawn_publisher(
     ]
     if wipe_live_root:
         inner_args.append("--wipe-live-root")
+    # Replay recording: if DGS_RECORD_REPLAY=<dir> is set, the publisher records
+    # the full SHM frame stream + control events there for deterministic replay.
+    _rec_dir = os.environ.get("DGS_RECORD_REPLAY")
+    if _rec_dir:
+        inner_args += ["--record-replay", str(_rec_dir)]
     # Wrap in a bash shell that sources ROS Noetic first so the env's
     # python finds rospy / sensor_msgs / tf at /opt/ros/noetic/lib/python3/
     # dist-packages. Pin PYTHONNOUSERSITE=1 so the user-local Python 3.8

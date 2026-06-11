@@ -426,9 +426,14 @@ class LivePublisher:
                     pass
 
     def __init__(self, live_root: Path, shm_name: str, keyframe_translation_m: float,
-                 keyframe_rotation_deg: float):
+                 keyframe_rotation_deg: float, record_replay_dir: Optional[str] = None):
         if not rospy.core.is_initialized():
             rospy.init_node("dynamic_gs_live_pub", disable_signals=True, anonymous=True)
+        # Replay-recording tap (off unless --record-replay): captures the full
+        # SHM frame stream + control events to disk so a fake publisher can
+        # replay the whole capture without ROS/Gazebo. Set up after intrinsics.
+        self._replay_dir = None
+        self._replay_record_dir_arg = record_replay_dir
 
         # Try ROS first; if Gazebo's camera_info lazy-publish is stuck
         # (happens after Ctrl-R world-reset or a subscriber crash), fall
@@ -637,6 +642,9 @@ class LivePublisher:
         # Spawn the worker thread that drains _frame_queue. Done last
         # so all member state (shm, _state_lock, _mask_gen=None, etc.)
         # is fully initialised before the worker can pull a frame.
+        if self._replay_record_dir_arg:
+            self._setup_replay_recording(self._replay_record_dir_arg)
+
         self.start_worker()
 
     def _spawn_depth_republisher(self) -> None:
@@ -848,6 +856,75 @@ class LivePublisher:
             except Exception as exc:
                 rospy.logwarn_throttle(2.0, "[live] worker exc: {}".format(exc))
 
+    # ---- Replay recording (--record-replay) ----
+
+    def _setup_replay_recording(self, record_replay_dir: str) -> None:
+        """Record the full SHM frame stream + control events to disk so a fake
+        publisher (live_replay_publisher) can replay the whole session without
+        ROS/Gazebo. Fixed-size raw records (fast, no compression, no drops)."""
+        import queue as _q
+        self._replay_dir = Path(record_replay_dir)
+        self._replay_dir.mkdir(parents=True, exist_ok=True)
+        H, W = self.intrinsics.height, self.intrinsics.width
+        # record = c2w(16 f64) + seq(i64) + stamp(f64) + rgb(HxWx3 u8) + depth(HxW f32) + mask(HxW u8)
+        self._replay_record_size = 16 * 8 + 8 + 8 + H * W * 3 + H * W * 4 + H * W
+        self._replay_stream = open(self._replay_dir / "stream.bin", "wb", buffering=4 * 1024 * 1024)
+        self._replay_queue = _q.Queue(maxsize=1200)
+        self._replay_count = 0
+        self._replay_dropped = 0
+        self._replay_control_events: List[Dict] = []
+        self._replay_stop = threading.Event()
+        self._replay_writer = threading.Thread(
+            target=self._replay_writer_loop, name="replay_writer", daemon=True)
+        self._replay_writer.start()
+        self._write_replay_meta(finalized=False)
+        print(f"[publisher] replay-recording ON → {self._replay_dir} "
+              f"({self._replay_record_size} B/frame, {H}x{W})", file=sys.stderr, flush=True)
+
+    def _write_replay_meta(self, finalized: bool) -> None:
+        H, W = self.intrinsics.height, self.intrinsics.width
+        meta = {
+            "shm_name": self.shm_name, "height": H, "width": W,
+            "fx": self.intrinsics.fx, "fy": self.intrinsics.fy,
+            "cx": self.intrinsics.cx, "cy": self.intrinsics.cy,
+            "record_size": self._replay_record_size,
+            "layout": ["c2w_f64x16", "seq_i64", "stamp_f64",
+                       f"rgb_u8_{H}x{W}x3", f"depth_f32_{H}x{W}", f"mask_u8_{H}x{W}"],
+            "num_frames": int(self._replay_count),
+            "dropped": int(self._replay_dropped),
+            "control_events": list(self._replay_control_events),
+            "finalized": bool(finalized),
+        }
+        (self._replay_dir / "replay_meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+
+    def _replay_writer_loop(self) -> None:
+        import queue as _q
+        while not (self._replay_stop.is_set() and self._replay_queue.empty()):
+            try:
+                seq, stamp, c2w, rgb, depth, mask = self._replay_queue.get(timeout=0.2)
+            except _q.Empty:
+                continue
+            try:
+                self._replay_stream.write(
+                    np.ascontiguousarray(c2w, dtype="<f8").tobytes()
+                    + struct.pack("<qd", int(seq), float(stamp))
+                    + np.ascontiguousarray(rgb, dtype=np.uint8).tobytes()
+                    + np.ascontiguousarray(depth, dtype="<f4").tobytes()
+                    + np.ascontiguousarray(mask, dtype=np.uint8).tobytes()
+                )
+                self._replay_count += 1
+            except Exception as exc:
+                print(f"[publisher] replay write failed: {exc}", file=sys.stderr, flush=True)
+
+    def record_control_event(self, op: str, **kw) -> None:
+        """Log a reader control op (capture_anchor / start_recording / ...)
+        mapped to the current frame seq, so replay can re-fire it (auto-Enter)."""
+        if self._replay_dir is None:
+            return
+        with self._state_lock:
+            seq = self._frame_seq
+        self._replay_control_events.append({"op": op, "seq": int(seq), "t": time.time(), **kw})
+
     def _process_synced_pair(self, image_msg: CompressedImage, depth_msg: Image) -> None:
         """The original _on_synced body, now running on the worker thread."""
         try:
@@ -902,6 +979,15 @@ class LivePublisher:
         slot["mask"][:] = mask_keep
         latest_off = HDR_OFFSETS["latest_seq"]
         struct.pack_into("<Q", self.shm.buf, latest_off, seq)
+
+        # Replay tap: enqueue the fresh decoded arrays (NOT the SHM views) for
+        # the background writer. They're per-frame fresh, so refs are safe; the
+        # writer serialises them off the worker thread → no per-frame copy here.
+        if self._replay_dir is not None:
+            try:
+                self._replay_queue.put_nowait((seq, stamp, c2w, rgb_bgr, depth_m, mask_keep))
+            except Exception:
+                self._replay_dropped += 1
 
         if not self._first_frame_event.is_set():
             self._first_frame_event.set()
@@ -1155,6 +1241,19 @@ class LivePublisher:
         memory alive while any fd references exist. Process exit cleans
         this up. The header.shutdown flag below is the polite signal.
         """
+        # Flush + finalize the replay recording (drain the writer, write meta).
+        if getattr(self, "_replay_dir", None) is not None:
+            try:
+                self._replay_stop.set()
+                self._replay_writer.join(timeout=10.0)
+                self._replay_stream.flush()
+                self._replay_stream.close()
+                self._write_replay_meta(finalized=True)
+                print(f"[publisher] replay-recording finalized: {self._replay_count} frames "
+                      f"({self._replay_dropped} dropped) → {self._replay_dir}",
+                      file=sys.stderr, flush=True)
+            except Exception as exc:
+                print(f"[publisher] replay finalize failed: {exc}", file=sys.stderr, flush=True)
         # Signal the worker thread to stop draining the queue.
         try:
             self._worker_shutdown.set()
@@ -1238,6 +1337,9 @@ def _main() -> int:
     parser.add_argument("--keyframe-translation-m", type=float, default=0.02)
     parser.add_argument("--keyframe-rotation-deg", type=float, default=20.0)
     parser.add_argument("--wipe-live-root", action="store_true")
+    parser.add_argument("--record-replay", type=str, default=None,
+                        help="Directory to record the full SHM frame stream + control "
+                             "events for deterministic replay (live_replay_publisher).")
     args = parser.parse_args()
 
     if args.wipe_live_root:
@@ -1249,6 +1351,7 @@ def _main() -> int:
             shm_name=args.shm_name,
             keyframe_translation_m=args.keyframe_translation_m,
             keyframe_rotation_deg=args.keyframe_rotation_deg,
+            record_replay_dir=args.record_replay,
         )
     except Exception as exc:
         _send_response({"event": "init_error", "error": "{}: {}".format(type(exc).__name__, exc)})
@@ -1312,6 +1415,7 @@ def _main() -> int:
                 if anchor is None:
                     _send_response({"ok": False, "error": "no_anchor"})
                 else:
+                    pub.record_control_event("capture_anchor", anchor_seq=int(anchor.seq))
                     _send_response({"ok": True, "seq": int(anchor.seq), "stamp": float(anchor.stamp_sec)})
             elif op == "start_recording":
                 anchor_seq = int(cmd.get("anchor_seq", -1))
@@ -1321,8 +1425,10 @@ def _main() -> int:
                     _send_response({"ok": False, "error": "anchor_not_latest"})
                 else:
                     pub.start_recording(cur)
+                    pub.record_control_event("start_recording", anchor_seq=anchor_seq)
                     _send_response({"ok": True, "recorded": pub.num_recorded_frames()})
             elif op == "stop_recording":
+                pub.record_control_event("stop_recording")
                 n = pub.stop_recording()
                 _send_response({"ok": True, "recorded": int(n)})
             elif op == "num_recorded":
