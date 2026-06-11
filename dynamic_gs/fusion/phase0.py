@@ -351,13 +351,22 @@ def run_phase0a_sam3_and_sam3d(
     debug_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    batch = datamanager.static_manager.cached_train[0]
+    # Segment the LAST static frame, not the first. The operator sweeps the
+    # arm camera TOWARD the object and ends centered on it, so the final
+    # keyframe has the closest, most head-on view — the best mask for SAM3 +
+    # the best input for SAM3D (a far/glancing first-frame view yields a thin
+    # sliver mask that can collapse SAM3D's crop below its 2x2 minimum).
+    # Mirrors adaptive_downsample, which already uses the last camera pose as
+    # its reference viewpoint. ``frame_idx_0`` (kept name for the downstream
+    # depth/intrinsics lookups) is read from the chosen batch's own
+    # ``image_idx`` so everything stays consistent.
+    batch = datamanager.static_manager.cached_train[-1]
     static_image = batch["image"]
 
     static_ds = datamanager.static_manager.train_dataset
     depth_filenames = static_ds.metadata.get("depth_filenames")
     depth_scale = float(static_ds.metadata.get("depth_unit_scale_factor", 1.0))
-    frame_idx_0 = int(batch.get("image_idx", 0))
+    frame_idx_0 = int(batch.get("image_idx", len(datamanager.static_manager.cached_train) - 1))
     static_depth_m = None
     if depth_filenames is not None and frame_idx_0 < len(depth_filenames):
         try:
@@ -622,9 +631,12 @@ def run_phase0b_fusion(
     debug_dir = datamanager.get_initialization_debug_dir()
     artifact_dir = datamanager.get_initialization_artifact_dir()
 
-    batch = datamanager.static_manager.cached_train[0]
+    # MUST match the frame Phase 0a segmented (the LAST static frame) — Phase 0b
+    # reprojects the SAM3D-generated object against this camera, so a mismatch
+    # would misalign the fusion. See the note in run_phase0a_sam3_and_sam3d.
+    batch = datamanager.static_manager.cached_train[-1]
     static_image = batch["image"]
-    frame_idx_0 = int(batch.get("image_idx", 0))
+    frame_idx_0 = int(batch.get("image_idx", len(datamanager.static_manager.cached_train) - 1))
     camera = datamanager.static_manager.train_dataset.cameras[
         frame_idx_0 : frame_idx_0 + 1
     ].to(device)
