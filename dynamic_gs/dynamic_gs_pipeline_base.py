@@ -322,6 +322,13 @@ class DynamicGSPipelineBase(VanillaPipeline):
         # State that subclasses may read in their own __init__ overrides
         # BEFORE super().__init__ runs.
         self._timing: defaultdict[str, list] = defaultdict(list)
+        # Fresh timing ledger for this teleop session (the static run already
+        # rendered its own to timing_report_static.txt).
+        try:
+            from .utils import timing_ledger as _tl
+            _tl.reset(config.datamanager.data)
+        except Exception:
+            pass
         self._motion_estimator = None
         self._latest_tracker_frame: Optional[TrackerFrame] = None
         self._global_frame_counter: int = 0
@@ -469,7 +476,14 @@ class DynamicGSPipelineBase(VanillaPipeline):
                     f"  ns-train static-gs --data {self.config.datamanager.data}\n"
                     f"  ns-train static-gs-preseg --data {self.config.datamanager.data}\n"
                 )
+        _t_ld = time.time()
         result = load_post_fusion_state(self.model, cache_path, self.device)
+        try:
+            from .utils import timing_ledger as _tl
+            _tl.record(self.config.datamanager.data, "teleop_init", "static_state.pt",
+                       "io", _t_ld, time.time())
+        except Exception:
+            pass
         if not result.success:
             raise RuntimeError(
                 f"[dynamic-gs] post-fusion cache load failed: {result.error}\n"
@@ -650,6 +664,33 @@ class DynamicGSPipelineBase(VanillaPipeline):
         lines.append(f"FF mode:     {ff_mode} (every {ff_n} ticks)")
         lines.append(f"Viser:       {'on (port ' + str(getattr(self.config, 'viser_direct_port', '?')) + ')' if getattr(self.config, 'enable_viser_direct', False) else 'off'}")
         lines.append("")
+
+        # By-phase bulleted load/inference report (teleop_init loads from the
+        # ledger + the recurring per-tick algos folded in under dynamic_runtime,
+        # all in the same n/avg/min/max row format).
+        try:
+            from .utils import timing_ledger as _tl
+            _runtime_keys = [
+                ("XFeat extract", "DN.3c_xfeat_extract"),
+                ("LighterGlue match", "DN.3i_lighterglue_match"),
+                ("RANSAC+Kabsch", "DN.3e_ransac_kabsch"),
+                ("tracker estimate (total)", "DN.3_estimate_total"),
+                ("CDN render", "DN.2_cdn_render"),
+                ("apply rigid transform", "DN.3g_apply_transform"),
+            ]
+            _extra_dyn = [(label, list(timing[k])) for (label, k) in _runtime_keys
+                          if k in timing and timing[k]]
+            # Fold any feedforward-decode keys (FF.*) as algos too.
+            for k in sorted(timing.keys()):
+                if k.startswith("FF.") and timing[k]:
+                    _extra_dyn.append((k, list(timing[k])))
+            lines.append(_tl.render(datamanager.config.data,
+                                    extra={"dynamic_runtime": _extra_dyn}))
+            lines.append("")
+            lines.append("DETAIL (per-substep, ms):")
+        except Exception as _exc:
+            lines.append(f"(timing-ledger render failed: {_exc})")
+            lines.append("")
 
         # Group keys by prefix for readability.
         all_keys = sorted(timing.keys())
@@ -1476,6 +1517,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
         if not self.model.config.enable_cotracker_rigid_motion:
             return
         from .utils.xfeat_motion import XFeatMotionEstimator
+        _t_xf = time.time()
         self._motion_estimator = XFeatMotionEstimator(
             device=self.model.device,
             top_k=self.model.config.xfeat_top_k,
@@ -1496,6 +1538,12 @@ class DynamicGSPipelineBase(VanillaPipeline):
             pose_filter_meas_trans_sigma_m=self.model.config.xfeat_pose_filter_meas_trans_sigma_m,
             pose_filter_meas_rot_sigma_deg=self.model.config.xfeat_pose_filter_meas_rot_sigma_deg,
         )
+        try:
+            from .utils import timing_ledger as _tl
+            _tl.record(self.config.datamanager.data, "teleop_init",
+                       "XFeat+LighterGlue", "load", _t_xf, time.time())
+        except Exception:
+            pass
         if getattr(self.model.config, "xfeat_crop_to_object_bbox", False):
             bbox = self._object_crop_bbox(
                 camera, padding_px=int(self.model.config.xfeat_crop_padding_px),
@@ -2261,6 +2309,12 @@ class DynamicGSPipelineBase(VanillaPipeline):
                 f"[anysplat] ADOPTED pre-spawned worker in {time.time()-t0:.1f}s "
                 f"(its load of {adopted.load_seconds:.1f}s already ran during capture/training)"
             )
+            try:
+                from .utils import timing_ledger as _tl
+                _tl.record(self.config.datamanager.data, "teleop_init",
+                           "AnySplat adopt (pre-warmed)", "io", t0, time.time())
+            except Exception:
+                pass
             return
 
         try:
