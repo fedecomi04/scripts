@@ -113,11 +113,17 @@ echo
   --vis tensorboard \
   --pipeline.model.sam3_prompt_text "$SAM3_PROMPT"
 
-# Verify the cache landed.
-WARM_CACHE="$DATA_DIR/static_scene/post_fusion_state.pt"
+# Verify the cache landed. static-gs writes static_state.pt (new name); fall
+# back to the legacy post_fusion_state.pt for old datasets.
+WARM_CACHE="$DATA_DIR/static_scene/static_state.pt"
 if [[ ! -f "$WARM_CACHE" ]]; then
-  echo "BOOTSTRAP FAILED: static-gs finished but $WARM_CACHE is missing." >&2
-  exit 1
+  LEGACY="$DATA_DIR/static_scene/post_fusion_state.pt"
+  if [[ -f "$LEGACY" ]]; then
+    WARM_CACHE="$LEGACY"
+  else
+    echo "BOOTSTRAP FAILED: static-gs finished but $WARM_CACHE (or legacy $LEGACY) is missing." >&2
+    exit 1
+  fi
 fi
 echo "     [ok] warm cache written: $WARM_CACHE ($(du -h "$WARM_CACHE" | cut -f1))"
 
