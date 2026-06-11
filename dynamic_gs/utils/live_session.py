@@ -29,6 +29,7 @@ import gc
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 from pathlib import Path
@@ -811,7 +812,11 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
         # so its model load (~17 s, ~3.5 GB VRAM) overlaps the sweep + static
         # training. Stage 3 (dynamic-gs-live) adopts it instead of paying the
         # load at go-live time. SAM3D just unloaded, so its VRAM slot is free.
-        if os.environ.get("DGS_EAGER_ANYSPLAT") == "1":
+        # In deferred-TSDF mode the spawn moves to AFTER the TSDF build:
+        # its ~3.5 GB load otherwise overlaps the GPU TSDF and (measured at
+        # 1920x1200) tips it into OOM. The load still hides behind static
+        # training + Phase 0b, so nothing is exposed either way.
+        if os.environ.get("DGS_EAGER_ANYSPLAT") == "1" and not _defer_tsdf:
             try:
                 from .anysplat_decode import spawn_detached_anysplat_worker
                 _as_pid = spawn_detached_anysplat_worker(LIVE_ROOT / ".anysplat_worker")
@@ -841,6 +846,18 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
         # `rgbd_fusion_init.build_tsdf_seed` (post-pass ICP+TSDF refine)
         # — both passes are subsumed by the streaming runner.
         if _defer_tsdf:
+            # Free the SAM worker's whole CUDA context + allocator cache BEFORE
+            # the TSDF: even with both models unloaded the worker process holds
+            # GBs of cached VRAM, which at 1920x1200 pushed free memory below
+            # the GPU-TSDF threshold (-> 127s CPU fallback). The finally-block
+            # close below stays as a no-op safety net.
+            if sam_worker is not None:
+                try:
+                    sam_worker.close()
+                    print("[live] SAM worker closed before deferred TSDF (frees VRAM)", flush=True)
+                except Exception as exc:
+                    print(f"[live] WARNING: early SAM worker close failed: {exc}", flush=True)
+                sam_worker = None
             # Deferred path: SAM3D + FastSAM are unloaded, so the GPU is free
             # for the batch ICP+TSDF. fuse_recorded_dataset runs the GPU
             # OnlineFusion (auto-CUDA, ~5s vs ~48s for the CPU build_tsdf_seed)
@@ -850,21 +867,28 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
             # bootstrap stage 1.5's _output_is_fresh check sees the seed as fresh
             # and skips the (previously ~45s) redundant rebuild.
             try:
-                from .online_fusion import fuse_recorded_dataset
-                # GPU TSDF at high camera resolutions needs several GB free;
-                # attempting it under VRAM pressure OOMs AND poisons Open3D's
-                # CUDA memory cache (teardown abort observed at 1920x1200).
-                # Pre-check and go straight to the CPU path when tight.
-                try:
-                    import torch as _torch
-                    _free_gb = _torch.cuda.mem_get_info()[0] / 1e9
-                except Exception:
-                    _free_gb = 99.0
-                if _free_gb < 5.0:
-                    raise RuntimeError(
-                        f"only {_free_gb:.1f} GB VRAM free — skipping GPU TSDF")
+                # SUBPROCESS isolation: a GPU OOM in Open3D poisons its CUDA
+                # memory cache and ABORTS the process at teardown (measured at
+                # 1920x1200) — in-process the whole capture dies even though
+                # the work succeeded. In a subprocess the abort is contained
+                # and we fall back to CPU cleanly. DGS_TSDF_VOXEL_M=0.003 for
+                # the GPU attempt: at 1200p/110deg the 2 mm VoxelBlockGrid
+                # hashmap OOMs 16 GB even with ~12 GB free; 3 mm fits.
+                import subprocess as _sp
                 t_fin = time.time()
-                seed_ply = fuse_recorded_dataset(static_dir)
+                _env = dict(os.environ)
+                _env.setdefault("DGS_TSDF_VOXEL_M", "0.003")
+                _r = _sp.run(
+                    [sys.executable, "-m", "dynamic_gs.utils.online_fusion", str(static_dir)],
+                    env=_env, capture_output=True, text=True, timeout=300,
+                )
+                if _r.returncode != 0:
+                    raise RuntimeError(
+                        f"GPU TSDF subprocess rc={_r.returncode}: "
+                        f"{(_r.stderr or '')[-300:]}")
+                seed_ply = static_dir / INIT_CLOUD_NAME
+                if not seed_ply.exists():
+                    raise RuntimeError("GPU TSDF subprocess wrote no seed PLY")
                 seed_ply.touch()
                 _tl.record(LIVE_ROOT, "pointcloud_fusion", "TSDF batch seed (GPU)",
                            "fusion", t_fin, time.time())
@@ -885,6 +909,14 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
                         sub.build_static_init_pointcloud()
                     except Exception as exc3:
                         print(f"[live] WARNING: naive seed fallback also failed ({exc3})", flush=True)
+            if os.environ.get("DGS_EAGER_ANYSPLAT") == "1":
+                try:
+                    from .anysplat_decode import spawn_detached_anysplat_worker
+                    _as_pid = spawn_detached_anysplat_worker(LIVE_ROOT / ".anysplat_worker")
+                    print(f"[live] AnySplat worker pre-spawned post-TSDF (pid={_as_pid})",
+                          flush=True)
+                except Exception as exc:
+                    print(f"[live] WARNING: eager AnySplat pre-spawn failed: {exc}", flush=True)
         else:
             try:
                 _finalize_safe("happy-path")

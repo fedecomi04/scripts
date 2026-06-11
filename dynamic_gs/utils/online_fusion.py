@@ -57,7 +57,10 @@ import open3d as o3d
 # ----------------------------------------------------------------------------
 # Tunables (mirror experiments/icp_fusion_mvp/online_fusion.py exactly).
 # ----------------------------------------------------------------------------
-TSDF_VOXEL_M = 0.002         # 2 mm — coarser, fewer seed points, lower VRAM
+# 2 mm default; DGS_TSDF_VOXEL_M overrides (the deferred GPU build at high
+# camera res / wide FOV needs a coarser grid: at 1920x1200/110deg the 2 mm
+# VoxelBlockGrid hashmap OOMs a 16 GB GPU even with ~12 GB free).
+TSDF_VOXEL_M = float(os.environ.get("DGS_TSDF_VOXEL_M", "0.002"))
 TSDF_TRUNC_M = 0.008         # ~4× voxel
 DEPTH_SCALE = 1000.0         # uint16 mm → m
 DEPTH_MIN_M, DEPTH_MAX_M = 0.05, 3.0
@@ -592,3 +595,13 @@ def fuse_recorded_dataset(static_dir: Path) -> Path:
     import os as _os
     _os.replace(tmp, meta_path)
     return ply_path
+
+
+if __name__ == "__main__":
+    # Subprocess entry: `python -m dynamic_gs.utils.online_fusion <static_dir>`.
+    # Used by live_session's deferred-TSDF path so a GPU OOM (which poisons
+    # Open3D's CUDA cache and aborts the PROCESS at teardown) cannot take down
+    # the capture session — the parent just falls back to the CPU build.
+    import sys as _sys
+    out = fuse_recorded_dataset(Path(_sys.argv[1]))
+    print(f"[online-fusion-subprocess] seed written -> {out}", flush=True)
