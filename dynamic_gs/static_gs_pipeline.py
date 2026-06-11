@@ -104,6 +104,15 @@ class StaticGSPipeline(VanillaPipeline):
         self._sam3d_generation_outputs: Optional[dict] = None
         self._phase0b_done: bool = False
         self._timing_report_written: bool = False
+        self._train_start_t: Optional[float] = None
+
+        # Fresh timing ledger for this run (recorded flow starts here; the live
+        # flow's capture stage owns its own ledger render before this resets).
+        try:
+            from .utils import timing_ledger as _tl
+            _tl.reset(config.datamanager.data)
+        except Exception:
+            pass
 
         super().__init__(
             config=config,
@@ -160,6 +169,19 @@ class StaticGSPipeline(VanillaPipeline):
     ):
         """Compose base callbacks with our end-of-training Phase 0b + save."""
         callbacks = super().get_training_callbacks(training_callback_attributes)
+
+        def _stamp_train_start(step: int) -> None:
+            if self._train_start_t is None:
+                import time as _time
+                self._train_start_t = _time.time()
+
+        callbacks.append(
+            TrainingCallback(
+                where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                update_every_num_iters=1,
+                func=_stamp_train_start,
+            )
+        )
         callbacks.append(
             TrainingCallback(
                 where_to_run=[TrainingCallbackLocation.AFTER_TRAIN],
@@ -174,6 +196,17 @@ class StaticGSPipeline(VanillaPipeline):
         if self._phase0b_done:
             return
         self._phase0b_done = True
+
+        # Record the Splatfacto training loop wall (pure training; phase0b runs
+        # after this point) into the ledger.
+        try:
+            import time as _time
+            from .utils import timing_ledger as _tl
+            if self._train_start_t is not None:
+                _tl.record(self.config.datamanager.data, "static_training",
+                           "Splatfacto", "train", self._train_start_t, _time.time())
+        except Exception:
+            pass
 
         if not self._sam3d_generation_outputs:
             CONSOLE.log(
@@ -264,6 +297,31 @@ class StaticGSPipeline(VanillaPipeline):
         lines.append(f"Num points:  {getattr(self.model, 'num_points', '?')}")
         lines.append("")
 
+        # Bulleted by-phase load/inference report from the unified timing ledger.
+        try:
+            from .utils import timing_ledger as _tl
+            # If an eager AnySplat worker reported its load, fold it in (loads
+            # during training → should show as overlap, not a stall).
+            try:
+                import json as _json
+                _aw = Path(datamanager.config.data) / ".anysplat_worker"
+                _ls = 0.0
+                for _f in (_aw / "ready.json", _aw / "spawn.json"):
+                    if _f.is_file():
+                        _d = _json.loads(_f.read_text().splitlines()[0])
+                        _ls = max(_ls, float(_d.get("load_seconds", 0.0)))
+                if _ls > 0 and getattr(self, "_train_start_t", None):
+                    _tl.record(datamanager.config.data, "static_training", "AnySplat",
+                               "load", self._train_start_t, self._train_start_t + _ls)
+            except Exception:
+                pass
+            lines.append(_tl.render(datamanager.config.data))
+            lines.append("")
+        except Exception as _exc:
+            lines.append(f"(timing-ledger render failed: {_exc})")
+            lines.append("")
+
+        lines.append("DETAIL (per-substep, ms):")
         # Group by prefix (S0. / static_step / etc.) for readability.
         groups: dict[str, list[str]] = {}
         for k in sorted(timing.keys()):

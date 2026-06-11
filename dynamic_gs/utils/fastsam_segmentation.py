@@ -382,8 +382,12 @@ def _parse_args() -> argparse.Namespace:
 def _main() -> int:
     a = _parse_args()
     try:
+        import time as _time
+        _t0 = _time.time()
         seg = FastSamTextSegmenter(weights=a.fastsam_weights, clip_model=a.clip_model,
                                    clip_pretrained=a.clip_pretrained)
+        _t_load = _time.time() - _t0
+        _t1 = _time.time()
         seg.infer(
             image_path=str(a.image), text_prompt=a.text_prompt,
             output_dir=str(a.output_dir), output_stem=a.output_stem,
@@ -391,6 +395,12 @@ def _main() -> int:
             dedup_iou=a.dedup_iou, max_objects=a.max_objects, min_score=a.min_score,
             fastsam_conf=a.fastsam_conf, fastsam_iou=a.fastsam_iou, imgsz=a.imgsz,
         )
+        # Timing sidecar (load vs infer split) for the unified ledger.
+        try:
+            (Path(a.output_dir) / "_fastsam_timing.json").write_text(
+                json.dumps({"load": _t_load, "infer": _time.time() - _t1}) + "\n")
+        except Exception:
+            pass
         return 0
     except Exception as exc:
         import traceback

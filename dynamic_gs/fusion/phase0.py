@@ -40,6 +40,7 @@ from ..utils import (
 )
 from ..utils.sam3_segmentation import load_sam3_masks, run_sam3_subprocess
 from ..utils.fastsam_segmentation import run_fastsam_subprocess
+from ..utils import timing_ledger as _tl
 from ..utils.sam3d import (
     get_sam3d_output_paths,
     resolve_sam3d_pose_path,
@@ -500,6 +501,24 @@ def run_phase0a_sam3_and_sam3d(
         except Exception as _exc:
             CONSOLE.log(f"[phase-0] could not read live SAM3 timing sidecar: {_exc}")
 
+        # --- timing ledger: segmentation load/infer split (recorded path) ---
+        _data_root = Path(getattr(datamanager.config, "data", debug_dir.parent.parent))
+        if not sam3_cached:
+            _seg_name = "FastSAM" if backend == "fastsam" else "SAM3"
+            _sc = debug_dir / ("_fastsam_timing.json" if backend == "fastsam" else "_sam3_timing.json")
+            try:
+                if _sc.is_file():
+                    _d = json.loads(_sc.read_text())
+                    _ld, _inf = float(_d.get("load", 0.0)), float(_d.get("infer", 0.0))
+                    _tl.record(_data_root, "segmentation", _seg_name, "load", t_sam3, t_sam3 + _ld)
+                    _tl.record(_data_root, "segmentation", _seg_name, "infer", t_sam3 + _ld, t_sam3 + _ld + _inf)
+                else:
+                    # no split sidecar (e.g. SAM3) — record the whole call as infer
+                    _tl.record(_data_root, "segmentation", _seg_name, "infer",
+                               t_sam3, t_sam3 + float(timing["S0.1_sam3_segmentation"][-1]))
+            except Exception:
+                pass
+
         if not sam3_objects:
             CONSOLE.log("[phase-0] SAM3 found 0 objects; skipping Phase 0 prefusion")
             return None
@@ -580,6 +599,20 @@ def run_phase0a_sam3_and_sam3d(
 
         sam3d_results = [r if r else {} for r in sam3d_results]
         timing.setdefault("S0.2_sam3d_multi_generation", []).append(time.time() - t_sam3d)
+        # --- timing ledger: SAM3D import/load/infer split (from the sidecar) ---
+        try:
+            _sd_sc = artifact_dir / "_sam3d_timing.json"
+            if _sd_sc.is_file() and _sd_sc.stat().st_mtime >= t_sam3d:
+                _d = json.loads(_sd_sc.read_text())
+                _imp = float(_d.get("import_config", 0.0))
+                _mld = float(_d.get("model_load", 0.0))
+                _inf = float(_d.get("infer_total", 0.0))
+                _b = t_sam3d
+                _tl.record(_data_root, "object_3d_gen", "SAM3D import", "load", _b, _b + _imp); _b += _imp
+                _tl.record(_data_root, "object_3d_gen", "SAM3D model", "load", _b, _b + _mld); _b += _mld
+                _tl.record(_data_root, "object_3d_gen", "SAM3D", "infer", _b, _b + _inf)
+        except Exception:
+            pass
     finally:
         if not sam3_cached:
             model.to(run_device)
@@ -997,6 +1030,12 @@ def run_phase0b_fusion(
 
     fusion_time = time.time() - t_total
     timing.setdefault("S0.4b_fusion_total", []).append(fusion_time)
+    try:
+        _tl.record(Path(getattr(datamanager.config, "data", debug_dir.parent.parent)),
+                   "object_fusion", "NDP register+fuse", "fusion", t_total, time.time(),
+                   n=len(manifest))
+    except Exception:
+        pass
     num_prefused = int((model.object_instance_ids > 0).any(dim=-1).sum().item())
     CONSOLE.log(
         f"[phase-0] fusion complete: {len(manifest)} objects fused, "

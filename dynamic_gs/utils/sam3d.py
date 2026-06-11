@@ -727,7 +727,8 @@ def run_sam3d_multi_object(
     # API accepted a path string. Load via OmegaConf so the same call works.
     from omegaconf import OmegaConf as _OmegaConf
     runtime_config_obj = _OmegaConf.load(str(runtime_config_path))
-    print(f"[sam3d-timing] import+config: {time.time()-_t_imp0:.1f}s", file=sys.stderr)
+    _sam3d_t = {"import_config": time.time() - _t_imp0, "model_load": 0.0, "infer_total": 0.0}
+    print(f"[sam3d-timing] import+config: {_sam3d_t['import_config']:.1f}s", file=sys.stderr)
 
     # Load model once
     gc.collect()
@@ -739,7 +740,8 @@ def run_sam3d_multi_object(
         inference = Inference(runtime_config_obj, compile=False)
     except Exception as exc:
         raise RuntimeError(f"Failed to load SAM3D model: {exc}") from exc
-    print(f"[sam3d-timing] model load (Inference ctor): {time.time()-_t_load0:.1f}s", file=sys.stderr)
+    _sam3d_t["model_load"] = time.time() - _t_load0
+    print(f"[sam3d-timing] model load (Inference ctor): {_sam3d_t['model_load']:.1f}s", file=sys.stderr)
 
     # Fast-SAM3D's inference_pipeline_pointmap.run() reads `self.hfer_2d`
     # without checking if it was set. Issue #9 in the upstream repo confirms
@@ -821,7 +823,9 @@ def run_sam3d_multi_object(
                     else:
                         output = inference(cur_image, cur_mask, seed=42)
                     used_shape = tuple(cur_image.shape)
-                    print(f"[sam3d-timing] infer mask {i} @{candidate_size}: {time.time()-_t_inf0:.1f}s",
+                    _dt_inf = time.time() - _t_inf0
+                    _sam3d_t["infer_total"] += _dt_inf
+                    print(f"[sam3d-timing] infer mask {i} @{candidate_size}: {_dt_inf:.1f}s",
                           file=sys.stderr)
                     break
                 except torch.cuda.OutOfMemoryError:
@@ -900,6 +904,13 @@ def run_sam3d_multi_object(
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    # Timing sidecar: lets the (cross-env) caller record SAM3D's import/load/infer
+    # split into the unified timing ledger without parsing stderr.
+    try:
+        (Path(output_dir) / "_sam3d_timing.json").write_text(json.dumps(_sam3d_t) + "\n")
+    except Exception:
+        pass
 
     return all_results
 
