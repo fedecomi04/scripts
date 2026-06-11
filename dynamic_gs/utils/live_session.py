@@ -502,15 +502,17 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
     # by the time the operator centers the camera and hits Enter the segmenter
     # is already on the GPU.
     #
-    # SAM3D-during-capture preload is DISABLED by default (2026-06-11): although
-    # the trim cuts SAM3D *resident* to 7.3 GB, the *load peak* is still ~12 GB
-    # (the generators load fp32, then the trim casts to fp16 AFTER Inference()
-    # returns). 12 GB load peak + TSDF integrate (~1.5) + FastSAM (0.85) + Gazebo
-    # (~2.6) overflows 16 GB → the preload OOMs, AND a failed load left the worker
-    # holding ~11 GB which then OOM'd TSDF integrate (26 frames dropped) and the
-    # at-Enter SAM3D load (0 objects). Net negative. Proven path = FastSAM during
-    # capture + SAM3D at Enter (no contention). Re-enable only after the trim is
-    # moved INTO the load (fp16 ckpt read) via DGS_SAM3D_LOAD_DURING_CAPTURE=1.
+    # SAM3D-during-capture preload: ENABLED by default WHEN the TSDF is deferred
+    # (the default). The preload hides SAM3D's ~28 s model-load behind the
+    # operator sweep, so only the ~10 s infer is exposed at Enter (measured
+    # 2026-06-11 vs the replay: dead-time-to-teleop-ready 76 s → 44 s).
+    # History: the preload OOM'd ONLY because the CONCURRENT TSDF held ~1.5–7 GB
+    # during capture (12 GB SAM3D load peak + 7 GB TSDF + 0.85 FastSAM + 2.6
+    # Gazebo > 16 GB). With DGS_LIVE_DEFER_TSDF=1 there is NO concurrent TSDF, so
+    # the measured capture-time peak is 12.65 GB (3.2 GB headroom) — safe. It is
+    # therefore gated OFF when deferred-TSDF is OFF (the old OOM condition), and a
+    # failed load is best-effort (falls back to the at-Enter load). Override with
+    # DGS_SAM3D_LOAD_DURING_CAPTURE=0/1.
     sam_worker: SamWorkerClient | None = None
     _sam3_load_thread: threading.Thread | None = None
     _sam3_load_err: dict = {"err": None, "seconds": 0.0}
@@ -519,7 +521,8 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
     # path loads SAM3D then (the proven sequential fallback).
     _sam3d_preload: dict = {"loaded": False, "seconds": 0.0, "err": None}
     _preload_sam3d = (SEGMENTATION_BACKEND == "fastsam"
-                      and os.environ.get("DGS_SAM3D_LOAD_DURING_CAPTURE", "0") == "1")
+                      and os.environ.get("DGS_SAM3D_LOAD_DURING_CAPTURE",
+                                         "1" if _defer_tsdf else "0") == "1")
     try:
         sam_worker = SamWorkerClient(conda_env=SAM3_CONDA_ENV)
         print(f"[live] SAM worker spawned ({sam_worker.spawn_seconds:.2f}s)", flush=True)
