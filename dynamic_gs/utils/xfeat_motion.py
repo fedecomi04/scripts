@@ -708,8 +708,14 @@ class XFeatMotionEstimator:
         # using the raw ``_cumulative_*``.
         if self._pose_filter is not None:
             if success:
+                # Adaptive trust: spike frames have ~half the inliers
+                # (measured: 38 vs 82 mean on the fixture); inflate the
+                # measurement noise as inliers drop below the healthy norm.
+                _inl = max(int(inlier_count), 1)
+                _scale = min(4.0, max(1.0, (80.0 / _inl) ** 0.5))
                 rotation_out, translation_out = self._pose_filter.filter(
                     self._cumulative_R, self._cumulative_t, time.time(),
+                    meas_scale=_scale,
                 )
             elif self._pose_filter.initialized:
                 rotation_out, translation_out = self._pose_filter.current()

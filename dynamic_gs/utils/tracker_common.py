@@ -400,6 +400,7 @@ class PoseKalmanFilter:
 
     def filter(
         self, R_meas: np.ndarray, t_meas: np.ndarray, timestamp: float,
+        meas_scale: float = 1.0,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Predict + update with one RANSAC pose measurement.
 
@@ -477,7 +478,11 @@ class PoseKalmanFilter:
         H = np.zeros((6, 12))
         H[0:3, 0:3] = np.eye(3)
         H[3:6, 6:9] = np.eye(3)
-        R_noise = np.diag([self._meas_trans_var] * 3 + [self._meas_rot_var] * 3)
+        # meas_scale > 1 inflates measurement noise (e.g. weak match set on
+        # this tick) -> the update leans on the velocity model -> spike
+        # suppression without adding lag on healthy ticks.
+        _ms2 = max(float(meas_scale), 1.0) ** 2
+        R_noise = np.diag([self._meas_trans_var * _ms2] * 3 + [self._meas_rot_var * _ms2] * 3)
         S = H @ self._P @ H.T + R_noise
         K = self._P @ H.T @ np.linalg.solve(S, np.eye(6))
         dx = K @ y
