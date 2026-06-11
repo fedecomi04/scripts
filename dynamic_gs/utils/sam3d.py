@@ -197,6 +197,66 @@ def _write_runtime_config() -> Path:
     return SAM3D_RUNTIME_CONFIG_PATH
 
 
+def apply_sam3d_gaussian_trim(inference) -> Dict[str, list]:
+    """Shrink the resident GPU footprint of a loaded SAM3D ``Inference`` for the
+    gaussian-only path, WITHOUT changing the gaussian output meaningfully.
+
+    Two safe trims (set ``DGS_SAM3D_NO_TRIM=1`` to disable):
+
+    1. **fp16 the diffusion generators + DINOv2 condition embedders.** The
+       SAM3D forward already runs under ``torch.autocast(dtype=float16)``
+       (inference_pipeline.py:723/866), so these weights are cast to fp16 per-op
+       anyway — storing them fp16 removes the wasted fp32 residency. Measured on
+       recording_15fps (screwdriver): resident 11698 → 7273 MiB (−4.4 GB), peak
+       12536 → 11707 MiB, gs count 58944 → 58912, chamfer(full,trim) = 4.66 mm on
+       a ~1 m object (0.5 %; and the cloud is NDP-registered onto real depth in
+       Phase 0b afterwards, so this prior-shift is well within the noise).
+    2. **Move never-invoked modules to CPU.** ``slat_decoder_mesh`` (mesh decode
+       is OFF, ``enable_mesh=False`` / ``decode_formats=["gaussian"]``),
+       ``ss_encoder`` (inference generates+decodes, never encodes), and
+       ``slat_decoder_gs_4`` (already None) sit on GPU at init for no reason.
+
+    Why this matters: 7.3 GB resident lets SAM3D LOAD during live capture
+    alongside Gazebo (~2.6 GB) + TSDF integrate (~3 GB) — impossible at 11.7 GB —
+    so its ~30 s load hides behind the operator sweep; and the 11.7 GB infer peak
+    co-resides with splatfacto training (~1.1 GB) for SAM3D‖training parallelism.
+    """
+    import os
+    if os.environ.get("DGS_SAM3D_NO_TRIM") == "1":
+        return {"skipped": ["DGS_SAM3D_NO_TRIM=1"]}
+    pipeline = getattr(inference, "_pipeline", None)
+    if pipeline is None:
+        return {"skipped": ["no _pipeline"]}
+    moved, halved = [], []
+    models = getattr(pipeline, "models", None)
+    if models is not None:
+        for name in ("slat_decoder_mesh", "ss_encoder", "slat_decoder_gs_4"):
+            m = models[name] if (name in models) else None
+            if m is not None:
+                try:
+                    m.to("cpu"); moved.append(name)
+                except Exception:
+                    pass
+        for name in ("ss_generator", "slat_generator"):
+            if name in models and models[name] is not None:
+                try:
+                    models[name].half(); halved.append(name)
+                except Exception:
+                    pass
+    ce = getattr(pipeline, "condition_embedders", None)
+    if isinstance(ce, dict):
+        for k, m in ce.items():
+            if m is not None:
+                try:
+                    m.half(); halved.append(k)
+                except Exception:
+                    pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"moved_to_cpu": moved, "fp16": halved}
+
+
 def _save_preview(mask: np.ndarray, image_rgb: np.ndarray, preview_path: Path) -> None:
     overlay = image_rgb.copy().astype(np.float32)
     overlay[mask > 0] = 0.65 * overlay[mask > 0] + 0.35 * np.array([255.0, 0.0, 0.0], dtype=np.float32)
@@ -483,6 +543,7 @@ def run_sam3d_single_object(
                 "mesh_spectral_threshold_low": 0.5, "mesh_spectral_threshold_high": 0.7,
             }
             inference._pipeline.enable_mesh = False
+            apply_sam3d_gaussian_trim(inference)
             if resized_pointmap is not None:
                 pm = resized_pointmap
                 if not isinstance(pm, torch.Tensor):
@@ -675,6 +736,8 @@ def run_sam3d_multi_object(
         "mesh_spectral_threshold_low": 0.5, "mesh_spectral_threshold_high": 0.7,
     }
     inference._pipeline.enable_mesh = False
+    _trim = apply_sam3d_gaussian_trim(inference)
+    print(f"[sam3d-multi] gaussian-only trim: {_trim}", file=sys.stderr)
 
     all_results: list[Dict[str, Path]] = []
     try:

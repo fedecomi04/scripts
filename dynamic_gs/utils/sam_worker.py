@@ -377,6 +377,14 @@ class _SamWorker:
             "mesh_spectral_threshold_low": 0.5, "mesh_spectral_threshold_high": 0.7,
         }
         inference._pipeline.enable_mesh = False
+        # Gaussian-only trim: fp16 generators+embedders + offload unused decoders.
+        # ~4.4 GB resident saved (11.7 → 7.3 GB) so SAM3D can load during capture
+        # and co-reside with splatfacto. Output chamfer ~4.7 mm (NDP-registered
+        # afterwards). Disable with DGS_SAM3D_NO_TRIM=1.
+        try:
+            _sd.apply_sam3d_gaussian_trim(inference)
+        except Exception as exc:
+            print(f"[sam_worker] SAM3D trim skipped: {exc}", file=sys.stderr)
         self.sam3d_inference = inference
         self.sam3d_runtime_cfg = cfg
         elapsed = time.perf_counter() - t0
