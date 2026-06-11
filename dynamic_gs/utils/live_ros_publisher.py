@@ -370,6 +370,61 @@ class _StoredFrame:
 class LivePublisher:
     """Single-process publisher: ROS subscribers + shm slots + recorder."""
 
+    @staticmethod
+    def _wait_for_camera_info_primed(timeout_s: float = 20.0) -> Optional["CameraInfo"]:
+        """Resolve camera_info, working around Gazebo's lazy-publish.
+
+        Gazebo's camera plugin only publishes ``camera_info`` / ``image_raw``
+        while something is subscribed to the image stream. A bare
+        ``wait_for_message(camera_info)`` races that warm-up and intermittently
+        times out even though the camera is perfectly healthy (the
+        "stuck at spawning ROS publisher" / "camera_info wait timed out"
+        symptom). We fix it deterministically by:
+
+          1. Holding a real subscriber on the RGB image topic (``/compressed``)
+             for the whole wait — this is what wakes Gazebo's lazy publisher
+             and keeps the camera_info pipeline emitting.
+          2. Polling ``wait_for_message(camera_info)`` in short slices until
+             ``timeout_s`` elapses, instead of one all-or-nothing 5 s wait.
+
+        Returns the CameraInfo on success, or ``None`` on timeout (caller
+        falls back to cached intrinsics).
+        """
+        primer = None
+        try:
+            # The message type doesn't matter — we only subscribe to force
+            # Gazebo to start publishing the camera pipeline. CompressedImage
+            # is the lightest RGB transport on this camera.
+            primer = rospy.Subscriber(
+                IMAGE_TOPIC + "/compressed", CompressedImage,
+                lambda _msg: None, queue_size=1,
+            )
+            deadline = time.time() + float(timeout_s)
+            attempt = 0
+            while time.time() < deadline:
+                attempt += 1
+                try:
+                    remaining = max(0.5, deadline - time.time())
+                    return rospy.wait_for_message(
+                        CAMERA_INFO_TOPIC, CameraInfo,
+                        timeout=min(2.0, remaining),
+                    )
+                except rospy.ROSException:
+                    if attempt == 1:
+                        print(
+                            f"[publisher] priming camera (subscribed {IMAGE_TOPIC}/compressed); "
+                            f"waiting for {CAMERA_INFO_TOPIC} ...",
+                            flush=True,
+                        )
+                    continue
+            return None
+        finally:
+            if primer is not None:
+                try:
+                    primer.unregister()
+                except Exception:
+                    pass
+
     def __init__(self, live_root: Path, shm_name: str, keyframe_translation_m: float,
                  keyframe_rotation_deg: float):
         if not rospy.core.is_initialized():
@@ -399,8 +454,8 @@ class LivePublisher:
             except Exception:
                 pass
 
-        try:
-            info_msg = rospy.wait_for_message(CAMERA_INFO_TOPIC, CameraInfo, timeout=5.0)
+        info_msg = self._wait_for_camera_info_primed(timeout_s=20.0)
+        if info_msg is not None:
             self.intrinsics = CameraIntrinsics(
                 width=int(info_msg.width),
                 height=int(info_msg.height),
@@ -410,7 +465,7 @@ class LivePublisher:
                 cy=float(info_msg.K[5]),
             )
             _write_cache(self.intrinsics)  # refresh the sticky fallback
-        except rospy.ROSException:
+        else:
             # Build the ordered list of fallback candidates.
             candidates = [
                 Path(live_root) / "static_scene" / "transforms.json",
@@ -425,7 +480,12 @@ class LivePublisher:
                 pass
             tj = next((p for p in candidates if p.is_file()), None)
             if tj is None:
-                raise
+                raise RuntimeError(
+                    f"camera_info never arrived on {CAMERA_INFO_TOPIC} after priming + "
+                    f"retry, and no cached intrinsics fallback exists (checked "
+                    f"static/dynamic transforms.json, {_CACHE_PATH}, and the datasets root). "
+                    f"Is Gazebo running and the camera topic alive?"
+                )
             meta = _json.loads(tj.read_text())
             self.intrinsics = CameraIntrinsics(
                 width=int(meta["w"]),
