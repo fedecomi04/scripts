@@ -48,6 +48,7 @@ from .sam3_segmentation import run_sam3_subprocess
 from .fastsam_segmentation import run_fastsam_subprocess
 from .sam3d import run_sam3d_multi_object_subprocess, sam3d_pose_has_rotation
 from .sam_worker import SamWorkerClient
+from . import timing_ledger as _tl
 
 INIT_CLOUD_NAME = "depth_camera_init_points.ply"
 
@@ -451,6 +452,16 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
     fusion_runner = ConcurrentFusionRunner(static_dir, sub.intrinsics)
     fusion_runner.start()
 
+    # Fresh timing ledger — capture is the true start of the live flow. The
+    # capture/segmentation/3d-gen/fusion rows recorded here are rendered to
+    # timing_report_capture.txt at the end of this function; the stage-2
+    # ns-train static-gs run resets the ledger again for its own report.
+    _t_capture_start = time.time()
+    try:
+        _tl.reset(LIVE_ROOT)
+    except Exception:
+        pass
+
     # Spawn the persistent SAM3+SAM3D worker and kick off SAM3's 6 s weight
     # load on a background thread. Capture wallclock is operator-controlled, so
     # by the time the operator centers the camera and hits Enter the segmenter
@@ -480,6 +491,9 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
                 else:
                     sam_worker.load_sam3(confidence_threshold=SAM3_CONFIDENCE_THRESHOLD)
                 _sam3_load_err["seconds"] = time.time() - t0
+                _tl.record(LIVE_ROOT, "capture",
+                           "FastSAM+CLIP" if SEGMENTATION_BACKEND == "fastsam" else "SAM3",
+                           "load", t0, time.time())
                 # Preload SAM3D during capture so its model-load hides behind the
                 # sweep. Best-effort — on OOM/any error we fall back to loading it
                 # at Enter (see the load_sam3d call site).
@@ -489,6 +503,7 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
                         sam_worker.load_sam3d()
                         _sam3d_preload["loaded"] = True
                         _sam3d_preload["seconds"] = time.time() - ts
+                        _tl.record(LIVE_ROOT, "capture", "SAM3D (trim)", "load", ts, time.time())
                         print(f"[live] SAM3D preloaded during capture "
                               f"({_sam3d_preload['seconds']:.1f}s) — its load now hides behind the sweep",
                               flush=True)
@@ -532,8 +547,11 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
             return
         _finalize_done["value"] = True
         print(f"[live] finalizing fusion ({reason})...", flush=True)
+        _t_fin = time.time()
         try:
             fusion_runner.stop_and_finalize()
+            _tl.record(LIVE_ROOT, "pointcloud_fusion", "TSDF finalize+seed", "fusion",
+                       _t_fin, time.time())
         except Exception as exc:
             print(f"[live] WARNING: fusion finalize on '{reason}' failed: {exc}", flush=True)
 
@@ -621,6 +639,11 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
             sam3_objects = []
             print(f"[live] SAM3 raised: {exc}", flush=True)
         sam3_duration = time.time() - t_sam3
+        if sam3_objects:
+            # Segmenter is already warm (loaded during capture) so this is ~infer.
+            _tl.record(LIVE_ROOT, "segmentation",
+                       "FastSAM" if SEGMENTATION_BACKEND == "fastsam" else "SAM3",
+                       "infer", t_sam3, t_sam3 + sam3_duration)
 
         if sam3_objects:
             print(f"[live] SAM3: found {len(sam3_objects)} graspable masks "
@@ -676,6 +699,8 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
                 else:
                     sam_worker.load_sam3d()
                     print(f"[live] SAM3D model loaded ({time.time()-t_load:.1f}s)", flush=True)
+                    # Exposed load (preload didn't happen) — record it.
+                    _tl.record(LIVE_ROOT, "object_3d_gen", "SAM3D model", "load", t_load, time.time())
                 t_infer = time.time()
                 worker_results = sam_worker.sam3d_infer(
                     render_image_path=anchor_rgb_path,
@@ -687,6 +712,7 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
                     depth_path=depth_path,
                     intrinsics_path=intrinsics_path,
                 )
+                _tl.record(LIVE_ROOT, "object_3d_gen", "SAM3D", "infer", t_infer, time.time())
                 print(f"[live] SAM3D inference {time.time()-t_infer:.1f}s "
                       f"({len(worker_results)} masks)", flush=True)
                 # Reconstruct the downstream-compatible per-object dict shape:
@@ -798,6 +824,15 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
         unpause_gazebo_physics(sub)
 
     _seed_dynamic_scene_stub(static_dir, dynamic_dir)
+
+    # Render the capture-phase by-phase load/inference report. Stage-2 ns-train
+    # static-gs resets the ledger for its own report, so capture its timings now.
+    try:
+        report = _tl.render(LIVE_ROOT)
+        (LIVE_ROOT / "timing_report_capture.txt").write_text(report + "\n")
+        print(f"[live] capture timing report → {LIVE_ROOT / 'timing_report_capture.txt'}", flush=True)
+    except Exception as exc:
+        print(f"[live] capture timing report failed: {exc}", flush=True)
 
     print("[live] static capture complete; starting static training", flush=True)
     return LIVE_ROOT
