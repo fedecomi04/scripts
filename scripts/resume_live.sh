@@ -41,6 +41,7 @@ export CONDA_PREFIX="$TRAIN_PREFIX"
 export LD_LIBRARY_PATH="$TRAIN_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 export CUDA_HOME="$TRAIN_PREFIX"
 export CPATH="$TRAIN_PREFIX/targets/x86_64-linux/include:${CPATH:-}"
+export LIBRARY_PATH="$TRAIN_PREFIX/targets/x86_64-linux/lib:${LIBRARY_PATH:-}"
 export DGS_LIVE_ROOT="$DATA_DIR"
 
 echo

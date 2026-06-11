@@ -38,6 +38,11 @@ export PATH="$TRAIN_PREFIX/bin:$PATH"
 export CONDA_DEFAULT_ENV="$TRAIN_ENV"
 export CONDA_PREFIX="$TRAIN_PREFIX"
 export LD_LIBRARY_PATH="$TRAIN_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+# CUDA build toolchain (sm_120) — see bootstrap_live.sh. Capture-only doesn't
+# train, but keep the three launch scripts uniform so any gsplat import works.
+export CUDA_HOME="$TRAIN_PREFIX"
+export CPATH="$TRAIN_PREFIX/targets/x86_64-linux/include:${CPATH:-}"
+export LIBRARY_PATH="$TRAIN_PREFIX/targets/x86_64-linux/lib:${LIBRARY_PATH:-}"
 export DGS_LIVE_ROOT="$DATA_DIR"
 
 exec "$PY" -u "$(dirname "$0")/capture_only.py" "$DATA_DIR" "${@:2}"

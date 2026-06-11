@@ -24,6 +24,25 @@ from PIL import Image
 
 
 # ---------------------------------------------------------------------------
+# Cross-env python resolver
+# ---------------------------------------------------------------------------
+# Mirror sam3d.py / sam_worker.py / anysplat_decode.py: resolve the conda
+# env's python binary DIRECTLY rather than relying on ``conda run``. ``conda``
+# is frequently NOT on PATH for the process that launches ns-train (only an
+# activated shell or bootstrap_live.sh puts it there), which made the legacy
+# ``["conda", "run", ...]`` path crash with ``[Errno 2] ... 'conda'`` and
+# silently skip SAM3 prefusion. Resolving the env python is launch-independent.
+_CONDA_ROOT = Path(os.environ.get("DYNAMIC_GS_CONDA_ROOT", str(Path.home() / "miniconda3")))
+
+
+def _resolve_env_python(conda_env: str):
+    """Return the env's python binary (Path) if it exists, else None
+    (caller falls back to ``conda run``)."""
+    py = _CONDA_ROOT / "envs" / conda_env / "bin" / "python"
+    return py if py.exists() else None
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -244,9 +263,17 @@ def run_sam3_subprocess(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    command = [
-        "conda", "run", "--no-capture-output", "-n", sam3_conda_env,
-        "python", str(Path(__file__).resolve()),
+    # Resolve the env python directly (launch-independent); fall back to
+    # ``conda run`` only if the binary can't be found.
+    env_python = _resolve_env_python(sam3_conda_env)
+    if env_python is not None:
+        command = [str(env_python), str(Path(__file__).resolve())]
+    else:
+        command = [
+            "conda", "run", "--no-capture-output", "-n", sam3_conda_env,
+            "python", str(Path(__file__).resolve()),
+        ]
+    command += [
         "--image", str(image_path),
         "--text-prompt", text_prompt,
         "--output-dir", str(output_dir),
@@ -256,10 +283,19 @@ def run_sam3_subprocess(
         arg_name = f"--{key.replace('_', '-')}"
         command.extend([arg_name, str(value)])
 
+    # Prepend the env's lib to LD_LIBRARY_PATH + PYTHONNOUSERSITE=1 so the
+    # subprocess uses the env's own native libs / site-packages, not the
+    # parent dynamic_gs env's (same hardening as sam_worker / anysplat).
+    sub_env = os.environ.copy()
+    if env_python is not None:
+        env_lib = str(env_python.parent.parent / "lib")
+        sub_env["LD_LIBRARY_PATH"] = (env_lib + ":" + sub_env.get("LD_LIBRARY_PATH", "")).rstrip(":")
+        sub_env["PYTHONNOUSERSITE"] = "1"
+
     completed = subprocess.run(
         command,
         cwd=str(Path(__file__).resolve().parents[2]),
-        env=os.environ.copy(),
+        env=sub_env,
         capture_output=True,
         text=True,
     )

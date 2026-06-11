@@ -46,6 +46,16 @@ export PATH="$TRAIN_PREFIX/bin:$PATH"
 export CONDA_DEFAULT_ENV="$TRAIN_ENV"
 export CONDA_PREFIX="$TRAIN_PREFIX"
 export LD_LIBRARY_PATH="$TRAIN_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+# CUDA build toolchain for gsplat's JIT (sm_120): the env ships nvcc 12.8
+# under bin/ + headers under targets/ + cicc under nvvm/. CUDA_HOME must be
+# the env prefix (so nvcc finds nvvm/bin/cicc), and CPATH must expose
+# cuda_runtime.h, or gsplat's first rasterization JIT-compile fails with
+# "cuda_runtime.h: No such file" / "cicc: not found" / "Unsupported gpu
+# architecture compute_120" (the latter if /usr/local/cuda-12.1 wins PATH).
+# Mirrors etc/conda/activate.d/dynamic_gs.sh + resume_live.sh.
+export CUDA_HOME="$TRAIN_PREFIX"
+export CPATH="$TRAIN_PREFIX/targets/x86_64-linux/include:${CPATH:-}"
+export LIBRARY_PATH="$TRAIN_PREFIX/targets/x86_64-linux/lib:${LIBRARY_PATH:-}"
 
 # Tell live_session + LiveShmSubscriber to use this dir (env override of
 # the hardcoded LIVE_ROOT in dynamic_gs/utils/live_shm_reader.py).
