@@ -118,7 +118,11 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     # color-aware FPFH correspondences + TEASER++ truncated-least-squares solver
     # (fast, outlier-robust; expects teaserpp_python installed). Both produce a
     # similarity_transform 4x4 with the same downstream contract.
-    sam3d_registration_backend: Literal["cpd", "teaser"] = "cpd"
+    sam3d_registration_backend: Literal["ndp", "cpd", "teaser"] = "ndp"
+    # "ndp" (DEFAULT) = Neural Deformation Pyramid non-rigid registration: reuses
+    # the rigid init then non-rigidly deforms the SAM3D cloud onto the accurate
+    # target (dynamic_gs/utils/ndp_register.py). "cpd"/"teaser" remain available
+    # as rigid+scale fallbacks. Keep in sync with StaticGSModelConfig.
     # TEASER++ tuning (only consulted when sam3d_registration_backend == "teaser").
     # The default config reproduces the "v13" 3-stage recipe benchmarked on the
     # 2026-03-28 teleop dataset (fitness 62%, chamfer 13.3mm, ~1.2s/object — beats

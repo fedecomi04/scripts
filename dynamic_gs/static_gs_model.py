@@ -85,11 +85,16 @@ class StaticGSModelConfig(SplatfactoModelConfig):
     # ---- Phase 0a (Fast-SAM3D 3D generation) + Phase 0b (registration) ----
     use_sam3d_object_init: bool = True
     reuse_sam3d_generated_ply: bool = True
-    sam3d_registration_backend: Literal["cpd", "teaser"] = "cpd"
-    """``cpd`` = legacy probreg coherent point drift (robust, slow).
+    sam3d_registration_backend: Literal["ndp", "cpd", "teaser"] = "ndp"
+    """``ndp`` = Neural Deformation Pyramid non-rigid registration (DEFAULT).
+    Reuses the rigid init (SAM3D-rotation + bbox-scale + centroid) then NON-RIGIDLY
+    deforms the complete SAM3D cloud onto the accurate partial target with a
+    hierarchical Sim3 deformation pyramid (no learned weights, GPU, in-process via
+    ``dynamic_gs/utils/ndp_register.py``). Conforms the approximate model to the
+    real geometry far better than a single rigid+scale fit.
+    ``cpd`` = legacy probreg coherent point drift (rigid+scale, robust, slow).
     ``teaser`` = the "v13" 3-stage recipe (FPFH+TEASER -> Euclidean-NN reproject
-    +TEASER -> point-to-plane ICP). Fast, outlier-robust; requires
-    ``teaserpp_python``. Benchmarked to beat CPD on every metric at ~400x speed.
+    +TEASER -> point-to-plane ICP), rigid+scale. Fast; requires ``teaserpp_python``.
     Keep this block byte-for-byte in sync with DynamicGSModelConfig — both feed
     the same ``register_and_fuse_sam3d_object`` via run_phase0b_fusion(model)."""
     sam3d_teaser_noise_bound: float = 0.02

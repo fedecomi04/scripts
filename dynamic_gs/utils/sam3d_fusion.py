@@ -1171,7 +1171,23 @@ def register_and_fuse_sam3d_object(
     icp_meta = None
     t_reproject = 0.0
     t_icp = 0.0
-    if registration_backend == "teaser":
+    # NDP (non-rigid) backend produces deformed POINTS rather than a 4x4 similarity
+    # transform. When set, `ndp_warped_full` overrides the similarity-based
+    # `aligned_points` below; `similarity_transform` stays identity (the rigid
+    # init — bbox-scale + centroid — is already baked into `scaled_source`).
+    ndp_warped_full = None
+    similarity_correspondence_count = 0
+    if registration_backend == "ndp":
+        from .ndp_register import deform_source_to_target
+
+        # NDP optimizes on the full-resolution scaled_source (it subsamples
+        # internally) and deforms onto the accurate target cloud.
+        ndp_warped_full, ndp_meta = deform_source_to_target(scaled_source, target_points)
+        similarity_correspondence_count = int(min(len(source_down_points), len(target_down_points)))
+        refinement_meta = ndp_meta
+        refinement_meta_key = "D0.3b3_ndp_meta"
+        t_cpd_refinement = time.time() - _t
+    elif registration_backend == "teaser":
         tp = teaser_params or {}
         # --- Stage 1: FPFH + mutual-NN + TEASER ---
         similarity_transform, similarity_correspondence_count, refinement_meta = _run_teaser_similarity_refinement(
@@ -1239,7 +1255,7 @@ def register_and_fuse_sam3d_object(
         t_cpd_refinement = time.time() - _t
     else:
         raise ValueError(
-            f"Unknown SAM3D registration backend: {registration_backend!r}. Expected 'cpd' or 'teaser'."
+            f"Unknown SAM3D registration backend: {registration_backend!r}. Expected 'ndp', 'cpd', or 'teaser'."
         )
 
     # --- TIMING: D0.3b4 explicit correspondence building (KD-tree per-point search) ---
@@ -1252,7 +1268,11 @@ def register_and_fuse_sam3d_object(
         target_down_points,
         max_distance=similarity_correspondence_threshold,
     )
-    aligned_points = _transform_points(scaled_source, similarity_transform)
+    if ndp_warped_full is not None:
+        # NDP backend: the deformed cloud IS the alignment (non-rigid; no 4x4).
+        aligned_points = ndp_warped_full.astype(np.float32)
+    else:
+        aligned_points = _transform_points(scaled_source, similarity_transform)
     aligned_colors = scaled_source_colors.astype(np.float32)
     final_scale = float(chosen_scale * _extract_isotropic_scale(similarity_transform))
 

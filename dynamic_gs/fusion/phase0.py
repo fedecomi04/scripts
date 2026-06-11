@@ -147,6 +147,68 @@ def backproject_mask_to_world(
     return pts_world.astype(np.float32), colors.astype(np.float32)
 
 
+def cull_points_in_front(
+    points_world: np.ndarray,
+    target_points_world: np.ndarray,
+    camera,
+    render_hw: tuple[int, int],
+    band_m: float = 0.0,
+    radius_px: int = 2,
+) -> np.ndarray:
+    """Boolean keep-mask: drop ``points_world`` that lie in FRONT of the trusted
+    real surface from the camera viewpoint (between the camera and the surface).
+
+    Builds a front-surface depth buffer by projecting ``target_points_world``
+    (the back-projected real/GT depth) into the image, then removes any inserted
+    point whose forward-depth is closer than that surface by more than ``band_m``.
+    Points with no surface along their ray (outside the silhouette) are kept.
+    Inverse of :func:`backproject_mask_to_world` (Nerfstudio/OpenGL camera frame).
+    Mirrors the tuned cull in scripts/experiments/nonrigid_bench/.
+    """
+    from scipy.ndimage import minimum_filter
+
+    H, W = int(render_hw[0]), int(render_hw[1])
+    fx = float(camera.fx[0].item())
+    fy = float(camera.fy[0].item())
+    cx = float(camera.cx[0].item())
+    cy = float(camera.cy[0].item())
+    c2w = camera.camera_to_worlds[0].detach().cpu().numpy().astype(np.float64)
+    src_H = int(camera.height[0].item()) if hasattr(camera.height[0], "item") else int(camera.height[0])
+    src_W = int(camera.width[0].item()) if hasattr(camera.width[0], "item") else int(camera.width[0])
+    if (H, W) != (src_H, src_W):
+        fx *= W / float(src_W)
+        fy *= H / float(src_H)
+        cx *= W / float(src_W)
+        cy *= H / float(src_H)
+    R = c2w[:3, :3]
+    t = c2w[:3, 3]
+
+    def _project(pts: np.ndarray):
+        cam = (pts.astype(np.float64) - t) @ R
+        z = -cam[:, 2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            u = cx + fx * cam[:, 0] / z
+            v = cy - fy * cam[:, 1] / z
+        return u, v, z
+
+    tu, tv, tz = _project(target_points_world)
+    tui, tvi = np.round(tu).astype(int), np.round(tv).astype(int)
+    tvalid = np.isfinite(tz) & (tz > 0) & (tui >= 0) & (tui < W) & (tvi >= 0) & (tvi < H)
+    depth_buf = np.full((H, W), np.inf, dtype=np.float64)
+    np.minimum.at(depth_buf, (tvi[tvalid], tui[tvalid]), tz[tvalid])
+    if radius_px > 0:
+        depth_buf = minimum_filter(depth_buf, size=2 * int(radius_px) + 1)
+
+    u, v, z = _project(points_world)
+    ui, vi = np.round(u).astype(int), np.round(v).astype(int)
+    in_img = np.isfinite(z) & (z > 0) & (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
+    d_surf = np.full(points_world.shape[0], np.inf, dtype=np.float64)
+    d_surf[in_img] = depth_buf[vi[in_img], ui[in_img]]
+    has_surface = np.isfinite(d_surf)
+    in_front = has_surface & (z < d_surf - float(band_m))
+    return ~in_front
+
+
 def save_sam3_debug_plots(
     rgb_path: Path,
     sam3_objects: list,
@@ -771,6 +833,21 @@ def run_phase0b_fusion(
             cull_pts_np = cull_pts_np[keep_mask]
             cull_colors_np = cull_colors_np[keep_mask]
 
+        # In-front (occlusion) cull: drop any surviving inserted point closer to
+        # the camera than the trusted real front surface (the back-projected
+        # target). band=0 => remove everything strictly in front; the occluded
+        # back (incl. thin parts) is kept. Complements the proximity de-dup above.
+        IN_FRONT_BAND_M = 0.0
+        n_culled_in_front = 0
+        if cull_pts_np.shape[0] > 0 and target_points_np.shape[0] >= 3:
+            keep_front = cull_points_in_front(
+                cull_pts_np, target_points_np, camera, (render_h, render_w),
+                band_m=IN_FRONT_BAND_M, radius_px=2,
+            )
+            n_culled_in_front = int((~keep_front).sum())
+            cull_pts_np = cull_pts_np[keep_front]
+            cull_colors_np = cull_colors_np[keep_front]
+
         if cull_pts_np.shape[0] > 0:
             inserted_indices = model.insert_object_gaussians(
                 torch.from_numpy(cull_pts_np),
@@ -847,6 +924,8 @@ def run_phase0b_fusion(
                 else 0.0
             ),
             "cull_tau_m": float(tau),
+            "sam3d_culled_in_front": int(n_culled_in_front),
+            "registration_backend": str(backend),
             "inserted_gaussians": int(inserted_indices.numel()),
             "flagged_existing_gaussians": int(n_flagged_existing),
             "instance_count": instance_count,
@@ -858,7 +937,7 @@ def run_phase0b_fusion(
             f"[phase-0] object {obj_idx} (instance_id={instance_id}): "
             f"existing={existing_indices.numel()}, "
             f"sam3d={insertion_result.kept_point_count}->{inserted_indices.numel()} "
-            f"(culled {n_culled_sam3d}, tau={tau * 1000:.1f}mm), "
+            f"(proximity_culled={n_culled_sam3d} tau={tau * 1000:.1f}mm, in_front_culled={n_culled_in_front}), "
             f"flagged_existing={n_flagged_existing}, "
             f"instance_total={instance_count}, "
             f"scale={insertion_result.chosen_scale:.4f}"
