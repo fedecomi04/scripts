@@ -173,7 +173,7 @@ class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
     used as the headless/timeout fallback when interactive selection is on."""
 
     # ---- Feedforward dispatcher (rgbd or anysplat) ----
-    enable_feedforward_inpaint: Literal["off", "rgbd_decode", "anysplat_decode"] = "rgbd_decode"
+    enable_feedforward_inpaint: Literal["off", "rgbd_decode", "anysplat_decode"] = "anysplat_decode"
     """``rgbd_decode`` back-projects sensor depth into per-pixel Gaussians
     (single GPU env, sub-ms). ``anysplat_decode`` calls the AnySplat
     subprocess worker (separate conda env, ~12 s/call) for multi-view
