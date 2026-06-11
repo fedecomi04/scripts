@@ -379,9 +379,12 @@ class StaticGSTrainer(NoSaveTrainer):
 
         loss, loss_dict, metrics_dict = Trainer.train_iteration(self, step)
 
+        main = loss_dict.get("main_loss")
+        main_val = float(main.detach()) if main is not None else None
+        if main_val is not None and step % 50 == 0:
+            CONSOLE.log(f"[static-gs] step {step} main_loss={main_val:.4f}")
+
         if STATIC_EARLY_STOP_ENABLED and STATIC_EARLY_STOP_LOSS > 0:
-            main = loss_dict.get("main_loss")
-            main_val = float(main.detach()) if main is not None else None
             if main_val is not None and step >= STATIC_EARLY_STOP_MIN_STEPS:
                 if main_val < STATIC_EARLY_STOP_LOSS:
                     self._early_stop_hits += 1
