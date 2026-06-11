@@ -133,6 +133,24 @@ class StaticGSPipeline(VanillaPipeline):
             )
             self._sam3d_generation_outputs = None
 
+        # Eager AnySplat pre-spawn (DGS_EAGER_ANYSPLAT=1, set by bootstrap_live.sh).
+        # Phase 0a is done (SAM3D unloaded), so the GPU has room: AnySplat (~3.5 GB)
+        # + splatfacto training (~2.5 GB) + Gazebo (~2.6 GB) = ~8.6 GB < 16. Its
+        # ~17 s load fully overlaps the static training loop, and the subsequent
+        # dynamic-gs-live run ADOPTS the warm worker (no teleop-start load stall).
+        # Spawns a detached FIFO worker at <data>/.anysplat_worker.
+        if os.environ.get("DGS_EAGER_ANYSPLAT") == "1":
+            try:
+                from .utils.anysplat_decode import spawn_detached_anysplat_worker
+                fifo_dir = Path(self.config.datamanager.data) / ".anysplat_worker"
+                _as_pid = spawn_detached_anysplat_worker(fifo_dir)
+                CONSOLE.log(
+                    f"[static-gs] eager AnySplat worker spawned (pid={_as_pid}) → {fifo_dir} "
+                    f"(loads during training; dynamic-gs-live will adopt it)"
+                )
+            except Exception as exc:
+                CONSOLE.log(f"[static-gs] eager AnySplat spawn failed (non-fatal): {exc}")
+
     # --------------------------------------------------------------
     # Training-time hooks
     # --------------------------------------------------------------

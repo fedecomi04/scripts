@@ -45,6 +45,7 @@ from .live_shm_reader import (
     LiveShmSubscriber,
 )
 from .sam3_segmentation import run_sam3_subprocess
+from .fastsam_segmentation import run_fastsam_subprocess
 from .sam3d import run_sam3d_multi_object_subprocess, sam3d_pose_has_rotation
 from .sam_worker import SamWorkerClient
 
@@ -150,6 +151,10 @@ atexit.register(_atexit_unpause)
 # the live workflow expects to override them via the user prompt).
 DEFAULT_SAM3_PROMPT = "oobject table"
 SAM3_CONDA_ENV = "sam3_dynamic_gs"
+# Segmentation backend: "fastsam" (default — ~0.85 GB, co-resides with SAM3D so
+# SAM3D can load during the capture tail) or "sam3". Env-overridable so
+# bootstrap_live.sh can switch without code edits.
+SEGMENTATION_BACKEND = os.environ.get("DGS_SEGMENTATION_BACKEND", "fastsam").strip().lower()
 SAM3_CANDIDATE_MIN_AREA_RATIO = 0.002
 SAM3_CANDIDATE_MAX_AREA_RATIO = 0.25
 SAM3_CANDIDATE_DEDUP_IOU = 0.6
@@ -462,7 +467,10 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
         def _bg_load_sam3() -> None:
             try:
                 t0 = time.time()
-                sam_worker.load_sam3(confidence_threshold=SAM3_CONFIDENCE_THRESHOLD)
+                if SEGMENTATION_BACKEND == "fastsam":
+                    sam_worker.load_fastsam()
+                else:
+                    sam_worker.load_sam3(confidence_threshold=SAM3_CONFIDENCE_THRESHOLD)
                 _sam3_load_err["seconds"] = time.time() - t0
             except Exception as exc:
                 _sam3_load_err["err"] = exc
@@ -543,19 +551,34 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
                     _sam3_load_thread.join()
                 if _sam3_load_err["err"] is not None:
                     raise _sam3_load_err["err"]
-                sam3_objects = sam_worker.sam3_infer(
-                    image_path=anchor_rgb_path,
-                    text_prompt=sam3_text,
-                    output_dir=debug_dir,
-                    output_stem="static0",
-                    min_area_ratio=SAM3_CANDIDATE_MIN_AREA_RATIO,
-                    max_area_ratio=SAM3_CANDIDATE_MAX_AREA_RATIO,
-                    dedup_iou=SAM3_CANDIDATE_DEDUP_IOU,
-                    max_objects=SAM3_CANDIDATE_MAX_OBJECTS,
-                    min_score=SAM3_MIN_SCORE,
-                ) or []
+                if SEGMENTATION_BACKEND == "fastsam":
+                    sam3_objects = sam_worker.fastsam_infer(
+                        image_path=anchor_rgb_path,
+                        text_prompt=sam3_text,
+                        output_dir=debug_dir,
+                        output_stem="static0",
+                        min_area_ratio=SAM3_CANDIDATE_MIN_AREA_RATIO,
+                        max_area_ratio=SAM3_CANDIDATE_MAX_AREA_RATIO,
+                        dedup_iou=SAM3_CANDIDATE_DEDUP_IOU,
+                        max_objects=SAM3_CANDIDATE_MAX_OBJECTS,
+                        min_score=SAM3_MIN_SCORE,
+                    ) or []
+                else:
+                    sam3_objects = sam_worker.sam3_infer(
+                        image_path=anchor_rgb_path,
+                        text_prompt=sam3_text,
+                        output_dir=debug_dir,
+                        output_stem="static0",
+                        min_area_ratio=SAM3_CANDIDATE_MIN_AREA_RATIO,
+                        max_area_ratio=SAM3_CANDIDATE_MAX_AREA_RATIO,
+                        dedup_iou=SAM3_CANDIDATE_DEDUP_IOU,
+                        max_objects=SAM3_CANDIDATE_MAX_OBJECTS,
+                        min_score=SAM3_MIN_SCORE,
+                    ) or []
             else:
-                sam3_objects = run_sam3_subprocess(
+                _seg_subprocess = (run_fastsam_subprocess if SEGMENTATION_BACKEND == "fastsam"
+                                   else run_sam3_subprocess)
+                _seg_kwargs = dict(
                     image_path=anchor_rgb_path,
                     text_prompt=sam3_text,
                     output_dir=debug_dir,
@@ -565,9 +588,11 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
                     max_area_ratio=SAM3_CANDIDATE_MAX_AREA_RATIO,
                     dedup_iou=SAM3_CANDIDATE_DEDUP_IOU,
                     max_objects=SAM3_CANDIDATE_MAX_OBJECTS,
-                    confidence_threshold=SAM3_CONFIDENCE_THRESHOLD,
                     min_score=SAM3_MIN_SCORE,
-                ) or []
+                )
+                if SEGMENTATION_BACKEND != "fastsam":
+                    _seg_kwargs["confidence_threshold"] = SAM3_CONFIDENCE_THRESHOLD
+                sam3_objects = _seg_subprocess(**_seg_kwargs) or []
         except Exception as exc:
             sam3_objects = []
             print(f"[live] SAM3 raised: {exc}", flush=True)
@@ -600,14 +625,19 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Swap SAM3 out and SAM3D in. SAM3 (4.5 GB) + SAM3D (13.2 GB) =
-        # 17.7 GB → exceeds 16 GB. So we unload SAM3 first.
+        # Swap the segmenter out and SAM3D in. Measured: SAM3 4.5 + SAM3D-trim
+        # 11.7 = 16.2 GB (over); FastSAM 1.9 + SAM3D-trim 11.7 = 13.6 GB (fits),
+        # but we still unload the segmenter first to keep headroom for Gazebo.
         if sam_worker is not None:
             try:
-                sam_worker.unload_sam3()
-                print("[live] SAM3 unloaded from worker", flush=True)
+                if SEGMENTATION_BACKEND == "fastsam":
+                    sam_worker.unload_fastsam()
+                    print("[live] FastSAM unloaded from worker", flush=True)
+                else:
+                    sam_worker.unload_sam3()
+                    print("[live] SAM3 unloaded from worker", flush=True)
             except Exception as exc:
-                print(f"[live] WARNING: SAM3 unload failed: {exc}", flush=True)
+                print(f"[live] WARNING: segmenter unload failed: {exc}", flush=True)
 
         print(f"[live] running SAM3D on {len(sam3_objects)} object(s)", flush=True)
         sam3d_results: list = [{} for _ in sam3_objects]
