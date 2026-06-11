@@ -1305,7 +1305,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
         gt_depth,
         gripper_mask,
         object_mask,
-        downsample_factor: int = 1,
+        downsample_factor: Optional[int] = None,
         keep_largest_only: bool = True,
         rendered_alpha=None,
     ):
@@ -1313,12 +1313,26 @@ class DynamicGSPipelineBase(VanillaPipeline):
         + object regions. Thin shim over ``change_detection.compute_change_mask``
         that pulls thresholds + cleanup knobs from ``self.model.config``.
 
+        ``downsample_factor=None`` (the default for every per-tick caller)
+        resolves the factor from ``change_mask_downsample_factor`` /
+        ``change_mask_downsample_target_side`` on the model config — so the RGB
+        MS-SSIM runs on a coarse grid (averaging away per-pixel noise) instead
+        of full native res, which otherwise flags the whole scene as changed
+        every tick. Pass an explicit int to override.
+
         ``rendered_alpha`` is the rasterizer's cumulative-alpha map from
         ``outputs['accumulation']``; below ``scene_coverage_threshold`` the
         rendered depth is the max-fallback at uncovered pixels and CDN must
         ignore those (otherwise the camera looking beyond the warm-cache
         scene generates huge spurious 'change' bands above the object)."""
         mc = self.model.config
+        if downsample_factor is None:
+            from .change_detection import resolve_downsample_factor
+            downsample_factor = resolve_downsample_factor(
+                rendered_rgb,
+                int(getattr(mc, "change_mask_downsample_factor", 0)),
+                int(getattr(mc, "change_mask_downsample_target_side", 100)),
+            )
         cfg = ChangeMaskConfig(
             depth_threshold=mc.change_mask_depth_threshold,
             rgb_threshold=mc.change_mask_rgb_threshold,
@@ -1332,6 +1346,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
             scene_coverage_threshold=float(getattr(mc, "change_mask_coverage_threshold", 0.5)),
             outlier_median_multiplier=float(getattr(mc, "change_mask_outlier_median_multiplier", 10.0)),
             outlier_min_threshold_m=float(getattr(mc, "change_mask_outlier_min_threshold_m", 0.01)),
+            gripper_erode_px=int(getattr(mc, "change_mask_gripper_erode_px", 0)),
         )
         return compute_change_mask(
             rendered_rgb=rendered_rgb,

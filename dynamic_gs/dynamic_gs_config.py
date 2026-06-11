@@ -28,7 +28,7 @@ from .static_gs_preseg_pipeline import StaticGSPresegPipelineConfig
 # Optimizer set + LRs intentionally identical to dynamic-gs so the loaded
 # snapshot is byte-compatible with the dynamic pipelines that consume it.
 
-STATIC_NUM_STEPS = 1000
+STATIC_NUM_STEPS = 500
 
 StaticGS = MethodSpecification(
     config=TrainerConfig(

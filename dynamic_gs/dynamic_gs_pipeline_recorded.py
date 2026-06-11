@@ -51,6 +51,16 @@ class RecordedDynamicGSPipelineConfig(DynamicGSPipelineBaseConfig):
     """Vertical anchor position. 0.75 = lower-third — matches the
     typical position of a gripper-held object in teleop datasets."""
 
+    keep_viser_alive_at_end: bool = True
+    """When True, after the recorded run replays its last frame the process
+    BLOCKS with viser-direct still serving, so the operator can inspect the
+    final reconstructed scene. A 'Shutdown viewer' button appears in the
+    viewer; clicking it (or the ``keep_viser_alive_timeout_s`` timeout) tears
+    down and exits. Set False to exit immediately when frames are exhausted."""
+    keep_viser_alive_timeout_s: float = 1800.0
+    """Max seconds to keep the viewer up at end-of-run before auto-shutdown
+    (so a headless / unattended run can't hang forever). 0 = wait forever."""
+
     # NOTE: ``d0_force_instance_id`` was promoted to the base config
     # (DynamicGSPipelineBaseConfig) so both recorded + live share it and the
     # interactive picker can use it as the headless/timeout fallback. The
@@ -111,6 +121,44 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
             f"[dynamic-gs-recorded] ready: {n_dyn} dynamic frames available "
             f"(D0 anchor at ({config.d0_anchor_x_ratio:.2f}*W, {config.d0_anchor_y_ratio:.2f}*H))"
         )
+
+        # Keep-viser-alive-at-end is driven by NoSaveTrainer._train_complete_viewer
+        # (which calls block_until_viser_shutdown below). That runs on the MAIN
+        # thread right after the training loop exits — BEFORE teardown/atexit —
+        # so the viser render daemon + websocket server are still alive and the
+        # scene stays interactive while blocked. (An earlier atexit-based
+        # version left the scene frozen: daemon threads stall during interpreter
+        # finalization.)
+        self._keep_alive_done = False
+
+    def block_until_viser_shutdown(self) -> None:
+        """Called by the trainer at end-of-run (main thread, pre-teardown):
+        keep viser-direct serving and block until the operator clicks the
+        in-viewer 'Shutdown viewer' button (or the configured timeout). No-op
+        if keep-alive is off, viser-direct is off, or already closing."""
+        if not getattr(self.config, "keep_viser_alive_at_end", False):
+            return
+        if getattr(self, "_keep_alive_done", False):
+            return
+        self._keep_alive_done = True
+        srv = getattr(self, "_viser_direct_server", None)
+        if srv is None or srv.is_closing:
+            return
+        try:
+            srv.keep_alive_until_shutdown(banner="Run finished")
+            timeout = float(self.config.keep_viser_alive_timeout_s)
+            CONSOLE.log(
+                "[dynamic-gs-recorded] run finished — viser still live at "
+                "http://localhost:8081 . Click 'Shutdown viewer' to exit"
+                + (f" (auto-exit in {timeout:.0f}s)." if timeout > 0 else " (no timeout).")
+            )
+            fired = srv.wait_for_shutdown(timeout_s=(timeout if timeout > 0 else None))
+            CONSOLE.log(
+                "[dynamic-gs-recorded] viewer shutdown "
+                + ("requested by operator" if fired else "timed out") + "; tearing down."
+            )
+        except Exception as exc:
+            CONSOLE.log(f"[dynamic-gs-recorded] keep-alive block failed: {exc}")
 
     # ====================================================================
     # Abstract hook implementations

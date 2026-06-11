@@ -36,6 +36,7 @@ dynamic trainer.
 
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -271,9 +272,28 @@ class StaticGSPipeline(VanillaPipeline):
 # ============================================================================
 
 
+# Early-stop knobs (env-overridable for tuning). The static phase optimizes
+# Splatfacto's photometric loss ``main_loss = (1-ssim_lambda)*L1 +
+# ssim_lambda*(1-SSIM)`` (see splatfacto.get_loss_dict). Means are frozen and
+# densification is off, so the loss is monotone-ish and plateaus quickly; once
+# it's below ``STATIC_EARLY_STOP_LOSS`` for ``STATIC_EARLY_STOP_PATIENCE``
+# consecutive steps (after a ``STATIC_EARLY_STOP_MIN_STEPS`` warmup so the
+# first noisy steps can't trip it), there's nothing left to gain — stop and go
+# straight to Phase 0b. Set the loss to 0 (or DGS_STATIC_EARLY_STOP=0) to
+# disable and always run the full max_num_iterations budget.
+STATIC_EARLY_STOP_ENABLED = os.environ.get("DGS_STATIC_EARLY_STOP", "1") != "0"
+STATIC_EARLY_STOP_LOSS = float(os.environ.get("DGS_STATIC_EARLY_STOP_LOSS", "0.02"))
+STATIC_EARLY_STOP_PATIENCE = int(os.environ.get("DGS_STATIC_EARLY_STOP_PATIENCE", "10"))
+STATIC_EARLY_STOP_MIN_STEPS = int(os.environ.get("DGS_STATIC_EARLY_STOP_MIN_STEPS", "100"))
+
+
 class StaticGSTrainer(NoSaveTrainer):
-    """Same as ``NoSaveTrainer`` today. Kept as a separate class so future
-    static-only trainer tweaks don't touch the dynamic trainer."""
+    """Same as ``NoSaveTrainer`` today, plus photometric-loss early-stop so the
+    static fit exits as soon as ``main_loss`` plateaus below threshold instead
+    of always burning the full step budget. Kept separate so static-only
+    trainer tweaks don't touch the dynamic trainer."""
+
+    _early_stop_hits: int = 0
 
     def train_iteration(self, step):  # type: ignore[override]
         # NoSaveTrainer's dynamic-phase fast path is irrelevant here
@@ -281,4 +301,26 @@ class StaticGSTrainer(NoSaveTrainer):
         # to the standard Trainer.train_iteration.
         from nerfstudio.engine.trainer import Trainer
 
-        return Trainer.train_iteration(self, step)
+        loss, loss_dict, metrics_dict = Trainer.train_iteration(self, step)
+
+        if STATIC_EARLY_STOP_ENABLED and STATIC_EARLY_STOP_LOSS > 0:
+            main = loss_dict.get("main_loss")
+            main_val = float(main.detach()) if main is not None else None
+            if main_val is not None and step >= STATIC_EARLY_STOP_MIN_STEPS:
+                if main_val < STATIC_EARLY_STOP_LOSS:
+                    self._early_stop_hits += 1
+                else:
+                    self._early_stop_hits = 0
+                if self._early_stop_hits >= STATIC_EARLY_STOP_PATIENCE:
+                    CONSOLE.log(
+                        f"[static-gs] early-stop: main_loss={main_val:.4f} < "
+                        f"{STATIC_EARLY_STOP_LOSS} for {STATIC_EARLY_STOP_PATIENCE} "
+                        f"consecutive steps at step {step}; ending static training. "
+                        f"(disable via DGS_STATIC_EARLY_STOP=0)"
+                    )
+                    # The Trainer.train() loop checks self.stop_training at the
+                    # top of each step and breaks; the AFTER_TRAIN callback
+                    # (_finalize_static_training → Phase 0b) still fires.
+                    self.stop_training = True
+
+        return loss, loss_dict, metrics_dict

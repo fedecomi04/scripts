@@ -31,6 +31,32 @@ class NoSaveTrainer(Trainer):
     def save_checkpoint(self, step: int) -> None:
         pass
 
+    def _train_complete_viewer(self) -> None:  # type: ignore[override]
+        """Called by ``Trainer.train()`` after the loop exits (when
+        ``viewer.quit_on_train_completion`` is False, our default). Runs on the
+        MAIN thread, BEFORE any teardown/atexit, with the viser-direct render
+        daemon thread + websocket server still fully alive — so the scene stays
+        interactive (mouse orbit re-renders via on_update→request_render).
+
+        If the pipeline opts into end-of-run keep-alive, block here until the
+        operator clicks the in-viewer 'Shutdown viewer' button (or the
+        timeout). This replaces the old atexit-based block, which ran during
+        interpreter shutdown and left the scene frozen (daemon threads stall
+        once finalization starts)."""
+        pipeline = self.pipeline
+        hook = getattr(pipeline, "block_until_viser_shutdown", None)
+        if callable(hook):
+            try:
+                hook()
+                return
+            except Exception:
+                pass
+        # Fall back to the stock NS-viewer keep-alive only if we didn't handle it.
+        try:
+            super()._train_complete_viewer()
+        except Exception:
+            pass
+
     def train_iteration(self, step):  # type: ignore[override]
         pipeline = self.pipeline
         live_tracking_only = (

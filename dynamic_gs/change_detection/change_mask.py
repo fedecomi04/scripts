@@ -55,6 +55,10 @@ class ChangeMaskConfig:
     filter_radius: int = 1
     min_component_size: int = 64
     dilate_radius: int = 0
+    gripper_erode_px: int = 0
+    """Erode the gripper KEEP mask by this many px (= grow the gripper
+    exclusion) so the leak ring of gripper-coloured pixels just outside the
+    silhouette is dropped from CDN. 0 = off."""
 
 
 def _resize_mask_to(mask: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
@@ -131,6 +135,17 @@ def compute_change_mask(
         if grip.ndim == 2:
             grip = grip[..., None]
         grip = _resize_mask_to(grip, target_h, target_w)
+        # Grow the gripper EXCLUSION by ``gripper_erode_px`` (= erode the KEEP
+        # mask): pixels just outside the gripper silhouette still carry gripper
+        # colour (anti-aliasing, an imperfect/under-tight mask, motion blur) and
+        # would otherwise read as 'change'. Eroding the keep-mask drops that
+        # leak ring so it can't fire. Works in BOTH the full-res and the
+        # downsampled paths (the latter then also drops any pooled block that
+        # touches the eroded gripper via strict block-validity below).
+        erode_px = int(getattr(config, "gripper_erode_px", 0))
+        if erode_px > 0:
+            from ..utils.active_mask import erode_binary_mask
+            grip = erode_binary_mask(grip, erode_px)
         valid_mask = grip * valid_mask if valid_mask is not None else grip
 
     # Scene-coverage gate: pixels with rendered alpha below threshold are

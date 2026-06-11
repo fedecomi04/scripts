@@ -252,6 +252,12 @@ class ViserDirectScene:
         self._follow_lock = threading.Lock()
         self._follow_toggle = None                         # server.gui checkbox handle
         self._feed_toggle = None                           # server.gui checkbox handle
+        # --- End-of-run "keep alive" shutdown control ---
+        # When a recorded run finishes, the pipeline can keep this server up so
+        # the operator inspects the final scene, then clicks the "Shutdown
+        # viewer" button (or the pipeline times out) to release the block.
+        self._shutdown_requested = threading.Event()
+        self._shutdown_button = None                       # server.gui button handle
         self._gui_built: bool = False
 
         # World axes are useful for orientation when the scene is empty
@@ -301,6 +307,37 @@ class ViserDirectScene:
             self._gui_built = True
         except Exception as exc:
             print(f"[viser-direct] GUI build failed: {exc}", flush=True)
+
+    def keep_alive_until_shutdown(self, banner: str = "Run finished") -> None:
+        """End-of-run hook: add a 'Shutdown viewer' button so the operator can
+        inspect the final scene, then click to release the block. Idempotent.
+
+        Pair with :meth:`wait_for_shutdown`. The render thread keeps running so
+        the browser stays interactive while blocked."""
+        if self._stop_event.is_set():
+            return
+        try:
+            if self._shutdown_button is None:
+                with self.server.gui.add_folder(banner):
+                    self._shutdown_button = self.server.gui.add_button(
+                        "Shutdown viewer", color="red",
+                    )
+
+                    @self._shutdown_button.on_click
+                    def _on_shutdown(_event) -> None:
+                        self._shutdown_requested.set()
+        except Exception as exc:
+            print(f"[viser-direct] shutdown-button add failed: {exc}", flush=True)
+            # If the button can't be added, don't trap the process forever.
+            self._shutdown_requested.set()
+
+    def wait_for_shutdown(self, timeout_s: Optional[float] = None) -> bool:
+        """Block until the 'Shutdown viewer' button is clicked (or timeout).
+        Returns True if the button fired, False on timeout. Returns immediately
+        if the server is already closing."""
+        if self._stop_event.is_set():
+            return True
+        return self._shutdown_requested.wait(timeout=timeout_s)
 
     def update_camera_feed(self, rgb: np.ndarray) -> None:
         """Pipeline hook: stash the current tracked frame's RGB (H,W,3 uint8)

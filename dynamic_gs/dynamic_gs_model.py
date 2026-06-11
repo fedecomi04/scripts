@@ -74,19 +74,27 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     change_mask_depth_threshold: float = 0.02
     change_mask_rgb_threshold: float = 0.07
     change_mask_use_rgb: bool = False
-    change_mask_mode: str = "depth_outlier"
+    change_mask_mode: str = "rgb"
     """CDN comparison mode:
-        'rgb'           — MS-SSIM on luminance
+        'rgb'           — MS-SSIM dissimilarity on luminance of the
+                          masked-avg-pool-downsampled RGB, thresholded at
+                          change_mask_rgb_threshold. Gripper/object pixels are
+                          excluded from the pooling (they contribute 0 to both
+                          numerator and denominator), so a darkened block near
+                          the gripper boundary can't false-fire — the
+                          gripper-proximity masking the simple downsampled-RGB
+                          path was designed for.
         'depth'         — per-pixel |pred_depth - gt_depth| in metres,
                           thresholded at change_mask_depth_threshold (fixed,
                           NOT robust to bulk pose drift)
         'depth_outlier' — robust per-frame: a pixel fires only if its abs
-                          depth error exceeds 40 × the frame's median error
+                          depth error exceeds N × the frame's median error
                           AND rendered > sensor (one-sided). Self-calibrates
                           against pose-drift + sensor-noise baseline; ported
                           from GaME (https://github.com/VladimirYugay/GaME).
-    Default 'depth_outlier' — fixes the global-pose-drift sensitivity of the
-    plain 'depth' mode while keeping the AnySplat-color-artifact immunity."""
+    Default 'rgb' — the simple downsampled-RGB change mask (MS-SSIM) with
+    gripper-proximity exclusion. (Was 'depth_outlier'; reverted by user
+    request — the RGB path's masked downsampling is the desired behaviour.)"""
     change_mask_blur_kernel_size: int = 5
     change_mask_blur_sigma: float = 1.0
     change_mask_outlier_median_multiplier: float = 15.0
@@ -102,6 +110,26 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     rasterization noise. Raise to suppress small false positives."""
     change_mask_filter_radius: int = 1
     change_mask_min_component_size: int = 64
+    change_mask_downsample_factor: int = 0
+    """CDN downsample factor for the RGB MS-SSIM path. The change mask is
+    computed on a masked-avg-pool-downsampled copy of the RGB (then
+    nearest-upsampled back), which averages away per-pixel noise (specular
+    shimmer, sub-pixel tracker jitter, AnySplat color artifacts) so MS-SSIM
+    doesn't flag the entire scene as 'changed' every tick. ``0`` = AUTO: scale
+    so MS-SSIM runs on ~``change_mask_downsample_target_side``² pixels
+    regardless of native resolution (recommended). ``1`` = no downsampling
+    (full native res — fires on the whole scene with mode='rgb'). A fixed
+    N>1 forces an NxN pool. Only affects mode='rgb' meaningfully; depth modes
+    pool too but are already robust."""
+    change_mask_downsample_target_side: int = 100
+    """For ``change_mask_downsample_factor=0`` (auto): MS-SSIM runs on roughly
+    this-many pixels per side (~target²  total). 100 → ~10k pixels, i.e. an
+    800x800 frame pools ~8x down. Lower = coarser/less sensitive."""
+    change_mask_gripper_erode_px: int = 3
+    """Erode the gripper KEEP mask by this many px before CDN, so the leak ring
+    of gripper-coloured pixels just outside the silhouette (anti-aliasing /
+    under-tight mask / motion blur) is excluded and can't read as change. 0 =
+    off. Threaded into ChangeMaskConfig.gripper_erode_px."""
     change_mask_coverage_threshold: float = 0.5
     """Minimum rendered-alpha at a pixel for the CDN to consider it 'real
     scene'. Below this, the rasterizer has no Gaussians and rendered_depth
