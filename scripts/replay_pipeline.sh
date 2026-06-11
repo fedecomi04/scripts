@@ -43,6 +43,7 @@ echo "==> [replay] cleanup + reset"
 pgrep -af "run_live_capture|sam_worker.py|live_ros_publisher|anysplat_worker|live_joint_replay|bootstrap_live|dgs_capture_stdin" \
   | grep -v grep | awk '{print $1}' | xargs -r kill -9 2>/dev/null || true
 sleep 2; rm -f /dev/shm/dgs* "$FIFO" "$LOG" 2>/dev/null || true
+timeout 6 rosservice call /gazebo/unpause_physics >/dev/null 2>&1 || true  # killed runs can leave physics paused (pose plugin goes silent)
 timeout 6 rosservice call /gazebo/reset_world >/dev/null 2>&1 || true
 sleep 2
 
@@ -50,7 +51,7 @@ echo "==> [replay] launch bootstrap (capture->static->teleop) data=$DATA"
 mkfifo "$FIFO"
 setsid bash -c "exec 9>'$FIFO'; sleep 7200" >/dev/null 2>&1 &
 nohup bash scripts/bootstrap_live.sh "$DATA" "$PROMPT" < "$FIFO" > "$LOG" 2>&1 &
-_wait_log "recording started" 90 || { echo "capture never started"; exit 1; }
+_wait_log "recording started" 240 || { echo "capture never started"; exit 1; }  # 1200p cold start can exceed 90s
 
 echo "==> [replay] drive static sweep [0->$((STATIC_SWEEP_S+4))s]"
 nohup "$SYS_PY" scripts/live_joint_replay.py --bag "$BAG" --start 0 \

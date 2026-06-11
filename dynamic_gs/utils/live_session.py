@@ -851,6 +851,18 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
             # and skips the (previously ~45s) redundant rebuild.
             try:
                 from .online_fusion import fuse_recorded_dataset
+                # GPU TSDF at high camera resolutions needs several GB free;
+                # attempting it under VRAM pressure OOMs AND poisons Open3D's
+                # CUDA memory cache (teardown abort observed at 1920x1200).
+                # Pre-check and go straight to the CPU path when tight.
+                try:
+                    import torch as _torch
+                    _free_gb = _torch.cuda.mem_get_info()[0] / 1e9
+                except Exception:
+                    _free_gb = 99.0
+                if _free_gb < 5.0:
+                    raise RuntimeError(
+                        f"only {_free_gb:.1f} GB VRAM free — skipping GPU TSDF")
                 t_fin = time.time()
                 seed_ply = fuse_recorded_dataset(static_dir)
                 seed_ply.touch()
