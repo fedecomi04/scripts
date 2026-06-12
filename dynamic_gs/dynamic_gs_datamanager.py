@@ -84,6 +84,12 @@ class DynamicGSDataManagerConfig(DataManagerConfig):
                 auto_scale_poses=False,
             ),
             cache_images_type="uint8",
+            # CPU cache: BOTH wrapped managers (static + dynamic) cache every
+            # frame; at 1920x1200 a ~300-frame dynamic episode is ~8-12 GB on
+            # GPU (rgb+depth+mask), which OOMed static-gs on the 16 GB card
+            # (PyTorch alone at 12.6 GB before the first refine). Per-step H2D
+            # of one frame is ~2-4 ms — negligible against the ~30 ms tick.
+            cache_images="cpu",
         )
     )
 

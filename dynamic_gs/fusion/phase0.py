@@ -617,6 +617,14 @@ def run_phase0a_sam3_and_sam3d(
         if not sam3_cached:
             model.to(run_device)
             for mgr in [datamanager.static_manager, datamanager.dynamic_manager]:
+                # Restore caches to GPU ONLY for managers that actually cache
+                # on GPU. With cache_images="cpu" (the default — a ~300-frame
+                # 1920x1200 episode is ~11 GB of rgb+depth+mask) batches live
+                # on CPU and move to GPU per-step; unconditionally restoring
+                # ALL of them to CUDA here was an 11.3 GB allocation that
+                # OOMed the first post-segmentation render on the 16 GB card.
+                if str(getattr(getattr(mgr, "config", None), "cache_images", "gpu")) != "gpu":
+                    continue
                 if hasattr(mgr, "cached_train"):
                     for batch_iter in mgr.cached_train:
                         for k in list(batch_iter.keys()):
