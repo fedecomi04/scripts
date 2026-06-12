@@ -326,13 +326,40 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     can't smooth away — that's an upstream matches/inliers problem
     (anchor policy), not a knob here; lowering alpha_sigma further or
     widening the snap-rot gate gave no improvement."""
-    xfeat_pose_filter_meas_trans_sigma_m: float = 0.003
+    xfeat_static_hold: bool = True
+    """Output-side static-hold: when the tracked pose shows no net trend
+    across ``xfeat_static_hold_window`` success ticks (object genuinely
+    stationary), output the window MEDIAN pose instead of the per-tick
+    estimate — the residual measurement wander (the KF plateau: every
+    output-filter knob measured saturated at ~2.4mm/2.5deg per tick on
+    the static tail) collapses to ~zero. Real motion accumulates in the
+    window and passes through once it exceeds the trend thresholds, so
+    the cost is a small onset deadband (~static_hold_trans_m / rot_deg
+    of net motion before a slow start registers)."""
+    xfeat_static_hold_window: int = 10
+    """Number of recent success-tick poses the static-hold trend check +
+    median run over. Larger = steadier hold + longer onset deadband."""
+    xfeat_static_hold_trans_m: float = 0.006
+    """Static-hold trend gate: net translation (m) across the window
+    below which the object is considered stationary."""
+    xfeat_static_hold_rot_deg: float = 2.0
+    """Static-hold trend gate: net rotation (deg) across the window
+    below which the object is considered stationary."""
+    xfeat_pose_filter_meas_trans_sigma_m: float = 0.020
     """Measurement noise: assumed 1-sigma of the RANSAC translation
     (metres). Raise if the stationary jiggle is still visible (trusts
-    each measurement less); lower if motion lags."""
-    xfeat_pose_filter_meas_rot_sigma_deg: float = 0.5
+    each measurement less); lower if motion lags. Tuned on the recorded
+    screwdriver static tail (with static-hold ON): measured U-curve
+    3mm->3.4mm jiggle, 10mm->1.1, 20mm->0.8 (best), 40mm->8.3 (WORSE —
+    gain so low the output drifts until the snap gate fires, a
+    drift/snap sawtooth). Do not raise past ~20mm."""
+    xfeat_pose_filter_meas_rot_sigma_deg: float = 10.0
     """Measurement noise: assumed 1-sigma of the RANSAC rotation
-    (degrees). Same trade-off as the translation sigma."""
+    (degrees). Same trade-off as the translation sigma. Tuned with the
+    translation sigma on the static tail (measured rotation wander is
+    ~3-4 deg/tick at low inliers, so the old 0.5 over-trusted 8x):
+    0.5->4.2deg jiggle, 5->1.6, 10->0.9 (best), 20->4.0 (worse — snap-
+    gate sawtooth). Do not raise past ~10."""
     xfeat_object_mask_cache_ticks: int = 3
     """Re-render the splat-rasterized object mask only every Nth tracker
     tick; reuse the cached mask otherwise. ``render_object_mask`` costs

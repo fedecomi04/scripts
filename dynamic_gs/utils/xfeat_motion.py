@@ -273,6 +273,10 @@ class XFeatMotionEstimator:
         pose_filter_alpha_sigma: float = 0.25,
         pose_filter_meas_trans_sigma_m: float = 0.003,
         pose_filter_meas_rot_sigma_deg: float = 0.5,
+        static_hold_enabled: bool = True,
+        static_hold_window: int = 10,
+        static_hold_trans_m: float = 0.006,
+        static_hold_rot_deg: float = 2.0,
     ) -> None:
         self.device = torch.device(device)
         self.top_k = max(int(top_k), 8)
@@ -375,6 +379,21 @@ class XFeatMotionEstimator:
                 meas_trans_sigma=float(pose_filter_meas_trans_sigma_m),
                 meas_rot_sigma=float(np.radians(pose_filter_meas_rot_sigma_deg)),
             )
+        # Static-hold: when the output pose shows NO net trend across the last
+        # ``window`` success ticks (object genuinely stationary), output the
+        # per-axis MEDIAN of that window instead of the per-tick pose. A filter
+        # that must stay responsive to motion cannot also erase the ~few-mm/deg
+        # measurement wander at low inlier counts; a trend-gated median can,
+        # at the cost of a small onset deadband (net motion must exceed the
+        # thresholds across the window before it passes through). Output-side
+        # ONLY — the raw ``_cumulative_*`` tracking state is never touched.
+        self._static_hold_enabled = bool(static_hold_enabled)
+        self._static_hold_window = max(int(static_hold_window), 3)
+        self._static_hold_trans_m = float(static_hold_trans_m)
+        self._static_hold_rot_rad = float(np.radians(static_hold_rot_deg))
+        from collections import deque
+        self._static_hold_hist: "deque[tuple[np.ndarray, np.ndarray]]" = deque(
+            maxlen=self._static_hold_window)
 
         # Last-tick diagnostics (cleared by each call to estimate_and_advance).
         self.last_anchor_idx_used: int = -1
@@ -433,6 +452,7 @@ class XFeatMotionEstimator:
         self._anchors = []
         if self._pose_filter is not None:
             self._pose_filter.reset()
+        self._static_hold_hist.clear()
 
         rgb_t = self._prepare_rgb_gpu(rgb)
         depth_np = _tc.prepare_depth_image(depth)
@@ -848,6 +868,29 @@ class XFeatMotionEstimator:
         else:
             rotation_out = self._cumulative_R.copy()
             translation_out = self._cumulative_t.copy()
+
+        # Static-hold (output-side, after the KF): if the output pose shows no
+        # net trend across the window, the object is stationary — emit the
+        # window MEDIAN so per-tick measurement wander collapses instead of
+        # shaking the splat. The window stores the PRE-hold (KF) outputs, so
+        # genuine motion accumulates in it and crosses the trend gate within
+        # ~the window length; failure ticks don't append (pose holds anyway).
+        if success and self._static_hold_enabled:
+            _hh = self._static_hold_hist
+            _hh.append((rotation_out.copy(), translation_out.copy()))
+            if len(_hh) == _hh.maxlen:
+                _R0, _t0 = _hh[0]
+                _net_t = float(np.linalg.norm(translation_out - _t0))
+                _cos = (float(np.trace(rotation_out @ _R0.T)) - 1.0) / 2.0
+                _net_r = float(np.arccos(np.clip(_cos, -1.0, 1.0)))
+                if _net_t < self._static_hold_trans_m and _net_r < self._static_hold_rot_rad:
+                    translation_out = np.median(
+                        np.stack([h[1] for h in _hh]), axis=0).astype(np.float32)
+                    _rvs = np.stack([
+                        cv2.Rodrigues(np.ascontiguousarray(h[0], dtype=np.float64))[0].ravel()
+                        for h in _hh])
+                    rotation_out = cv2.Rodrigues(
+                        np.median(_rvs, axis=0))[0].astype(np.float32)
 
         # Anchor-creation gate: if the current RELATIVE (object-in-camera)
         # orientation is further than the gate from every existing anchor's

@@ -1339,7 +1339,11 @@ class DynamicGSPipelineBase(VanillaPipeline):
         tracked instance's screen footprint, so the cache survives them — which
         is the whole point (one render reused across the cull→reclean)."""
         if self._obj_mask_cache is None:
-            self._obj_mask_cache = self.model.render_object_mask(camera)
+            # Under the model lock: a concurrent FF bg insert re-allocates
+            # gauss_params, so an unlocked read tears (instance_ids at the old
+            # N vs means at the new N -> IndexError mid-rasterize).
+            with self._viser_lock_ctx():
+                self._obj_mask_cache = self.model.render_object_mask(camera)
         return self._obj_mask_cache
 
     def _invalidate_object_mask_cache(self) -> None:
@@ -1572,6 +1576,10 @@ class DynamicGSPipelineBase(VanillaPipeline):
             pose_filter_enabled=self.model.config.xfeat_pose_filter_enabled,
             pose_filter_accel_sigma=self.model.config.xfeat_pose_filter_accel_sigma,
             pose_filter_alpha_sigma=self.model.config.xfeat_pose_filter_alpha_sigma,
+            static_hold_enabled=self.model.config.xfeat_static_hold,
+            static_hold_window=self.model.config.xfeat_static_hold_window,
+            static_hold_trans_m=self.model.config.xfeat_static_hold_trans_m,
+            static_hold_rot_deg=self.model.config.xfeat_static_hold_rot_deg,
             pose_filter_meas_trans_sigma_m=self.model.config.xfeat_pose_filter_meas_trans_sigma_m,
             pose_filter_meas_rot_sigma_deg=self.model.config.xfeat_pose_filter_meas_rot_sigma_deg,
         )
