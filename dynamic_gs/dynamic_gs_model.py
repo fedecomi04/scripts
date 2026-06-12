@@ -329,7 +329,8 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     xfeat_static_hold: bool = True
     """Output-side static-hold: when the tracked pose shows no net trend
     across ``xfeat_static_hold_window`` success ticks (object genuinely
-    stationary), output the window MEDIAN pose instead of the per-tick
+    stationary; gates xfeat_static_hold_trans_m / _rot_deg), output
+    the window MEDIAN pose instead of the per-tick
     estimate — the residual measurement wander (the KF plateau: every
     output-filter knob measured saturated at ~2.4mm/2.5deg per tick on
     the static tail) collapses to ~zero. Real motion accumulates in the
@@ -339,10 +340,10 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     xfeat_static_hold_window: int = 10
     """Number of recent success-tick poses the static-hold trend check +
     median run over. Larger = steadier hold + longer onset deadband."""
-    xfeat_static_hold_trans_m: float = 0.006
+    xfeat_static_hold_trans_m: float = 0.012
     """Static-hold trend gate: net translation (m) across the window
     below which the object is considered stationary."""
-    xfeat_static_hold_rot_deg: float = 2.0
+    xfeat_static_hold_rot_deg: float = 4.0
     """Static-hold trend gate: net rotation (deg) across the window
     below which the object is considered stationary."""
     xfeat_pose_filter_meas_trans_sigma_m: float = 0.020

@@ -7,7 +7,10 @@ from scipy.ndimage import label as _scipy_label
 
 # Fallback per-pixel MS-SSIM dissimilarity threshold for `build_change_mask`.
 # Used when the caller does not pass `rgb_threshold` explicitly.
-OFFICIAL_RGB_MSSSIM_THRESHOLD = 0.10
+# 0.07 matches the validated runtime config (DynamicGSModelConfig.
+# change_mask_rgb_threshold) used in the 2026-06-12 sharpness-mismatch A/B —
+# see `_rgb_msssim_score`'s docstring for the measured numbers.
+OFFICIAL_RGB_MSSSIM_THRESHOLD = 0.07
 OFFICIAL_FILTER_CLOSE_RADIUS = 10
 OFFICIAL_FILTER_OPEN_RADIUS = 3
 OFFICIAL_FILTER_MIN_AREA = 760
@@ -287,7 +290,36 @@ def _ssim_map(gray_pred, gray_gt, kernel_size=11, sigma=1.5):
     return (numerator / denominator.clamp_min(1e-6))[0, 0].clamp(0.0, 1.0)
 
 
-def _rgb_msssim_score(pred_rgb, gt_rgb, valid_mask=None, blur_kernel_size=5, blur_sigma=1.0):
+def _rgb_msssim_score(
+    pred_rgb,
+    gt_rgb,
+    valid_mask=None,
+    blur_kernel_size=5,
+    blur_sigma=1.0,
+    pyramid_weights=(0.15, 0.30, 0.55),
+):
+    """Per-pixel MS-SSIM dissimilarity (3-level pyramid on luminance).
+
+    ``pyramid_weights`` are (full-res, 1/2-res, 1/4-res). Default is
+    COARSE-weighted (0.15, 0.30, 0.55): the rendered scene is inherently
+    softer than the live camera image (static training early-stops, SH
+    degree 0, downsampled seed), so the full-res SSIM band reads the
+    texture-sharpness mismatch as "change" across the whole frame.
+    Down-weighting the full-res band suppresses that while real content
+    changes survive at the coarse scales.
+
+    Measured (2026-06-12 A/B, recording_15fps_2026-06-11_115107, 6 static +
+    6 motion 800x800 pairs through the runtime CDN path: gripper-erode 3 px,
+    object exclusion, masked avg-pool ds=8, blur k=5 sigma=1.0, thr=0.07):
+      - fine (0.55, 0.30, 0.15) [old default]: static-segment false positives
+        1408-1984 px on EVERY pair; motion pairs 576-44736 px.
+      - coarse (0.15, 0.30, 0.55) [new default]: static FPs 0-128 px
+        (mean 0.01 % of valid pixels, was 0.31 %); motion pairs retain
+        384-43328 px on 5/6 pairs (frame-155 pair: 576 px -> 0; its actual
+        runtime CDN was already near-empty at 64 px).
+      - Increasing the shared blur instead (sigma=2, coarse) made static FPs
+        WORSE (0-1600 px) — reweighting, not more blur, is the fix.
+    """
     region_mask = None
     if valid_mask is not None:
         region_mask = _to_hw1(valid_mask)[..., 0] > 0.5
@@ -310,7 +342,7 @@ def _rgb_msssim_score(pred_rgb, gt_rgb, valid_mask=None, blur_kernel_size=5, blu
 
     original_height, original_width = pred_gray.shape
     total = torch.zeros_like(pred_gray)
-    weights = (0.55, 0.30, 0.15)
+    weights = tuple(pyramid_weights)
     current_mask = None if region_mask is None else region_mask.float()
 
     for level, weight in enumerate(weights):
@@ -471,9 +503,15 @@ def _apply_cleanup_recipe(mask, valid_mask=None, close_radius=0, open_radius=0, 
         cleaned = keep_all_components_above_min_area(cleaned, min_area)
     if valid_mask is not None:
         cleaned = cleaned * _to_hw1(valid_mask)
-    if torch.any(cleaned):
-        return cleaned
-    return (mask > 0.5).float()
+    # Cleanup-empty means NO real change — return empty. The old fallback
+    # returned the RAW thresholded mask here (the very noise specks the
+    # cleanup just rejected), so every "nothing changed" tick fed specks to
+    # the feedforward, which inserted garbage there, which rendered worse
+    # than the scene it replaced, which the next tick re-flagged BIGGER — a
+    # compounding insert loop (measured: static-frame inserts ramping
+    # 47 -> 849/call at 1920x1200; bounded but wasteful 18-83/call at
+    # 800x800). Downstream handles an empty mask fine ("decode skipped").
+    return cleaned
 
 
 def build_change_mask(

@@ -275,8 +275,8 @@ class XFeatMotionEstimator:
         pose_filter_meas_rot_sigma_deg: float = 0.5,
         static_hold_enabled: bool = True,
         static_hold_window: int = 10,
-        static_hold_trans_m: float = 0.006,
-        static_hold_rot_deg: float = 2.0,
+        static_hold_trans_m: float = 0.012,
+        static_hold_rot_deg: float = 4.0,
     ) -> None:
         self.device = torch.device(device)
         self.top_k = max(int(top_k), 8)

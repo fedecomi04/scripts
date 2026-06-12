@@ -248,9 +248,13 @@ class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
     feedforward_anysplat_min_opacity: float = 0.05
     feedforward_anysplat_scale_multiplier: float = 2.0
     """Multiplicative enlargement applied to the three per-axis scales of each
-    AnySplat gaussian after world-frame reprojection. The reproject step already
-    preserves image-space footprint; this is an additional bias toward bigger
-    splats. Default 2.0 (= splats twice as wide along each axis vs raw AnySplat)."""
+    AnySplat gaussian after world-frame reprojection (the reproject step already
+    preserves image-space footprint). Tuned by eye on the recorded screwdriver
+    scene: RAW (1.0) scales at full density render gritty / not smooth; 2.0
+    closes the gaps. Density is the other half of the trade — the old
+    thinned-then-2x combination (voxel dedup on) looked blurry and made
+    change-detection re-flag the inserted regions; full density + 2.0 is the
+    current setting."""
 
     feedforward_anysplat_min_visible_scene_points: int = 1000
     """If the per-call frustum cull keeps fewer than this many scene Gaussians,
@@ -259,15 +263,21 @@ class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
     would back-project whatever random surface the camera is now pointed at
     into a region with no scene context, polluting the model with floaters that
     have no spatial relation to the existing reconstruction. Set to 0 to disable."""
-    feedforward_anysplat_voxel_dedup_m: float = 0.002
+    feedforward_anysplat_voxel_dedup_m: float = 0.0
     """Voxel size (metres) for the NEAR dedup pass (points within
     ``feedforward_anysplat_dedup_near_radius_m`` of the current camera position).
-    ``0.0`` disables BOTH near and far dedup. Defaults to 2 mm to match the
-    static-phase TSDF voxel."""
-    feedforward_anysplat_voxel_dedup_far_m: float = 0.010
+    ``0.0`` (default) disables the near pass; the far pass has its own knob and
+    BOTH must be 0 for truly RAW insertion. With both 0, AnySplat gaussians are
+    inserted at full density. The old 2 mm default thinned the insert, which
+    (with the 2x scale enlargement) degraded the rendered region enough that
+    change-detection re-flagged it every call -> cull/reinsert churn. Set to
+    0.002 to restore the TSDF-matched dedup if insert counts become a problem."""
+    feedforward_anysplat_voxel_dedup_far_m: float = 0.0
     """Voxel size (metres) for the FAR dedup pass (points beyond
-    ``feedforward_anysplat_dedup_near_radius_m``). Coarser than the near voxel
-    so distant background gets aggressively compressed. Default 1 cm."""
+    ``feedforward_anysplat_dedup_near_radius_m``). ``0.0`` (default) disables
+    the far pass — see ``feedforward_anysplat_voxel_dedup_m``; both must be 0
+    for truly RAW insertion (the dedup block runs if EITHER is > 0). Set to
+    0.010 to restore the coarse background compression."""
     feedforward_anysplat_dedup_near_radius_m: float = 0.5
     """Splits AnySplat output into NEAR (||xyz - cam|| <= radius) and FAR
     (> radius). NEAR uses the fine voxel, FAR uses the coarse voxel."""
