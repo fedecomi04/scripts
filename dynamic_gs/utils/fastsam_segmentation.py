@@ -82,7 +82,7 @@ def select_kept_indices(
     *,
     min_ratio: float = 2.5,
     mad_k: float = 3.0,
-    margin_min: float = 0.05,
+    margin_min: float = 0.04,
     eps: float = 1e-12,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """Automatic replacement for the hardcoded ``score < min_score`` cut.
@@ -283,7 +283,7 @@ class FastSamTextSegmenter:
               auto_threshold: bool = True,
               auto_min_ratio: float = 2.5,
               auto_mad_k: float = 3.0,
-              auto_margin_min: float = 0.05) -> List[Dict[str, Any]]:
+              auto_margin_min: float = 0.04) -> List[Dict[str, Any]]:
         image = Image.open(image_path).convert("RGB")
         image_rgb = np.array(image)
         image_area = image.width * image.height
@@ -525,7 +525,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--auto-threshold", type=_b, default=True)
     p.add_argument("--auto-min-ratio", type=float, default=2.5)
     p.add_argument("--auto-mad-k", type=float, default=3.0)
-    p.add_argument("--auto-margin-min", type=float, default=0.05)
+    p.add_argument("--auto-margin-min", type=float, default=0.04)
     return p.parse_args()
 
 
