@@ -266,6 +266,9 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         device = torch.device(self.device) if isinstance(self.device, str) else self.device
         camera = cameras_from_live_frame(latest, self._shm_sub.intrinsics, device=device)
         batch = self._batch_from_live_frame(latest, device=device)
+        # New frame/camera → invalidate the per-tick object-mask cache so this
+        # tick's first consumer renders it once and the rest reuse it.
+        self._invalidate_object_mask_cache()
 
         frame_idx = self._next_live_frame_counter
         self._next_live_frame_counter += 1
@@ -530,7 +533,7 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         gripper_mask = self.model._get_batch_mask(batch)
 
         try:
-            obj_mask = self.model.render_object_mask(camera)
+            obj_mask = self._render_object_mask_cached(camera)
         except Exception:
             obj_mask = None
 

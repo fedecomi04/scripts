@@ -182,6 +182,9 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         # Pin datamanager to this frame and pull the batch.
         self.datamanager.set_dynamic_frame_idx(frame_idx)
         camera, batch = self.datamanager.get_current_dynamic_train_batch()
+        # New frame/camera → invalidate the per-tick object-mask cache so this
+        # tick's first consumer renders it once and the rest reuse it.
+        self._invalidate_object_mask_cache()
 
         # Interactive object picker: when active, this BLOCKS the tick until the
         # operator selects in viser (or the timeout fires), then reseeds. The
@@ -389,7 +392,7 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         gripper_mask = self.model._get_batch_mask(batch)
 
         try:
-            obj_mask = self.model.render_object_mask(camera)
+            obj_mask = self._render_object_mask_cached(camera)
         except Exception:
             obj_mask = None
 

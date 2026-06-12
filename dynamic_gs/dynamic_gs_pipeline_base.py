@@ -366,6 +366,9 @@ class DynamicGSPipelineBase(VanillaPipeline):
         self._initial_selection_done: bool = False  # first pick happened?
         self._sam3_objects = None               # cached (overlay_rgb, [ObjEntry])
         self._anysplat_persistent_worker = None
+        # Per-tick cached tracked-object mask (see _render_object_mask_cached):
+        # rendered once per tick, reused by CDN/FF/debug. None = needs render.
+        self._obj_mask_cache = None
         self._feedforward_video_writer = None
         self._viser_direct_server = None
         self._viser_direct_handles_built: bool = False
@@ -838,10 +841,13 @@ class DynamicGSPipelineBase(VanillaPipeline):
             if hasattr(self.model, "capture_reference_object_pose"):
                 self.model.capture_reference_object_pose(instance_id=new_id)
         n_flagged = int((self.model.object_flags.squeeze(-1) > 0.5).sum().item())
+        # Tracked instance changed → drop the cached mask so step 3 (and the
+        # rest of this tick) re-renders for the new object.
+        self._invalidate_object_mask_cache()
 
         # --- step 3 (object mask) ---
         try:
-            obj_mask = self.model.render_object_mask(camera)
+            obj_mask = self._render_object_mask_cached(camera)
         except Exception as exc:
             CONSOLE.log(f"[dynamic-gs] reseed render_object_mask failed: {exc}")
             obj_mask = None
@@ -1322,6 +1328,23 @@ class DynamicGSPipelineBase(VanillaPipeline):
     # ====================================================================
 
     @torch.no_grad()
+    def _render_object_mask_cached(self, camera):
+        """Tracked-object mask, rendered AT MOST ONCE per tracker tick and
+        shared by every consumer (CDN object-exclusion, FF clean, post-cull
+        re-clean, _ff_debug dump). Enforces 'render once, use everywhere' so
+        the mask is always self-consistent and the saved debug mask is exactly
+        the one used. The cache is invalidated whenever the object mask can
+        change: tick start (new camera), rigid transform (object moved), and
+        reseed/D0 (instance set changed). Culls/FF-inserts don't touch the
+        tracked instance's screen footprint, so the cache survives them — which
+        is the whole point (one render reused across the cull→reclean)."""
+        if self._obj_mask_cache is None:
+            self._obj_mask_cache = self.model.render_object_mask(camera)
+        return self._obj_mask_cache
+
+    def _invalidate_object_mask_cache(self) -> None:
+        self._obj_mask_cache = None
+
     def _render_from_camera(self, camera):
         """Render from ``camera`` in training mode so we get the
         training-resolution output.
@@ -1675,6 +1698,8 @@ class DynamicGSPipelineBase(VanillaPipeline):
             moved_count = self.model.apply_rigid_object_transform_from_reference(
                 motion_estimate.rotation, motion_estimate.translation,
             )
+        # Object moved → its rendered mask is stale; next request re-renders.
+        self._invalidate_object_mask_cache()
         self._last_motion_estimate = motion_estimate
         # Trajectory log for smoothness analysis (DGS_TRACK_TRAJ_LOG=<csv>).
         # Object centroid c(t)=R·c0+T from the FIXED D0 reference means, so it's
@@ -1930,7 +1955,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
                 if prerendered_obj_mask is not None:
                     om = prerendered_obj_mask
                 else:
-                    om = self.model.render_object_mask(camera)
+                    om = self._render_object_mask_cached(camera)
                 if om is not None:
                     _cv2.imwrite(str(out_dir / f"{stem}_objmask.png"), _to_u8(om))
             except Exception:
@@ -1969,7 +1994,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
             obj_mask_now = prerendered_obj_mask
         else:
             try:
-                obj_mask_now = self.model.render_object_mask(camera)
+                obj_mask_now = self._render_object_mask_cached(camera)
             except Exception as exc:
                 CONSOLE.log(f"[feedforward] render_object_mask failed: {exc}; using raw CDN")
                 return cdn
@@ -2448,7 +2473,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
         # saved one), so the saved objmask could disagree with what was used.
         if prerendered_obj_mask is None:
             try:
-                prerendered_obj_mask = self.model.render_object_mask(camera)
+                prerendered_obj_mask = self._render_object_mask_cached(camera)
             except Exception:
                 prerendered_obj_mask = None
 
