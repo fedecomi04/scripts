@@ -357,13 +357,16 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     edge). Camera intrinsics (cx, cy, width, height) are adjusted so
     depth backprojection stays metric. Set False to revert to full-image
     extract + post-match gripper-keep filter."""
-    xfeat_crop_padding_px: int = 60
+    xfeat_crop_padding_px: int = 300
     """Padding (pixels) around the projected-bbox crop used by
     ``xfeat_crop_to_object_bbox``. Wide enough that fast tick-to-tick
     motion still keeps the actual object inside the crop (the bbox lags
-    the true object by one tick of motion). 60 px tolerates ~60 px of
-    per-tick displacement at 800x800. Raise for faster motion, lower for
-    tighter focus."""
+    the true object by one tick of motion). 300 px keeps a generous
+    background margin around the object so XFeat keypoints near the
+    object boundary see the same natural surroundings the anchor saw
+    (their CNN-descriptor receptive field isn't clipped by the crop
+    edge) -> stable descriptors across ticks -> more LighterGlue matches.
+    Raise for faster motion / more context, lower for tighter focus."""
     xfeat_object_search_radius_px: int = 80
     """Dilation radius (pixels) applied to the rendered object mask before
     using it as the per-frame post-match filter on the current frame. The

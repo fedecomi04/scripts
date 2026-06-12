@@ -1,6 +1,65 @@
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+## 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" â "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" â "Write a test that reproduces it, then make it pass"
+- "Refactor X" â "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+```
+1. [Step] â verify: [check]
+2. [Step] â verify: [check]
+3. [Step] â verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+---
+
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
 
 <!-- ============================================================ -->
 <!-- BEGIN: CLEANUP NOTES (working section, prepend new items here) -->
@@ -10,6 +69,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Working section for the in-progress cleanup of the dynamic-gs pipeline. All new cleanup-related notes go here, above the separator below. Older project documentation stays untouched after the separator.
 
+## Keeping this file accurate (MANDATORY)
+
+This file is loaded as authoritative instructions every session — a stale claim actively misleads. Two rules:
+
+1. **If you change code that this file references, update this file in the SAME change.** That includes: config defaults / field values (`xfeat_top_k`, `STATIC_NUM_STEPS`, `segmentation_backend`, …), the lines that enforce a Design Invariant, default-flag states, and any symbol/file/module name mentioned here. The diff is not done until the doc matches the code.
+2. **Reference code by symbol name, NOT line number.** Write `` [`dynamic_gs_config.py`](dynamic_gs/dynamic_gs_config.py) (`_ZERO_LR_OPTIMIZERS`) `` — never `:138` / `#L138`. Line numbers drift on any unrelated edit above them; symbol names only break when the symbol is actually renamed (and then rule 1 applies). The exception is the vendored-nerfstudio reference trace far below, which points into a pinned dependency.
+
+Dated session notes (`### … (YYYY-MM-DD)`) are historical records of *measurements taken at that date* — do NOT rewrite their numbers (that fabricates). If a dated note's conclusion was later reverted, prepend a `> **SUPERSEDED (date):**` banner stating current reality instead of editing the body.
+
 ## Goal
 
 Do a whole cleanup of the dynamic-gs pipeline (model, pipeline, datamanager, config, utils). Open scope — entries below will refine what "cleanup" covers.
@@ -18,13 +86,13 @@ Do a whole cleanup of the dynamic-gs pipeline (model, pipeline, datamanager, con
 
 These are hard rules the pipeline depends on. If a change appears to require breaking one of them, **stop and flag it explicitly** — do not silently violate. Each rule has a stated reason so you can judge edge cases.
 
-1. **Static phase: `means` LR = 0.** Gaussian positions stay locked on the TSDF-fused seed (`depth_camera_init_points.ply`). Only `features_dc`, `features_rest`, `opacities`, `scales`, `quats` train. **Why:** the TSDF seed is geometrically correct (ICP-fused depth); allowing means to drift under photometric loss in 1000 steps produces visibly blurry / smeared output. Verified by: [`dynamic_gs_config.py:53`](dynamic_gs/dynamic_gs_config.py#L53) `lr=0.0`. *History: was `1.6e-4` until 2026-06-02; the docstring claimed "effectively 0 because densification is off" but Adam moves means via `.grad` regardless of densification — that claim was wrong. Resolved by setting LR to 0.0 explicitly.*
+1. **Static phase: `means` LR = 0.** Gaussian positions stay locked on the TSDF-fused seed (`depth_camera_init_points.ply`). Only `features_dc`, `features_rest`, `opacities`, `scales`, `quats` train. **Why:** the TSDF seed is geometrically correct (ICP-fused depth); allowing means to drift under photometric loss in 500 steps (`STATIC_NUM_STEPS=500`) produces visibly blurry / smeared output. Verified by: the `means` optimizer in [`dynamic_gs_config.py`](dynamic_gs/dynamic_gs_config.py) (`lr=0.0`). *History: was `1.6e-4` until 2026-06-02; the docstring claimed "effectively 0 because densification is off" but Adam moves means via `.grad` regardless of densification — that claim was wrong. Resolved by setting LR to 0.0 explicitly.*
 
-2. **Static phase: `camera_optimizer.mode = "off"`.** Camera poses are NOT optimized during static training. **Why:** `transforms.json` contains ICP-refined poses (see invariant #3), so the residual error is sub-mm — there is nothing for camera-opt to fix. Leaving it on at LR=1e-3 over 1000 steps drifts cameras by visible amounts (degrees / cm), smearing the scene. Verified by: [`dynamic_gs_config.py:46`](dynamic_gs/dynamic_gs_config.py#L46) `mode="off"`. *History: was `"SO3xR3"` until 2026-06-02; user explicitly observed cameras moving "by a LOT" in the viewer during run #2 and reported the prior fixed-means + fixed-poses runs converged "insanely good" in 500 epochs.*
+2. **Static phase: `camera_optimizer.mode = "off"`.** Camera poses are NOT optimized during static training. **Why:** `transforms.json` contains ICP-refined poses (see invariant #3), so the residual error is sub-mm — there is nothing for camera-opt to fix. Leaving it on at LR=1e-3 over 500 steps drifts cameras by visible amounts (degrees / cm), smearing the scene. Verified by: the static-gs `camera_optimizer` in [`dynamic_gs_config.py`](dynamic_gs/dynamic_gs_config.py) (`mode="off"`). *History: was `"SO3xR3"` until 2026-06-02; user explicitly observed cameras moving "by a LOT" in the viewer during run #2 and reported the prior fixed-means + fixed-poses runs converged "insanely good" in 500 epochs.*
 
 3. **`<data>/static_scene/transforms.json` contains ICP-refined poses, not raw URDF FK.** The raw URDF capture is preserved at `<data>/static_scene/transforms_urdf_backup.json`. **Why:** the TSDF seed PLY lives in the ICP-refined frame; if training cameras stay in the raw FK frame, there's a systematic 1–4 mm misalignment across the trajectory that camera-opt would have to undo (but per invariant #2, camera-opt is off). Tool: [`scripts/rewrite_transforms_with_icp.py`](rewrite_transforms_with_icp.py) (back up + ICP rewrite + new top-level `pose_source: "icp_refined_from_urdf_v1"` flag in transforms.json). Idempotent — re-runs detect the existing backup and refuse to overwrite it. **Drift on new_env (measured):** median 0.96 mm / 0.053°, max 3.94 mm / 0.41° over 68 frames. *Future: integrate this write-back directly into `ConcurrentFusionRunner.stop_and_finalize` so capture itself produces ICP-refined transforms.json (no post-pass needed).*
 
-4. **Dynamic phase: ALL gauss-param LRs = 0.** Only the XFeat tracker's rigid transform + feedforward decode insertions mutate the scene during dynamic phase. **Why:** the dynamic phase is a runtime, not a training loop. Per-step gradient descent on Gaussian params would fight against the tracker. Enforced by [`_ZERO_LR_OPTIMIZERS`](dynamic_gs/dynamic_gs_config.py#L76) used by both `dynamic-gs` and `dynamic-gs-live`.
+4. **Dynamic phase: ALL gauss-param LRs = 0.** Only the XFeat tracker's rigid transform + feedforward decode insertions mutate the scene during dynamic phase. **Why:** the dynamic phase is a runtime, not a training loop. Per-step gradient descent on Gaussian params would fight against the tracker. Enforced by [`_ZERO_LR_OPTIMIZERS`](dynamic_gs/dynamic_gs_config.py) used by both `dynamic-gs` and `dynamic-gs-live`.
 
 5. **`outputs/` is suppressed across all runs.** Nerfstudio's default `outputs/<exp>/<method>/<timestamp>/` directory tree is not used. All artifacts live under `<data_dir>/`. **Why:** dataset dir is self-contained, portable, and survives output-tree cleanups. Enforced by three monkeypatches in [`dynamic_gs/__init__.py`](dynamic_gs/__init__.py) targeting `ExperimentConfig.save_config`, `Trainer.train`'s `dataparser_transforms.json` write, and `writer.setup_event_writer`'s tensorboard branch. Note: when `--vis viewer` is enabled, Nerfstudio's `ViewerState.__init__` still calls `mkdir(exist_ok=True)` on `outputs/<run>` — pre-create the parent before launching.
 
@@ -168,6 +236,11 @@ To revive a purged tracker: port its `CoTrackerMotionEstimator._foo` static-meth
 
 ### Per-tick object mask removal — XFeat (2026-05-26)
 
+> **SUPERSEDED (2026-06-12):** the per-tick object mask was later RE-ADDED, and full-frame extraction was dropped. Current code:
+> - `xfeat_object_mask_filter: bool = True` (in [`dynamic_gs_model.py`](dynamic_gs/dynamic_gs_model.py), default ON) renders the tracked instance's mask each tick and uses it as a **post-match** filter — matches landing outside the object's predicted footprint are dropped before RANSAC. Without it the pose pins to static background once the object is grasped + lifted ("stops moving"). Set to `False` to restore the gripper-keep-only behavior described below.
+> - Extraction no longer runs on the full natural frame: `xfeat_crop_to_object_bbox=True` (in [`dynamic_gs_model.py`](dynamic_gs/dynamic_gs_model.py)) crops rgb+depth+camera to the object's projected bbox padded by `xfeat_crop_padding_px=300` (raised from 60 on 2026-06-12 — the 60 px box clipped the CNN receptive field of boundary keypoints, destabilizing descriptors).
+> The 2026-05-26 measurements below are historical (top_k was 300 then; now 3000).
+
 `render_object_mask + erode + dilate + pre-mask` was firing every tick for XFeat (~4 ms/tick) and produced **zero measurable quality benefit**. Removed entirely; XFeat now extracts on the full natural frame and uses **only `gripper_keep`** for post-match filtering.
 
 Net effect at 800×800, `xfeat_top_k=300`:
@@ -179,6 +252,8 @@ Net effect at 800×800, `xfeat_top_k=300`:
 Anchor pool quality holds — new anchors filter on `gripper_keep` only (instead of `gripper_keep ∩ object_mask`), but LighterGlue's attention rejects background pairs and RANSAC catches anything that slips through. KLT path (still in `_purged/`) **does** need the mask structurally because it samples FAST keypoints from inside it.
 
 ### XFeat config sweet spots — known shake / RANSAC failure modes (2026-05-26)
+
+> **UPDATE (2026-06-12):** `xfeat_top_k` default is now **3000** (in [`dynamic_gs_model.py`](dynamic_gs/dynamic_gs_model.py)), raised from 300 in `06d2c47` (2026-06-03). The 300-era reasoning below still holds as an argument against going *too low* (match-set variance → shake) — it does not endorse 300 specifically. `xfeat_lighterglue_depth_confidence=-1.0` and `xfeat_ransac_iterations=32` are unchanged and current.
 
 These three settings together produced a stable tracker (17-30 Hz, inliers/correspondences ≈ 1.0). Deviations caused regressions that took hours to diagnose:
 
@@ -340,6 +415,8 @@ In dynamic-gs, `camera_optimizer.mode="SO3xR3"` is overridden on in `DynamicGSMo
 
 ### Live-mode viewer refresh fix (2026-05-25)
 
+> **PRE-REWRITE (2026-06-12 note):** this describes code in the since-deleted monolith `dynamic_gs_pipeline.py` (5329 LOC, removed in the 2026-05-30→06-01 rewrite). `_tracker_tick_live` and `_apply_cotracker_motion` no longer exist; the logic moved into the split `dynamic_gs_pipeline_{base,live,recorded}.py`. Kept for the design reasoning, not as a current code map.
+
 **Problem.** In live tracking-only mode the tracker mutated object Gaussian means at ~8 Hz, but the viser viewer only repainted them at ~0.5–2 Hz (camera-move was smooth, object motion was not). Two throttles on the render path were the cause:
 
 1. **`viewer.update_scene(step)`'s step-count gate** at [viewer.py:520](../nerfstudio/nerfstudio/viewer/viewer.py#L520) — fires a `"step"` render action only every `render_freq = train_util * vis_time / (train_time - train_util * train_time)` train iterations. With `train_time` very small (tracker-tick-only step), `render_freq` blows up to ~70+ iters/render → ~3–4 actions/sec.
@@ -358,7 +435,7 @@ sm.next_action = RenderAction("step", camera_state)   # queue high-res step
 sm.render_trigger.set()                               # wake render thread
 ```
 
-Called from [`_tracker_tick_live`](dynamic_gs/dynamic_gs_pipeline.py#L1893) immediately after `_apply_cotracker_motion` returns. Zero modifications to nerfstudio core code — the back-reference to the trainer (and thus `trainer.viewer_state.render_statemachines`) is acquired via `training_callback_attributes.trainer` in [`get_training_callbacks`](dynamic_gs/dynamic_gs_pipeline.py#L2962).
+Called from `_tracker_tick_live` immediately after `_apply_cotracker_motion` returns. Zero modifications to nerfstudio core code — the back-reference to the trainer (and thus `trainer.viewer_state.render_statemachines`) is acquired via `training_callback_attributes.trainer` in `get_training_callbacks`. *(All three symbols were in the deleted monolith — see the banner above.)*
 
 **Net effect.** Visual rate becomes whatever `_render_img` itself can do (limited by render cost + `train_lock` contention), instead of being throttled to 0.5–2 Hz. `outside-tick` in the `[tracker-rate]` line grows correspondingly — that's real render work now, not dedup-spinning.
 
@@ -443,7 +520,7 @@ StaticGSPipeline                 (static_gs_pipeline.py)
 ### Models (2 modules)
 
 * **`StaticGSModel`** (`static_gs_model.py`) — straight subclass of `SplatfactoModel` + the four persistent buffers (`object_flags`, `object_instance_ids`, `sam3d_init_target_flags`, `inserted_flags`). Uses `NoRefineStrategy` so densification is OFF during static training. Means LR is zeroed so seed positions stay fixed.
-* **`DynamicGSModel`** (`dynamic_gs_model.py`) — superset used by recorded + live dynamic pipelines. Adds `render_object_mask`, the rigid-transform helpers, ESAM lazy load, scene-opt gradient hooks, and the dynamic-phase config knobs.
+* **`DynamicGSModel`** (`dynamic_gs_model.py`) — superset used by recorded + live dynamic pipelines. Adds `render_object_mask`, the rigid-transform helpers, ESAM lazy load, a `means`-gradient zeroing hook (enforces invariant #4), and the dynamic-phase config knobs. *(The scene-optimization machinery — `enable_scene_optimization`, `scene_opt_*`, `scene_opt_active_mask` — was purged in `06d2c47`; the dynamic phase does no per-step gradient descent.)*
 
 ### Data + persistence
 
@@ -475,7 +552,7 @@ The PLY at `<data>/static_scene/depth_camera_init_points.ply` is what Splatfacto
 | `sam3_segmentation.py`, `sam3d.py`, `sam3d_fusion.py` | SAM3 + Fast-SAM3D subprocess wrappers + Phase-0b registration & fusion (NDP default; CPD/TEASER++ fallbacks). |
 | `ndp_register.py`, `ndp/` | Vendored NDP non-rigid deformation (`deform_source_to_target`) — the default Phase-0b backend. Pure-torch, no pytorch3d, in-process GPU. |
 | `esam.py` | ESAM interactive object-mask query (D0 bootstrap). |
-| `optim_pool.py` | Dynamic-phase optimization pool (capacity 15, FIFO). |
+| ~~`optim_pool.py`~~ | **REMOVED** — dynamic-phase per-step optimization was dropped (the dynamic phase is a pure tracker+FF runtime; see invariant #4). File no longer exists; `OptimPool`/`optim_pool_*` are dead references. |
 | `active_mask.py` | `build_change_mask`, `select_top_n_components_filtered`, projection helpers. |
 | `viser_direct.py` | Standalone viser server pushed by the tracker; bypasses ns-viewer state machine. |
 | `rgbd_decode.py` | Feedforward Mode A/B: direct RGB-D back-projection into frozen Gaussians. |
@@ -486,7 +563,7 @@ The PLY at `<data>/static_scene/depth_camera_init_points.ply` is what Splatfacto
 
 ### Three-phase training (overview)
 
-**Phase 0 (Static)** — `static-gs`. Splatfacto fit on the SfM/TSDF seed for `static_num_steps` (default 1000). Densification OFF, means LR = 0, camera-pose optimizer = `SO3xR3`. At end: Phase 0a SAM3 + Fast-SAM3D, then Phase 0b NDP non-rigid registration (default; CPD/TEASER++ selectable) + insertion + post-fusion cull (proximity de-dup + in-front occlusion). Writes `post_fusion_state.pt`.
+**Phase 0 (Static)** — `static-gs`. Splatfacto fit on the SfM/TSDF seed for `static_num_steps` (default 500, `STATIC_NUM_STEPS` in `dynamic_gs_config.py`). Densification OFF, means LR = 0, camera-pose optimizer = `off` (NOT `SO3xR3` — see invariant #2). At end: Phase 0a SAM3 + Fast-SAM3D, then Phase 0b NDP non-rigid registration (default; CPD/TEASER++ selectable) + insertion + post-fusion cull (proximity de-dup + in-front occlusion). Writes `post_fusion_state.pt`.
 
 **Phase 1 (Dynamic)** — `dynamic-gs` / `dynamic-gs-live`. Warm-load from `.pt`. Per tracker tick: XFeat motion estimation → `apply_rigid_object_transform_from_reference` → viser-direct push. Optionally feedforward-decode CDN regions (rgbd or anysplat) into the scene.
 
