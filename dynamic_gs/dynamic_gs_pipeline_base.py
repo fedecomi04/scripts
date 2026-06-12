@@ -1799,6 +1799,15 @@ class DynamicGSPipelineBase(VanillaPipeline):
             curr_img = curr_img / 255.0
         prev_img = prev_img.clip(0, 1)
         curr_img = curr_img.clip(0, 1)
+        # The XFeat crop bbox varies per tick, so prev/curr crops can differ in
+        # height by a pixel — pad both to the taller one (bottom) so the
+        # side-by-side concat (axis=1) doesn't raise. Point coords are unaffected
+        # (they live within the original crop bounds).
+        Hc = max(prev_img.shape[0], curr_img.shape[0])
+        if prev_img.shape[0] != Hc:
+            prev_img = np.pad(prev_img, ((0, Hc - prev_img.shape[0]), (0, 0), (0, 0)))
+        if curr_img.shape[0] != Hc:
+            curr_img = np.pad(curr_img, ((0, Hc - curr_img.shape[0]), (0, 0), (0, 0)))
         h, w = prev_img.shape[:2]
         canvas = np.concatenate([prev_img, curr_img], axis=1)
         canvas = (canvas * 255).astype(np.uint8).copy()
