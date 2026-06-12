@@ -378,6 +378,19 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     Lower to ~40 if matches get noisy; raise toward 150 for very fast
     motion. Set to 0 to skip the object filter entirely (matches are then
     only gripper-keep filtered)."""
+    xfeat_object_mask_filter: bool = True
+    """When True (default), per-tick XFeat matches are restricted to
+    ``gripper_keep ∩ dilate(rendered_object_mask, xfeat_object_search_radius_px)``
+    before Kabsch/RANSAC, so STATIC background/scene features (which survive
+    gripper-keep + depth) cannot outvote the object's real motion in the
+    pose solve. Without it, a grasped+lifted object's pose pins to the
+    background and the object "stops moving" mid-trajectory (the screwdriver
+    pickup failure: tracked the lift to ~40 deg, then snapped back to ~22 deg
+    and froze for the rest of the run — the lifted object's few visible
+    features were outvoted by the table/plate behind it). Falls back to
+    gripper-keep-only on any tick where the object-masked match set drops
+    below ``min_track_points``, so an occluded/tiny mask can't kill tracking.
+    Set False to revert to the gripper-keep-only behavior."""
 
     esam_prompt_keep_ratio: float = ESAM_PROMPT_KEEP_RATIO
     object_mask_dilate_px: int = 0

@@ -534,13 +534,34 @@ class XFeatMotionEstimator:
             if current_object_mask is not None else None
         )
 
-        # Per-frame post-match filter region. With the per-tick object
-        # mask removed, this is just ``gripper_keep`` — matches that
-        # land on the gripper get dropped, everything else is kept.
-        # XFeat extracts globally on the full frame; LighterGlue relies
-        # on its transformer attention to reject ambiguous background
-        # pairs. RANSAC handles whatever outliers slip through.
+        # Per-frame post-match filter region:
+        #   gripper_keep ∩ dilate(rendered_object_mask, search_radius).
+        # Restricting current-frame matches to a halo around the object's
+        # PREDICTED footprint stops STATIC background/scene features (which
+        # survive gripper-keep + depth) from outvoting the object's real
+        # motion in RANSAC. This is the grasped+lifted-object failure mode:
+        # once the object leaves the table the crop fills with static
+        # background, those features match consistently (high inlier count),
+        # and the Kabsch majority becomes the background's zero motion — the
+        # pose pins to the nearest anchor and the object "stops moving".
+        # The mask lags the true object by one tick, hence the dilation halo.
+        # We do NOT mask the anchor side (its mask was "where the object WAS"
+        # at anchor time). When the object-masked set drops below
+        # ``min_track_points`` the keep_region fallback below reverts to
+        # gripper-keep-only, so an occluded/tiny mask can't kill tracking.
         keep_region = gripper_keep_np
+        if obj_mask_for_debug is not None:
+            obj_halo = obj_mask_for_debug
+            if obj_halo.ndim == 3:
+                obj_halo = obj_halo[..., 0]
+            r = self._object_search_radius_px
+            if r > 0:
+                k = 2 * int(r) + 1
+                obj_halo = cv2.dilate(
+                    obj_halo.astype(np.uint8),
+                    np.ones((k, k), np.uint8), iterations=1,
+                ).astype(bool)
+            keep_region = obj_halo if keep_region is None else (keep_region & obj_halo)
         current_rgb_for_extract = current_rgb_prepared
 
         # --- Sub-timing: GPU queue drain (diagnostic) ---

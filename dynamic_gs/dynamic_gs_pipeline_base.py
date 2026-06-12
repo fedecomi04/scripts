@@ -1621,7 +1621,16 @@ class DynamicGSPipelineBase(VanillaPipeline):
         current_live_rgb = self._build_tracking_rgb(batch)
         self._timing["DN.3a_get_live_rgb"].append(time.time() - t)
         t_mask = time.time()
-        current_object_mask = None
+        # Per-tick object mask (cached render of the tracked instance only) —
+        # passed to the tracker so matches landing OUTSIDE the object's
+        # predicted footprint (static background that survives gripper-keep)
+        # are dropped before RANSAC. Without it the pose pins to the
+        # background once the object is grasped+lifted ("stops moving").
+        current_object_mask = (
+            self._render_object_mask_cached(camera)
+            if getattr(self.model.config, "xfeat_object_mask_filter", True)
+            else None
+        )
         if current_mask is None:
             current_mask = self.model._get_batch_mask(batch)
         self._timing["DN.3j_object_mask_render"].append(time.time() - t_mask)
@@ -1640,6 +1649,15 @@ class DynamicGSPipelineBase(VanillaPipeline):
                         current_live_rgb, current_depth, camera, current_mask, bbox,
                     )
                 )
+                # Crop the object mask to the SAME bbox so it stays aligned
+                # with the cropped frame the tracker extracts/matches on.
+                if current_object_mask is not None:
+                    x0, y0, x1, y1 = bbox
+                    current_object_mask = (
+                        current_object_mask[y0:y1, x0:x1, ...].contiguous()
+                        if current_object_mask.ndim == 3
+                        else current_object_mask[y0:y1, x0:x1].contiguous()
+                    )
         t = time.time()
         motion_estimate = self._motion_estimator.estimate_and_advance(
             current_rgb=current_live_rgb,
