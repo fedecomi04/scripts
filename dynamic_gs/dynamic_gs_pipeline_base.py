@@ -1827,6 +1827,8 @@ class DynamicGSPipelineBase(VanillaPipeline):
             call_NNNN_frame_NNNNNN_objmask.png    render_object_mask (instance_id==d0 only)
             call_NNNN_frame_NNNNNN_cdn_raw.png    CDN before object subtract
             call_NNNN_frame_NNNNNN_cdn_clean.png  CDN after object subtract (== what FF sees)
+            call_NNNN_frame_NNNNNN_rendered.png   scene render (what CDN compares live RGB to);
+                                                  save_debug_images only (full GPU render)
 
         Use these to verify:
             * Is the object mask covering ONLY the tracked instance (no FF inserts)?
@@ -1940,6 +1942,20 @@ class DynamicGSPipelineBase(VanillaPipeline):
                     _cv2.imwrite(str(out_dir / f"{stem}_cdn_raw.png"), _to_u8(cdn_raw))
                 if cdn_clean is not None:
                     _cv2.imwrite(str(out_dir / f"{stem}_cdn_clean.png"), _to_u8(cdn_clean))
+            except Exception:
+                pass
+
+            # --- Rendered scene (Gaussian splat from this camera) ---
+            # The render the CDN compares the live RGB against — i.e. what the
+            # scene currently looks like (static + tracked object + prior FF
+            # inserts), BEFORE this call's insert. Gated by save_debug_images:
+            # it's a full GPU render (~tens of ms), unlike the cheap saves above.
+            try:
+                if self.config.save_debug_images:
+                    rend = self._render_from_camera(camera).get("rgb")
+                    if rend is not None:
+                        _cv2.imwrite(str(out_dir / f"{stem}_rendered.png"),
+                                     _cv2.cvtColor(_to_u8(rend), _cv2.COLOR_RGB2BGR))
             except Exception:
                 pass
         except Exception:
