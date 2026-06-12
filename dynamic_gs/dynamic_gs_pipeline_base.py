@@ -2048,6 +2048,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
         t0 = time.time()
         cdn_clean, n_pre_culled = self._feedforward_cull_then_reclean_cdn(
             camera, batch, cdn_clean, gt_depth, frame_name=frame_name_for_cdn,
+            prerendered_obj_mask=prerendered_obj_mask,
         )
         self._timing["FF.1b_cull_before_decode"].append(time.time() - t0)
         if n_pre_culled > 0:
@@ -2293,7 +2294,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
 
     @torch.no_grad()
     def _feedforward_cull_then_reclean_cdn(
-        self, camera, batch, cdn_clean, gt_depth, *, frame_name=None,
+        self, camera, batch, cdn_clean, gt_depth, *, frame_name=None, prerendered_obj_mask=None,
     ):
         """Cull-before-decode: delete every eligible Gaussian sitting in front
         of the true sensor surface within the changed (CDN) region, then
@@ -2325,8 +2326,12 @@ class DynamicGSPipelineBase(VanillaPipeline):
         cdn_new = self._compute_tick_cdn(camera, batch)
         if cdn_new is None:
             return cdn_clean, n_culled
+        # Reuse the same object mask as the initial clean + the debug save (the
+        # cull never deletes tracked-object Gaussians, so it's still valid) —
+        # don't re-render a fresh, unsaved one here.
         cdn_clean_new = self._feedforward_clean_cdn(
             camera, cdn_new, frame_name=frame_name,
+            prerendered_obj_mask=prerendered_obj_mask,
         )
         return cdn_clean_new, n_culled
 
@@ -2435,6 +2440,18 @@ class DynamicGSPipelineBase(VanillaPipeline):
         frame_idx = int(target_frame["frame_idx"])
         cdn = target_frame["cdn"]
 
+        # Render the tracked-object mask ONCE and reuse it for every cleaning
+        # step (initial clean, post-cull re-clean) AND the _ff_debug dump — so
+        # the objmask saved to disk is EXACTLY the mask that cleaned the CDN.
+        # Previously each step re-rendered render_object_mask independently at a
+        # different model state (the post-cull re-clean's render was never the
+        # saved one), so the saved objmask could disagree with what was used.
+        if prerendered_obj_mask is None:
+            try:
+                prerendered_obj_mask = self.model.render_object_mask(camera)
+            except Exception:
+                prerendered_obj_mask = None
+
         t0 = time.time()
         try:
             frame_name_for_cdn = self.datamanager.get_dynamic_frame_name(frame_idx)
@@ -2464,6 +2481,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
         t0 = time.time()
         cdn_clean, n_pre_culled = self._feedforward_cull_then_reclean_cdn(
             camera, batch, cdn_clean, gt_depth, frame_name=frame_name_for_cdn,
+            prerendered_obj_mask=prerendered_obj_mask,
         )
         self._timing["FF.1b_cull_before_decode"].append(time.time() - t0)
         if n_pre_culled > 0:
