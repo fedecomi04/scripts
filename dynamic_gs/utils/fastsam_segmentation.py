@@ -76,6 +76,65 @@ def _default_weights_path(weights: str) -> str:
     return str(cache / p.name)
 
 
+def select_kept_indices(
+    probs: np.ndarray,
+    cosines: np.ndarray,
+    *,
+    min_ratio: float = 2.5,
+    mad_k: float = 3.0,
+    margin_min: float = 0.05,
+    eps: float = 1e-12,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """Automatic replacement for the hardcoded ``score < min_score`` cut.
+
+    Two decisions in two score spaces (a single threshold cannot do both):
+      (A) HOW MANY objects -> largest consecutive log-prob (== ratio) gap in the
+          softmax ``probs``. A real winner->tail jump is a >=``min_ratio`` ratio
+          (measured 13-40x across scenes) vs <2.5x tail-internal steps; the ratio
+          (log) space is N-invariant where the raw-prob gap is not (a raw-prob
+          gap mis-cuts uneven multi-object sets).
+      (B) WHETHER ANY object exists -> a raw-COSINE presence gate. Softmax discards
+          absolute scale (a flat zero-object field can softmax to a HIGHER max than
+          a weak true match), so "is anything here at all" can only be judged on raw
+          cosine: keep cos >= median + mad_k*1.4826*MAD AND cos - median >= margin_min.
+          The second (MAD-invariant) clause kills homogeneous-background phantoms
+          where MAD->0 explodes a chance specular patch.
+
+    Operates on the survivors of the area/border filter, with ``probs`` re-softmaxed
+    over just those survivors. Returns (kept_indices_sorted, diagnostics).
+    """
+    n = int(probs.shape[0])
+    diag = {"n": float(n), "cliff_ratio": 0.0, "cos_floor": 0.0, "top_margin": 0.0}
+    if n == 0:
+        return np.empty(0, dtype=np.intp), diag
+    order = np.argsort(-probs, kind="stable")  # descending
+    s = probs[order]
+
+    # --- (A) "how many": largest consecutive log-prob (== ratio) gap ---
+    if n >= 2:
+        log_s = np.log(s + eps)
+        gaps = log_s[:-1] - log_s[1:]            # >= 0 (descending)
+        k = int(np.argmax(gaps))
+        diag["cliff_ratio"] = float(np.exp(gaps[k]))
+        cliff_keep = order[: k + 1] if gaps[k] >= np.log(min_ratio) else order[:0]
+    else:
+        cliff_keep = order[:1]
+
+    # --- (B) "whether any": raw-cosine presence gate (per-scene, N-invariant) ---
+    med = float(np.median(cosines))
+    mad = float(np.median(np.abs(cosines - med)))
+    cos_floor = med + mad_k * (1.4826 * mad)
+    diag["cos_floor"] = float(cos_floor)
+    diag["top_margin"] = float(np.max(cosines) - med)
+
+    # If the cliff produced nothing (n==1 or no real cliff) fall back to gating the
+    # single top candidate, so a lone clean object with a weak softmax (large N) can
+    # still survive on its absolute cosine.
+    cand = cliff_keep if cliff_keep.size else order[:1]
+    passes = (cosines[cand] >= cos_floor) & ((cosines[cand] - med) >= margin_min)
+    return np.sort(cand[passes]), diag
+
+
 class FastSamTextSegmenter:
     """Persistent FastSAM + CLIP segmenter. Construct once, call ``infer`` /
     ``infer_raw`` many times (warm)."""
@@ -132,16 +191,18 @@ class FastSamTextSegmenter:
     def _clip_scores(self,
                      image_rgb: np.ndarray,
                      masks: np.ndarray,
-                     text_prompt: str) -> np.ndarray:
-        """Per-mask CLIP match score in [0,1] (softmax over crops, FastSAM-style).
+                     text_prompt: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Per-mask (softmax_prob, raw_cosine) vs the text prompt.
 
         Each mask's bbox is cropped, background within the bbox is whited-out so
         CLIP sees the object, then crops are encoded and matched to the text.
-        Softmax over crops makes the best-matching object dominant."""
+        Softmax over crops makes the best-matching object dominant; the RAW cosine
+        is returned alongside because the automatic threshold needs the absolute,
+        N-invariant cosine for its presence gate (softmax discards that scale)."""
         torch = self.torch
         N = masks.shape[0]
         if N == 0:
-            return np.zeros((0,), dtype=np.float32)
+            return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32)
         crops = []
         valid_idx = []
         for i in range(N):
@@ -156,8 +217,9 @@ class FastSamTextSegmenter:
             crops.append(self.clip_preprocess(Image.fromarray(sub)))
             valid_idx.append(i)
         scores = np.zeros((N,), dtype=np.float32)
+        cosines = np.zeros((N,), dtype=np.float32)
         if not crops:
-            return scores
+            return scores, cosines
         batch = torch.stack(crops).to(self.device)
         with torch.no_grad():
             img_f = self.clip.encode_image(batch)
@@ -167,9 +229,40 @@ class FastSamTextSegmenter:
             txt_f = txt_f / txt_f.norm(dim=-1, keepdim=True)
             sims = (img_f @ txt_f.T).squeeze(-1)  # cosine, (Nvalid,)
             probs = (self.clip_logit_scale * sims).softmax(dim=0).float().cpu().numpy()
+            sims_np = sims.float().cpu().numpy()
         for j, i in enumerate(valid_idx):
             scores[i] = float(probs[j])
-        return scores
+            cosines[i] = float(sims_np[j])
+        return scores, cosines
+
+    def _split_into_components(self, masks: np.ndarray, min_area_px: float
+                              ) -> Tuple[np.ndarray, np.ndarray]:
+        """Split each FastSAM instance mask into its connected components (each
+        >= ``min_area_px``) so CLIP scores every object independently.
+
+        A single FastSAM mask can span two DISJOINT objects (measured: a
+        'screwdriver' mask carrying a 2716px blob on a neighbouring object, 19%
+        of the mask). Bundled into one crop, the dominant object's appearance
+        carries the contaminant past CLIP. Split, the contaminant becomes its own
+        candidate that scores low on its own and the threshold drops it.
+        Single-component masks pass through unchanged (one component == itself)."""
+        import cv2
+        H, W = masks.shape[1], masks.shape[2]
+        comp_masks: List[np.ndarray] = []
+        comp_boxes: List[List[int]] = []
+        for i in range(masks.shape[0]):
+            m = masks[i].astype(np.uint8)
+            ncomp, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+            for c in range(1, ncomp):  # 0 is background
+                if stats[c, cv2.CC_STAT_AREA] < min_area_px:
+                    continue
+                cm = lab == c
+                ys, xs = np.nonzero(cm)
+                comp_masks.append(cm)
+                comp_boxes.append([int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())])
+        if not comp_masks:
+            return np.zeros((0, H, W), dtype=bool), np.zeros((0, 4), dtype=np.float32)
+        return np.array(comp_masks, dtype=bool), np.array(comp_boxes, dtype=np.float32)
 
     # -- public API (mirrors sam_worker.sam3_infer / sam3_infer_raw) --------
 
@@ -185,29 +278,68 @@ class FastSamTextSegmenter:
               min_score: float = 0.2,
               fastsam_conf: float = 0.4,
               fastsam_iou: float = 0.9,
-              imgsz: int = 1024) -> List[Dict[str, Any]]:
+              imgsz: int = 1024,
+              split_components: bool = True,
+              auto_threshold: bool = True,
+              auto_min_ratio: float = 2.5,
+              auto_mad_k: float = 3.0,
+              auto_margin_min: float = 0.05) -> List[Dict[str, Any]]:
         image = Image.open(image_path).convert("RGB")
         image_rgb = np.array(image)
         image_area = image.width * image.height
 
         masks, boxes = self._run_fastsam(image_path, fastsam_conf, fastsam_iou, imgsz)
-        scores = self._clip_scores(image_rgb, masks, text_prompt)
+        n_raw = int(masks.shape[0])
+        # Split disjoint components so CLIP scores each object on its own (a single
+        # FastSAM mask can merge two objects; see _split_into_components).
+        if split_components and masks.shape[0]:
+            masks, boxes = self._split_into_components(masks, min_area_ratio * image_area)
 
-        candidates = []
+        scores, cosines = self._clip_scores(image_rgb, masks, text_prompt)
+
+        # Survivors of the area/border filter — the set the threshold judges.
+        surv = []
         for i in range(masks.shape[0]):
-            m = masks[i].astype(np.uint8)
-            area = int(m.sum())
+            area = int(masks[i].sum())
             if area == 0:
                 continue
             if area < min_area_ratio * image_area or area > max_area_ratio * image_area:
                 continue
-            if _touches_n_borders(m, n=2):
+            if _touches_n_borders(masks[i].astype(np.uint8), n=2):
                 continue
-            score = float(scores[i]) if i < len(scores) else 0.0
-            if score < min_score:
-                continue
-            bbox = boxes[i].tolist() if i < len(boxes) else [0, 0, 0, 0]
-            candidates.append({"mask": m, "score": score, "bbox": bbox, "mask_area": area})
+            surv.append(i)
+
+        diag: Dict[str, float] = {}
+        surv_score: Dict[int, float] = {}
+        if not surv:
+            keep: List[int] = []
+        elif auto_threshold:
+            cos_s = np.asarray([cosines[i] for i in surv], dtype=np.float64)
+            # Re-softmax over survivors only: _clip_scores softmaxes over the RAW
+            # FastSAM set (often 100-300 masks), so its probs do NOT sum to 1 over
+            # the survivors. Re-normalise so the cliff is measured on what's judged.
+            p = np.exp(self.clip_logit_scale * cos_s)
+            p = p / (p.sum() + 1e-12)
+            surv_score = {surv[j]: float(p[j]) for j in range(len(surv))}
+            keep_local, diag = select_kept_indices(
+                p, cos_s, min_ratio=auto_min_ratio, mad_k=auto_mad_k, margin_min=auto_margin_min)
+            keep = [surv[j] for j in keep_local.tolist()]
+            # Optional hard floor (default 0.2): an AND-guard on the survivor-softmax
+            # prob, kept for backward-compat. The auto gate already owns the decision.
+            if min_score > 0.0:
+                keep = [i for i in keep if surv_score[i] >= min_score]
+        else:  # legacy fixed-threshold path (auto_threshold=False)
+            surv_score = {i: float(scores[i]) for i in surv}
+            keep = [i for i in surv if surv_score[i] >= min_score]
+
+        candidates = []
+        for i in keep:
+            candidates.append({
+                "mask": masks[i].astype(np.uint8),
+                "score": surv_score.get(i, float(scores[i])),
+                "bbox": boxes[i].tolist() if i < len(boxes) else [0, 0, 0, 0],
+                "mask_area": int(masks[i].sum()),
+            })
 
         candidates.sort(key=lambda c: c["score"], reverse=True)
         deduped: List[Dict[str, Any]] = []
@@ -216,6 +348,11 @@ class FastSamTextSegmenter:
                 continue
             deduped.append(c)
         deduped = deduped[:max_objects]
+
+        if auto_threshold and diag:
+            print(f"[fastsam-thr] raw={n_raw} cand={masks.shape[0]} surv={len(surv)} "
+                  f"cliff_ratio={diag.get('cliff_ratio', 0):.1f} cos_floor={diag.get('cos_floor', 0):.3f} "
+                  f"top_margin={diag.get('top_margin', 0):.3f} kept={len(deduped)}", flush=True)
 
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -239,12 +376,17 @@ class FastSamTextSegmenter:
             "image_path": str(image_path),
             "text_prompt": text_prompt,
             "segmentation_backend": "fastsam",
-            "total_raw_masks": int(masks.shape[0]),
+            "total_raw_masks": n_raw,
+            "total_candidates_after_split": int(masks.shape[0]),
             "total_after_filtering": len(results),
             "filter_params": {
                 "min_area_ratio": min_area_ratio, "max_area_ratio": max_area_ratio,
                 "dedup_iou": dedup_iou, "max_objects": max_objects, "min_score": min_score,
                 "fastsam_conf": fastsam_conf, "fastsam_iou": fastsam_iou, "imgsz": imgsz,
+                "split_components": split_components, "auto_threshold": auto_threshold,
+                "auto_min_ratio": auto_min_ratio, "auto_mad_k": auto_mad_k,
+                "auto_margin_min": auto_margin_min,
+                "auto_cos_floor": diag.get("cos_floor"), "auto_cliff_ratio": diag.get("cliff_ratio"),
             },
             "objects": results,
         }, indent=2) + "\n")
@@ -268,7 +410,7 @@ class FastSamTextSegmenter:
         image = Image.open(image_path).convert("RGB")
         image_rgb = np.array(image)
         masks, boxes = self._run_fastsam(image_path, fastsam_conf, fastsam_iou, imgsz)
-        scores = self._clip_scores(image_rgb, masks, text_prompt)
+        scores, _ = self._clip_scores(image_rgb, masks, text_prompt)
 
         keep = [i for i in range(masks.shape[0])
                 if (float(scores[i]) if i < len(scores) else 0.0) >= min_score]
@@ -329,7 +471,9 @@ def run_fastsam_subprocess(
     # confidence_threshold so the same phase0a call site works for both).
     _cli_keys = {"min_area_ratio", "max_area_ratio", "dedup_iou", "max_objects",
                  "min_score", "fastsam_conf", "fastsam_iou", "imgsz",
-                 "fastsam_weights", "clip_model", "clip_pretrained"}
+                 "fastsam_weights", "clip_model", "clip_pretrained",
+                 "split_components", "auto_threshold", "auto_min_ratio",
+                 "auto_mad_k", "auto_margin_min"}
     for key, value in filter_kwargs.items():
         if key not in _cli_keys:
             continue
@@ -376,6 +520,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--fastsam-weights", type=str, default="FastSAM-x.pt")
     p.add_argument("--clip-model", type=str, default="ViT-B-32-quickgelu")
     p.add_argument("--clip-pretrained", type=str, default="openai")
+    _b = lambda v: str(v).lower() in ("1", "true", "yes", "on")
+    p.add_argument("--split-components", type=_b, default=True)
+    p.add_argument("--auto-threshold", type=_b, default=True)
+    p.add_argument("--auto-min-ratio", type=float, default=2.5)
+    p.add_argument("--auto-mad-k", type=float, default=3.0)
+    p.add_argument("--auto-margin-min", type=float, default=0.05)
     return p.parse_args()
 
 
@@ -394,6 +544,9 @@ def _main() -> int:
             min_area_ratio=a.min_area_ratio, max_area_ratio=a.max_area_ratio,
             dedup_iou=a.dedup_iou, max_objects=a.max_objects, min_score=a.min_score,
             fastsam_conf=a.fastsam_conf, fastsam_iou=a.fastsam_iou, imgsz=a.imgsz,
+            split_components=a.split_components, auto_threshold=a.auto_threshold,
+            auto_min_ratio=a.auto_min_ratio, auto_mad_k=a.auto_mad_k,
+            auto_margin_min=a.auto_margin_min,
         )
         # Timing sidecar (load vs infer split) for the unified ledger.
         try:
