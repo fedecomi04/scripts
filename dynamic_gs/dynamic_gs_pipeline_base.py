@@ -1829,6 +1829,10 @@ class DynamicGSPipelineBase(VanillaPipeline):
         h, w = prev_img.shape[:2]
         canvas = np.concatenate([prev_img, curr_img], axis=1)
         canvas = (canvas * 255).astype(np.uint8).copy()
+        # prev/curr crop widths differ per tick, so the canvas is
+        # (prev_w + curr_w) wide, NOT 2*w — use the true canvas dims for all
+        # draw-bounds checks below (a stale 2*w let edge markers overflow).
+        cw = canvas.shape[1]
         prev_pts = est.previous_points_xy
         curr_pts = est.current_points_xy
         inlier_mask = est.tracked_inlier_mask
@@ -1843,13 +1847,13 @@ class DynamicGSPipelineBase(VanillaPipeline):
             for t in range(steps + 1):
                 lx = int(px + (cx - px) * t / steps)
                 ly = int(py + (cy - py) * t / steps)
-                if 0 <= ly < h and 0 <= lx < 2 * w:
+                if 0 <= ly < h and 0 <= lx < cw:
                     canvas[ly, lx] = line_color
             for dy in range(-2, 3):
                 for dx in range(-2, 3):
                     if 0 <= py + dy < h and 0 <= px + dx < w:
                         canvas[py + dy, px + dx] = point_color
-                    if 0 <= cy + dy < h and 0 <= cx + dx < 2 * w:
+                    if 0 <= cy + dy < h and 0 <= cx + dx < cw:
                         canvas[cy + dy, cx + dx] = point_color
         dbg = self._get_motion_debug_dir()
         dbg.mkdir(parents=True, exist_ok=True)

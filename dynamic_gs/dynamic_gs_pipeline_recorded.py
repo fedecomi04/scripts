@@ -316,6 +316,9 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         """
         if is_first:
             return  # no FF on D0
+        if str(self.config.enable_feedforward_inpaint) == "off":
+            return  # FF disabled entirely — no recurring inserts (was leaking
+                    # ~5k gaussians/6 ticks even with FF off, bloating to OOM)
         N = int(self.config.feedforward_recurring_every_n_ticks)
         if N <= 0:
             return
