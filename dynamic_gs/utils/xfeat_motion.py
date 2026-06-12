@@ -83,6 +83,14 @@ _XFEAT_REPO = os.path.abspath(
 # new anchor. 22.5° → expect ~16 anchors across a full 360° sweep.
 ROTATION_GATE_DEG: float = 22.5
 
+# Apparent-scale gate for anchor keyframing: capture a fresh anchor when the
+# camera<->object distance ratio to every existing anchor exceeds this (object
+# appears 1/distance in pixels, so 1.3 == the object's on-screen size changed
+# ~1.3x, beyond which XFeat/LighterGlue start shedding matches). Distance-
+# invariant, unlike an absolute-cm threshold. Complements ROTATION_GATE_DEG:
+# an anchor "covers" the current view only if within BOTH gates.
+SCALE_GATE_RATIO: float = 1.3
+
 # Fallback threshold for anchor selection: if Kabsch against the nearest
 # anchor finds fewer inliers than this, retry against the 2nd-nearest before
 # declaring tracking lost. Higher than min_track_points (12) so the fallback
@@ -120,6 +128,10 @@ class _Anchor:
                                  # a new anchor is captured when the viewpoint of
                                  # the object changes — covering camera-only and
                                  # object-only motion alike.
+    camera_distance: float = 0.0  # cam<->object-centroid distance (m) at capture.
+                                  # Gates + selects anchors on apparent SCALE so a
+                                  # fresh keyframe is captured when the object moves
+                                  # nearer/farther (matching degrades with scale).
     rgb: Optional[Tensor] = None      # (H, W, 3) float tensor on GPU, 0..255 range
     mask: Optional[Tensor] = None     # (H, W, 1) bool/float — region used to filter
                                       # this anchor's keypoints (for debug overlay)
@@ -151,48 +163,80 @@ def _relative_object_rotation(
     return camera_rotation_world.T @ object_rotation_world
 
 
+def _scale_ratio(dist_a: float, dist_b: float) -> float:
+    """Symmetric apparent-scale ratio between two camera<->object distances (>=1).
+    On-screen object size ~ 1/distance, so this is how much the object's apparent
+    size differs between the two viewpoints — what degrades XFeat matching."""
+    if not (np.isfinite(dist_a) and np.isfinite(dist_b)) or dist_a <= 1e-6 or dist_b <= 1e-6:
+        return 1.0  # unknown distance -> don't let scale veto (fall back to rotation)
+    return max(dist_a / dist_b, dist_b / dist_a)
+
+
 def _select_nearest_anchor_by_rotation(
     anchors: List[_Anchor],
     predicted_relative_rotation: np.ndarray,
     *,
     exclude: Optional[Set[int]] = None,
+    current_distance: Optional[float] = None,
+    rotation_gate_deg: float = ROTATION_GATE_DEG,
+    scale_gate: float = SCALE_GATE_RATIO,
 ) -> int:
-    """Index of the anchor whose RELATIVE (object-in-camera) rotation is closest
-    to ``predicted_relative_rotation`` — i.e. the anchor whose stored viewpoint
-    of the object is most similar to the current viewpoint (easiest to match).
+    """Index of the anchor whose stored viewpoint of the object is most similar to
+    the current view — closest in BOTH relative (object-in-camera) rotation AND
+    apparent scale, so the match runs against a similarly-posed AND similarly-sized
+    keyframe.
 
-    ``exclude`` is an optional set of indices to skip (used to retry against
-    the 2nd-nearest anchor when the 1st gave too few inliers). Returns -1 if
-    every anchor is excluded or the pool is empty.
+    Scale mismatch is folded into the rotation distance as an equivalent-degrees
+    penalty (a scale ratio of ``scale_gate`` costs ``rotation_gate_deg``), so the
+    two trade off on one axis. When ``current_distance`` is None/unknown this
+    reduces to nearest-rotation. ``exclude`` skips indices (2nd-nearest retry).
+    Returns -1 if every anchor is excluded or the pool is empty.
     """
     excluded = exclude if exclude is not None else set()
-    best_idx, best_dist = -1, float("inf")
+    _scale_to_deg = rotation_gate_deg / max(scale_gate - 1.0, 1e-6)
+    best_idx, best_cost = -1, float("inf")
     for i, anchor in enumerate(anchors):
         if i in excluded:
             continue
         anchor_rel = _relative_object_rotation(anchor.rotation, anchor.camera_rotation)
-        dist = _rotation_distance_deg(predicted_relative_rotation, anchor_rel)
-        if dist < best_dist:
-            best_dist, best_idx = dist, i
+        cost = _rotation_distance_deg(predicted_relative_rotation, anchor_rel)
+        if current_distance is not None:
+            cost += max(0.0, _scale_ratio(current_distance, anchor.camera_distance) - 1.0) * _scale_to_deg
+        if cost < best_cost:
+            best_cost, best_idx = cost, i
     return best_idx
 
 
-def _min_anchor_relative_distance_deg(
-    anchors: List[_Anchor], relative_rotation: np.ndarray,
-) -> float:
-    """Smallest geodesic distance (deg) from ``relative_rotation`` (the current
-    object-in-camera orientation) to any anchor's relative orientation. Gates
-    new-anchor creation: a new anchor is captured when the current viewpoint of
-    the object is >gate degrees from every stored anchor's viewpoint."""
+def _needs_new_anchor(
+    anchors: List[_Anchor],
+    relative_rotation: np.ndarray,
+    current_distance: float,
+    rotation_gate_deg: float,
+    scale_gate: float,
+) -> tuple[bool, float, float]:
+    """Decide whether the current view needs a fresh anchor.
+
+    An anchor "covers" the current view iff it is within BOTH the rotation gate
+    AND the scale gate; a new anchor is captured when NO anchor covers both — so
+    the pool tiles the (orientation x apparent-scale) viewpoint space, not just
+    orientation. Returns (need_new, min_rotation_deg, min_scale_ratio) — the two
+    minima (taken independently across the pool) are for the log line.
+    """
     if not anchors:
-        return float("inf")
-    return min(
-        _rotation_distance_deg(
-            relative_rotation,
-            _relative_object_rotation(a.rotation, a.camera_rotation),
+        return True, float("inf"), float("inf")
+    best_rot = float("inf")
+    best_scale = float("inf")
+    covered = False
+    for a in anchors:
+        rot = _rotation_distance_deg(
+            relative_rotation, _relative_object_rotation(a.rotation, a.camera_rotation),
         )
-        for a in anchors
-    )
+        scl = _scale_ratio(current_distance, a.camera_distance)
+        best_rot = min(best_rot, rot)
+        best_scale = min(best_scale, scl)
+        if rot <= rotation_gate_deg and scl <= scale_gate:
+            covered = True
+    return (not covered), best_rot, best_scale
 
 
 def _ensure_repo_on_path() -> None:
@@ -218,6 +262,7 @@ class XFeatMotionEstimator:
         weights_path: str = "",
         anchor_min_inliers: int = _MIN_INLIERS_DEFAULT,
         anchor_rotation_gate_deg: float = ROTATION_GATE_DEG,
+        anchor_scale_gate: float = SCALE_GATE_RATIO,
         use_lighterglue: bool = True,
         lighterglue_min_conf: float = 0.1,
         lighterglue_depth_confidence: float = 0.95,
@@ -241,6 +286,10 @@ class XFeatMotionEstimator:
         # gating (e.g. tighter gate for fast rotators).
         self._anchor_min_inliers = max(int(anchor_min_inliers), self.min_track_points)
         self._anchor_rotation_gate_deg = float(anchor_rotation_gate_deg)
+        # Apparent-scale anchor gate (>1). Object centroid in world at D0, used to
+        # measure cam<->object distance each tick (1 matmul + norm); set in initialize.
+        self._anchor_scale_gate = max(float(anchor_scale_gate), 1.0 + 1e-3)
+        self._centroid_d0: Optional[np.ndarray] = None
         self._lighterglue_min_conf = float(lighterglue_min_conf)
         self._lighterglue_depth_confidence = float(lighterglue_depth_confidence)
         self._object_search_radius_px = max(int(object_search_radius_px), 0)
@@ -460,6 +509,10 @@ class XFeatMotionEstimator:
 
         self._anchors.append(d0_anchor)
         self.last_pool_size = 1
+        # Fixed D0 object centroid in world — the point the scale gate transforms by
+        # the cumulative pose each tick to get cam<->object distance. The D0 anchor's
+        # own camera_distance already used this centroid, so the pool is consistent.
+        self._centroid_d0 = d0_anchor.world_3d.mean(axis=0).astype(np.float32)
 
         self.last_init_fast_point_count = int(keypoints.shape[0])
         self.last_init_sampled_count = int(keypoints.shape[0])
@@ -647,9 +700,23 @@ class XFeatMotionEstimator:
         primary_anchor_rgb: Optional[Tensor] = None
         primary_anchor_mask: Optional[Tensor] = None
 
+        # Predicted cam<->object distance (object at last pose, camera now). Only
+        # used by the scale-aware selection when DGS_XFEAT_SCALE_SELECT=1 — by
+        # default selection stays nearest-rotation (the scale GATE already ensures
+        # a similarly-scaled anchor exists; a steep scale penalty in selection was
+        # measured to add tracking failures without improving the tail).
+        _scale_select = os.environ.get("DGS_XFEAT_SCALE_SELECT") == "1"
+        predicted_distance = (
+            self._current_camera_object_distance(current_camera_to_world)
+            if _scale_select else None
+        )
+
         for attempt in range(2):
             anchor_idx = _select_nearest_anchor_by_rotation(
                 self._anchors, predicted_R_rel, exclude=excluded,
+                current_distance=predicted_distance,
+                rotation_gate_deg=self._anchor_rotation_gate_deg,
+                scale_gate=self._anchor_scale_gate,
             )
             if anchor_idx < 0:
                 break  # no more anchors to try
@@ -788,10 +855,15 @@ class XFeatMotionEstimator:
         # whenever the VIEW of the object has changed enough, whether the
         # object rotated, the camera moved, or both. Translation is never used.
         if success:
-            min_dist_deg = _min_anchor_relative_distance_deg(
-                self._anchors, predicted_R_rel,
+            # Re-anchor when no existing anchor covers the current view in BOTH
+            # relative orientation AND apparent scale (cam<->object distance ratio).
+            # The cumulative pose was just updated, so this is the current distance.
+            current_distance = self._current_camera_object_distance(current_camera_to_world)
+            need_new, min_dist_deg, min_scale_ratio = _needs_new_anchor(
+                self._anchors, predicted_R_rel, current_distance,
+                self._anchor_rotation_gate_deg, self._anchor_scale_gate,
             )
-            if min_dist_deg > self._anchor_rotation_gate_deg:
+            if need_new:
                 # Filter the new anchor's keypoints to (object ∩ gripper-keep)
                 # at the time of creation. We CAN use the rendered object
                 # mask here because the cumulative pose was just updated, so
@@ -803,25 +875,34 @@ class XFeatMotionEstimator:
                     if keep_region is not None and obj_mask_for_debug is not None
                     else (obj_mask_for_debug if keep_region is None else keep_region)
                 )
-                # Re-extract on a pre-masked copy of the current RGB so the
-                # new anchor's descriptor pool is concentrated on the
-                # object (XFeat spends its full top_k budget on object
-                # pixels instead of background). Pays one extra ~7 ms
-                # XFeat forward, but only when a new anchor is created
-                # (every ~22.5° of rotation).
-                masked_anchor_rgb = self._pre_mask_image(
-                    current_rgb_prepared, anchor_keep_region, erode_px=5,
-                )
-                anchor_kp, anchor_desc, anchor_kp_gpu, anchor_image_size = self._extract(
-                    masked_anchor_rgb,
-                )
+                # Build the anchor from the CURRENT frame's already-extracted
+                # FULL-IMAGE keypoints, POST-filtered to the object — the SAME
+                # process as the D0 seed. The previous masked-image re-extract
+                # (a) corrupted descriptors at the erosion edge, (b) made the
+                # anchor's descriptors inconsistent with the per-tick (full-
+                # image) descriptors LighterGlue matches them against, and (c)
+                # cost an extra ~7 ms XFeat forward. Post-filtering selects
+                # keypoints by the mask without mutating the image the CNN sees,
+                # so a few px of (rendered-mask) misalignment just trims/adds a
+                # couple of edge points instead of corrupting descriptors, and
+                # RANSAC drops any background point that slips in.
+                anchor_kp = curr_keypoints
+                anchor_desc = curr_descriptors
+                anchor_kp_gpu = curr_keypoints_gpu
+                anchor_image_size = curr_image_size
+                if anchor_keep_region is not None and anchor_kp.shape[0] > 0:
+                    _H, _W = anchor_keep_region.shape[:2]
+                    _xy = np.clip(anchor_kp.round().astype(np.int64), 0,
+                                  np.array([_W - 1, _H - 1], dtype=np.int64))
+                    _surv = np.where(anchor_keep_region.astype(bool)[_xy[:, 1], _xy[:, 0]])[0]
+                    anchor_kp = anchor_kp[_surv]
+                    anchor_desc = anchor_desc[torch.from_numpy(_surv).to(anchor_desc.device).long()]
+                    anchor_kp_gpu = anchor_kp_gpu[torch.from_numpy(_surv).to(anchor_kp_gpu.device).long()]
                 if anchor_kp.shape[0] >= self.min_track_points:
-                    anchor_depth_values, anchor_depth_valid = (
-                        _tc.sample_depth_bilinear(
-                            current_depth_prepared, anchor_kp,
-                        )
+                    anchor_depth_values, anchor_depth_valid = _tc.sample_depth_bilinear(
+                        current_depth_prepared, anchor_kp,
                     )
-                    # Belt-and-braces filter against the non-eroded region.
+                    # Belt-and-braces filter against the (same) region.
                     anchor_depth_valid = self._restrict_depth_valid_to_image_mask(
                         anchor_kp, anchor_depth_valid, anchor_keep_region,
                     )
@@ -849,8 +930,8 @@ class XFeatMotionEstimator:
                     self.last_pool_size = len(self._anchors)
                     print(
                         f"[xfeat-anchor] pool size: {len(self._anchors)} "
-                        f"(added; rel-view rot from nearest = {min_dist_deg:.1f} deg, "
-                        f"{new_anchor.descriptors.shape[0]} keypoints)"
+                        f"(added; nearest rot={min_dist_deg:.1f}deg scale={min_scale_ratio:.2f}x "
+                        f"dist={current_distance:.2f}m, {new_anchor.descriptors.shape[0]} keypoints)"
                     )
         timings["resample"] = 0.0
 
@@ -982,6 +1063,18 @@ class XFeatMotionEstimator:
         m_np = matches.detach().cpu().numpy().astype(np.int64)
         return m_np[:, 0], m_np[:, 1]
 
+    def _current_camera_object_distance(self, camera_to_world: np.ndarray) -> float:
+        """Camera<->object-centroid distance (m) for the CURRENT tick: the fixed D0
+        centroid pushed through the current cumulative pose, vs the camera position.
+        One 3x3 matmul + a norm — the object's position is tracked implicitly by the
+        pose, so we never iterate the point cloud. NaN before D0 is seeded."""
+        if self._centroid_d0 is None:
+            return float("nan")
+        obj = (np.asarray(self._cumulative_R, dtype=np.float64) @ np.asarray(self._centroid_d0, dtype=np.float64)
+               + np.asarray(self._cumulative_t, dtype=np.float64))
+        cam = np.asarray(camera_to_world, dtype=np.float64)[:3, 3]
+        return float(np.linalg.norm(cam - obj))
+
     def _build_anchor(
         self,
         *,
@@ -1021,6 +1114,15 @@ class XFeatMotionEstimator:
         world_3d = _tc.backproject_to_world(
             kept_kp, kept_depth, intrinsics, camera_to_world,
         )
+        # cam<->object-centroid distance at this anchor's viewpoint (scale gate).
+        # Use the fixed D0 centroid transformed by this anchor's pose so distances
+        # are consistent across anchors; before D0 is set (the D0 anchor itself)
+        # fall back to this anchor's own keypoint centroid (== the future D0 centroid).
+        _centroid = self._centroid_d0 if self._centroid_d0 is not None else world_3d.mean(axis=0)
+        _obj = (np.asarray(rotation, dtype=np.float64) @ np.asarray(_centroid, dtype=np.float64)
+                + np.asarray(translation, dtype=np.float64))
+        _cam = np.asarray(camera_to_world, dtype=np.float64)[:3, 3]
+        camera_distance = float(np.linalg.norm(_cam - _obj))
         rgb_stored: Optional[Tensor] = None
         if rgb is not None:
             rgb_stored = rgb.detach().clone()
@@ -1036,6 +1138,7 @@ class XFeatMotionEstimator:
             rotation=rotation.astype(np.float32),
             translation=translation.astype(np.float32),
             camera_rotation=np.asarray(camera_to_world, dtype=np.float32)[:3, :3].copy(),
+            camera_distance=camera_distance,
             rgb=rgb_stored,
             mask=mask_stored,
         )
