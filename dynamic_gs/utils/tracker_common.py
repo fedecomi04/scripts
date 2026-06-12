@@ -375,8 +375,15 @@ class PoseKalmanFilter:
         # anchor-pool discontinuity. Smoothing through it causes
         # overshoot (the step kicks the velocity state), so snap-reset
         # to the measurement instead.
-        self._snap_trans_m = float(snap_trans_m)
-        self._snap_rot_rad = float(snap_rot_rad)
+        # Env overrides for tuning the snap (innovation) gate without a recompile:
+        #   DGS_KF_SNAP_TRANS_M (metres), DGS_KF_SNAP_ROT_DEG (degrees).
+        # Widening the ROT gate lets the filter smooth a larger stationary
+        # rotation jiggle instead of snapping straight to the measurement (the
+        # 10 deg default caps rotation smoothing when jiggle peaks near 11 deg).
+        _snap_t = os.environ.get("DGS_KF_SNAP_TRANS_M")
+        _snap_r = os.environ.get("DGS_KF_SNAP_ROT_DEG")
+        self._snap_trans_m = float(_snap_t) if _snap_t else float(snap_trans_m)
+        self._snap_rot_rad = float(np.radians(float(_snap_r))) if _snap_r else float(snap_rot_rad)
         self.reset()
 
     def reset(self) -> None:

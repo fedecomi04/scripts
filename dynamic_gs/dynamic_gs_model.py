@@ -306,18 +306,26 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     internal cumulative pose (anchor selection / creation / next-tick
     prediction) stays raw, so smoothing lag can never destabilize
     tracking itself."""
-    xfeat_pose_filter_accel_sigma: float = 0.05
+    xfeat_pose_filter_accel_sigma: float = 0.02
     """Process noise: white translational acceleration 1-sigma (m/s^2).
     Lower = smoother + more lag after sudden jerks; higher = follows the
     raw RANSAC pose more closely. Bench (synthetic, 3 mm / 0.5 deg
     measurement noise at 20 Hz): 0.05 attenuates stationary jitter
-    ~2.1x and settles a worst-case instantaneous 5 cm jump in 4 ticks
-    (~200 ms); 0.02 gives ~2.5x but 7-tick settle; 0.5 gives ~1.4x with
-    2-tick settle. Smooth (constant-velocity-ish) motion tracks BETTER
-    at lower sigmas because the filter's velocity state models it."""
-    xfeat_pose_filter_alpha_sigma: float = 0.25
+    ~2.1x and settles a worst-case 5 cm jump in 4 ticks; 0.02 gives ~2.5x
+    but 7-tick settle. On the recorded screwdriver scene, 0.02 cut the
+    static-tail translation jiggle MAX 16.8 -> 11.2 mm with no tracking-
+    range cost (peak/end unchanged); going to 0.01 gave no further gain.
+    NOTE: Q ~ accel_sigma^2 * dt^4, so at the live ~50 ms tick this
+    smooths ~1600x harder than on the offline ~314 ms replay — 0.02 is
+    a strong-but-safe default; raise toward 0.05 if live motion lags."""
+    xfeat_pose_filter_alpha_sigma: float = 0.1
     """Process noise: white angular acceleration 1-sigma (rad/s^2). Same
-    trade-off as the translational sigma, for rotation."""
+    trade-off as the translational sigma, for rotation. 0.1 (was 0.25).
+    NOTE: residual rotation jiggle on the offline replay is spike-frame
+    dominated (occasional low-inlier bad matches, ~11 deg), which the KF
+    can't smooth away — that's an upstream matches/inliers problem
+    (anchor policy), not a knob here; lowering alpha_sigma further or
+    widening the snap-rot gate gave no improvement."""
     xfeat_pose_filter_meas_trans_sigma_m: float = 0.003
     """Measurement noise: assumed 1-sigma of the RANSAC translation
     (metres). Raise if the stationary jiggle is still visible (trusts
@@ -357,16 +365,19 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     edge). Camera intrinsics (cx, cy, width, height) are adjusted so
     depth backprojection stays metric. Set False to revert to full-image
     extract + post-match gripper-keep filter."""
-    xfeat_crop_padding_px: int = 300
+    xfeat_crop_padding_px: int = 150
     """Padding (pixels) around the projected-bbox crop used by
     ``xfeat_crop_to_object_bbox``. Wide enough that fast tick-to-tick
-    motion still keeps the actual object inside the crop (the bbox lags
-    the true object by one tick of motion). 300 px keeps a generous
-    background margin around the object so XFeat keypoints near the
-    object boundary see the same natural surroundings the anchor saw
-    (their CNN-descriptor receptive field isn't clipped by the crop
-    edge) -> stable descriptors across ticks -> more LighterGlue matches.
-    Raise for faster motion / more context, lower for tighter focus."""
+    motion keeps the object inside the crop (the bbox lags the true object
+    by one tick; measured per-tick motion ~30 px) AND that XFeat keypoints
+    near the object boundary keep enough natural background context that
+    their CNN-descriptor receptive field (~64 px) isn't clipped by the
+    crop edge -> stable descriptors -> more LighterGlue matches. 150 px
+    clears both (~5x the per-tick motion, ~2x the receptive field) while
+    keeping the crop small enough for fast extraction; at 300 px the crop
+    ballooned to ~730x680 (nearly the full 800x800 frame) and XFeat extract
+    was ~20 ms. Raise for faster motion / more context, lower for tighter
+    focus + speed."""
     xfeat_object_search_radius_px: int = 80
     """Dilation radius (pixels) applied to the rendered object mask before
     using it as the per-frame post-match filter on the current frame. The
