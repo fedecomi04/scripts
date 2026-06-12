@@ -863,7 +863,14 @@ class LivePublisher:
         publisher (live_replay_publisher) can replay the whole session without
         ROS/Gazebo. Fixed-size raw records (fast, no compression, no drops)."""
         import queue as _q
-        self._replay_dir = Path(record_replay_dir)
+        # A bootstrap spawns TWO publishers (capture, then teleop). Give each
+        # spawn its own timestamped subdir so they don't clobber stream.bin;
+        # the replay driver reads subdirs in chronological (lexical) order →
+        # [capture, teleop]. The phase tag (env, best-effort) aids readability.
+        _base = Path(record_replay_dir)
+        _base.mkdir(parents=True, exist_ok=True)
+        _phase = os.environ.get("DGS_REPLAY_PHASE", "seg")
+        self._replay_dir = _base / f"{int(time.time()*1000):013d}_{_phase}_{os.getpid()}"
         self._replay_dir.mkdir(parents=True, exist_ok=True)
         H, W = self.intrinsics.height, self.intrinsics.width
         # record = c2w(16 f64) + seq(i64) + stamp(f64) + rgb(HxWx3 u8) + depth(HxW f32) + mask(HxW u8)
