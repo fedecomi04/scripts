@@ -2551,12 +2551,17 @@ class DynamicGSPipelineBase(VanillaPipeline):
             CONSOLE.log(f"[anysplat] frame {frame_idx} has no depth — skip")
             return
 
-        # PRE-cull render (what the RAW CDN compares the live RGB against),
-        # captured for the debug dump before the cull mutates the scene.
-        try:
-            pre_cull_render = self._render_from_camera(camera).get("rgb")
-        except Exception:
-            pre_cull_render = None
+        # PRE-cull render for the debug dump. DEBUG-ONLY: this is a full GPU
+        # render on the MAIN tick thread that contends with the XFeat tracker
+        # kernels, so it is skipped entirely unless save_debug_images is set
+        # (otherwise every FF call stalls the tracker with 1-2 extra renders).
+        save_dbg = bool(self.config.save_debug_images)
+        pre_cull_render = None
+        if save_dbg:
+            try:
+                pre_cull_render = self._render_from_camera(camera).get("rgb")
+            except Exception:
+                pre_cull_render = None
 
         # Cull-before-decode: drop in-front occluders (original + prior FF
         # Gaussians) over the CDN region, recompute CDN. If culling alone
@@ -2568,29 +2573,29 @@ class DynamicGSPipelineBase(VanillaPipeline):
             prerendered_obj_mask=prerendered_obj_mask,
         )
         self._timing["FF.1b_cull_before_decode"].append(time.time() - t0)
-        # POST-cull render = the scene state the re-rendered (clean) CDN used.
-        # Only re-render when the cull actually changed the scene; otherwise it
-        # is identical to the pre-cull render.
         if n_pre_culled > 0:
             self._refresh_viser_direct_after_feedforward()
+        # POST-cull render = the scene state the re-rendered (clean) CDN used
+        # (debug-only; only re-render when the cull actually changed the scene).
+        post_cull_render = pre_cull_render
+        if save_dbg and n_pre_culled > 0:
             try:
                 post_cull_render = self._render_from_camera(camera).get("rgb")
             except Exception:
                 post_cull_render = pre_cull_render
-        else:
-            post_cull_render = pre_cull_render
 
-        # --- Debug-image dump: per-call ordered set for raw→clean debugging ---
+        # --- Debug-image dump (debug-only): per-call ordered set for raw→clean.
         # gripper / object / real / rendered / rerendered-after-cull / raw / clean.
-        try:
-            self._save_ff_debug_images(
-                call_id=call_id, frame_idx=frame_idx, camera=camera,
-                cdn_raw=cdn, cdn_clean=cdn_clean,
-                prerendered_obj_mask=prerendered_obj_mask, target_frame=target_frame,
-                pre_cull_render=pre_cull_render, post_cull_render=post_cull_render,
-            )
-        except Exception as exc:
-            CONSOLE.log(f"[ff-debug] dump failed call={call_id}: {exc}")
+        if save_dbg:
+            try:
+                self._save_ff_debug_images(
+                    call_id=call_id, frame_idx=frame_idx, camera=camera,
+                    cdn_raw=cdn, cdn_clean=cdn_clean,
+                    prerendered_obj_mask=prerendered_obj_mask, target_frame=target_frame,
+                    pre_cull_render=pre_cull_render, post_cull_render=post_cull_render,
+                )
+            except Exception as exc:
+                CONSOLE.log(f"[ff-debug] dump failed call={call_id}: {exc}")
 
         t0 = time.time()
         if mode_label == "oneshot":
