@@ -1980,10 +1980,19 @@ class DynamicGSPipelineBase(VanillaPipeline):
             _save("1_gripper_mask",
                   _to_u8(batch.get("mask")) if batch is not None else None)
 
-            # 2. object mask (tracked instance footprint that gets subtracted)
+            # 2. object mask — the EFFECTIVE subtracted footprint (scaled +2%
+            #    about centroid + px-dilated), exactly as _feedforward_clean_cdn
+            #    applies it, so the enlargement is visible here.
             try:
                 om = prerendered_obj_mask if prerendered_obj_mask is not None \
                     else self._render_object_mask_cached(camera)
+                if om is not None:
+                    sc = float(getattr(self.config, "feedforward_object_mask_scale", 1.0))
+                    if sc != 1.0:
+                        om = self._scale_mask_about_centroid(om, sc)
+                    dpx = int(self.config.feedforward_object_mask_dilate_px)
+                    if dpx > 0:
+                        om = dilate_binary_mask(om, dpx)
             except Exception:
                 om = None
             _save("2_object_mask", _to_u8(om) if om is not None else None)
