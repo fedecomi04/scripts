@@ -121,10 +121,16 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     (full native res — fires on the whole scene with mode='rgb'). A fixed
     N>1 forces an NxN pool. Only affects mode='rgb' meaningfully; depth modes
     pool too but are already robust."""
-    change_mask_downsample_target_side: int = 100
+    change_mask_downsample_target_side: int = 140
     """For ``change_mask_downsample_factor=0`` (auto): MS-SSIM runs on roughly
     this-many pixels per side (~target²  total). 100 → ~10k pixels, i.e. an
-    800x800 frame pools ~8x down. Lower = coarser/less sensitive."""
+    800x800 frame pools ~8x down. Lower = coarser/less sensitive; higher =
+    finer/more sensitive (catches smaller change regions). 140 (2026-06-13,
+    by request, for a slightly more aggressive CDN): ~2x the pixel count of
+    100 (~20k px), so an 800x800 frame pools ~6x instead of ~8x and a
+    1920x1200 frame proportionally less — the CDN sees finer change without
+    going full-native (factor=1 fires on the whole scene). Lower back toward
+    100 if static-frame false positives reappear."""
     change_mask_gripper_erode_px: int = 3
     """Erode the gripper KEEP mask by this many px before CDN, so the leak ring
     of gripper-coloured pixels just outside the silhouette (anti-aliasing /
@@ -306,7 +312,7 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     internal cumulative pose (anchor selection / creation / next-tick
     prediction) stays raw, so smoothing lag can never destabilize
     tracking itself."""
-    xfeat_pose_filter_accel_sigma: float = 0.02
+    xfeat_pose_filter_accel_sigma: float = 0.01
     """Process noise: white translational acceleration 1-sigma (m/s^2).
     Lower = smoother + more lag after sudden jerks; higher = follows the
     raw RANSAC pose more closely. Bench (synthetic, 3 mm / 0.5 deg
@@ -314,18 +320,23 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     ~2.1x and settles a worst-case 5 cm jump in 4 ticks; 0.02 gives ~2.5x
     but 7-tick settle. On the recorded screwdriver scene, 0.02 cut the
     static-tail translation jiggle MAX 16.8 -> 11.2 mm with no tracking-
-    range cost (peak/end unchanged); going to 0.01 gave no further gain.
-    NOTE: Q ~ accel_sigma^2 * dt^4, so at the live ~50 ms tick this
-    smooths ~1600x harder than on the offline ~314 ms replay — 0.02 is
-    a strong-but-safe default; raise toward 0.05 if live motion lags."""
-    xfeat_pose_filter_alpha_sigma: float = 0.1
+    range cost (peak/end unchanged). 0.01 (2026-06-13, by request, for
+    extra smoothing): the offline measurement showed no further static
+    gain past 0.02, but at the live ~50 ms tick the stronger Q-floor
+    still smooths stationary wander harder; the cost is a slightly longer
+    settle after a fast lift. NOTE: Q ~ accel_sigma^2 * dt^4, so at the
+    live ~50 ms tick this smooths ~1600x harder than on the offline
+    ~314 ms replay; raise back toward 0.02-0.05 if live motion lags."""
+    xfeat_pose_filter_alpha_sigma: float = 0.05
     """Process noise: white angular acceleration 1-sigma (rad/s^2). Same
-    trade-off as the translational sigma, for rotation. 0.1 (was 0.25).
-    NOTE: residual rotation jiggle on the offline replay is spike-frame
-    dominated (occasional low-inlier bad matches, ~11 deg), which the KF
-    can't smooth away — that's an upstream matches/inliers problem
-    (anchor policy), not a knob here; lowering alpha_sigma further or
-    widening the snap-rot gate gave no improvement."""
+    trade-off as the translational sigma, for rotation. 0.05 (was 0.1,
+    earlier 0.25); lowered 2026-06-13 with accel_sigma for extra
+    smoothing. NOTE: residual rotation jiggle on the offline replay is
+    spike-frame dominated (occasional low-inlier bad matches, ~11 deg),
+    which the KF can't smooth away — that's an upstream matches/inliers
+    problem (anchor policy), not a knob here; lowering alpha_sigma
+    further or widening the snap-rot gate gave no improvement there, so
+    this only helps the continuous-wander component."""
     xfeat_static_hold: bool = True
     """Output-side static-hold: when the tracked pose shows no net trend
     across ``xfeat_static_hold_window`` success ticks (object genuinely
