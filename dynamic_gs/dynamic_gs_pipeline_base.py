@@ -2022,14 +2022,18 @@ class DynamicGSPipelineBase(VanillaPipeline):
             # --- Rendered scene (Gaussian splat from this camera) ---
             # The render the CDN compares the live RGB against — i.e. what the
             # scene currently looks like (static + tracked object + prior FF
-            # inserts), BEFORE this call's insert. Gated by save_debug_images:
-            # it's a full GPU render (~tens of ms), unlike the cheap saves above.
+            # inserts), BEFORE this call's insert. ALWAYS saved now: it's the
+            # single most useful debug image (judge render sharpness + WHY the
+            # CDN flags change), and the rest of this dump already writes
+            # unconditionally — gating only the render behind save_debug_images
+            # left it silently missing while rgb/cdn/objmask appeared, which
+            # repeatedly read as "the rendered image isn't being saved". One
+            # full GPU render per FF call (~tens of ms, only every Nth tick).
             try:
-                if self.config.save_debug_images:
-                    rend = self._render_from_camera(camera).get("rgb")
-                    if rend is not None:
-                        _cv2.imwrite(str(out_dir / f"{stem}_rendered.png"),
-                                     _cv2.cvtColor(_to_u8(rend), _cv2.COLOR_RGB2BGR))
+                rend = self._render_from_camera(camera).get("rgb")
+                if rend is not None:
+                    _cv2.imwrite(str(out_dir / f"{stem}_rendered.png"),
+                                 _cv2.cvtColor(_to_u8(rend), _cv2.COLOR_RGB2BGR))
             except Exception:
                 pass
         except Exception:
