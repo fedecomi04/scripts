@@ -1891,23 +1891,24 @@ class DynamicGSPipelineBase(VanillaPipeline):
         cdn_clean,
         prerendered_obj_mask,
         target_frame,
+        pre_cull_render=None,
+        post_cull_render=None,
     ) -> None:
         """Dump per-FF-call debug PNGs under <data>/dynamic_scene/_ff_debug/.
 
-        Files per call:
-            call_NNNN_frame_NNNNNN_rgb.png         live RGB (linear)
-            call_NNNN_frame_NNNNNN_depth.png       live depth, scaled 0-3 m → 0-255
-            call_NNNN_frame_NNNNNN_gripper.png    dataset mask (gripper=black, keep=white)
-            call_NNNN_frame_NNNNNN_objmask.png    render_object_mask (instance_id==d0 only)
-            call_NNNN_frame_NNNNNN_cdn_raw.png    CDN before object subtract
-            call_NNNN_frame_NNNNNN_cdn_clean.png  CDN after object subtract (== what FF sees)
-            call_NNNN_frame_NNNNNN_rendered.png   scene render (what CDN compares live RGB to);
-                                                  save_debug_images only (full GPU render)
+        Saved in a fixed numbered order so they sort + view in the raw→clean
+        pipeline order (call_NNNN_frame_NNNNNN_<N>_<name>.png):
+            1_gripper_mask          dataset mask (gripper=black, keep=white)
+            2_object_mask           render_object_mask (tracked instance_id==d0 only)
+            3_real                  live RGB
+            4_rendered              scene render BEFORE the cull (== what RAW CDN saw)
+            5_rerendered_after_cull scene render AFTER the in-front cull (== what CLEAN CDN saw)
+            6_raw_mask              CDN before object-subtract + cull-reclean
+            7_clean_mask            CDN after object-subtract + cull-reclean (== what FF decodes)
 
-        Use these to verify:
-            * Is the object mask covering ONLY the tracked instance (no FF inserts)?
-            * Does the CDN still light up under the gripper (issue 1)?
-            * Is the gripper mask polarity what we think (black=0=gripper)?
+        Compare 4 vs 5 to see what the cull removed, and 6 vs 7 to see what that
+        did to the change mask — the raw→clean delta that is neither object nor
+        gripper is the cull-reclean re-render (4→5).
         """
         from pathlib import Path as _Path
         import cv2 as _cv2
@@ -1937,105 +1938,60 @@ class DynamicGSPipelineBase(VanillaPipeline):
                 return (t.clip(0, 1) * 255).astype("uint8")
             return _np.clip(t, 0, 255).astype("uint8")
 
+        def _rgb_bgr_u8(x):
+            """RGB tensor/array (float 0-1 or uint8) → BGR uint8 for cv2."""
+            import numpy as _np
+            if x is None:
+                return None
+            if isinstance(x, torch.Tensor):
+                x = x.detach().cpu().numpy()
+            else:
+                x = _np.asarray(x)
+            if x.dtype == _np.uint8:
+                u8 = x
+            else:
+                u8 = _np.clip(x.astype(_np.float32) * 255.0, 0, 255).astype(_np.uint8)
+            if u8.ndim == 3 and u8.shape[-1] == 4:
+                u8 = u8[..., :3]
+            if u8.ndim == 3 and u8.shape[-1] == 3:
+                return _cv2.cvtColor(u8, _cv2.COLOR_RGB2BGR)
+            return None
+
         try:
             batch = target_frame.get("batch") if isinstance(target_frame, dict) else None
 
-            # --- RGB ---
-            try:
-                rgb = batch.get("image") if batch is not None else None
-                if rgb is not None:
-                    # Probe one-time so we can see what dtype/range we're actually getting.
-                    if call_id == 0:
-                        try:
-                            _t = rgb.detach().cpu() if isinstance(rgb, torch.Tensor) else rgb
-                            import numpy as _np
-                            arr = _t.numpy() if isinstance(rgb, torch.Tensor) else _np.asarray(_t)
-                            CONSOLE.log(
-                                f"[ff-debug] batch['image'] shape={arr.shape} dtype={arr.dtype} "
-                                f"min={float(arr.min()):.4f} max={float(arr.max()):.4f} "
-                                f"mean={float(arr.mean()):.4f}"
-                            )
-                        except Exception as _exc:
-                            CONSOLE.log(f"[ff-debug] probe failed: {_exc}")
-                    # Convert: explicit per-dtype path, no heuristics.
-                    import numpy as _np
-                    if isinstance(rgb, torch.Tensor):
-                        arr = rgb.detach().cpu().numpy()
-                    else:
-                        arr = _np.asarray(rgb)
-                    if arr.dtype == _np.uint8:
-                        u8 = arr
-                    else:
-                        u8 = _np.clip(arr.astype(_np.float32) * 255.0, 0, 255).astype(_np.uint8)
-                    if u8.ndim == 3 and u8.shape[-1] == 4:
-                        u8 = u8[..., :3]
-                    if u8.ndim == 3 and u8.shape[-1] == 3:
-                        _cv2.imwrite(str(out_dir / f"{stem}_rgb.png"),
-                                     _cv2.cvtColor(u8, _cv2.COLOR_RGB2BGR))
-            except Exception:
-                pass
+            def _save(name, img):
+                try:
+                    if img is not None:
+                        _cv2.imwrite(str(out_dir / f"{stem}_{name}.png"), img)
+                except Exception:
+                    pass
 
-            # --- Live depth (0..3m → 0..255) ---
-            try:
-                d = batch.get("depth_image") if batch is not None else None
-                if d is not None:
-                    if isinstance(d, torch.Tensor):
-                        d = d.detach().cpu().numpy()
-                    if d.ndim == 3 and d.shape[-1] == 1:
-                        d = d[..., 0]
-                    import numpy as _np
-                    d_vis = _np.clip(d.astype("float32") / 3.0 * 255.0, 0, 255).astype("uint8")
-                    _cv2.imwrite(str(out_dir / f"{stem}_depth.png"), d_vis)
-            except Exception:
-                pass
+            # Fixed pipeline order (1..7) so the files sort the way they're read.
+            # 1. gripper / dataset mask (0=gripper, 255=keep)
+            _save("1_gripper_mask",
+                  _to_u8(batch.get("mask")) if batch is not None else None)
 
-            # --- Gripper / dataset mask (0=gripper, 255=keep) ---
+            # 2. object mask (tracked instance footprint that gets subtracted)
             try:
-                gm = batch.get("mask") if batch is not None else None
-                if gm is not None:
-                    gm_u8 = _to_u8(gm)
-                    if gm_u8 is not None:
-                        _cv2.imwrite(str(out_dir / f"{stem}_gripper.png"), gm_u8)
+                om = prerendered_obj_mask if prerendered_obj_mask is not None \
+                    else self._render_object_mask_cached(camera)
             except Exception:
-                pass
+                om = None
+            _save("2_object_mask", _to_u8(om) if om is not None else None)
 
-            # --- Object mask (render of instance_id==d0 only) ---
-            try:
-                if prerendered_obj_mask is not None:
-                    om = prerendered_obj_mask
-                else:
-                    om = self._render_object_mask_cached(camera)
-                if om is not None:
-                    _cv2.imwrite(str(out_dir / f"{stem}_objmask.png"), _to_u8(om))
-            except Exception:
-                pass
+            # 3. real (live RGB)
+            _save("3_real", _rgb_bgr_u8(batch.get("image")) if batch is not None else None)
 
-            # --- CDN raw + cleaned ---
-            try:
-                if cdn_raw is not None:
-                    _cv2.imwrite(str(out_dir / f"{stem}_cdn_raw.png"), _to_u8(cdn_raw))
-                if cdn_clean is not None:
-                    _cv2.imwrite(str(out_dir / f"{stem}_cdn_clean.png"), _to_u8(cdn_clean))
-            except Exception:
-                pass
+            # 4. rendered scene BEFORE the cull (== what the RAW CDN compared to)
+            _save("4_rendered", _rgb_bgr_u8(pre_cull_render))
 
-            # --- Rendered scene (Gaussian splat from this camera) ---
-            # The render the CDN compares the live RGB against — i.e. what the
-            # scene currently looks like (static + tracked object + prior FF
-            # inserts), BEFORE this call's insert. ALWAYS saved now: it's the
-            # single most useful debug image (judge render sharpness + WHY the
-            # CDN flags change), and the rest of this dump already writes
-            # unconditionally — gating only the render behind save_debug_images
-            # left it silently missing while rgb/cdn/objmask appeared, which
-            # repeatedly read as "the rendered image isn't being saved". One
-            # full GPU render per FF call (~tens of ms, only every Nth tick).
-            try:
-                rend = self._render_from_camera(camera).get("rgb")
-                if rend is not None:
-                    _cv2.imwrite(str(out_dir / f"{stem}_rendered.png"),
-                                 _cv2.cvtColor(_to_u8(rend), _cv2.COLOR_RGB2BGR))
-            except Exception:
-                pass
+            # 5. re-rendered scene AFTER the in-front cull (== what the CLEAN CDN compared to)
+            _save("5_rerendered_after_cull", _rgb_bgr_u8(post_cull_render))
+
+            # 6. raw change mask, 7. clean change mask (after object-subtract + cull-reclean)
+            _save("6_raw_mask", _to_u8(cdn_raw))
+            _save("7_clean_mask", _to_u8(cdn_clean))
         except Exception:
             pass
 
@@ -2552,6 +2508,13 @@ class DynamicGSPipelineBase(VanillaPipeline):
             CONSOLE.log(f"[anysplat] frame {frame_idx} has no depth — skip")
             return
 
+        # PRE-cull render (what the RAW CDN compares the live RGB against),
+        # captured for the debug dump before the cull mutates the scene.
+        try:
+            pre_cull_render = self._render_from_camera(camera).get("rgb")
+        except Exception:
+            pre_cull_render = None
+
         # Cull-before-decode: drop in-front occluders (original + prior FF
         # Gaussians) over the CDN region, recompute CDN. If culling alone
         # clears the change, components below is empty and we skip the
@@ -2562,19 +2525,26 @@ class DynamicGSPipelineBase(VanillaPipeline):
             prerendered_obj_mask=prerendered_obj_mask,
         )
         self._timing["FF.1b_cull_before_decode"].append(time.time() - t0)
+        # POST-cull render = the scene state the re-rendered (clean) CDN used.
+        # Only re-render when the cull actually changed the scene; otherwise it
+        # is identical to the pre-cull render.
         if n_pre_culled > 0:
             self._refresh_viser_direct_after_feedforward()
+            try:
+                post_cull_render = self._render_from_camera(camera).get("rgb")
+            except Exception:
+                post_cull_render = pre_cull_render
+        else:
+            post_cull_render = pre_cull_render
 
-        # --- Debug-image dump: per-call object_mask + CDN + gripper_mask ---
-        # Writes everything we need to see WHY the tracker is stuck and WHY the
-        # CDN may still include the gripper. Files land under
-        # <data>/dynamic_scene/_ff_debug/call_NNNN_frame_NNNNNN_*.png so they
-        # can be inspected side-by-side.
+        # --- Debug-image dump: per-call ordered set for raw→clean debugging ---
+        # gripper / object / real / rendered / rerendered-after-cull / raw / clean.
         try:
             self._save_ff_debug_images(
                 call_id=call_id, frame_idx=frame_idx, camera=camera,
                 cdn_raw=cdn, cdn_clean=cdn_clean,
                 prerendered_obj_mask=prerendered_obj_mask, target_frame=target_frame,
+                pre_cull_render=pre_cull_render, post_cull_render=post_cull_render,
             )
         except Exception as exc:
             CONSOLE.log(f"[ff-debug] dump failed call={call_id}: {exc}")
