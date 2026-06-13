@@ -674,19 +674,36 @@ def reproject_anysplat_to_scene(
     u = fx_p * p_cam_cv[:, 0] / safe_z + cx_p
     v = fy_p * p_cam_cv[:, 1] / safe_z + cy_p
     in_image = (z_cam > 1e-6) & (u >= 0) & (u < W_any) & (v >= 0) & (v < H_any)
-    u_idx = np.clip(u.astype(np.int64), 0, W_any - 1)
-    v_idx = np.clip(v.astype(np.int64), 0, H_any - 1)
+    # --- Map each pred-crop pixel (u, v) BACK to the full scene pixel ---
+    # AnySplat's process_image() aspect-preserve-resizes so the SHORTER side =
+    # W_any (= H_any = 448), then CENTER-CROPS to (W_any, H_any). Invert that here
+    # so the depth lookup + back-projection below use TRUE scene pixels. The old
+    # full-frame-squash mapping (`scene_intr * W_any / scene_w`) only matched a
+    # SQUARE scene (the 800x800 era); at 1920x1200 it used the wrong x-scale
+    # (448/1920 instead of 448/1200) and dropped the center-crop offset, so every
+    # insert was mapped sideways -> the "ghost" copies offset next to objects.
+    sc_w = float(scene_intr["w"]); sc_h = float(scene_intr["h"])
+    crop_scale = float(W_any) / min(sc_w, sc_h)
+    new_w = W_any if sc_w <= sc_h else int(sc_w * crop_scale)
+    new_h = H_any if sc_h <= sc_w else int(sc_h * crop_scale)
+    crop_left = (new_w - W_any) // 2
+    crop_top  = (new_h - H_any) // 2
+    u_scene = (u + crop_left) / crop_scale
+    v_scene = (v + crop_top)  / crop_scale
 
-    # --- Sensor depth at pred resolution + per-gauss lookup ---
-    sensor_resized = cv2.resize(sensor_depth_m.astype(np.float32), (W_any, H_any), interpolation=cv2.INTER_NEAREST)
-    sensor_per_gauss = np.where(in_image, sensor_resized[v_idx, u_idx], 0.0).astype(np.float64)
+    # --- Sensor depth at FULL scene resolution + per-gauss lookup ---
+    Hs, Ws = sensor_depth_m.shape[:2]
+    sensor_full = sensor_depth_m.astype(np.float32)
+    us_idx = np.clip(np.round(u_scene).astype(np.int64), 0, Ws - 1)
+    vs_idx = np.clip(np.round(v_scene).astype(np.int64), 0, Hs - 1)
+    sensor_per_gauss = np.where(in_image, sensor_full[vs_idx, us_idx], 0.0).astype(np.float64)
     valid_sensor = in_image & (sensor_per_gauss > 0.01)
 
     if drop_no_sensor_depth:
         keep_d = valid_sensor
         means_canonical = means_canonical[keep_d]; log_scales = log_scales[keep_d]; quats_wxyz = quats_wxyz[keep_d]
         opacity_logits = opacity_logits[keep_d]; features_dc = features_dc[keep_d]; features_rest = features_rest[keep_d]
-        u = u[keep_d]; v = v[keep_d]; z_cam = z_cam[keep_d]
+        u_scene = u_scene[keep_d]; v_scene = v_scene[keep_d]; z_cam = z_cam[keep_d]
         d_per_gauss = sensor_per_gauss[keep_d]
         N = means_canonical.shape[0]
     else:
@@ -696,29 +713,29 @@ def reproject_anysplat_to_scene(
     if N == 0:
         return {"xyz": np.empty((0, 3), dtype=np.float32)}
 
-    # --- Optional CDN component mask filter (resized to pred resolution) ---
+    # --- Optional CDN component mask filter (indexed at SCENE resolution) ---
     if component_mask is not None:
         mask_np = component_mask if isinstance(component_mask, np.ndarray) else np.asarray(component_mask)
         if mask_np.ndim == 3: mask_np = mask_np[..., 0]
-        mask_resized = cv2.resize(mask_np.astype(np.uint8), (W_any, H_any), interpolation=cv2.INTER_NEAREST).astype(bool)
-        u_idx2 = np.clip(u.astype(np.int64), 0, W_any - 1)
-        v_idx2 = np.clip(v.astype(np.int64), 0, H_any - 1)
-        keep_c = mask_resized[v_idx2, u_idx2]
+        mask_bool = mask_np.astype(np.uint8) > 0
+        if mask_bool.shape[:2] != (Hs, Ws):
+            mask_bool = cv2.resize(mask_bool.astype(np.uint8), (Ws, Hs), interpolation=cv2.INTER_NEAREST).astype(bool)
+        usc = np.clip(np.round(u_scene).astype(np.int64), 0, Ws - 1)
+        vsc = np.clip(np.round(v_scene).astype(np.int64), 0, Hs - 1)
+        keep_c = mask_bool[vsc, usc]
         means_canonical = means_canonical[keep_c]; log_scales = log_scales[keep_c]; quats_wxyz = quats_wxyz[keep_c]
         opacity_logits = opacity_logits[keep_c]; features_dc = features_dc[keep_c]; features_rest = features_rest[keep_c]
-        u = u[keep_c]; v = v[keep_c]; z_cam = z_cam[keep_c]; d_per_gauss = d_per_gauss[keep_c]
+        u_scene = u_scene[keep_c]; v_scene = v_scene[keep_c]; z_cam = z_cam[keep_c]; d_per_gauss = d_per_gauss[keep_c]
         N = means_canonical.shape[0]
         if N == 0:
             return {"xyz": np.empty((0, 3), dtype=np.float32)}
 
-    # --- Back-project (u, v, d) through SCENE intrinsics, OpenGL convention ---
-    fx_s = scene_intr["fl_x"] * W_any / scene_intr["w"]
-    fy_s = scene_intr["fl_y"] * H_any / scene_intr["h"]
-    cx_s = scene_intr["cx"]   * W_any / scene_intr["w"]
-    cy_s = scene_intr["cy"]   * H_any / scene_intr["h"]
+    # --- Back-project (u_scene, v_scene, d) through FULL SCENE intrinsics ---
+    fx_s = float(scene_intr["fl_x"]); fy_s = float(scene_intr["fl_y"])
+    cx_s = float(scene_intr["cx"]);   cy_s = float(scene_intr["cy"])
     p_cam_gl = np.stack([
-        d_per_gauss * (u - cx_s) / fx_s,
-        -d_per_gauss * (v - cy_s) / fy_s,
+        d_per_gauss * (u_scene - cx_s) / fx_s,
+        -d_per_gauss * (v_scene - cy_s) / fy_s,
         -d_per_gauss,
     ], axis=-1)
     R_scene = scene_c2w[:3, :3]; t_scene = scene_c2w[:3, 3]

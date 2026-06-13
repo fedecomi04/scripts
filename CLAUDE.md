@@ -114,6 +114,14 @@ These are hard rules the pipeline depends on. If a change appears to require bre
 
 ## Notes
 
+### AnySplat reprojection was square-only — broke at 1920×1200 (2026-06-13)
+
+**Symptom:** at 1200p the FF produced a "ghost" second copy of static objects offset sideways (e.g. a second droid next to the real one), comet-tail smears, the gripper appearing in the scene, and runaway insert accumulation (scene ballooned 459k→1.6M gaussians as misplaced inserts re-triggered CDN every tick). At 800×800 the SAME code worked perfectly.
+
+**Root cause:** AnySplat's [`process_image`](third_party/AnySplat/src/utils/image.py) does **aspect-preserving resize (shorter side → 448) + CENTER-CROP to 448×448** — for 1920×1200 it resizes to 716×448 then crops 134 px off each side (AnySplat only sees the centre horizontal slice). But [`reproject_anysplat_to_scene`](dynamic_gs/utils/anysplat_decode.py) assumed a full-frame **anisotropic squash**: it scaled scene intrinsics by `W_any/scene_w` (= 448/1920) for x and resized sensor depth with a plain `cv2.resize(..., (448,448))`. Those two agree **only when the scene is square** (the 800×800 era: resize→448, no crop, `448/800` correct on both axes). At 1920×1200 the x-scale was wrong (used /1920 instead of /1200) **and** the centre-crop offset (−134 px) was missing → every insert mapped sideways = ghosts; the component (CDN/gripper) mask was indexed at the wrong pixels too → gripper leaked in.
+
+**Fix:** `reproject_anysplat_to_scene` now **inverts the resize+center-crop**. It maps each AnySplat pred-crop pixel `(u,v)` back to the true scene pixel via `crop_scale = 448/min(W,H)`, `crop_left/top = (new−448)//2`, then samples **full-resolution** sensor depth at `(u_scene,v_scene)`, indexes the component mask at **scene** resolution, and back-projects through the **full** scene intrinsics. Algebraically identical to the old path at 800×800 (crop_scale=448/800, crop_left=0). Recorded-1200p result vs the broken run: per-call inserts 20k–66k → 200–1.8k, scene 1.6M → ~497k, ghost/comet-tail/gripper gone (frames 131/137). **No code regression caused this — the reproject was always square-only; the ZED-X move to 1920×1200 exposed the latent assumption.** The hardcoded `H_any,W_any = 448,448` in [`_anysplat_bg_run`](dynamic_gs/dynamic_gs_pipeline_base.py) is CORRECT (AnySplat does output a 448 crop) — the bug was the coordinate math around it, not the 448.
+
 ### Real-1200p end-to-end + tracker/CDN/insert overhaul (2026-06-12 → 13)
 
 One day of fixes, each measured on the recorded screwdriver scene (800×800 `recording_15fps_2026-06-11_115107`, then the REAL 1920×1200 `replay_20260612_203321`). Commits `4402133..d1f6e7e`. Final validation on the real-1200p episode: **312/312 ticks, 0 tracking failures, peak 22.7 cm / 33°, end 20.6 cm (object stays on the plate), tail jiggle 0.7 mm / 0.2°/tick**.
