@@ -752,6 +752,42 @@ class DynamicGSPipelineBase(VanillaPipeline):
     # Trainer entry — Nerfstudio calls this every step
     # ====================================================================
 
+    def _recurring_ff_due(self, tick_count: int, is_first: bool) -> bool:
+        """Whether recurring (Mode B) feedforward fires for the given tick count.
+
+        PURE — no side effects — so the tick can decide UP FRONT whether to
+        spend a CDN render. The per-tick CDN is consumed ONLY by feedforward, so
+        on non-FF ticks the render is skipped entirely and the tracker thread
+        stays undisturbed. Pass the tick count AS THE FF GATE WILL SEE IT (i.e.
+        post-this-tick increment) — :meth:`_on_tracker_frame` runs after the
+        subclass increments ``_tracker_tick_count``, so the tick passes
+        ``_tracker_tick_count + 1`` and the hook passes ``_tracker_tick_count``.
+        """
+        if is_first:
+            return False
+        if str(self.config.enable_feedforward_inpaint) == "off":
+            return False
+        N = int(self.config.feedforward_recurring_every_n_ticks)
+        if N <= 0 or (tick_count % N) != 0:
+            return False
+        gap = (
+            self.config.feedforward_anysplat_min_gap_s
+            if str(self.config.enable_feedforward_inpaint) == "anysplat_decode"
+            else self.config.feedforward_recurring_min_gap_s
+        )
+        if gap > 0 and (time.time() - self._last_feedforward_wall_time) < gap:
+            return False
+        return True
+
+    def _oneshot_ff_due(self, step: int) -> bool:
+        """Whether the Mode A one-shot feedforward fires this step (also needs
+        the per-tick CDN present)."""
+        return (
+            int(self.config.feedforward_oneshot_step) > 0
+            and step >= int(self.config.feedforward_oneshot_step)
+            and not self._feedforward_oneshot_done
+        )
+
     def get_train_loss_dict(self, step: int):
         """Dynamic-only entry point.
 

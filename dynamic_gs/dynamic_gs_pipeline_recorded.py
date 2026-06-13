@@ -204,15 +204,22 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         else:
             self._apply_motion_estimator(camera, batch)
 
-        # Render + CDN for downstream feedforward. DGS_DIAG_SYNC=1 adds a
-        # cuda.synchronize inside the timer so DN.2 reports the true GPU cost
-        # of the render (otherwise it's CPU enqueue time only and the GPU work
-        # gets absorbed by the NEXT tick's xfeat sync — see DN.3c0).
-        t_cdn = time.time()
-        cdn = self._compute_tick_cdn(camera, batch)
-        if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
-            torch.cuda.synchronize()
-        self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
+        # Render + CDN for downstream feedforward — ONLY when FF will actually
+        # consume it this tick. The CDN is a full GPU render; computing it every
+        # tick (FF fires only every Nth) stalls the tracker for nothing. Decide
+        # up front via the same gate the FF hook uses (it runs post-increment,
+        # so predict with _tracker_tick_count + 1). DGS_DIAG_SYNC=1 adds a
+        # cuda.synchronize inside the timer for the true GPU cost.
+        need_cdn = self._recurring_ff_due(self._tracker_tick_count + 1, is_first) \
+            or self._oneshot_ff_due(step)
+        if need_cdn:
+            t_cdn = time.time()
+            cdn = self._compute_tick_cdn(camera, batch)
+            if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
+        else:
+            cdn = None
 
         # Publish to latest tracker frame.
         self._latest_tracker_frame = {
@@ -314,27 +321,11 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         gated by a wall-clock floor (``feedforward_recurring_min_gap_s``)
         so high tracker rates don't dominate FF cost.
         """
-        if is_first:
-            return  # no FF on D0
-        if str(self.config.enable_feedforward_inpaint) == "off":
-            return  # FF disabled entirely — no recurring inserts (was leaking
-                    # ~5k gaussians/6 ticks even with FF off, bloating to OOM)
-        N = int(self.config.feedforward_recurring_every_n_ticks)
-        if N <= 0:
+        # Same gate the tick used to decide whether to render the CDN — runs
+        # here post-increment, so pass _tracker_tick_count directly.
+        if not self._recurring_ff_due(self._tracker_tick_count, is_first):
             return
-        if (self._tracker_tick_count % N) != 0:
-            return
-        # Wall-clock floor.
-        import time as _time
-        gap = (
-            self.config.feedforward_anysplat_min_gap_s
-            if str(self.config.enable_feedforward_inpaint) == "anysplat_decode"
-            else self.config.feedforward_recurring_min_gap_s
-        )
-        now = _time.time()
-        if gap > 0 and (now - self._last_feedforward_wall_time) < gap:
-            return
-        self._last_feedforward_wall_time = now
+        self._last_feedforward_wall_time = time.time()
         if self._latest_tracker_frame is None:
             return
         self._run_feedforward(self._latest_tracker_frame, mode_label="recurring")
