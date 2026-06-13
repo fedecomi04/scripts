@@ -114,6 +114,14 @@ These are hard rules the pipeline depends on. If a change appears to require bre
 
 ## Notes
 
+### Per-tick CDN gated to FF ticks → MUST run with DGS_KF_SYNTHETIC_FPS (2026-06-13)
+
+The per-tick CDN (`_compute_tick_cdn`, a full GPU render + MS-SSIM) is consumed ONLY by feedforward, which fires every Nth tick (`feedforward_recurring_every_n_ticks=6`) + a wall-clock min-gap. So the recorded/live tick now renders the CDN **only on FF-firing ticks** (`_recurring_ff_due` / `_oneshot_ff_due` gate in [`dynamic_gs_pipeline_recorded.py`](dynamic_gs/dynamic_gs_pipeline_recorded.py) + [`_live`](dynamic_gs/dynamic_gs_pipeline_live.py); `cdn=None` otherwise). This roughly **doubled the tracker rate** (the BEFORE timing_report showed CDN n=313 @ 59 ms every tick → tick ≈ 9 Hz; gated → non-FF ticks ≈ 18 Hz).
+
+**CRITICAL COUPLING:** the pose Kalman filter uses **wall-clock dt** (`tracker_common.PoseKalmanFilter.filter` → `dt = timestamp - self._last_time`, fed `time.time()` in [`xfeat_motion.py`](dynamic_gs/utils/xfeat_motion.py)). Its process-noise was tuned at the OLD ~9 Hz rate, so the gating's faster+variable rate **detuned it → visible oscillation**. The fix is NOT to retune but to make the KF **rate-invariant**: set **`DGS_KF_SYNTHETIC_FPS=20`** — `xfeat_motion` then feeds the filter fixed frame-cadence timestamps (`_kf_tick / fps`) so dt is constant regardless of loop speed. **Always run the recorded fast path with `DGS_KF_SYNTHETIC_FPS` set** (canonical launch adds it alongside `DGS_XFEAT_SCALE_SELECT=1`); without it the gated tracker oscillates. Live mode could keep wall-clock dt (real-time, stable rate) but synthetic-fps is harmless there too. *Open: bake the synthetic-fps default into the recorded pipeline so the gated default is stable without the env var.*
+
+**Decide-FF-once invariant:** the FF-fire gate is evaluated EXACTLY ONCE per tick and stored in `self._ff_due_this_tick` (set where the tick decides `need_cdn`); `_on_tracker_frame` reuses the flag. Re-evaluating `_recurring_ff_due` in the hook raced the min-gap clock → fired FF on a CDN-skipped tick → `cdn.shape` on `None` crash that killed the tracker thread (fixed `5ee9d2b`; a defensive `cdn is None → skip` guard sits in the `_run_feedforward` dispatcher as backstop). Predict with `_tracker_tick_count + 1` in the tick (the hook runs post-increment).
+
 ### AnySplat reprojection was square-only — broke at 1920×1200 (2026-06-13)
 
 **Symptom:** at 1200p the FF produced a "ghost" second copy of static objects offset sideways (e.g. a second droid next to the real one), comet-tail smears, the gripper appearing in the scene, and runaway insert accumulation (scene ballooned 459k→1.6M gaussians as misplaced inserts re-triggered CDN every tick). At 800×800 the SAME code worked perfectly.
