@@ -688,6 +688,22 @@ class DynamicGSPipelineBase(VanillaPipeline):
         ff_n = int(getattr(self.config, "feedforward_recurring_every_n_ticks", 0) or 0)
         lines.append(f"FF mode:     {ff_mode} (every {ff_n} ticks)")
         lines.append(f"Viser:       {'on (port ' + str(getattr(self.config, 'viser_direct_port', '?')) + ')' if getattr(self.config, 'enable_viser_direct', False) else 'off'}")
+        # Effective rates from wall-clock span of the dynamic tick loop (n-1
+        # intervals over the first→last tick stamp). Tracker Hz = ticks/s; FF Hz
+        # = AnySplat-dispatch calls/s. "N/A" if the span wasn't captured.
+        _t0 = getattr(self, "_dyn_first_tick_wall", None)
+        _t1 = getattr(self, "_dyn_last_tick_wall", None)
+        _n_ticks = len(timing.get("DN.3_estimate_total", []))
+        _n_ff = len(timing.get("FF.1_cdn_clean", []))
+        if _t0 is not None and _t1 is not None and _t1 > _t0 and _n_ticks > 1:
+            _span = _t1 - _t0
+            _trk_hz = (_n_ticks - 1) / _span
+            _ff_hz = _n_ff / _span
+            lines.append(f"Tracker:     {_trk_hz:.1f} Hz  ({_n_ticks} ticks over {_span:.1f}s)")
+            lines.append(f"FF:          {_ff_hz:.2f} Hz  ({_n_ff} calls over {_span:.1f}s)")
+        else:
+            lines.append("Tracker:     N/A (no tick-span captured)")
+            lines.append("FF:          N/A")
         lines.append("")
 
         # By-phase bulleted load/inference report (teleop_init loads from the
@@ -1454,10 +1470,16 @@ class DynamicGSPipelineBase(VanillaPipeline):
         mc = self.model.config
         if downsample_factor is None:
             from .change_detection import resolve_downsample_factor
+            # Env override for live A/B of CDN sensitivity (no relaunch): higher
+            # target_side = finer MS-SSIM grid = MORE sensitive (smaller change
+            # regions detected); lower = more conservative.
+            _tgt = int(os.environ.get(
+                "DGS_CDN_TARGET_SIDE",
+                getattr(mc, "change_mask_downsample_target_side", 100)))
             downsample_factor = resolve_downsample_factor(
                 rendered_rgb,
                 int(getattr(mc, "change_mask_downsample_factor", 0)),
-                int(getattr(mc, "change_mask_downsample_target_side", 100)),
+                _tgt,
             )
         cfg = ChangeMaskConfig(
             depth_threshold=mc.change_mask_depth_threshold,
@@ -1734,6 +1756,14 @@ class DynamicGSPipelineBase(VanillaPipeline):
             current_object_mask=current_object_mask,
         )
         self._timing["DN.3_estimate_total"].append(time.time() - t)
+        # Wall-clock span of the dynamic tick loop, for the effective tracker /
+        # FF Hz in the report header. Stamped once per tick (both pipelines call
+        # this). Recorded mode runs as fast as compute allows, so the real rate
+        # must come from wall-time, not from summing per-tick compute.
+        _now_wall = time.time()
+        if getattr(self, "_dyn_first_tick_wall", None) is None:
+            self._dyn_first_tick_wall = _now_wall
+        self._dyn_last_tick_wall = _now_wall
         sub = motion_estimate.timings or {}
         self._timing["DN.3b_estimator_input_prep"].append(float(sub.get("input_prep", 0.0)))
         self._timing["DN.3c_predictor_forward"].append(

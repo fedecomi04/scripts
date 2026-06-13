@@ -136,6 +136,12 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         keep viser-direct serving and block until the operator clicks the
         in-viewer 'Shutdown viewer' button (or the configured timeout). No-op
         if keep-alive is off, viser-direct is off, or already closing."""
+        # Write the timing report HERE (run-finished, pre-linger) so it always
+        # lands on disk — atexit alone is not enough: it never fires on SIGKILL
+        # (kill -9), which is how a lingering run is usually torn down. Idempotent
+        # via the _timing_report_written guard, so the atexit registration is a
+        # harmless backstop.
+        self._write_timing_report()
         if not getattr(self.config, "keep_viser_alive_at_end", False):
             return
         if getattr(self, "_keep_alive_done", False):

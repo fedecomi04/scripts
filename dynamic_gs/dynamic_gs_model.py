@@ -121,16 +121,23 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     (full native res — fires on the whole scene with mode='rgb'). A fixed
     N>1 forces an NxN pool. Only affects mode='rgb' meaningfully; depth modes
     pool too but are already robust."""
-    change_mask_downsample_target_side: int = 140
+    change_mask_downsample_target_side: int = 150
     """For ``change_mask_downsample_factor=0`` (auto): MS-SSIM runs on roughly
     this-many pixels per side (~target²  total). 100 → ~10k pixels, i.e. an
     800x800 frame pools ~8x down. Lower = coarser/less sensitive; higher =
-    finer/more sensitive (catches smaller change regions). 140 (2026-06-13,
-    by request, for a slightly more aggressive CDN): ~2x the pixel count of
-    100 (~20k px), so an 800x800 frame pools ~6x instead of ~8x and a
-    1920x1200 frame proportionally less — the CDN sees finer change without
-    going full-native (factor=1 fires on the whole scene). Lower back toward
-    100 if static-frame false positives reappear."""
+    finer/more sensitive (catches smaller change regions). **150 is the tuned
+    default** (2026-06-13): measured clean at 688k gauss, 0 OOM — slightly more
+    sensitive than the prior 140 with no bloat. **DO NOT exceed ~150:**
+    measured target_side=160 re-exposed the soft-render-vs-sharp-live mismatch
+    as false 'change' across the scene → runaway inserts (per-call up to 69k,
+    scene 700k→1.75M gauss) → AnySplat/Open3D CUDA OOM. 150→160 is a sharp
+    nonlinear cliff (688k→1.75M); stay at/below 150.
+    The coarse MS-SSIM pyramid weights (0.15,0.30,0.55) suppress that mismatch
+    at the COARSE grid; a finer grid defeats the suppression. **Env override
+    DGS_CDN_TARGET_SIDE** for live A/B (no relaunch): lower toward 100 = more
+    conservative; raising past 140 bloats. For genuinely-more sensitivity
+    without the false-positive explosion, lower ``change_mask_rgb_threshold``
+    slightly instead (gentler — it doesn't refine the grid)."""
     change_mask_gripper_erode_px: int = 3
     """Erode the gripper KEEP mask by this many px before CDN, so the leak ring
     of gripper-coloured pixels just outside the silhouette (anti-aliasing /
