@@ -207,11 +207,12 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         # Render + CDN for downstream feedforward — ONLY when FF will actually
         # consume it this tick. The CDN is a full GPU render; computing it every
         # tick (FF fires only every Nth) stalls the tracker for nothing. Decide
-        # up front via the same gate the FF hook uses (it runs post-increment,
-        # so predict with _tracker_tick_count + 1). DGS_DIAG_SYNC=1 adds a
-        # cuda.synchronize inside the timer for the true GPU cost.
-        need_cdn = self._recurring_ff_due(self._tracker_tick_count + 1, is_first) \
-            or self._oneshot_ff_due(step)
+        # the FF-fire ONCE here and STORE it (predict with _tracker_tick_count+1
+        # because the hook runs post-increment); _on_tracker_frame reuses the
+        # stored flag. Re-evaluating the gate there would race the min-gap clock
+        # and could fire FF on a tick where we skipped the CDN (cdn=None crash).
+        self._ff_due_this_tick = self._recurring_ff_due(self._tracker_tick_count + 1, is_first)
+        need_cdn = self._ff_due_this_tick or self._oneshot_ff_due(step)
         if need_cdn:
             t_cdn = time.time()
             cdn = self._compute_tick_cdn(camera, batch)
@@ -321,9 +322,10 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         gated by a wall-clock floor (``feedforward_recurring_min_gap_s``)
         so high tracker rates don't dominate FF cost.
         """
-        # Same gate the tick used to decide whether to render the CDN — runs
-        # here post-increment, so pass _tracker_tick_count directly.
-        if not self._recurring_ff_due(self._tracker_tick_count, is_first):
+        # Reuse the SAME decision the tick made when it chose whether to render
+        # the CDN — re-evaluating the gate here would race the min-gap clock and
+        # could fire FF on a tick where the CDN was skipped (cdn=None crash).
+        if not getattr(self, "_ff_due_this_tick", False):
             return
         self._last_feedforward_wall_time = time.time()
         if self._latest_tracker_frame is None:

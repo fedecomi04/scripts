@@ -355,6 +355,10 @@ class DynamicGSPipelineBase(VanillaPipeline):
         self._feedforward_call_counter: int = 0
         self._feedforward_oneshot_done: bool = False
         self._last_feedforward_wall_time: float = 0.0
+        # Per-tick FF-fire decision, set by the subclass tick and reused by
+        # _on_tracker_frame so the gate is evaluated exactly once (the CDN
+        # render is gated on the same flag).
+        self._ff_due_this_tick: bool = False
         self._d0_selected_instance_id: int = 0
         # cudnn benchmark mode OFF for the dynamic phase. ns-train sets
         # torch.backends.cudnn.benchmark=True globally (nerfstudio/scripts/
@@ -2121,6 +2125,12 @@ class DynamicGSPipelineBase(VanillaPipeline):
         prerendered_depth=None,
     ) -> None:
         """Dispatcher for feedforward hole-fill at a target tracker frame."""
+        # Defensive: the CDN is rendered only on FF-firing ticks; if it's
+        # somehow absent (None), there is nothing to decode against — skip
+        # rather than dereference None downstream.
+        if target_frame is None or target_frame.get("cdn") is None:
+            CONSOLE.log(f"[feedforward] {mode_label}: no CDN this tick — skip")
+            return
         if str(getattr(self.config, "enable_feedforward_inpaint", "off")) == "anysplat_decode":
             return self._run_feedforward_anysplat(
                 target_frame, mode_label,

@@ -299,10 +299,12 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
             self._apply_motion_estimator(camera, batch)
 
         # CDN render ONLY when FF will consume it this tick (it's a full GPU
-        # render; FF fires every Nth tick). Same gate the FF hook uses, which
-        # runs post-increment — predict with _tracker_tick_count + 1.
-        need_cdn = self._recurring_ff_due(self._tracker_tick_count + 1, is_first) \
-            or self._oneshot_ff_due(step)
+        # render; FF fires every Nth tick). Decide ONCE and STORE it (predict
+        # with _tracker_tick_count+1; the hook runs post-increment) so the hook
+        # reuses it — re-evaluating the min-gap gate there would race the clock
+        # and could fire FF on a CDN-skipped tick (cdn=None crash).
+        self._ff_due_this_tick = self._recurring_ff_due(self._tracker_tick_count + 1, is_first)
+        need_cdn = self._ff_due_this_tick or self._oneshot_ff_due(step)
         if need_cdn:
             t_cdn = time.time()
             cdn = self._compute_tick_cdn(camera, batch)
@@ -415,9 +417,9 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         is_first: bool,
     ) -> None:
         """Live: Mode B feedforward cadence (same gate as recorded)."""
-        # Same gate the tick used to decide whether to render the CDN — runs
-        # here post-increment, so pass _tracker_tick_count directly.
-        if not self._recurring_ff_due(self._tracker_tick_count, is_first):
+        # Reuse the tick's stored decision (re-evaluating the min-gap gate here
+        # would race the clock and could fire FF on a CDN-skipped tick).
+        if not getattr(self, "_ff_due_this_tick", False):
             return
         self._last_feedforward_wall_time = time.time()
         if self._latest_tracker_frame is None:
