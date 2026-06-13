@@ -242,6 +242,14 @@ class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
     feedforward_object_mask_dilate_px: int = 2
     """Dilation applied to the rendered object mask before subtracting it
     from CDN in :meth:`_feedforward_clean_cdn`."""
+    feedforward_object_mask_scale: float = 1.02
+    """Enlarge the subtracted object footprint by this factor about its OWN
+    centroid (1.02 = +2%) before subtracting from CDN. Unlike the fixed-px
+    dilation this scales with object size, so it swallows the thin
+    'misplacement ring' between the rendered tracked object and the live
+    object (a few px of residual where tracking is slightly off) — without it
+    the CDN flags that ring as change and the FF tries to insert a flat copy
+    of the object onto the tracked 3D object. 1.0 disables."""
 
     feedforward_anysplat_conda_env: str = "anysplat_dynamic_gs"
     feedforward_anysplat_worker_timeout_s: float = 300.0
@@ -1995,6 +2003,38 @@ class DynamicGSPipelineBase(VanillaPipeline):
         except Exception:
             pass
 
+    def _scale_mask_about_centroid(self, mask, scale: float):
+        """Enlarge a binary mask by ``scale`` (1.02 = +2%) about its OWN centroid.
+
+        Used to slightly over-cover the tracked object's subtracted footprint so
+        the thin rendered-vs-live misplacement ring isn't treated as change.
+        """
+        if scale is None or abs(float(scale) - 1.0) < 1e-6:
+            return mask
+        import numpy as _np
+        import cv2 as _cv2
+        was_tensor = isinstance(mask, torch.Tensor)
+        dev = mask.device if was_tensor else None
+        arr = mask.detach().cpu().numpy() if was_tensor else _np.asarray(mask)
+        has_ch = (arr.ndim == 3 and arr.shape[-1] == 1)
+        sq = arr[..., 0] if has_ch else arr
+        ys, xs = _np.where(sq > 0.5)
+        if xs.size == 0:
+            return mask
+        cx, cy = float(xs.mean()), float(ys.mean())
+        H, W = sq.shape[:2]
+        s = float(scale)
+        M = _np.array([[s, 0.0, cx * (1.0 - s)],
+                       [0.0, s, cy * (1.0 - s)]], dtype=_np.float32)
+        out = _cv2.warpAffine((sq > 0.5).astype(_np.uint8), M, (W, H),
+                              flags=_cv2.INTER_NEAREST)
+        # Union with the original so the enlarged mask always CONTAINS it
+        # (scaling-about-centroid can leave a few rounding gaps on thin parts).
+        out = _np.maximum(out, (sq > 0.5).astype(_np.uint8)).astype(_np.float32)
+        if has_ch:
+            out = out[..., None]
+        return torch.from_numpy(out).to(dev) if was_tensor else out
+
     def _feedforward_clean_cdn(self, camera, cdn, frame_name: Optional[str] = None, prerendered_obj_mask=None):
         """Subtract the moving object's rendered Gaussian footprint from CDN.
         Prevents the decoder from back-projecting the live object's surface
@@ -2018,6 +2058,9 @@ class DynamicGSPipelineBase(VanillaPipeline):
                 size=(h, w),
                 mode="nearest",
             ).squeeze(0).permute(1, 2, 0)
+        scale = float(getattr(self.config, "feedforward_object_mask_scale", 1.0))
+        if scale != 1.0:
+            obj_mask_now = self._scale_mask_about_centroid(obj_mask_now, scale)
         dilate_px = int(self.config.feedforward_object_mask_dilate_px)
         if dilate_px > 0:
             obj_mask_now = dilate_binary_mask(obj_mask_now, dilate_px)
