@@ -312,7 +312,7 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     internal cumulative pose (anchor selection / creation / next-tick
     prediction) stays raw, so smoothing lag can never destabilize
     tracking itself."""
-    xfeat_pose_filter_accel_sigma: float = 0.01
+    xfeat_pose_filter_accel_sigma: float = 0.02
     """Process noise: white translational acceleration 1-sigma (m/s^2).
     Lower = smoother + more lag after sudden jerks; higher = follows the
     raw RANSAC pose more closely. Bench (synthetic, 3 mm / 0.5 deg
@@ -320,23 +320,22 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     ~2.1x and settles a worst-case 5 cm jump in 4 ticks; 0.02 gives ~2.5x
     but 7-tick settle. On the recorded screwdriver scene, 0.02 cut the
     static-tail translation jiggle MAX 16.8 -> 11.2 mm with no tracking-
-    range cost (peak/end unchanged). 0.01 (2026-06-13, by request, for
-    extra smoothing): the offline measurement showed no further static
-    gain past 0.02, but at the live ~50 ms tick the stronger Q-floor
-    still smooths stationary wander harder; the cost is a slightly longer
-    settle after a fast lift. NOTE: Q ~ accel_sigma^2 * dt^4, so at the
-    live ~50 ms tick this smooths ~1600x harder than on the offline
-    ~314 ms replay; raise back toward 0.02-0.05 if live motion lags."""
-    xfeat_pose_filter_alpha_sigma: float = 0.05
+    range cost (peak/end unchanged); going to 0.01 gave no further gain.
+    TRIED 0.01 (2026-06-13, by request, for extra smoothing) and REVERTED:
+    at the live ~50 ms tick the stronger Q-floor added visible motion lag /
+    catch-up oscillation (the user's tracker had been working perfectly at
+    0.02). 0.02 is the validated default. NOTE: Q ~ accel_sigma^2 * dt^4, so
+    at the live ~50 ms tick this smooths ~1600x harder than on the offline
+    ~314 ms replay — do NOT lower below 0.02; raise toward 0.05 if motion lags."""
+    xfeat_pose_filter_alpha_sigma: float = 0.1
     """Process noise: white angular acceleration 1-sigma (rad/s^2). Same
-    trade-off as the translational sigma, for rotation. 0.05 (was 0.1,
-    earlier 0.25); lowered 2026-06-13 with accel_sigma for extra
-    smoothing. NOTE: residual rotation jiggle on the offline replay is
-    spike-frame dominated (occasional low-inlier bad matches, ~11 deg),
-    which the KF can't smooth away — that's an upstream matches/inliers
-    problem (anchor policy), not a knob here; lowering alpha_sigma
-    further or widening the snap-rot gate gave no improvement there, so
-    this only helps the continuous-wander component."""
+    trade-off as the translational sigma, for rotation. 0.1 (was 0.25).
+    TRIED 0.05 (2026-06-13, with accel_sigma) and REVERTED for the same
+    reason — added motion lag. NOTE: residual rotation jiggle on the
+    offline replay is spike-frame dominated (occasional low-inlier bad
+    matches, ~11 deg), which the KF can't smooth away — that's an upstream
+    matches/inliers problem (anchor policy), not a knob here; lowering
+    alpha_sigma further or widening the snap-rot gate gave no improvement."""
     xfeat_static_hold: bool = True
     """Output-side static-hold: when the tracked pose shows no net trend
     across ``xfeat_static_hold_window`` success ticks (object genuinely
