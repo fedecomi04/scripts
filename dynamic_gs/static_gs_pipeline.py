@@ -358,7 +358,14 @@ class StaticGSPipeline(VanillaPipeline):
 # straight to Phase 0b. Set the loss to 0 (or DGS_STATIC_EARLY_STOP=0) to
 # disable and always run the full max_num_iterations budget.
 STATIC_EARLY_STOP_ENABLED = os.environ.get("DGS_STATIC_EARLY_STOP", "1") != "0"
-STATIC_EARLY_STOP_LOSS = float(os.environ.get("DGS_STATIC_EARLY_STOP_LOSS", "0.09"))
+# 0.09 fired at ~step 107 on the real 1920x1200 scene, but render PSNR keeps
+# climbing well past that (measured ladder, same 459k seed: step107=24.0 dB,
+# step500=26.3, step1000=27.3) — the loss-EMA flattens long before the render
+# is sharp at high resolution, so 0.09 was undertraining = the "scene is
+# blurry" report. 0.02 sits below the EMA reached by ~step 500, so the scene
+# trains essentially the full STATIC_NUM_STEPS=500 budget (the +2.3 dB jump)
+# while still early-exiting a genuinely-trivial scene that converges harder.
+STATIC_EARLY_STOP_LOSS = float(os.environ.get("DGS_STATIC_EARLY_STOP_LOSS", "0.02"))
 STATIC_EARLY_STOP_PATIENCE = int(os.environ.get("DGS_STATIC_EARLY_STOP_PATIENCE", "8"))
 STATIC_EARLY_STOP_MIN_STEPS = int(os.environ.get("DGS_STATIC_EARLY_STOP_MIN_STEPS", "100"))
 
