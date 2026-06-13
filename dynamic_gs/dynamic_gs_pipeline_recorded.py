@@ -222,14 +222,10 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         # rate no longer detunes it — the earlier revert-to-every-tick was only
         # because the wall-clock-dt KF couldn't tolerate the rate change.
         self._ff_due_this_tick = self._recurring_ff_due(self._tracker_tick_count + 1, is_first)
-        if self._ff_due_this_tick:
-            t_cdn = time.time()
-            cdn = self._compute_tick_cdn(camera, batch)
-            if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
-                torch.cuda.synchronize()
-            self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
-        else:
-            cdn = None
+        # The CDN render (56 ms) is NO LONGER done on the tracker tick — it moved
+        # onto the FF bg thread (_feedforward_threaded) along with the rest of FF,
+        # so the tick never blocks on it. Store cdn=None; the bg thread renders it.
+        cdn = None
 
         # Publish to latest tracker frame.
         self._latest_tracker_frame = {
@@ -243,10 +239,12 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         self._tracker_tick_count += 1
 
         # Visualization: push to viser-direct, also kick the Nerfstudio viewer.
+        _t_vis = time.time()
         self._build_viser_direct_handles(camera)
         self._push_viser_direct_transforms()
         self._push_viser_camera_feed(camera, batch)
         self._force_viewer_rerender()
+        self._timing["DN.4_viser_push"].append(time.time() - _t_vis)
 
         # Subclass / Mode B hook.
         self._on_tracker_frame(camera, batch, cdn, is_first)
@@ -336,10 +334,9 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         # could fire FF on a tick where the CDN was skipped (cdn=None crash).
         if not getattr(self, "_ff_due_this_tick", False):
             return
-        self._last_feedforward_wall_time = time.time()
-        if self._latest_tracker_frame is None:
-            return
-        self._run_feedforward(self._latest_tracker_frame, mode_label="recurring")
+        # Run the whole FF (CDN render included) on a bg thread — never block
+        # the tracker tick. No-op if a prior FF is still in flight.
+        self._dispatch_feedforward_async(self._latest_tracker_frame, "recurring")
 
     # ====================================================================
     # D0 bootstrap (recorded-specific implementation)
@@ -375,43 +372,5 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         # XFeat anchor seed. (Same path used by every interactive switch.)
         self._reseed_tracked_object(int(picked), camera, batch)
 
-    @torch.no_grad()
-    def _compute_tick_cdn(self, camera, batch):
-        """Render + compare for the change mask. Returns the CDN tensor."""
-        try:
-            outputs = self._render_from_camera(camera)
-        except Exception as exc:
-            CONSOLE.log(f"[dynamic-gs-recorded] render for CDN failed: {exc}")
-            return None
-        rendered_rgb = outputs.get("rgb")
-        rendered_depth = outputs.get("depth")
-        rendered_alpha = outputs.get("accumulation")
-        if rendered_rgb is None:
-            return None
-
-        bg = self.model._get_background_color()
-        live_rgb = self.model.composite_with_background(
-            self.model.get_gt_img(batch["image"]), bg
-        )
-        gt_depth = self.model._get_gt_depth(batch)
-        gripper_mask = self.model._get_batch_mask(batch)
-
-        try:
-            obj_mask = self._render_object_mask_cached(camera)
-        except Exception:
-            obj_mask = None
-
-        try:
-            cdn = self._compute_change_mask(
-                rendered_rgb=rendered_rgb,
-                rendered_depth=rendered_depth,
-                live_rgb=live_rgb,
-                gt_depth=gt_depth,
-                gripper_mask=gripper_mask,
-                object_mask=obj_mask,
-                rendered_alpha=rendered_alpha,
-            )
-            return cdn
-        except Exception as exc:
-            CONSOLE.log(f"[dynamic-gs-recorded] _compute_change_mask failed: {exc}")
-            return None
+    # _compute_tick_cdn is now the shared base implementation (renders the scene
+    # at the CDN grid resolution). The recorded + live overrides were identical.

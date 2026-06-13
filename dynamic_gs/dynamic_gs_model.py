@@ -221,18 +221,18 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     # cu128): sparse 1280x720 ~7 ms end-to-end (extract A + extract B +
     # match). Semi-dense (XFeat*) at the same res takes ~12 ms - to try
     # it, swap match_xfeat for match_xfeat_star in xfeat_motion.py.
-    xfeat_top_k: int = 3000
+    xfeat_top_k: int = 1024
     """Number of XFeat keypoints sampled per frame. Higher = more candidates
     that land inside small-object masks (a 2-3% screwdriver only gets ~8-20
-    keypoints at top_k=300, well below min_track_points=12). 3000 covers the
-    typical 1-10% object-area range comfortably. Cost: detectAndCompute scales
-    roughly linearly with top_k — verify DN.3c_xfeat_extract in the timing
-    report after changing this; it must stay under the per-tick budget
-    (≈100 ms). Measured on new_env (192 frames, viser on): avg 14.3 ms at 3000,
-    17.4 ms at 6000 — doubling cost only ~22% (extract is image-bound, not
-    purely top_k-bound), but doubling gave no tracking benefit on new_env (the
-    object was lost at the tail because it left the view, not for lack of
-    keypoints), so 3000 stays the default."""
+    keypoints at top_k=300, well below min_track_points=12). 1024 still covers
+    the typical 1-10% object-area range and stays well above the ~200 shake
+    floor. Cost: **1024 (2026-06-13, from 3000) for tracker Hz** — measured on
+    replay_20260612 (1200p, FF off): extract 31.5→26.0 ms, tracker 12.5→13.8 Hz,
+    0 tracking failures. (top_k 3000→1024 only saved 5.5 ms — the 26 ms
+    remainder is the CNN backbone at 1200p, resolution-bound not top_k-bound —
+    but the 5.5 ms is free with no quality cost here.) DO NOT drop below ~512
+    (match-set variance → stationary shake below ~200, per the 2026-05-26
+    notes)."""
     """Max keypoints per frame. The XFeat top-k is applied AFTER NMS so
     in practice you get fewer keypoints on small/textureless images —
     the value is only a cap. 300 is sized for the worst case where the
@@ -454,7 +454,22 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     keeping the crop small enough for fast extraction; at 300 px the crop
     ballooned to ~730x680 (nearly the full 800x800 frame) and XFeat extract
     was ~20 ms. Raise for faster motion / more context, lower for tighter
-    focus + speed."""
+    focus + speed. **50 px (2026-06-13, for tracker Hz):** the bbox already
+    bounds the object; 50 px just guards one tick of motion. Paired with
+    ``xfeat_crop_max_side=600`` to bound XFeat extract (the biggest per-tick
+    GPU cost) at 1200p. CAVEAT: 60 px once clipped the ~64 px CNN receptive
+    field and destabilised boundary descriptors — watch inlier counts; raise
+    back toward 100-150 if matches drop under motion."""
+    xfeat_crop_max_side: int = 600
+    """Hard cap (pixels) on the XFeat crop's width/height, centred on the
+    object. XFeat extract is a CNN → cost scales with crop AREA, and at 1200p
+    the bbox+padding crop can balloon toward full-frame (extract ~35 ms, the
+    single biggest per-tick cost). Capping to a 600x600 window keeps extract
+    bounded while staying ~10x the ~64 px CNN receptive field. The object is
+    only clipped if it's itself larger than this on screen (with 50 px padding
+    that means an object >500 px across). 0 = no cap. NOTE (2026-06-13): an
+    800 cap measured INERT here — the bbox+150px crop was already <800 — so the
+    cap only bites once paired with a tighter bbox/padding."""
     xfeat_object_search_radius_px: int = 80
     """Dilation radius (pixels) applied to the rendered object mask before
     using it as the per-frame post-match filter on the current frame. The
@@ -492,6 +507,14 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     declared 'on the object'. Default 0.5 (= 'this pixel is at least 50%
     object'). Was 0.01 historically, which counted soft-falloff Gaussian tails
     as part of the object and inflated the mask area ~10x for small objects."""
+    object_mask_render_scale: float = 1.0
+    """Render :meth:`render_object_mask` at this fraction of full resolution
+    (then nearest-upsample the binary mask back to full res). **Measured 2026-06-13:
+    NO useful speedup** — at 0.25 the render only dropped 13.9→13.1 ms because the
+    cost is GAUSSIAN-COUNT bound (projection + tile-binning of ~45k object
+    Gaussians), NOT pixel bound. Left at 1.0 (full res, no coarsening) since
+    lowering it only coarsens the silhouette for ~1 ms. Knob kept for the rare
+    pixel-bound case (huge frame, few Gaussians)."""
     object_mask_scale_shrink: float = 1.0
     """Multiplier on each Gaussian's per-axis scale applied ONLY inside
     :meth:`render_object_mask`. ``1.0`` = no change (full splat extent).
@@ -2116,7 +2139,24 @@ class DynamicGSModel(SplatfactoModel):
             scaled_camera, _ = self._get_scaled_camera(camera)
             viewmat = get_viewmat(optimized_camera_to_world)
             K = scaled_camera.get_intrinsics_matrices().to(self.device)
-            width, height = int(scaled_camera.width.item()), int(scaled_camera.height.item())
+            full_w, full_h = int(scaled_camera.width.item()), int(scaled_camera.height.item())
+            # Render the mask at reduced resolution then upsample. It's only a
+            # coarse keypoint/region filter (and a CDN object-exclusion mask that's
+            # +2%-scaled + dilated downstream), so sub-pixel silhouette precision is
+            # irrelevant — but full-res rasterization of ~45k object Gaussians at
+            # 1200p costs ~14 ms EVERY tick. ``object_mask_render_scale`` (0.25 =
+            # 1/4 res) cuts that ~3-4x. K scales with resolution; the binary mask
+            # is nearest-upsampled back to full res before dilation.
+            _ms = float(self.config.object_mask_render_scale)
+            if 0.0 < _ms < 1.0:
+                width = max(1, int(round(full_w * _ms)))
+                height = max(1, int(round(full_h * _ms)))
+                sx = width / float(full_w); sy = height / float(full_h)
+                K = K.clone()
+                K[:, 0, 0] *= sx; K[:, 0, 2] *= sx
+                K[:, 1, 1] *= sy; K[:, 1, 2] *= sy
+            else:
+                width, height = full_w, full_h
 
             # Renders ONLY the Gaussians with the tracked object's D0 instance id,
             # NOTHING ELSE. `_tracked_object_mask()` is `instance_ids == d0_id` after
@@ -2125,7 +2165,7 @@ class DynamicGSModel(SplatfactoModel):
             # insertions.
             obj_mask = self._tracked_object_mask()
             if not obj_mask.any():
-                return torch.zeros(height, width, 1, device=self.device)
+                return torch.zeros(full_h, full_w, 1, device=self.device)
 
             opacities = torch.sigmoid(self.opacities[obj_mask]).squeeze(-1)
             scales = torch.exp(self.scales[obj_mask]) * float(self.config.object_mask_scale_shrink)
@@ -2159,6 +2199,12 @@ class DynamicGSModel(SplatfactoModel):
             binary = (subset_alpha.squeeze(0) > alpha_thr).float()
             if binary.ndim == 2:
                 binary = binary[..., None]
+            # Upsample the reduced-res mask back to full res (nearest) BEFORE
+            # dilation, so dilate_px stays in full-res pixels.
+            if (height, width) != (full_h, full_w):
+                binary = torch.nn.functional.interpolate(
+                    binary.permute(2, 0, 1)[None], size=(full_h, full_w), mode="nearest"
+                )[0].permute(1, 2, 0)
             if self.config.object_mask_dilate_px > 0:
                 binary = dilate_binary_mask(binary, self.config.object_mask_dilate_px)
             return binary

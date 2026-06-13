@@ -184,9 +184,13 @@ class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
 
     feedforward_oneshot_step: int = 0
     """Mode A: fire once at this dynamic-phase step. 0 disables."""
-    feedforward_recurring_every_n_ticks: int = 6
+    feedforward_recurring_every_n_ticks: int = 10
     """Mode B cadence (>0 enables; 0 disables). Every Nth tracker tick,
-    fire the dispatcher on the current frame."""
+    fire the dispatcher on the current frame. 10 (was 6, 2026-06-13): each FF
+    firing dumps a ~270 ms AnySplat inference onto the shared GPU that contends
+    with the tracker's XFeat kernels (no MPS), slowing the ~4 ticks after each
+    fire — so firing less often lifts the effective tracker Hz. Trade-off:
+    newly-revealed surface is decoded slightly less frequently."""
     feedforward_recurring_min_gap_s: float = 0.3
     """Wall-clock floor between consecutive FF firings, on top of the
     tick-count cadence. 0 disables (cadence-only)."""
@@ -436,6 +440,13 @@ class DynamicGSPipelineBase(VanillaPipeline):
         atexit.register(self._write_timing_report)
         self._final_snapshot_written: bool = False
         self._timing_report_written: bool = False
+        # Marks this as the tracker-only dynamic runtime so DynamicGSTrainer
+        # takes its fast path (skips the wasted zero_grad/backward/optimizer/
+        # scheduler/callbacks — all no-ops when every LR is 0). Was referenced by
+        # the trainer but never set since the rewrite, so the fast path was dead.
+        # StaticGSPipeline is a different class without this attr, so static
+        # training correctly keeps the full train step.
+        self.current_phase = "dynamic"
 
         # Build datamanager + model (cold model with SfM-seed Gaussians).
         super().__init__(
@@ -825,7 +836,10 @@ class DynamicGSPipelineBase(VanillaPipeline):
             and not self._feedforward_oneshot_done
             and self._latest_tracker_frame is not None
         ):
-            self._run_feedforward(self._latest_tracker_frame, mode_label="oneshot")
+            # Off-thread, same as recurring (the tick no longer renders the CDN;
+            # _feedforward_threaded does). Mark done even if the slot was busy —
+            # oneshot is best-effort and the recurring path covers the scene.
+            self._dispatch_feedforward_async(self._latest_tracker_frame, "oneshot")
             self._feedforward_oneshot_done = True
         zero = torch.zeros((), device=self.device, requires_grad=True)
         return {}, {"main_loss": zero}, {}
@@ -1439,6 +1453,76 @@ class DynamicGSPipelineBase(VanillaPipeline):
             if not was_training:
                 self.model.eval()
 
+    def _render_from_camera_at_scale(self, camera, scale: float):
+        """Render the full scene at ``scale``× the camera resolution (scale<1 =
+        smaller). The CDN uses this so the scene render happens AT the resolution
+        the MS-SSIM actually compares at, instead of rendering full-res then
+        pooling it away — the full-scene rasterisation is the bulk of the CDN's
+        per-FF GPU cost. Falls back to the full-res render if rescale fails."""
+        if scale >= 0.999:
+            return self._render_from_camera(camera)
+        import copy
+        try:
+            cam = copy.deepcopy(camera).to(self.model.device)
+            cam.rescale_output_resolution(float(scale))
+        except Exception:
+            return self._render_from_camera(camera)
+        was_training = self.model.training
+        self.model.train()
+        try:
+            with self._viser_lock_ctx():
+                return self.model.get_outputs(cam)
+        finally:
+            if not was_training:
+                self.model.eval()
+
+    def _compute_tick_cdn(self, camera, batch):
+        """Render + compare for the change mask. Shared by recorded + live.
+
+        Renders the scene at FULL resolution, then ``_compute_change_mask``
+        avg-pools to the MS-SSIM grid. NOTE (2026-06-13): rendering directly at
+        the grid resolution to save GPU was TRIED and REVERTED — a gsplat render
+        AT 192×120 is not the same as avg-pooling a full render (and the object
+        mask shrinks to ~28×51, weakening the exclusion), which decalibrated the
+        MS-SSIM → false-positive flood → scene ballooned to 3.66 M Gaussians and
+        Hz dropped (10.2→8.3). The full-scene render is also Gaussian-count bound,
+        not purely pixel bound, so the reduced-res render saved little anyway."""
+        try:
+            outputs = self._render_from_camera(camera)
+        except Exception as exc:  # noqa: BLE001
+            CONSOLE.log(f"[dynamic-gs] render for CDN failed: {exc}")
+            return None
+        rendered_rgb = outputs.get("rgb")
+        rendered_depth = outputs.get("depth")
+        rendered_alpha = outputs.get("accumulation")
+        if rendered_rgb is None:
+            return None
+
+        bg = self.model._get_background_color()
+        live_rgb = self.model.composite_with_background(
+            self.model.get_gt_img(batch["image"]), bg
+        )
+        gt_depth = self.model._get_gt_depth(batch)
+        gripper_mask = self.model._get_batch_mask(batch)
+        try:
+            obj_mask = self._render_object_mask_cached(camera)
+        except Exception:
+            obj_mask = None
+
+        try:
+            return self._compute_change_mask(
+                rendered_rgb=rendered_rgb,
+                rendered_depth=rendered_depth,
+                live_rgb=live_rgb,
+                gt_depth=gt_depth,
+                gripper_mask=gripper_mask,
+                object_mask=obj_mask,
+                rendered_alpha=rendered_alpha,
+            )
+        except Exception as exc:  # noqa: BLE001
+            CONSOLE.log(f"[dynamic-gs] _compute_change_mask failed: {exc}")
+            return None
+
     def _compute_change_mask(
         self,
         rendered_rgb,
@@ -1577,6 +1661,18 @@ class DynamicGSPipelineBase(VanillaPipeline):
         y0 = max(0, int(v_v.min().item()) - int(padding_px))
         x1 = min(W, int(u_v.max().item()) + int(padding_px) + 1)
         y1 = min(H, int(v_v.max().item()) + int(padding_px) + 1)
+        # Cap the crop to a fixed max side, centred on the object, so XFeat
+        # extract cost (CNN — area-bound) stays bounded regardless of how large
+        # the bbox+padding grows at high res. The object is only clipped if it's
+        # itself larger than max_side. 0 = no cap (legacy: bbox+padding clamped).
+        max_side = int(getattr(self.model.config, "xfeat_crop_max_side", 0))
+        if max_side > 0:
+            if (x1 - x0) > max_side:
+                cxb = (x0 + x1) // 2
+                x0 = max(0, cxb - max_side // 2); x1 = min(W, x0 + max_side); x0 = max(0, x1 - max_side)
+            if (y1 - y0) > max_side:
+                cyb = (y0 + y1) // 2
+                y0 = max(0, cyb - max_side // 2); y1 = min(H, y0 + max_side); y0 = max(0, y1 - max_side)
         if (x1 - x0) < 16 or (y1 - y0) < 16:
             return None
         return (x0, y0, x1, y1)
@@ -2146,6 +2242,51 @@ class DynamicGSPipelineBase(VanillaPipeline):
             obj_mask_now = dilate_binary_mask(obj_mask_now, dilate_px)
         cleaned = (cdn * (1.0 - obj_mask_now)).detach()
         return cleaned
+
+    def _dispatch_feedforward_async(self, target_frame: TrackerFrame, mode_label: str) -> bool:
+        """Acquire the single-in-flight slot and run the WHOLE feedforward
+        (CDN render + clean + cull + select + decode + insert) on a bg thread,
+        so it never blocks the tracker tick. Returns False (no-op) if a prior
+        FF is still in flight or there's no frame. Called by both subclasses'
+        ``_on_tracker_frame`` (recurring) and the oneshot path."""
+        if target_frame is None:
+            return False
+        if not self._anysplat_slot_lock.acquire(blocking=False):
+            CONSOLE.log(f"[feedforward] {mode_label} skipped — previous FF still in flight")
+            return False
+        self._last_feedforward_wall_time = time.time()
+        threading.Thread(
+            target=self._feedforward_threaded, args=(target_frame, mode_label),
+            daemon=True, name=f"ff-{mode_label}",
+        ).start()
+        return True
+
+    def _feedforward_threaded(self, target_frame: TrackerFrame, mode_label: str) -> None:
+        """Run the ENTIRE feedforward off the tracker thread.
+
+        The tracker tick no longer renders the CDN (the 56 ms render + the
+        ~78 ms clean/cull/select that used to block the tick are all moved
+        here). The caller MUST have acquired ``_anysplat_slot_lock``
+        (non-blocking) right before spawning this thread — that's the
+        single-in-flight guard and it covers the WHOLE FF (CDN render
+        included), so two FF dispatches can't render/cull concurrently. We
+        release it on exit. The GPU work itself still shares the device with
+        the tracker (no MPS), but the tracker thread no longer *blocks* on it."""
+        try:
+            if target_frame is not None and target_frame.get("cdn") is None:
+                cam = target_frame.get("camera"); btch = target_frame.get("batch")
+                if cam is not None and btch is not None:
+                    try:
+                        with self._viser_lock_ctx():
+                            target_frame["cdn"] = self._compute_tick_cdn(cam, btch)
+                    except Exception as exc:  # noqa: BLE001
+                        CONSOLE.log(f"[feedforward] {mode_label}: bg CDN render failed: {exc}")
+            self._run_feedforward(target_frame, mode_label)
+        finally:
+            try:
+                self._anysplat_slot_lock.release()
+            except RuntimeError:
+                pass
 
     def _run_feedforward(
         self,
@@ -2741,17 +2882,10 @@ class DynamicGSPipelineBase(VanillaPipeline):
             CONSOLE.log(f"[anysplat] call={call_id} empty change mask after clean; skip")
             return
 
-        # Off-thread the slow part. If a previous AnySplat call is still
-        # running we skip this dispatch instead of queueing (the FF
-        # min-gap config usually prevents this but cold calls can exceed
-        # the gap; queueing would just stack stale frames).
-        if not self._anysplat_slot_lock.acquire(blocking=False):
-            CONSOLE.log(
-                f"[anysplat] {mode_label} call={call_id} step={self._dynamic_step_counter} "
-                f"frame={frame_idx} skipped — previous FF call still in flight"
-            )
-            return
-
+        # This whole method already runs on the FF bg thread (spawned by
+        # _feedforward_threaded, which holds _anysplat_slot_lock for the entire
+        # call). So DON'T re-acquire the slot or spawn a second thread — run the
+        # decode+insert inline.
         bg_args = dict(
             t_call0=t_call0,
             call_id=call_id,
@@ -2767,10 +2901,8 @@ class DynamicGSPipelineBase(VanillaPipeline):
             scene_intr=scene_intr,
             scene_c2w_np=scene_c2w_np,
         )
-        threading.Thread(
-            target=self._anysplat_bg_run, args=(bg_args,),
-            daemon=True, name=f"anysplat-bg-{call_id}",
-        ).start()
+        # Inline (already on the FF bg thread).
+        self._anysplat_bg_run(bg_args)
 
     def _anysplat_crop_windows(self, change_mask_np, W: int, H: int, pad_px: int = 50):
         """Square scene crop window(s) that ENCOMPASS the change mask, for AnySplat.
@@ -3104,4 +3236,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
                     f"ld={_last_ms('FF.3a.npz_load'):.0f}"
                 )
         finally:
-            self._anysplat_slot_lock.release()
+            # Slot lock is now owned by _feedforward_threaded (the bg-thread
+            # wrapper), which releases it after this inline call returns. Do
+            # NOT release here or it'd double-release.
+            pass

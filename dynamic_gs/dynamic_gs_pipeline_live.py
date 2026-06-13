@@ -308,14 +308,9 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         # rate no longer detunes it — this is the speedup the every-tick revert
         # was blocking.
         self._ff_due_this_tick = self._recurring_ff_due(self._tracker_tick_count + 1, is_first)
-        if self._ff_due_this_tick:
-            t_cdn = time.time()
-            cdn = self._compute_tick_cdn(camera, batch)
-            if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
-                torch.cuda.synchronize()
-            self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
-        else:
-            cdn = None
+        # CDN render moved off the tracker tick onto the FF bg thread
+        # (_feedforward_threaded) along with the rest of FF. Store cdn=None.
+        cdn = None
 
         # Cache the latest BGR frame for FF AnySplat dump (see
         # _resolve_anysplat_context_image_paths).
@@ -424,10 +419,9 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         # would race the clock and could fire FF on a CDN-skipped tick).
         if not getattr(self, "_ff_due_this_tick", False):
             return
-        self._last_feedforward_wall_time = time.time()
-        if self._latest_tracker_frame is None:
-            return
-        self._run_feedforward(self._latest_tracker_frame, mode_label="recurring")
+        # Run the whole FF (CDN render included) on a bg thread — never block
+        # the tracker tick. No-op if a prior FF is still in flight.
+        self._dispatch_feedforward_async(self._latest_tracker_frame, "recurring")
 
     # ====================================================================
     # Recorded-method overrides (live equivalents)
@@ -511,47 +505,8 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         self._tracker_tick_count = 0
         self._d0_completed = True
 
-    @torch.no_grad()
-    def _compute_tick_cdn(self, camera, batch):
-        """Render + compare for the change mask. Returns the CDN tensor.
-        Identical to recorded's helper."""
-        try:
-            outputs = self._render_from_camera(camera)
-        except Exception as exc:
-            CONSOLE.log(f"[dynamic-gs-live] render for CDN failed: {exc}")
-            return None
-        rendered_rgb = outputs.get("rgb")
-        rendered_depth = outputs.get("depth")
-        rendered_alpha = outputs.get("accumulation")
-        if rendered_rgb is None:
-            return None
-
-        bg = self.model._get_background_color()
-        live_rgb = self.model.composite_with_background(
-            self.model.get_gt_img(batch["image"]), bg
-        )
-        gt_depth = self.model._get_gt_depth(batch)
-        gripper_mask = self.model._get_batch_mask(batch)
-
-        try:
-            obj_mask = self._render_object_mask_cached(camera)
-        except Exception:
-            obj_mask = None
-
-        try:
-            cdn = self._compute_change_mask(
-                rendered_rgb=rendered_rgb,
-                rendered_depth=rendered_depth,
-                live_rgb=live_rgb,
-                gt_depth=gt_depth,
-                gripper_mask=gripper_mask,
-                object_mask=obj_mask,
-                rendered_alpha=rendered_alpha,
-            )
-            return cdn
-        except Exception as exc:
-            CONSOLE.log(f"[dynamic-gs-live] _compute_change_mask failed: {exc}")
-            return None
+    # _compute_tick_cdn is now the shared base implementation (renders the scene
+    # at the CDN grid resolution). The recorded + live overrides were identical.
 
     # ====================================================================
     # LiveFrame -> Splatfacto batch dict

@@ -59,10 +59,14 @@ class NoSaveTrainer(Trainer):
 
     def train_iteration(self, step):  # type: ignore[override]
         pipeline = self.pipeline
-        live_tracking_only = (
-            getattr(pipeline.config, "disable_dynamic_optimization", False)
-            and getattr(pipeline, "current_phase", None) == "dynamic"
-        )
+        # The dynamic phase is ALWAYS a tracker-only runtime now (invariant #4:
+        # every gauss-param LR is 0 and get_train_loss_dict returns a zero loss),
+        # so the full NS train step — zero_grad / backward / optimizer / scheduler
+        # / AFTER_TRAIN_ITERATION callbacks — is pure waste (~25 ms/tick measured
+        # as GAP.trainer_outer_loop). Skip it for the whole dynamic phase. (This
+        # gate used to also require disable_dynamic_optimization, which was purged
+        # with the scene-opt machinery — leaving the fast path dead until now.)
+        live_tracking_only = (getattr(pipeline, "current_phase", None) == "dynamic")
         if not live_tracking_only:
             return super().train_iteration(step)
 
