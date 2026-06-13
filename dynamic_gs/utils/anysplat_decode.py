@@ -629,6 +629,7 @@ def reproject_anysplat_to_scene(
     component_mask: Optional[np.ndarray] = None,   # (H, W) bool, restrict insertion to this mask (any resolution)
     voxel_dedup_m: Optional[float] = None,         # if set, pick ONE representative per voxel of this size (metres). 0.002 matches static-phase TSDF.
     scale_multiplier: float = 1.0,                 # additionally enlarges each gaussian's three log-scales by log(scale_multiplier).
+    scene_crop: Optional[tuple] = None,            # (left, top, size): the SQUARE scene sub-window that was fed to AnySplat. When set, the pred-crop pixel maps back via this window (NOT process_image's full-frame center-crop).
 ) -> dict:
     """Canonical AnySplat → scene reprojection (memory: anysplat-reprojection-method).
 
@@ -682,14 +683,22 @@ def reproject_anysplat_to_scene(
     # SQUARE scene (the 800x800 era); at 1920x1200 it used the wrong x-scale
     # (448/1920 instead of 448/1200) and dropped the center-crop offset, so every
     # insert was mapped sideways -> the "ghost" copies offset next to objects.
-    sc_w = float(scene_intr["w"]); sc_h = float(scene_intr["h"])
-    crop_scale = float(W_any) / min(sc_w, sc_h)
-    new_w = W_any if sc_w <= sc_h else int(sc_w * crop_scale)
-    new_h = H_any if sc_h <= sc_w else int(sc_h * crop_scale)
-    crop_left = (new_w - W_any) // 2
-    crop_top  = (new_h - H_any) // 2
-    u_scene = (u + crop_left) / crop_scale
-    v_scene = (v + crop_top)  / crop_scale
+    if scene_crop is not None:
+        # The caller pre-cropped the scene to a SQUARE window (left, top, size)
+        # and fed THAT to AnySplat (process_image then just resizes size->W_any,
+        # no further crop). Invert: scene_x = u * size/W_any + left.
+        cw_left, cw_top, cw_size = int(scene_crop[0]), int(scene_crop[1]), int(scene_crop[2])
+        u_scene = u * (float(cw_size) / W_any) + cw_left
+        v_scene = v * (float(cw_size) / H_any) + cw_top
+    else:
+        sc_w = float(scene_intr["w"]); sc_h = float(scene_intr["h"])
+        crop_scale = float(W_any) / min(sc_w, sc_h)
+        new_w = W_any if sc_w <= sc_h else int(sc_w * crop_scale)
+        new_h = H_any if sc_h <= sc_w else int(sc_h * crop_scale)
+        crop_left = (new_w - W_any) // 2
+        crop_top  = (new_h - H_any) // 2
+        u_scene = (u + crop_left) / crop_scale
+        v_scene = (v + crop_top)  / crop_scale
 
     # --- Sensor depth at FULL scene resolution + per-gauss lookup ---
     Hs, Ws = sensor_depth_m.shape[:2]

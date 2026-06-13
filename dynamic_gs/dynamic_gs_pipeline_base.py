@@ -2625,6 +2625,18 @@ class DynamicGSPipelineBase(VanillaPipeline):
         else:
             scene_c2w_np = scene_c2w_np.astype(np.float64)
 
+        # Adaptive AnySplat crop: AnySplat only sees a square, so pick the square
+        # to ENCOMPASS the change mask (+50 px) instead of the image centre. One
+        # window, or two when the change is wider than the image short side.
+        cdn_np = cdn_clean.detach().cpu().numpy() if torch.is_tensor(cdn_clean) else np.asarray(cdn_clean)
+        if cdn_np.ndim == 3:
+            cdn_np = cdn_np[..., 0]
+        cdn_np = cdn_np > 0.5
+        crop_windows = self._anysplat_crop_windows(cdn_np, int(scene_intr["w"]), int(scene_intr["h"]))
+        if not crop_windows:
+            CONSOLE.log(f"[anysplat] call={call_id} empty change mask after clean; skip")
+            return
+
         # Off-thread the slow part. If a previous AnySplat call is still
         # running we skip this dispatch instead of queueing (the FF
         # min-gap config usually prevents this but cold calls can exceed
@@ -2643,7 +2655,9 @@ class DynamicGSPipelineBase(VanillaPipeline):
             frame_idx=frame_idx,
             camera=camera,
             components=components,
-            image_paths=image_paths,
+            source_image_path=str(image_paths[0]),
+            crop_windows=crop_windows,
+            cdn_np=cdn_np,
             gt_depth=gt_depth,
             sensor_depth_np=sensor_depth_np,
             scene_intr=scene_intr,
@@ -2653,6 +2667,50 @@ class DynamicGSPipelineBase(VanillaPipeline):
             target=self._anysplat_bg_run, args=(bg_args,),
             daemon=True, name=f"anysplat-bg-{call_id}",
         ).start()
+
+    def _anysplat_crop_windows(self, change_mask_np, W: int, H: int, pad_px: int = 50):
+        """Square scene crop window(s) that ENCOMPASS the change mask, for AnySplat.
+
+        AnySplat only sees a square (its process_image resizes whatever square we
+        give it to 448×448). So choose the square to cover the change region:
+        ``size = max(bbox_w, bbox_h) + 2·pad_px`` at the change mask's natural
+        scale — NOT forced to 448 (AnySplat up/down-samples internally; the
+        reproject maps 448→scene via the window). One window normally; TWO
+        horizontally-tiled windows ONLY when the change bbox is wider than the
+        image short side (one square physically can't cover it). Capped at 2.
+
+        Returns ``[(left, top, size), ...]`` in scene pixels.
+        """
+        m = change_mask_np
+        if m.ndim == 3:
+            m = m[..., 0]
+        ys, xs = np.where(m > 0)
+        if xs.size == 0:
+            return []
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        bw, bh = x1 - x0 + 1, y1 - y0 + 1
+        cx, cy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+        max_size = min(W, H)
+        size = max(bw, bh) + 2 * int(pad_px)
+        if size <= max_size:
+            size = max(16, size)
+            left = max(0, min(int(round(cx - size / 2.0)), W - size))
+            top  = max(0, min(int(round(cy - size / 2.0)), H - size))
+            return [(left, top, size)]
+        # Padded bbox bigger than the largest square that fits → cap at short side.
+        size = max_size
+        top = max(0, min(int(round(cy - size / 2.0)), H - size))
+        if bw <= size:
+            left = max(0, min(int(round(cx - size / 2.0)), W - size))
+            return [(left, top, size)]
+        # Change wider than one square → two windows covering the left + right ends.
+        left1 = max(0, min(x0 - pad_px, W - size))
+        left2 = max(0, min(x1 + pad_px - size + 1, W - size))
+        wins = [(left1, top, size)]
+        if abs(left2 - left1) > 4:
+            wins.append((left2, top, size))
+        return wins
 
     def _anysplat_bg_run(self, args: dict) -> None:
         """Background worker for the AnySplat FF path. Calls the persistent
@@ -2671,60 +2729,18 @@ class DynamicGSPipelineBase(VanillaPipeline):
         mode_label       = args["mode_label"]
         frame_idx        = args["frame_idx"]
         camera           = args["camera"]
-        components       = args["components"]
-        image_paths      = args["image_paths"]
-        gt_depth         = args["gt_depth"]
-        sensor_depth_np  = args["sensor_depth_np"]
-        scene_intr       = args["scene_intr"]
-        scene_c2w_np     = args["scene_c2w_np"]
-
-        out_npz = Path(f"/dev/shm/anysplat_ipc_{os.getpid()}.npz")
+        components        = args["components"]
+        source_image_path = args["source_image_path"]
+        crop_windows      = args["crop_windows"]
+        cdn_np            = args["cdn_np"]
+        gt_depth          = args["gt_depth"]
+        sensor_depth_np   = args["sensor_depth_np"]
+        scene_intr        = args["scene_intr"]
+        scene_c2w_np      = args["scene_c2w_np"]
 
         try:
-            t0 = time.time()
-            worker_timings: dict = {}
-            try:
-                if self._anysplat_persistent_worker is not None:
-                    worker_timings = self._anysplat_persistent_worker.inference(
-                        image_paths, out_npz,
-                        timeout_s=float(self.config.feedforward_anysplat_worker_timeout_s),
-                    )
-                else:
-                    run_anysplat_subprocess(
-                        image_paths, out_npz,
-                        conda_env=str(self.config.feedforward_anysplat_conda_env),
-                        timeout_s=float(self.config.feedforward_anysplat_worker_timeout_s),
-                    )
-            except Exception as exc:
-                CONSOLE.log(f"[anysplat] call={call_id} worker FAILED: {exc}")
-                return
-            self._timing["FF.3a_anysplat_inference"].append(time.time() - t0)
-            for k_in, k_out in (
-                ("t_ipc_send_ms",    "FF.3a.ipc_send"),
-                ("t_images_load_ms", "FF.3a.images_load"),
-                ("t_forward_ms",     "FF.3a.forward"),
-                ("t_convert_ms",     "FF.3a.convert_to_numpy"),
-                ("t_npz_save_ms",    "FF.3a.npz_save"),
-                ("t_ipc_wait_ms",    "FF.3a.ipc_wait"),
-            ):
-                v = worker_timings.get(k_in)
-                if v is not None:
-                    self._timing[k_out].append(float(v) / 1000.0)
-
-            t_load0 = time.time()
             import pickle
-            with open(out_npz, "rb") as f:
-                data = pickle.load(f)
-            means_can      = data["means_canonical"]
-            log_scales     = data["log_scales"]
-            quats          = data["quats_wxyz"]
-            opacity_logits = data["opacity_logits"]
-            features_dc    = data["features_dc"]
-            features_rest  = data["features_rest"]
-            pred_c2w_0     = data["pred_extrinsic_c2w"][0]
-            pred_K_norm    = data["pred_intrinsic_norm"][0]
-            self._timing["FF.3a.npz_load"].append(time.time() - t_load0)
-            H_any, W_any = 448, 448
+            import cv2 as _cv2
 
             # --- Frustum-cull scene cloud + ICP-refine scene_c2w (ONCE per FF call, on GPU) ---
             # The frustum cull and ICP are component-agnostic: align the whole visible
@@ -2789,47 +2805,75 @@ class DynamicGSPipelineBase(VanillaPipeline):
 
             total_inserted = 0
             total_culled = 0
-            # Per-component decoded blobs accumulate here so we can voxel-dedup ONCE
-            # across the union, on GPU, after the reprojection loop.
+            H_any, W_any = 448, 448
+            # Decode per CROP WINDOW (1, or 2 when the change is wider than the
+            # image short side). Each window is a square scene sub-region that
+            # ENCOMPASSES the change mask (+pad); AnySplat resizes it to 448 and
+            # reproject maps the 448 pixels back via the window. Every window is
+            # filtered by the FULL change mask (cdn_np) and union-deduped below,
+            # so overlapping windows do not double-insert.
+            src_img = _cv2.imread(str(source_image_path))
+            if src_img is None:
+                CONSOLE.log(f"[anysplat] call={call_id} could not read {source_image_path}; skip")
+                return
             per_component_decoded: list[dict] = []
-            for k, comp_mask in enumerate(components):
+            for wi, win in enumerate(crop_windows):
+                left, top, size = int(win[0]), int(win[1]), int(win[2])
+                crop_png = Path(f"/dev/shm/anysplat_crop_{os.getpid()}_{wi}.png")
+                _cv2.imwrite(str(crop_png), src_img[top:top + size, left:left + size])
+                out_npz = Path(f"/dev/shm/anysplat_ipc_{os.getpid()}_{wi}.npz")
                 t0 = time.time()
-                comp_np = comp_mask.detach().cpu().numpy() if torch.is_tensor(comp_mask) else np.asarray(comp_mask)
+                worker_timings: dict = {}
+                try:
+                    if self._anysplat_persistent_worker is not None:
+                        worker_timings = self._anysplat_persistent_worker.inference(
+                            [crop_png], out_npz,
+                            timeout_s=float(self.config.feedforward_anysplat_worker_timeout_s),
+                        )
+                    else:
+                        run_anysplat_subprocess(
+                            [crop_png], out_npz,
+                            conda_env=str(self.config.feedforward_anysplat_conda_env),
+                            timeout_s=float(self.config.feedforward_anysplat_worker_timeout_s),
+                        )
+                except Exception as exc:
+                    CONSOLE.log(f"[anysplat] call={call_id} win={wi} worker FAILED: {exc}")
+                    continue
+                self._timing["FF.3a_anysplat_inference"].append(time.time() - t0)
+                for k_in, k_out in (
+                    ("t_ipc_send_ms",    "FF.3a.ipc_send"),
+                    ("t_images_load_ms", "FF.3a.images_load"),
+                    ("t_forward_ms",     "FF.3a.forward"),
+                    ("t_convert_ms",     "FF.3a.convert_to_numpy"),
+                    ("t_npz_save_ms",    "FF.3a.npz_save"),
+                    ("t_ipc_wait_ms",    "FF.3a.ipc_wait"),
+                ):
+                    v = worker_timings.get(k_in)
+                    if v is not None:
+                        self._timing[k_out].append(float(v) / 1000.0)
+                t_load0 = time.time()
+                with open(out_npz, "rb") as f:
+                    data = pickle.load(f)
+                self._timing["FF.3a.npz_load"].append(time.time() - t_load0)
+
+                t0 = time.time()
                 decoded = reproject_anysplat_to_scene(
-                    means_canonical=means_can, log_scales=log_scales, quats_wxyz=quats,
-                    opacity_logits=opacity_logits, features_dc=features_dc, features_rest=features_rest,
-                    pred_c2w_0=pred_c2w_0, pred_K_norm=pred_K_norm,
+                    means_canonical=data["means_canonical"], log_scales=data["log_scales"],
+                    quats_wxyz=data["quats_wxyz"], opacity_logits=data["opacity_logits"],
+                    features_dc=data["features_dc"], features_rest=data["features_rest"],
+                    pred_c2w_0=data["pred_extrinsic_c2w"][0], pred_K_norm=data["pred_intrinsic_norm"][0],
                     pred_image_hw=(H_any, W_any),
                     sensor_depth_m=sensor_depth_np, scene_c2w=scene_c2w_refined,
                     scene_intr=scene_intr,
                     opacity_min=float(self.config.feedforward_anysplat_min_opacity),
-                    component_mask=comp_np,
-                    voxel_dedup_m=None,  # dedup is done ONCE across all components below
+                    component_mask=cdn_np,
+                    scene_crop=(left, top, size),
+                    voxel_dedup_m=None,  # dedup is done ONCE across all windows below
                     scale_multiplier=float(self.config.feedforward_anysplat_scale_multiplier),
                 )
                 self._timing["FF.3b_anysplat_reproject"].append(time.time() - t0)
-
-                n_in_comp = int(decoded["xyz"].shape[0])
-                if n_in_comp == 0:
-                    CONSOLE.log(f"[anysplat] call={call_id} comp={k} empty; skip")
-                    continue
-
-                # Per-component in-front cull. Redundant when the pre-decode
-                # cull already swept the CDN union (and ran on the main tick
-                # thread, not here on the bg thread), so only run it on the
-                # legacy path where that pass is disabled.
-                t0 = time.time()
-                n_culled = 0
-                if self.config.feedforward_cull_in_front and not self.config.feedforward_cull_before_decode:
-                    with self._viser_lock_ctx():
-                        n_culled = self._feedforward_cull_in_front_of_depth(
-                            camera, comp_mask, gt_depth,
-                            depth_tol_m=float(self.config.feedforward_cull_in_front_depth_tol_m),
-                        )
-                total_culled += int(n_culled)
-                self._timing["FF.4_crop_and_delete"].append(time.time() - t0)
-
-                per_component_decoded.append(decoded)
+                if int(decoded["xyz"].shape[0]) > 0:
+                    per_component_decoded.append(decoded)
 
             # --- One union-wide voxel dedup on GPU, then one insert ---
             if per_component_decoded:
@@ -2932,8 +2976,8 @@ class DynamicGSPipelineBase(VanillaPipeline):
                 return arr[-1] * 1000.0 if arr else 0.0
             CONSOLE.log(
                 f"[anysplat] {mode_label} call={call_id} step={self._dynamic_step_counter} "
-                f"frame={frame_idx} components={len(components)} inserted={total_inserted} "
-                f"culled={total_culled} total_ms={total_per_call*1000:.0f} "
+                f"frame={frame_idx} components={len(components)} windows={len(crop_windows)} "
+                f"inserted={total_inserted} culled={total_culled} total_ms={total_per_call*1000:.0f} "
                 f"object_flags={obj_count} inserted_flags={ins_count} "
                 f"total_gauss={self.model.num_points} "
                 f"| cdn={_last_ms('FF.1_cdn_clean'):.0f} "
