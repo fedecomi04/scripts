@@ -303,16 +303,14 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         # with _tracker_tick_count+1; the hook runs post-increment) so the hook
         # reuses it — re-evaluating the min-gap gate there would race the clock
         # and could fire FF on a CDN-skipped tick (cdn=None crash).
+        # CDN rendered EVERY tick (reverted FF-only gating) — keeps the tracker
+        # tick rate stable so the wall-clock-dt KF stays at its tuned cadence.
         self._ff_due_this_tick = self._recurring_ff_due(self._tracker_tick_count + 1, is_first)
-        need_cdn = self._ff_due_this_tick or self._oneshot_ff_due(step)
-        if need_cdn:
-            t_cdn = time.time()
-            cdn = self._compute_tick_cdn(camera, batch)
-            if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
-                torch.cuda.synchronize()
-            self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
-        else:
-            cdn = None
+        t_cdn = time.time()
+        cdn = self._compute_tick_cdn(camera, batch)
+        if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
 
         # Cache the latest BGR frame for FF AnySplat dump (see
         # _resolve_anysplat_context_image_paths).

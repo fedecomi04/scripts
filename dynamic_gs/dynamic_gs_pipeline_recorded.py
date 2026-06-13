@@ -211,16 +211,17 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         # because the hook runs post-increment); _on_tracker_frame reuses the
         # stored flag. Re-evaluating the gate there would race the min-gap clock
         # and could fire FF on a tick where we skipped the CDN (cdn=None crash).
+        # CDN rendered EVERY tick (reverted the FF-only gating): gating it
+        # changed/varied the tracker tick rate, and the pose KF uses wall-clock
+        # dt tuned at this ~9 Hz cadence — the rate change detuned the KF
+        # (oscillation). Keep the per-tick CDN so the KF stays at its tuned
+        # cadence. (Going faster needs the KF retuned at a fixed rate.)
         self._ff_due_this_tick = self._recurring_ff_due(self._tracker_tick_count + 1, is_first)
-        need_cdn = self._ff_due_this_tick or self._oneshot_ff_due(step)
-        if need_cdn:
-            t_cdn = time.time()
-            cdn = self._compute_tick_cdn(camera, batch)
-            if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
-                torch.cuda.synchronize()
-            self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
-        else:
-            cdn = None
+        t_cdn = time.time()
+        cdn = self._compute_tick_cdn(camera, batch)
+        if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
 
         # Publish to latest tracker frame.
         self._latest_tracker_frame = {
