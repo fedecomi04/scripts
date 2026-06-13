@@ -299,18 +299,23 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
             self._apply_motion_estimator(camera, batch)
 
         # CDN render ONLY when FF will consume it this tick (it's a full GPU
-        # render; FF fires every Nth tick). Decide ONCE and STORE it (predict
-        # with _tracker_tick_count+1; the hook runs post-increment) so the hook
-        # reuses it — re-evaluating the min-gap gate there would race the clock
-        # and could fire FF on a CDN-skipped tick (cdn=None crash).
-        # CDN rendered EVERY tick (reverted FF-only gating) — keeps the tracker
-        # tick rate stable so the wall-clock-dt KF stays at its tuned cadence.
+        # render; FF fires every Nth tick, so on other ticks it's pure waste).
+        # Decide ONCE and STORE it (predict with _tracker_tick_count+1; the hook
+        # runs post-increment) so the hook reuses it — re-evaluating the min-gap
+        # gate there would race the clock and could fire FF on a CDN-skipped
+        # tick (cdn=None crash). SAFE TO GATE NOW: the pose KF is rate-invariant
+        # (xfeat_pose_filter_fixed_fps feeds a fixed dt), so varying the tick
+        # rate no longer detunes it — this is the speedup the every-tick revert
+        # was blocking.
         self._ff_due_this_tick = self._recurring_ff_due(self._tracker_tick_count + 1, is_first)
-        t_cdn = time.time()
-        cdn = self._compute_tick_cdn(camera, batch)
-        if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
-            torch.cuda.synchronize()
-        self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
+        if self._ff_due_this_tick:
+            t_cdn = time.time()
+            cdn = self._compute_tick_cdn(camera, batch)
+            if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
+        else:
+            cdn = None
 
         # Cache the latest BGR frame for FF AnySplat dump (see
         # _resolve_anysplat_context_image_paths).

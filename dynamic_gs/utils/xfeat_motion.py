@@ -273,6 +273,7 @@ class XFeatMotionEstimator:
         pose_filter_alpha_sigma: float = 0.25,
         pose_filter_meas_trans_sigma_m: float = 0.003,
         pose_filter_meas_rot_sigma_deg: float = 0.5,
+        pose_filter_fixed_fps: float = 9.0,
         static_hold_enabled: bool = True,
         static_hold_window: int = 10,
         static_hold_trans_m: float = 0.012,
@@ -371,14 +372,34 @@ class XFeatMotionEstimator:
         # pipeline; the raw ``_cumulative_*`` pose stays unfiltered so
         # anchor selection / anchor creation / next-tick prediction are
         # never contaminated by smoothing lag.
+        # Fixed-rate dt for the KF (rate-invariance). >0 => feed the filter
+        # 1/fixed_fps per success tick instead of wall-clock dt, so the tracker
+        # rate no longer detunes it. Env DGS_KF_SYNTHETIC_FPS still overrides.
+        self._pose_filter_fixed_fps = float(pose_filter_fixed_fps)
+        # Env overrides for fast live A/B of KF strength (no relaunch of the
+        # tuning loop needed). Two independent levers:
+        #   accel/alpha (process noise): LOWER = smoother + more lag.
+        #   meas sigma (measurement noise): LOWER = trusts measurement => MORE
+        #     responsive / LESS lag (but less jiggle-smoothing). The 20mm/10deg
+        #     default was tuned to crush STATIONARY jiggle but it distrusts the
+        #     (correct) moving measurements => motion lag. For a LIGHT, responsive
+        #     filter ("smooth tiny oscillations, don't lag motion") keep process
+        #     noise moderate-high AND drop meas sigma low (e.g. 5mm/2deg).
+        _accel = float(os.environ.get("DGS_KF_ACCEL_SIGMA", pose_filter_accel_sigma))
+        _alpha = float(os.environ.get("DGS_KF_ALPHA_SIGMA", pose_filter_alpha_sigma))
+        _meas_t = float(os.environ.get("DGS_KF_MEAS_TRANS_MM", pose_filter_meas_trans_sigma_m * 1000.0)) / 1000.0
+        _meas_r = float(os.environ.get("DGS_KF_MEAS_ROT_DEG", pose_filter_meas_rot_sigma_deg))
         self._pose_filter: Optional[_tc.PoseKalmanFilter] = None
         if pose_filter_enabled:
             self._pose_filter = _tc.PoseKalmanFilter(
-                accel_sigma=float(pose_filter_accel_sigma),
-                alpha_sigma=float(pose_filter_alpha_sigma),
-                meas_trans_sigma=float(pose_filter_meas_trans_sigma_m),
-                meas_rot_sigma=float(np.radians(pose_filter_meas_rot_sigma_deg)),
+                accel_sigma=_accel,
+                alpha_sigma=_alpha,
+                meas_trans_sigma=_meas_t,
+                meas_rot_sigma=float(np.radians(_meas_r)),
             )
+            print(f"[xfeat-kf] pose filter: accel_sigma={_accel} alpha_sigma={_alpha} "
+                  f"meas_trans={_meas_t*1000:.1f}mm meas_rot={_meas_r}deg "
+                  f"fixed_fps={self._pose_filter_fixed_fps}")
         # Static-hold: when the output pose shows NO net trend across the last
         # ``window`` success ticks (object genuinely stationary), output the
         # per-axis MEDIAN of that window instead of the per-tick pose. A filter
@@ -387,10 +408,20 @@ class XFeatMotionEstimator:
         # at the cost of a small onset deadband (net motion must exceed the
         # thresholds across the window before it passes through). Output-side
         # ONLY — the raw ``_cumulative_*`` tracking state is never touched.
+        # Env overrides for fast live A/B of the static-hold (no relaunch).
+        # RAISE trans/rot gates => engages on larger near-stationary wander
+        # (smooths more oscillation, but freezes slow motion up to the gate =
+        # onset deadband). WIDEN window => steadier median + longer deadband.
+        _sh_win = int(os.environ.get("DGS_HOLD_WINDOW", static_hold_window))
+        _sh_trans = float(os.environ.get("DGS_HOLD_TRANS_MM", static_hold_trans_m * 1000.0)) / 1000.0
+        _sh_rot = float(os.environ.get("DGS_HOLD_ROT_DEG", static_hold_rot_deg))
         self._static_hold_enabled = bool(static_hold_enabled)
-        self._static_hold_window = max(int(static_hold_window), 3)
-        self._static_hold_trans_m = float(static_hold_trans_m)
-        self._static_hold_rot_rad = float(np.radians(static_hold_rot_deg))
+        self._static_hold_window = max(_sh_win, 3)
+        self._static_hold_trans_m = _sh_trans
+        self._static_hold_rot_rad = float(np.radians(_sh_rot))
+        if self._static_hold_enabled:
+            print(f"[xfeat-hold] static-hold: window={self._static_hold_window} "
+                  f"trans={_sh_trans*1000:.1f}mm rot={_sh_rot}deg")
         from collections import deque
         self._static_hold_hist: "deque[tuple[np.ndarray, np.ndarray]]" = deque(
             maxlen=self._static_hold_window)
@@ -846,14 +877,18 @@ class XFeatMotionEstimator:
                 # measurement noise as inliers drop below the healthy norm.
                 _inl = max(int(inlier_count), 1)
                 _scale = min(4.0, max(1.0, (80.0 / _inl) ** 0.5))
-                # Offline replays process ticks much slower than live (~0.4s
-                # vs ~50ms): wall-clock dt makes process noise dominate and
-                # the KF barely smooths. DGS_KF_SYNTHETIC_FPS feeds the filter
-                # frame-cadence timestamps so offline == live filter behavior.
-                _sfps = os.environ.get("DGS_KF_SYNTHETIC_FPS")
-                if _sfps:
+                # RATE-INVARIANCE: feed the KF a FIXED synthetic dt every tick
+                # instead of wall-clock dt, so the tracker rate (CDN gating,
+                # debug renders, scene size, FPS) can never detune the filter
+                # (Q ~ accel_sigma^2 * dt^4 — a faster tracker = smaller dt =
+                # collapsed Q = over-smoothing/lag). Priority: env override
+                # (offline tuning) > config fixed_fps (the default, ~9 Hz =
+                # the cadence the sigmas were tuned at) > wall-clock fallback.
+                _sfps_env = os.environ.get("DGS_KF_SYNTHETIC_FPS")
+                _sfps = float(_sfps_env) if _sfps_env else self._pose_filter_fixed_fps
+                if _sfps and _sfps > 0.0:
                     self._kf_tick = getattr(self, "_kf_tick", 0) + 1
-                    _ts = self._kf_tick / float(_sfps)
+                    _ts = self._kf_tick / _sfps
                 else:
                     _ts = time.time()
                 rotation_out, translation_out = self._pose_filter.filter(

@@ -303,39 +303,49 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     when the underlying object is stationary. Leave at -1 unless you can
     show the shake is harmless for your downstream consumer (e.g. when
     the consumer applies its own temporal smoothing)."""
-    xfeat_pose_filter_enabled: bool = True
+    xfeat_pose_filter_enabled: bool = False
     """Smooth the tracker's output pose with a constant-velocity SE(3)
-    Kalman filter (``tracker_common.PoseKalmanFilter``). Targets the
-    stationary-object jiggle caused by per-tick match-set variance
-    (different LighterGlue subsets -> slightly different Kabsch poses).
-    Filters ONLY the pose returned to the pipeline; the tracker's
-    internal cumulative pose (anchor selection / creation / next-tick
-    prediction) stays raw, so smoothing lag can never destabilize
+    Kalman filter (``tracker_common.PoseKalmanFilter``).
+
+    **DISABLED by default (2026-06-13, user decision after extensive A/B).**
+    On the real-1200p jerky pickup motion the CV-KF could not achieve
+    zero-lag smoothing at ANY setting: low process noise lagged; high
+    process noise overshot (velocity-state swing read as jitter AND lag at
+    the stop); the 20mm/10deg meas sigma that crushes stationary jiggle
+    also distrusts the correct moving measurements -> lag. KF-OFF (raw pose)
+    was measured the best of 5 configs. The stationary-jiggle job is handled
+    instead by the ``xfeat_static_hold`` median filter, which engages ONLY
+    when the object is genuinely fixed (no net trend over the window) and so
+    adds ZERO motion lag by construction. Re-enable + tune via the env knobs
+    (DGS_KF_ACCEL_SIGMA / _ALPHA_SIGMA / _MEAS_TRANS_MM / _MEAS_ROT_DEG) if a
+    future scene has smoother motion where the CV model helps.
+
+    When enabled: filters ONLY the pose returned to the pipeline; the
+    tracker's internal cumulative pose (anchor selection / creation /
+    next-tick prediction) stays raw, so smoothing lag can never destabilize
     tracking itself."""
-    xfeat_pose_filter_accel_sigma: float = 0.02
+    xfeat_pose_filter_accel_sigma: float = 0.005
     """Process noise: white translational acceleration 1-sigma (m/s^2).
-    Lower = smoother + more lag after sudden jerks; higher = follows the
-    raw RANSAC pose more closely. Bench (synthetic, 3 mm / 0.5 deg
-    measurement noise at 20 Hz): 0.05 attenuates stationary jitter
-    ~2.1x and settles a worst-case 5 cm jump in 4 ticks; 0.02 gives ~2.5x
-    but 7-tick settle. On the recorded screwdriver scene, 0.02 cut the
-    static-tail translation jiggle MAX 16.8 -> 11.2 mm with no tracking-
-    range cost (peak/end unchanged); going to 0.01 gave no further gain.
-    TRIED 0.01 (2026-06-13, by request, for extra smoothing) and REVERTED:
-    at the live ~50 ms tick the stronger Q-floor added visible motion lag /
-    catch-up oscillation (the user's tracker had been working perfectly at
-    0.02). 0.02 is the validated default. NOTE: Q ~ accel_sigma^2 * dt^4, so
-    at the live ~50 ms tick this smooths ~1600x harder than on the offline
-    ~314 ms replay — do NOT lower below 0.02; raise toward 0.05 if motion lags."""
-    xfeat_pose_filter_alpha_sigma: float = 0.1
+    Lower = SMOOTHER (less jiggle, more lag after sudden jerks); higher =
+    follows the raw RANSAC pose more closely. Env override: DGS_KF_ACCEL_SIGMA.
+    0.005 (2026-06-13, user: "make it much smoother with the KF"). **This is
+    only safe because the KF is now RATE-INVARIANT** (xfeat_pose_filter_fixed_fps
+    feeds a fixed dt): the earlier 0.01 attempt added lag/oscillation ONLY
+    because under wall-clock dt a faster tracker collapsed Q (Q ~
+    accel_sigma^2 * dt^4) — with fixed dt the smoothing is stable at any tracker
+    speed, so we can push process noise down for more smoothing without the
+    speed-coupled detune. Bench history (synthetic 3mm/0.5deg @ 20Hz): 0.05
+    ~2.1x jitter attenuation / 4-tick settle; 0.02 ~2.5x / 7-tick. Raise toward
+    0.02-0.05 if motion lags too much; lower toward 0.002 for even more
+    smoothing (slower step response)."""
+    xfeat_pose_filter_alpha_sigma: float = 0.025
     """Process noise: white angular acceleration 1-sigma (rad/s^2). Same
-    trade-off as the translational sigma, for rotation. 0.1 (was 0.25).
-    TRIED 0.05 (2026-06-13, with accel_sigma) and REVERTED for the same
-    reason — added motion lag. NOTE: residual rotation jiggle on the
-    offline replay is spike-frame dominated (occasional low-inlier bad
-    matches, ~11 deg), which the KF can't smooth away — that's an upstream
-    matches/inliers problem (anchor policy), not a knob here; lowering
-    alpha_sigma further or widening the snap-rot gate gave no improvement."""
+    SMOOTHER-when-lower trade-off as the translational sigma, for rotation.
+    Env override: DGS_KF_ALPHA_SIGMA. 0.025 (2026-06-13, with accel_sigma, for
+    more smoothing; safe now that the KF is rate-invariant). NOTE: residual
+    rotation jiggle on the offline replay is spike-frame dominated (occasional
+    low-inlier bad matches, ~11 deg), which the KF can't smooth away — that's an
+    upstream matches/inliers problem (anchor policy), not a knob here."""
     xfeat_static_hold: bool = True
     """Output-side static-hold: when the tracked pose shows no net trend
     across ``xfeat_static_hold_window`` success ticks (object genuinely
@@ -347,15 +357,37 @@ class DynamicGSModelConfig(SplatfactoModelConfig):
     window and passes through once it exceeds the trend thresholds, so
     the cost is a small onset deadband (~static_hold_trans_m / rot_deg
     of net motion before a slow start registers)."""
-    xfeat_static_hold_window: int = 10
+    xfeat_pose_filter_fixed_fps: float = 9.0
+    """Make the pose KF RATE-INVARIANT: feed it a FIXED synthetic dt of
+    ``1/fixed_fps`` every success tick instead of wall-clock dt. The KF's
+    process noise grows as ``Q ~ accel_sigma^2 * dt^4``, so with wall-clock
+    dt a FASTER tracker (smaller dt) silently collapses Q and over-smooths
+    (lag / catch-up oscillation) — and ANY change to per-tick cost (CDN
+    gating, debug renders, scene size, resolution) changes the rate and
+    detunes the filter. Pinning dt decouples the KF from the tick rate
+    entirely: the tracker can run as fast as it can and the filter behaves
+    identically. 9.0 = the cadence the accel/alpha/meas sigmas were tuned at
+    (per-tick CDN era). The velocity state is then in per-(1/9 s) units —
+    self-consistent as long as fixed_fps is constant; snap-gate + static-hold
+    are tick-based so unaffected. ``0`` (or env ``DGS_KF_SYNTHETIC_FPS``,
+    which still overrides) falls back to wall-clock dt. Only touch if you
+    re-tune the sigmas at a different cadence."""
+    xfeat_static_hold_window: int = 15
     """Number of recent success-tick poses the static-hold trend check +
-    median run over. Larger = steadier hold + longer onset deadband."""
-    xfeat_static_hold_trans_m: float = 0.012
-    """Static-hold trend gate: net translation (m) across the window
-    below which the object is considered stationary."""
-    xfeat_static_hold_rot_deg: float = 4.0
-    """Static-hold trend gate: net rotation (deg) across the window
-    below which the object is considered stationary."""
+    median run over. Larger = steadier hold + longer onset deadband. 15
+    (2026-06-13, tightened from 10 with the KF off — static-hold is now the
+    ONLY output smoothing). Env override: DGS_HOLD_WINDOW."""
+    xfeat_static_hold_trans_m: float = 0.018
+    """Static-hold trend gate: net translation (m) across the window below
+    which the object is considered stationary -> output the window median.
+    RAISE to smooth more near-stationary oscillation (the residual jitter
+    the user sees with KF off), at the cost of freezing slow motion up to
+    this net displacement (onset deadband). 0.018 (2026-06-13, from 0.012).
+    Env override: DGS_HOLD_TRANS_MM."""
+    xfeat_static_hold_rot_deg: float = 6.0
+    """Static-hold trend gate: net rotation (deg) across the window below
+    which the object is considered stationary. Same trade-off as the trans
+    gate. 6.0 (2026-06-13, from 4.0). Env override: DGS_HOLD_ROT_DEG."""
     xfeat_pose_filter_meas_trans_sigma_m: float = 0.020
     """Measurement noise: assumed 1-sigma of the RANSAC translation
     (metres). Raise if the stationary jiggle is still visible (trusts

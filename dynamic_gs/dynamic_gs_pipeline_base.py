@@ -1640,6 +1640,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
             static_hold_rot_deg=self.model.config.xfeat_static_hold_rot_deg,
             pose_filter_meas_trans_sigma_m=self.model.config.xfeat_pose_filter_meas_trans_sigma_m,
             pose_filter_meas_rot_sigma_deg=self.model.config.xfeat_pose_filter_meas_rot_sigma_deg,
+            pose_filter_fixed_fps=self.model.config.xfeat_pose_filter_fixed_fps,
         )
         try:
             from .utils import timing_ledger as _tl

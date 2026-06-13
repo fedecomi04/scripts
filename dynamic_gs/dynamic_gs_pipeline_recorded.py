@@ -205,23 +205,25 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
             self._apply_motion_estimator(camera, batch)
 
         # Render + CDN for downstream feedforward — ONLY when FF will actually
-        # consume it this tick. The CDN is a full GPU render; computing it every
-        # tick (FF fires only every Nth) stalls the tracker for nothing. Decide
-        # the FF-fire ONCE here and STORE it (predict with _tracker_tick_count+1
-        # because the hook runs post-increment); _on_tracker_frame reuses the
-        # stored flag. Re-evaluating the gate there would race the min-gap clock
-        # and could fire FF on a tick where we skipped the CDN (cdn=None crash).
-        # CDN rendered EVERY tick (reverted the FF-only gating): gating it
-        # changed/varied the tracker tick rate, and the pose KF uses wall-clock
-        # dt tuned at this ~9 Hz cadence — the rate change detuned the KF
-        # (oscillation). Keep the per-tick CDN so the KF stays at its tuned
-        # cadence. (Going faster needs the KF retuned at a fixed rate.)
+        # consume it this tick. The CDN is a full GPU render; FF fires only every
+        # Nth tick, so on the other (N-1)/N ticks the render is pure waste that
+        # slows the tracker. Decide the FF-fire ONCE here and STORE it (predict
+        # with _tracker_tick_count+1 because the hook runs post-increment);
+        # _on_tracker_frame reuses the stored flag (re-evaluating the gate there
+        # would race the min-gap clock and could fire FF on a CDN-skipped tick =>
+        # cdn=None crash). SAFE TO GATE NOW: the pose KF is rate-invariant
+        # (xfeat_pose_filter_fixed_fps feeds it a fixed dt), so varying the tick
+        # rate no longer detunes it — the earlier revert-to-every-tick was only
+        # because the wall-clock-dt KF couldn't tolerate the rate change.
         self._ff_due_this_tick = self._recurring_ff_due(self._tracker_tick_count + 1, is_first)
-        t_cdn = time.time()
-        cdn = self._compute_tick_cdn(camera, batch)
-        if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
-            torch.cuda.synchronize()
-        self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
+        if self._ff_due_this_tick:
+            t_cdn = time.time()
+            cdn = self._compute_tick_cdn(camera, batch)
+            if os.environ.get("DGS_DIAG_SYNC") == "1" and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._timing["DN.2_cdn_render"].append(time.time() - t_cdn)
+        else:
+            cdn = None
 
         # Publish to latest tracker frame.
         self._latest_tracker_frame = {
