@@ -80,12 +80,30 @@ echo " sam3_prompt=\"$SAM3_PROMPT\""
 echo "============================================================"
 echo
 
+# Scoped flush of any leaked publisher/worker from a previous unclean run,
+# so the fresh publisher below doesn't hang on "waiting for /camera_info".
+# (Replaces the need to restart Gazebo between runs.)
+source "$(dirname "$0")/_ros_cleanup.sh"
+dgs_ros_cleanup
+dgs_check_sim_alive || exit 1
+
+# Pin every pipeline stage (+ the publisher they spawn, via inherited
+# affinity) off the cores the dVRK 1 kHz control loop needs, and cap the
+# BLAS/OpenMP/nvcc thread pools. Without this the gsplat CUDA JIT (cicc
+# storm at first training step) + tracker/AnySplat/CUDA-sync threads
+# saturate the dVRK loop's core for >1 ms -> missed deadline -> the
+# controller cuts actuator power ("power is unexpectedly off"). MEASURED:
+# the dVRK+Gazebo+controllers RT domain peaks ~2.9 cores, so 0-3 are
+# reserved and the pipeline runs on 4-23. See _ros_cleanup.sh.
+dgs_export_thread_caps
+DGS_PIN="$(dgs_cpu_pin_prefix)"
+
 # ---------------------------------------------------------------- 1/3
 echo
 echo "===> [1/3] CAPTURE -- live_session.run_live_capture_session()"
 echo "     (sweeps the scene + SAM3 + SAM3D; follow the on-screen prompts)"
 echo
-"$PY" -u -c "
+$DGS_PIN "$PY" -u -c "
 import os
 from dynamic_gs.utils.live_session import run_live_capture_session
 out = run_live_capture_session(sam3_prompt_text=os.environ.get('DGS_SAM3_PROMPT'))
@@ -99,7 +117,7 @@ print(f'\n[bootstrap] capture session complete -> {out}', flush=True)
 # before static-gs reads it.
 echo
 echo "===> [1.5/3] RGBD-FUSION INIT -- ICP-refined TSDF seed (idempotent)"
-"$PY" -u -m dynamic_gs.utils.rgbd_fusion_init "$DATA_DIR"
+$DGS_PIN "$PY" -u -m dynamic_gs.utils.rgbd_fusion_init "$DATA_DIR"
 
 # ---------------------------------------------------------------- 2/3
 echo
@@ -107,7 +125,7 @@ echo "===> [2/3] FIT -- ns-train static-gs"
 echo "     (trains the Splatfacto scene + Phase 0b CPD fusion)"
 echo "     SAM3 prompt: \"$SAM3_PROMPT\""
 echo
-"$NS_TRAIN" static-gs \
+$DGS_PIN "$NS_TRAIN" static-gs \
   --data "$DATA_DIR" \
   --output-dir "$OUTPUT_DIR" \
   --vis tensorboard \
@@ -136,7 +154,7 @@ echo
 # Re-run dynamic-gs-live in non-destructive mode (live_wipe_root=False is
 # already the default, but we set it explicitly so this script documents
 # the intent -- we just spent stage 1 + 2 building this dir, don't wipe it).
-exec "$NS_TRAIN" dynamic-gs-live \
+exec $DGS_PIN "$NS_TRAIN" dynamic-gs-live \
   --data "$DATA_DIR" \
   --output-dir "$OUTPUT_DIR" \
   --vis tensorboard \

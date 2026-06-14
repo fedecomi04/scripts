@@ -45,4 +45,16 @@ export CPATH="$TRAIN_PREFIX/targets/x86_64-linux/include:${CPATH:-}"
 export LIBRARY_PATH="$TRAIN_PREFIX/targets/x86_64-linux/lib:${LIBRARY_PATH:-}"
 export DGS_LIVE_ROOT="$DATA_DIR"
 
-exec "$PY" -u "$(dirname "$0")/capture_only.py" "$DATA_DIR" "${@:2}"
+# Scoped flush of any leaked publisher/worker from a previous unclean run,
+# so the fresh publisher doesn't hang on "waiting for /camera_info".
+# (Replaces the need to restart Gazebo between runs.)
+source "$(dirname "$0")/_ros_cleanup.sh"
+dgs_ros_cleanup
+dgs_check_sim_alive || exit 1
+
+# Pin the pipeline (+ the publisher it spawns, via inherited affinity) off
+# the cores the dVRK 1 kHz control loop needs, and cap the BLAS/OpenMP
+# thread pools. Prevents the gsplat CUDA JIT / CUDA-sync threads from
+# starving the dVRK loop -> "power is unexpectedly off". See _ros_cleanup.sh.
+dgs_export_thread_caps
+exec $(dgs_cpu_pin_prefix) "$PY" -u "$(dirname "$0")/capture_only.py" "$DATA_DIR" "${@:2}"

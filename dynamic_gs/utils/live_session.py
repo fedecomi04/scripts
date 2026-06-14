@@ -699,6 +699,14 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
               f"       re-aim the camera and press ENTER to retry, or 'q' to abort.",
               flush=True)
 
+    # The single Enter ends static-view capture: the sweep happened BEFORE
+    # it, and the frame just captured is the SAM3D anchor. Stop recording
+    # NOW (no post-SAM3D sweep stage) so capture is over before Gazebo is
+    # paused for the SAM3D compute window.
+    sub.stop_recording()
+    n_static = sub.num_recorded_frames()
+    print(f"[live] recording stopped after {n_static} keyframes", flush=True)
+
     # Pause Gazebo physics from here through the end of the init-PLY
     # build. The window covers SAM3D subprocess and the depth-back-
     # projection PLY assembly — both compete with gzserver for CPU/GPU.
@@ -827,15 +835,10 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
                 print(f"[live] WARNING: eager AnySplat pre-spawn failed: {exc} "
                       f"(go-live will load it as usual)", flush=True)
 
-        # Sweep window: recording is still running. Let the operator
-        # sweep additional views of the scene to give the static
-        # optimiser more coverage. Press Enter to end the sweep.
-        print("[live] SAM3D complete — sweep the scene to capture more views.\n"
-              "       press ENTER when done capturing static views.", flush=True)
-        _prompt_user("")
-        sub.stop_recording()
-        n_static = sub.num_recorded_frames()
-        print(f"[live] recording stopped after {n_static} keyframes", flush=True)
+        # Recording already stopped at the single Enter (above) — there is
+        # no post-SAM3D sweep. Gazebo stays paused through the TSDF seed
+        # build; the finally-block unpause is the idempotent safety net.
+        print("[live] SAM3D complete — building static seed.", flush=True)
 
         # Concurrent ICP+TSDF fusion has been running on a worker thread
         # since `start_recording`; here we just drain the tail + run

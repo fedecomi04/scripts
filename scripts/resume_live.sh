@@ -50,7 +50,18 @@ echo "     warm cache: $WARM_CACHE ($(du -h "$WARM_CACHE" | cut -f1))"
 echo "     viser at http://localhost:8081 -- Ctrl+C or 'stop' to end"
 echo
 
-exec "$NS_TRAIN" dynamic-gs-live \
+# Scoped flush of any leaked publisher/worker from a previous unclean run,
+# so the fresh live publisher doesn't hang on "waiting for /camera_info".
+# (Replaces the need to restart Gazebo between runs.)
+source "$(dirname "$0")/_ros_cleanup.sh"
+dgs_ros_cleanup
+dgs_check_sim_alive || exit 1
+
+# Pin the pipeline (+ publisher) off the dVRK's RT cores + cap thread pools
+# so the tracker/AnySplat/CUDA-sync load can't starve the dVRK 1 kHz loop
+# ("power is unexpectedly off"). See _ros_cleanup.sh.
+dgs_export_thread_caps
+exec $(dgs_cpu_pin_prefix) "$NS_TRAIN" dynamic-gs-live \
   --data "$DATA_DIR" \
   --output-dir "$OUTPUT_DIR" \
   --vis tensorboard \
