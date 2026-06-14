@@ -329,6 +329,10 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         gated by a wall-clock floor (``feedforward_recurring_min_gap_s``)
         so high tracker rates don't dominate FF cost.
         """
+        # First tracked frame: stamp the from-scratch end-to-end section (no-op
+        # unless a bootstrap_live.sh wrote the cross-process t0 sidecar).
+        if is_first:
+            self._capture_static_sequence_total()
         # Reuse the SAME decision the tick made when it chose whether to render
         # the CDN — re-evaluating the gate here would race the min-gap clock and
         # could fire FF on a tick where the CDN was skipped (cdn=None crash).

@@ -216,6 +216,22 @@ class ConcurrentFusionRunner:
         self._watcher.start()
         self._started = True
 
+    def per_frame_add_stats(self) -> Optional[dict]:
+        """Per-frame ``add_frame`` stats collected by the worker, or ``None``
+        when the concurrent worker never ran (deferred-TSDF path — the seed is
+        built by a single batch GPU pass instead, so there are no per-frame
+        timings to report). Returns ``{mean, p90, max, n, fail}`` in ms."""
+        if self._worker is None or not self._worker.timings_ms:
+            return None
+        arr = np.asarray(self._worker.timings_ms)
+        return {
+            "mean_ms": float(arr.mean()),
+            "p90_ms": float(np.percentile(arr, 90)),
+            "max_ms": float(arr.max()),
+            "n": int(arr.size),
+            "fail": int(self._worker.fail_count),
+        }
+
     def _last_camera_world_xyz(self) -> Optional[np.ndarray]:
         """Return the world-frame position of the LAST captured frame's
         camera, read from ``<static_dir>/transforms.json``. Returns

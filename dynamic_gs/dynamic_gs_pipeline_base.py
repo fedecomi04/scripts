@@ -359,6 +359,9 @@ class DynamicGSPipelineBase(VanillaPipeline):
         self._feedforward_call_counter: int = 0
         self._feedforward_oneshot_done: bool = False
         self._last_feedforward_wall_time: float = 0.0
+        # From-scratch end-to-end section (set once on the first tracked frame
+        # iff a bootstrap_live.sh stamped the cross-process t0 sidecar).
+        self._static_sequence_section: Optional[str] = None
         # Per-tick FF-fire decision, set by the subclass tick and reused by
         # _on_tracker_frame so the gate is evaluated exactly once (the CDN
         # render is gated on the same flag).
@@ -646,6 +649,85 @@ class DynamicGSPipelineBase(VanillaPipeline):
                 pass
             self._feedforward_video_writer = None
 
+    # Sidecar stamped by bootstrap_live.sh (the only place that sees the whole
+    # capture→train→go-live span across the three separate processes). Read +
+    # consumed ONCE on the first tracked frame; see _capture_static_sequence_total.
+    _STATIC_SEQUENCE_T0_FILE = ".static_sequence_t0"
+
+    def _capture_static_sequence_total(self) -> None:
+        """On the FIRST tracked frame, if a from-scratch bootstrap stamped the
+        cross-process sidecar, compute the command-entered → first-frame-tracked
+        wall-clock + the per-stage breakdown, stash the formatted block on
+        ``self._static_sequence_section``, then DELETE the sidecar so it fires
+        exactly once (a later resume on the same dir won't re-emit it).
+
+        No-op (and no section) when the sidecar is absent — i.e. any run NOT
+        launched from bootstrap_live.sh (resume_live, bare ns-train, recorded).
+        """
+        if getattr(self, "_static_sequence_section", None) is not None:
+            return  # already captured this run
+        try:
+            data_root = Path(self.config.datamanager.data)
+        except Exception:
+            return
+        sidecar = data_root / self._STATIC_SEQUENCE_T0_FILE
+        if not sidecar.is_file():
+            return
+        now = time.time()
+        stamps: dict[str, float] = {}
+        try:
+            for line in sidecar.read_text().splitlines():
+                line = line.strip()
+                if not line or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                stamps[k.strip()] = float(v.strip())
+        except Exception:
+            return
+        finally:
+            try:
+                sidecar.unlink()
+            except Exception:
+                pass
+        t0 = stamps.get("t0_command")
+        if t0 is None:
+            return
+        # Stage breakdown from the consecutive boundary stamps the shell wrote.
+        # Each pair is a real wall delta (includes inter-process overhead), not
+        # an estimate. A stage row is shown only when both its bounds exist.
+        stages = [
+            ("Capture + segmentation + SAM3D + TSDF seed", "t1_capture_start", "t2_capture_end"),
+            ("ICP TSDF-seed refine (idempotent)", "t2_capture_end", "t3_fit_start"),
+            ("Static training + Phase 0b fusion", "t3_fit_start", "t4_golive_start"),
+            ("Go-live load → first tracked frame", "t4_golive_start", None),
+        ]
+        rows: list[tuple[str, float]] = []
+        for label, a, b in stages:
+            ta = stamps.get(a)
+            tb = now if b is None else stamps.get(b)
+            if ta is None or tb is None or tb < ta:
+                continue
+            rows.append((label, tb - ta))
+        self._static_sequence_section = self._render_static_sequence_section(
+            now - t0, rows
+        )
+
+    @staticmethod
+    def _render_static_sequence_section(total_s: float, rows: list) -> str:
+        """Format the from-scratch end-to-end section (main-step breakdown +
+        the single full command-entered → first-tracked-frame wall-clock)."""
+        def _fmt(s: float) -> str:
+            return f"{s:.1f}s" if s < 90 else f"{s/60.0:.1f} min ({s:.0f}s)"
+        out = ["=" * 96,
+               "STATIC SEQUENCE FROM SCRATCH — command entered → first dynamic frame tracked",
+               "=" * 96]
+        for label, dur in rows:
+            out.append(f"  {label:<48s} {_fmt(dur):>16s}")
+        out.append("-" * 96)
+        out.append(f"  {'FULL (command entered → first frame tracked)':<48s} {_fmt(total_s):>16s}")
+        out.append("=" * 96)
+        return "\n".join(out)
+
     def _write_timing_report(self) -> None:
         """Write ``<data_root>/timing_report.txt`` from ``self._timing``.
 
@@ -716,6 +798,13 @@ class DynamicGSPipelineBase(VanillaPipeline):
             lines.append("Tracker:     N/A (no tick-span captured)")
             lines.append("FF:          N/A")
         lines.append("")
+
+        # From-scratch end-to-end section — only present on a bootstrap_live.sh
+        # run (the sidecar is consumed on the first tracked frame); absent on
+        # resume / bare ns-train / recorded.
+        if getattr(self, "_static_sequence_section", None):
+            lines.append(self._static_sequence_section)
+            lines.append("")
 
         # By-phase bulleted load/inference report (teleop_init loads from the
         # ledger + the recurring per-tick algos folded in under dynamic_runtime,

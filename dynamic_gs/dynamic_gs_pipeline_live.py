@@ -415,6 +415,10 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         is_first: bool,
     ) -> None:
         """Live: Mode B feedforward cadence (same gate as recorded)."""
+        # First tracked frame: stamp the from-scratch end-to-end section (no-op
+        # unless a bootstrap_live.sh wrote the cross-process t0 sidecar).
+        if is_first:
+            self._capture_static_sequence_total()
         # Reuse the tick's stored decision (re-evaluating the min-gap gate here
         # would race the clock and could fire FF on a CDN-skipped tick).
         if not getattr(self, "_ff_due_this_tick", False):

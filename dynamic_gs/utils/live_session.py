@@ -597,8 +597,31 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
             fusion_runner.stop_and_finalize()
             _tl.record(LIVE_ROOT, "pointcloud_fusion", "TSDF finalize+seed", "fusion",
                        _t_fin, time.time())
+            # Per-frame add_frame breakdown (concurrent path only). In the
+            # deferred-TSDF default the worker never ran, so per_frame_add_stats
+            # returns None → no row (the batch GPU seed has its own row). The
+            # mean fills the timed slot; p90/max/n/fail go in the name string
+            # since the ledger has no extra-fields mechanism.
+            _pf = fusion_runner.per_frame_add_stats()
+            if _pf is not None:
+                _mean_s = _pf["mean_ms"] / 1000.0
+                _t_pf = time.time()
+                _tl.record(
+                    LIVE_ROOT, "pointcloud_fusion",
+                    (f"TSDF per-frame add_frame (mean; p90={_pf['p90_ms']:.0f}ms "
+                     f"max={_pf['max_ms']:.0f}ms n={_pf['n']} fail={_pf['fail']})"),
+                    "fusion", _t_pf - _mean_s, _t_pf,
+                )
         except Exception as exc:
             print(f"[live] WARNING: fusion finalize on '{reason}' failed: {exc}", flush=True)
+
+    # Counts SAM3 attempts that returned 0 objects. Each failed attempt's
+    # input RGB + (empty/garbage) segmentation overview is preserved under
+    # `failed_segmentations/attempt_NN_*` so the operator can inspect them
+    # afterwards and judge whether it's a threshold issue. Without this the
+    # next attempt overwrites `static0_rgb.png` and the failure is lost.
+    _failed_seg_dir = debug_dir / "failed_segmentations"
+    _seg_attempt = 0
 
     while True:
         reply = _prompt_user("").strip().lower()
@@ -695,6 +718,25 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
                   f"({sam3_duration:.1f}s)", flush=True)
             break
 
+        # Preserve this failed attempt before the next retry overwrites the
+        # debug files. Copy the input RGB + the (empty) segmentation overview
+        # into failed_segmentations/attempt_NN_* so it can be reviewed later
+        # (e.g. to decide if SAM3_MIN_SCORE / fastsam_conf is too strict).
+        _seg_attempt += 1
+        try:
+            _failed_seg_dir.mkdir(parents=True, exist_ok=True)
+            for _src_name, _dst_suffix in (
+                ("static0_rgb.png", "input_rgb.png"),
+                ("static0_sam3_overview.png", "overview.png"),
+            ):
+                _src = debug_dir / _src_name
+                if _src.exists():
+                    shutil.copy2(_src, _failed_seg_dir / f"attempt_{_seg_attempt:02d}_{_dst_suffix}")
+            print(f"[live] saved failed segmentation attempt {_seg_attempt} -> "
+                  f"{_failed_seg_dir}/attempt_{_seg_attempt:02d}_*", flush=True)
+        except Exception as _exc:
+            print(f"[live] WARNING: could not save failed segmentation attempt: {_exc}", flush=True)
+
         print(f"[live] SAM3 found 0 objects (took {sam3_duration:.1f}s).\n"
               f"       re-aim the camera and press ENTER to retry, or 'q' to abort.",
               flush=True)
@@ -703,9 +745,20 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
     # it, and the frame just captured is the SAM3D anchor. Stop recording
     # NOW (no post-SAM3D sweep stage) so capture is over before Gazebo is
     # paused for the SAM3D compute window.
+    _t_capture_end = time.time()
     sub.stop_recording()
     n_static = sub.num_recorded_frames()
     print(f"[live] recording stopped after {n_static} keyframes", flush=True)
+
+    # Operator sweep duration: wall-clock the user spent moving the arm and
+    # capturing static keyframes — from recording-armed (_t_capture_start, just
+    # after start_recording) to the single Enter that ends static-view capture
+    # (the SAM3 retry loop broke on success → _t_capture_end captured above).
+    # This is operator-controlled, not compute, so it's the slowest segment by
+    # design; the row makes that explicit in the report.
+    _tl.record(LIVE_ROOT, "capture",
+               f"operator sweep ({n_static} keyframes)", "infer",
+               _t_capture_start, _t_capture_end)
 
     # Pause Gazebo physics from here through the end of the init-PLY
     # build. The window covers SAM3D subprocess and the depth-back-
@@ -755,19 +808,56 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
                     # Exposed load (preload didn't happen) — record it.
                     _tl.record(LIVE_ROOT, "object_3d_gen", "SAM3D model", "load", t_load, time.time())
                 t_infer = time.time()
-                worker_results = sam_worker.sam3d_infer(
-                    render_image_path=anchor_rgb_path,
-                    object_mask_paths=[Path(obj["mask_path"]) for obj in sam3_objects],
-                    output_stems=[f"static0_obj_{i:02d}_sam3d" for i in range(len(sam3_objects))],
-                    output_dir=artifact_dir,
-                    image_dir=debug_dir,
-                    max_side=518,
-                    depth_path=depth_path,
-                    intrinsics_path=intrinsics_path,
-                )
+                # Crop each object to a square around its mask BEFORE SAM3D,
+                # instead of feeding the full frame (which SAM3D resizes to
+                # max_side=518 — squashing a 1920x1200 scene so a small object
+                # becomes a few pixels -> garbage 3D). prepare_cropped_sam3d_inputs
+                # makes a tight crop (object bbox + 32 px context, min 300 px
+                # square) and writes crop-shifted intrinsics + cropped depth so
+                # the metric pointmap stays correct. The object then fills the
+                # 518 frame -> real detail. The worker takes ONE shared render/
+                # depth, so we crop per-object and call it once per object.
+                from .sam3d import prepare_cropped_sam3d_inputs
+                cam_intr = json.loads(Path(intrinsics_path).read_text())
+                worker_results = []
+                for _i, obj in enumerate(sam3_objects):
+                    _stem = f"static0_obj_{_i:02d}_sam3d"
+                    try:
+                        _crop = prepare_cropped_sam3d_inputs(
+                            render_image_path=anchor_rgb_path,
+                            object_mask_path=Path(obj["mask_path"]),
+                            output_dir=artifact_dir,
+                            output_stem=_stem,
+                            image_dir=debug_dir,
+                            depth_path=depth_path,
+                            depth_scale=1.0,           # depth tiff is float32 METERS
+                            camera_intrinsics=cam_intr,
+                        )
+                    except Exception as _exc:
+                        print(f"[live] SAM3D crop failed for obj {_i} ({_exc}); "
+                              f"falling back to full-frame", flush=True)
+                        worker_results.extend(sam_worker.sam3d_infer(
+                            render_image_path=anchor_rgb_path,
+                            object_mask_paths=[Path(obj["mask_path"])],
+                            output_stems=[_stem],
+                            output_dir=artifact_dir, image_dir=debug_dir,
+                            max_side=518, depth_path=depth_path,
+                            intrinsics_path=intrinsics_path))
+                        continue
+                    _r = sam_worker.sam3d_infer(
+                        render_image_path=_crop["render_image_path"],
+                        object_mask_paths=[_crop["object_mask_path"]],
+                        output_stems=[_stem],
+                        output_dir=artifact_dir,
+                        image_dir=debug_dir,
+                        max_side=518,
+                        depth_path=_crop.get("depth_path"),
+                        intrinsics_path=_crop.get("intrinsics_path"),
+                    )
+                    worker_results.extend(_r)
                 _tl.record(LIVE_ROOT, "object_3d_gen", "SAM3D", "infer", t_infer, time.time())
                 print(f"[live] SAM3D inference {time.time()-t_infer:.1f}s "
-                      f"({len(worker_results)} masks)", flush=True)
+                      f"({len(worker_results)} masks, cropped per-object)", flush=True)
                 # Reconstruct the downstream-compatible per-object dict shape:
                 # {ply_path, pose_path, preview_path, ...} when ok, else {}.
                 from .sam3d import get_sam3d_output_paths, resolve_sam3d_pose_path

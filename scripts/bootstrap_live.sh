@@ -33,6 +33,20 @@ if [[ -z "$DATA_DIR" ]]; then
 fi
 DATA_DIR="$(realpath -m "$DATA_DIR")"
 
+# Cross-process "static sequence ran from scratch" stopwatch. This shell is the
+# only place that sees the whole capture→train→go-live span across THREE
+# separate processes (each resets its own in-process timing ledger), so it
+# stamps real wall-clock boundaries into a sidecar. The dynamic-gs-live process
+# reads this on the FIRST tracked frame, emits the end-to-end section in
+# timing_report.txt, then DELETES the sidecar (so a later resume_live.sh on the
+# same dir — which never stamps it — correctly skips the section). resume_live
+# / capture_only never write this file, so the section is bootstrap-only.
+SEQ_T0="$DATA_DIR/.static_sequence_t0"
+mkdir -p "$DATA_DIR"
+: > "$SEQ_T0"
+dgs_stamp_seq() { echo "$1=$(date +%s.%N)" >> "$SEQ_T0"; }
+dgs_stamp_seq t0_command
+
 # Env setup -- pin the train env on PATH + LD_LIBRARY_PATH so the
 # subprocesses inherit a consistent toolchain.
 CONDA_ROOT=/home/mrc-cuhk/miniconda3
@@ -103,6 +117,7 @@ echo
 echo "===> [1/3] CAPTURE -- live_session.run_live_capture_session()"
 echo "     (sweeps the scene + SAM3 + SAM3D; follow the on-screen prompts)"
 echo
+dgs_stamp_seq t1_capture_start
 $DGS_PIN "$PY" -u -c "
 import os
 from dynamic_gs.utils.live_session import run_live_capture_session
@@ -117,6 +132,7 @@ print(f'\n[bootstrap] capture session complete -> {out}', flush=True)
 # before static-gs reads it.
 echo
 echo "===> [1.5/3] RGBD-FUSION INIT -- ICP-refined TSDF seed (idempotent)"
+dgs_stamp_seq t2_capture_end
 $DGS_PIN "$PY" -u -m dynamic_gs.utils.rgbd_fusion_init "$DATA_DIR"
 
 # ---------------------------------------------------------------- 2/3
@@ -125,6 +141,7 @@ echo "===> [2/3] FIT -- ns-train static-gs"
 echo "     (trains the Splatfacto scene + Phase 0b CPD fusion)"
 echo "     SAM3 prompt: \"$SAM3_PROMPT\""
 echo
+dgs_stamp_seq t3_fit_start
 $DGS_PIN "$NS_TRAIN" static-gs \
   --data "$DATA_DIR" \
   --output-dir "$OUTPUT_DIR" \
@@ -151,6 +168,7 @@ echo "===> [3/3] GO-LIVE -- ns-train dynamic-gs-live"
 echo "     (XFeat tracker + AnySplat FF, viser at http://localhost:8081)"
 echo "     Ctrl+C or type 'stop' to end."
 echo
+dgs_stamp_seq t4_golive_start
 # Re-run dynamic-gs-live in non-destructive mode (live_wipe_root=False is
 # already the default, but we set it explicitly so this script documents
 # the intent -- we just spent stage 1 + 2 building this dir, don't wipe it).
