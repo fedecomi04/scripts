@@ -240,6 +240,8 @@ Replaced the rigid-only CPD/TEASER++ similarity fit as the **default** Phase-0b 
 
 ### Static-phase init seed: online ICP+TSDF fusion (2026-06-01)
 
+> **SUPERSEDED (2026-06-12, constants only):** the dated voxel/downsample numbers below drifted. Current code ([`online_fusion.py`](dynamic_gs/utils/online_fusion.py)): `TSDF_VOXEL_M = 0.002` (**2 mm**, not 1.5 mm; env-overridable via `DGS_TSDF_VOXEL_M`), `FAR_VOXEL_M = 0.01` (**1 cm**, not 5 mm). The fusion ingests depth ONLY in the band `DEPTH_MIN_M, DEPTH_MAX_M = 0.05, 3.0` m — **hardcoded, no env override** — applied at the integration validity mask and `depth_trunc`. Depth outside 0.05–3.0 m is excluded from integration entirely (not clamped → no surface there, not retained noise). The measurements in the body (point counts, ms, speedups) are historical and unchanged.
+
 Replaced the naive per-frame back-projection + post-pass refine with **one streaming pass** that runs concurrent with capture.
 
 * New shared utility: [`dynamic_gs/utils/online_fusion.py`](dynamic_gs/utils/online_fusion.py) — `OnlineFusion` class wrapping Open3D `ScalableTSDFVolume` + point-to-plane ICP. Verbatim port of `experiments/icp_fusion_mvp/online_fusion.py`.
@@ -585,7 +587,7 @@ StaticGSPipeline                 (static_gs_pipeline.py)
 
 The PLY at `<data>/static_scene/depth_camera_init_points.ply` is what Splatfacto inits Gaussians from. Today:
 
-1. **During capture**, [`utils/fusion_runner.py`](dynamic_gs/utils/fusion_runner.py) runs an `OnlineFusion` worker thread that watches `transforms.json` and integrates each new keyframe (`add_frame`). GPU TSDF + ICP at 1.5 mm voxel, ~16 ms/frame at 800×800.
+1. **During capture**, [`utils/fusion_runner.py`](dynamic_gs/utils/fusion_runner.py) runs an `OnlineFusion` worker thread that watches `transforms.json` and integrates each new keyframe (`add_frame`). GPU TSDF + ICP at 2 mm voxel (`TSDF_VOXEL_M=0.002`), only depth in the 0.05–3.0 m band (`DEPTH_MIN_M`/`DEPTH_MAX_M`, hardcoded), ~16 ms/frame at 800×800.
 2. **On capture stop**, `stop_and_finalize()` drains the queue, calls `finalize()`, and writes the PLY (~0.6 s).
 3. **Optional adaptive downsample**: [`scripts/adaptive_downsample.py`](scripts/adaptive_downsample.py) keeps the <1 m near-zone at full density, voxel-downsamples the rest to 5 mm. Not yet auto-wired into the bootstrap flow; run manually if seed size matters.
 
@@ -664,7 +666,9 @@ Dataparser settings: `orientation_method="none"`, `center_method="none"`, `auto_
 
 The live publisher subprocess is auto-spawned by `LiveShmSubscriber`. It runs the URDF FK + frame sync + atomic frame writes; the reader-side process never imports rospy.
 
-Required: `dynaarm_with_gripper_for_gazebo_only_no_wrist_collision.urdf` must define `camera_pose_link` as a `<link>` and load the `libactive_camera_arm_link_pose_publisher.so` Gazebo plugin (publishes `/dynaarm_arm/dynaarm_arm/camera1/gazebo_pose`). See the historic 2026-05-04 version in `~/.config/Code/User/History/-45f4ea38/KHwu.urdf` for the canonical content.
+Required: `dynaarm_with_gripper_for_gazebo_only_no_wrist_collision.urdf` must load the `libactive_camera_arm_link_pose_publisher.so` Gazebo plugin (publishes the camera pose to `/dynaarm_arm/dynaarm_arm/camera1/gazebo_pose`). See the historic 2026-05-04 version in `~/.config/Code/User/History/-45f4ea38/KHwu.urdf` for the canonical content.
+
+**Camera-pose plugin (`StampedLinkPosePublisher`) — what it actually publishes + the reset-survival fix (2026-06-14):** the plugin source is `active_camera_arm_control/active_camera_arm_gazebo/src/StampedLinkPosePublisher.cpp` (in the teleop catkin_ws, NOT this repo). Corrections to earlier notes here: it publishes the pose of **`dynaarm_WRIST_2_base`** (relative to `dynaarm_base`), **not** `camera_pose_link` (that link exists but is unused by this plugin); `updateRate=250.0` is set in the URDF `<plugin>` block, not the `.cpp`. **Failure mode + fix:** the plugin throttles by `world->SimTime()` and cached `last_publish_time_`. Until 2026-06-14 it had **no `Reset()` override**, so a `reset_world`/`reset_simulation` (or any `/clock` reset) rewound SimTime to ~0 while `last_publish_time_` kept its large value → the throttle delta went negative → it skipped publishing **every tick forever** (plugin stays loaded, world keeps stepping, but `gazebo_pose` goes permanently silent → the live publisher hangs waiting for the pose topic; the preflight `dgs_check_sim_alive` catches this). Fixed (teleop repo `federico/dynamic-gaussian-splat`, commit `d905560`) by adding a `Reset()` override + a backwards-SimTime guard in `OnUpdate`, so it re-arms on reset and keeps publishing across world resets. **The rebuilt `.so` only loads on a fresh model spawn / Gazebo restart** — a `reset_world` on an already-running pre-fix sim won't pick it up. If `gazebo_pose` is ever silent while the sim is otherwise healthy (joint_states flowing, RTF≈1, physics not paused), this is the first thing to check.
 
 `urdf/dynamic_gaussian_splat/` and `worlds/dynamic_gaussian_splat/` symlinks are required under the catkin workspace — the publisher expects them at those paths.
 
