@@ -300,6 +300,16 @@ class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
     observe — bounds cost AND avoids occluded-point bias."""
     feedforward_anysplat_icp_max_iters: int = 30
     feedforward_anysplat_icp_max_dist_m: float = 0.02
+    feedforward_anysplat_max_scale_m: float = 0.05
+    """Clamp each FF-inserted gaussian's per-axis WORLD scale to <= this (metres).
+    A single oversized AnySplat insert (worst far from the camera) otherwise lands
+    as a giant blob that smears the whole render. 5 cm is a conservative cap (real
+    surface inserts are sub-cm); tighten by eye. 0 disables. Env A/B (no relaunch):
+    ``DGS_FF_MAX_SCALE_M``."""
+    feedforward_anysplat_min_scale_m: float = 0.0
+    """DROP FF-inserted gaussians whose LARGEST world-scale axis is < this (metres)
+    — sub-mm specks that are pure count bloat. 0 (default) disables; set e.g.
+    0.0005 to cull. Env A/B: ``DGS_FF_MIN_SCALE_M``."""
 
 
 # ============================================================================
@@ -1624,6 +1634,13 @@ class DynamicGSPipelineBase(VanillaPipeline):
                 gripper_mask=gripper_mask,
                 object_mask=obj_mask,
                 rendered_alpha=rendered_alpha,
+                # The FF fills EVERY revealed region (it runs
+                # select_top_n_components_filtered(n=256) downstream), so the CDN
+                # must return all change blobs above min-area — NOT just the single
+                # largest. keep_largest_only=True (the old default) silently dropped
+                # every change region except the biggest, so a separate revealed
+                # surface in the same frame was never detected/filled.
+                keep_largest_only=False,
             )
         except Exception as exc:  # noqa: BLE001
             CONSOLE.log(f"[dynamic-gs] _compute_change_mask failed: {exc}")
@@ -3090,7 +3107,24 @@ class DynamicGSPipelineBase(VanillaPipeline):
             # by definition and pull the pose toward the right answer; changed regions
             # are too few to bias it.
             scene_c2w_refined = scene_c2w_np
-            if self.config.feedforward_anysplat_icp_refine:
+            # ICP aligns inserts to the static SCENE cloud (refined = T·raw). In
+            # theory this can fight the CDN, which renders + judges from the RAW
+            # live pose: a non-identity T displaces each insert by raw⁻¹·T·raw, a
+            # depth-scaled offset that could re-flag far inserts (the churn loop).
+            # BUT empirically (after the coverage-gate / keep-all-blobs / fractional
+            # block-validity fixes) ICP-ON looked BETTER to the operator — it pulls
+            # inserts onto the existing scene so they seam less — and it runs on the
+            # FF bg thread (does NOT block the tracker tick). So it's kept ON by
+            # default. NOTE: this was an eyeball call, NOT a rigorous A/B — the net
+            # win over ICP-off was never measured. Live A/B without relaunch:
+            # DGS_FF_ICP=0 forces off, =1 forces on.
+            _icp_env = os.environ.get("DGS_FF_ICP")
+            icp_enabled = (
+                _icp_env not in ("0", "false", "False")
+                if _icp_env is not None
+                else bool(self.config.feedforward_anysplat_icp_refine)
+            )
+            if icp_enabled:
                 t_fc0 = time.time()
                 with self._viser_lock_ctx():
                     means_all_t = self.model.gauss_params["means"].detach()  # (N, 3) on device
@@ -3158,6 +3192,17 @@ class DynamicGSPipelineBase(VanillaPipeline):
             if src_img is None:
                 CONSOLE.log(f"[anysplat] call={call_id} could not read {source_image_path}; skip")
                 return
+            # Scale-hygiene bounds (config, env-overridable for live A/B). Computed
+            # once per FF call and applied to every crop window's reproject.
+            def _env_float(name, cfg_val):
+                v = os.environ.get(name)
+                try:
+                    return float(v) if v is not None else float(cfg_val)
+                except (TypeError, ValueError):
+                    return float(cfg_val)
+            max_scale_m = _env_float("DGS_FF_MAX_SCALE_M", self.config.feedforward_anysplat_max_scale_m)
+            min_scale_m = _env_float("DGS_FF_MIN_SCALE_M", self.config.feedforward_anysplat_min_scale_m)
+
             per_component_decoded: list[dict] = []
             for wi, win in enumerate(crop_windows):
                 left, top, size = int(win[0]), int(win[1]), int(win[2])
@@ -3212,6 +3257,8 @@ class DynamicGSPipelineBase(VanillaPipeline):
                     scene_crop=(left, top, size),
                     voxel_dedup_m=None,  # dedup is done ONCE across all windows below
                     scale_multiplier=float(self.config.feedforward_anysplat_scale_multiplier),
+                    max_scale_m=max_scale_m,
+                    min_scale_m=min_scale_m,
                 )
                 self._timing["FF.3b_anysplat_reproject"].append(time.time() - t0)
                 if int(decoded["xyz"].shape[0]) > 0:

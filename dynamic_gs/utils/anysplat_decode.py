@@ -629,6 +629,8 @@ def reproject_anysplat_to_scene(
     component_mask: Optional[np.ndarray] = None,   # (H, W) bool, restrict insertion to this mask (any resolution)
     voxel_dedup_m: Optional[float] = None,         # if set, pick ONE representative per voxel of this size (metres). 0.002 matches static-phase TSDF.
     scale_multiplier: float = 1.0,                 # additionally enlarges each gaussian's three log-scales by log(scale_multiplier).
+    max_scale_m: float = 0.0,                      # clamp each gaussian's per-axis WORLD scale to <= this (metres). 0 disables. Stops a single oversized insert (worst far from camera) from smearing the whole render.
+    min_scale_m: float = 0.0,                      # DROP gaussians whose largest WORLD-scale axis is < this (metres). 0 disables. Culls sub-mm specks that are pure count bloat.
     scene_crop: Optional[tuple] = None,            # (left, top, size): the SQUARE scene sub-window that was fed to AnySplat. When set, the pred-crop pixel maps back via this window (NOT process_image's full-frame center-crop).
 ) -> dict:
     """Canonical AnySplat → scene reprojection (memory: anysplat-reprojection-method).
@@ -762,6 +764,29 @@ def reproject_anysplat_to_scene(
     Rg_can = quat_wxyz_to_rotmat(quats_wxyz).astype(np.float64)
     Rg_world = (M_rot[None, :, :] @ Rg_can).astype(np.float32)
     quats_world = rotmat_to_quat_wxyz(Rg_world).astype(np.float32)
+
+    # --- Scale hygiene: uniformly shrink oversized + cull tiny inserts ---
+    # An AnySplat insert with a large predicted scale (× per-gauss s × scale_multiplier)
+    # can land as a giant blob — worst FAR from the camera, where one Gaussian
+    # subtends cm — that smears the whole render; a sub-mm speck is pure count bloat.
+    # Oversized (largest axis > max_scale_m) → UNIFORMLY shrink (all three axes
+    # divided by the SAME factor so the largest becomes max_scale_m), preserving the
+    # splat's shape — NOT a per-axis clamp (which flattens it), NOT a cull. Tiny
+    # (largest axis < min_scale_m) → DROP. Done here (before voxel dedup) so it
+    # covers every crop window and the dedup path. Mirrors the static-phase shrink.
+    if max_scale_m and max_scale_m > 0.0 and log_scales_world.shape[0] > 0:
+        log_max_axis = log_scales_world.max(axis=1)                       # (N,)
+        log_cap = float(np.log(float(max_scale_m)))
+        shift = np.maximum(log_max_axis - log_cap, 0.0).astype(np.float32)  # (N,) ≥0
+        log_scales_world = log_scales_world - shift[:, None]              # uniform divide
+    if min_scale_m and min_scale_m > 0.0 and means_world.shape[0] > 0:
+        keep_s = np.exp(log_scales_world).max(axis=1) >= float(min_scale_m)
+        means_world = means_world[keep_s]
+        log_scales_world = log_scales_world[keep_s]
+        quats_world = quats_world[keep_s]
+        features_dc = features_dc[keep_s]
+        features_rest = features_rest[keep_s]
+        opacity_logits = opacity_logits[keep_s]
 
     # --- Optional voxel dedup: pick ONE representative per voxel (no averaging) ---
     # np.unique on the integer voxel index returns the FIRST occurrence per

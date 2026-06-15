@@ -121,9 +121,14 @@ nvidia-smi                      # full GPU status
 | var | effect |
 |---|---|
 | `DGS_FF_DEBUG=1` | save FF/CDN debug frames on a live run (section 2) |
+| `DGS_FF_ICP=0` | disable AnySplat FF ICP refine (inserts placed via raw live pose). Default is ON (looks better — less seam with the static scene; not rigorously A/B'd). `=1` forces on. Runs off the tracker thread either way. |
+| `DGS_FF_MAX_SCALE_M=0.03` | clamp each FF-inserted gaussian's per-axis world scale (m). Default 0.05 (5 cm). Stops one oversized insert from smearing the scene; lower = tighter. 0 disables. |
+| `DGS_FF_MIN_SCALE_M=0.0005` | drop FF-inserted gaussians whose largest axis < this (m) — culls sub-mm specks. Default 0.0 (off). |
 | `DGS_NO_CPU_PIN=1` | skip the dVRK CPU isolation |
 | `DGS_LIVE_DEFER_TSDF=0` | use the concurrent TSDF fuser instead of the deferred batch seed |
 | `DGS_FUSION_DEVICE=cpu` | force CPU TSDF (default auto-GPU) |
+| `DGS_TSDF_DEPTH_MAX_M=6.0` | raise the 3 m TSDF integration cap (default 3.0). **OOM risk** — raise `DGS_TSDF_VOXEL_M` too and watch `nvidia-smi`. |
+| `DGS_TSDF_VOXEL_M=0.004` | coarser TSDF voxel (default 0.002 = 2 mm); needed if you raise the depth cap on a 16 GB GPU. |
 | `DGS_EAGER_ANYSPLAT=1` | preload AnySplat during capture/training (set by bootstrap) |
 
 Tracker live A/B knobs (no relaunch): `DGS_HOLD_WINDOW`, `DGS_HOLD_TRANS_MM`,

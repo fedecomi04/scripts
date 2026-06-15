@@ -85,6 +85,15 @@ class StaticGSPipelineConfig(VanillaPipelineConfig):
     ``datamanager.data``. The future dynamic-gs pipeline warm-starts from
     this path via ``persistence.load_post_fusion_state``."""
 
+    static_phase_opacity_purge_threshold: float = 0.05
+    """One-shot opacity purge at the end of static training (just before Phase 0b):
+    permanently delete scene Gaussians whose ``sigmoid(opacity)`` is below this.
+    Splatfacto leaves a large halo of near-zero-opacity splats that cost
+    render/wire/memory downstream (measured -26% on this scene at 0.05, no visible
+    change). Official 3DGS prunes at 0.005 continuously DURING densification; 0.05
+    is a more aggressive one-shot END-of-training cleanup. 0.0 disables. Runs before
+    Phase 0b so the SAM3D object (inserted later) is never touched."""
+
 
 class StaticGSPipeline(VanillaPipeline):
     """End-to-end static-only pipeline. See module docstring for flow."""
@@ -213,6 +222,24 @@ class StaticGSPipeline(VanillaPipeline):
                 "[static-gs] Phase 0a produced no objects; skipping Phase 0b + cache save"
             )
             return
+
+        # One-shot opacity purge on the TRAINED scene, BEFORE Phase 0b inserts the
+        # SAM3D object (so the object is never at risk) and before the cache save
+        # (so the dynamic phase inherits the leaner scene). Only scene Gaussians
+        # exist at this point — object_flags is all 0 (set later by dynamic D0),
+        # SAM3D object not yet fused — so there is nothing tracked to protect.
+        purge_thr = float(getattr(self.config, "static_phase_opacity_purge_threshold", 0.0))
+        if purge_thr > 0.0:
+            with torch.no_grad():
+                opac = torch.sigmoid(self.model.gauss_params["opacities"].detach().reshape(-1))
+                low_idx = torch.nonzero(opac < purge_thr, as_tuple=False).reshape(-1)
+            n_before = self.model.num_points
+            n_del = self.model.delete_gaussian_indices(low_idx)
+            CONSOLE.log(
+                f"[static-gs] opacity purge (sigmoid<{purge_thr}): dropped "
+                f"{n_del}/{n_before} ({100.0 * n_del / max(1, n_before):.1f}%) → "
+                f"{self.model.num_points} Gaussians"
+            )
 
         CONSOLE.log(
             "[static-gs] training complete — running Phase 0b (fusion) on the trained scene"

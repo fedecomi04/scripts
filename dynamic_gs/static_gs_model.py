@@ -40,12 +40,17 @@ even by accident.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Literal, Tuple, Type
+from typing import Dict, List, Literal, Tuple, Type
 
 import numpy as np
 import torch
 from torch import Tensor
 
+from nerfstudio.engine.callbacks import (
+    TrainingCallback,
+    TrainingCallbackAttributes,
+    TrainingCallbackLocation,
+)
 from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig
 from nerfstudio.utils.math import k_nearest_sklearn
 from nerfstudio.utils.spherical_harmonics import RGB2SH
@@ -63,6 +68,43 @@ class StaticGSModelConfig(SplatfactoModelConfig):
     # ---- Render background ----
     use_simulator_background: bool = True
     simulator_background_rgb: Tuple[float, float, float] = (0.86, 0.92, 1.0)
+
+    # ---- Static-scene depth cutoff (single knob, paired with the TSDF seed cap) ----
+    scene_depth_max_m: float = 2.0
+    """Cap the static reconstruction at this sensor depth (m). Adds a depth-exclude
+    to the TRAINING loss mask: pixels with depth outside (0.05, scene_depth_max_m]
+    are masked out (on top of the gripper keep-mask), so the optimizer never fits
+    color to far / no-return pixels where there are no seed Gaussians anyway (real
+    ZED depth error grows to ~5 cm past ~2 m). Keep EQUAL to ``DEPTH_MAX_M`` /
+    ``DGS_TSDF_DEPTH_MAX_M`` in utils/online_fusion.py (the seed cap), so the seed
+    geometry and the trained-loss band agree. 0.0 disables (gripper-only mask)."""
+
+    # ---- Oversized-Gaussian scale RESET DURING training (hysteresis) ----
+    scale_clamp_max_m: float = 0.05
+    """TRIGGER: largest-axis world scale (m) above which a Gaussian is "oversized".
+    Every ``scale_clamp_every_n`` steps DURING training, any Gaussian whose largest
+    axis exceeds this is RESET (see ``scale_reset_value_m``). Applied mid-training (a
+    callback), NOT at the end: end-shrinking is destructive — the converged scene
+    leans on the big far-band splats for coverage, so shrinking them post-hoc leaves
+    big holes; mid-training lets the optimizer re-cover with the reset + neighbour
+    Gaussians between resets. Densification is OFF so Splatfacto's own scale prune
+    never fires. Real detail is sub-cm. 0.0 disables."""
+    scale_reset_value_m: float = 0.01
+    """RESET TARGET: when an oversized Gaussian (largest axis > ``scale_clamp_max_m``)
+    is reset, all three axes are UNIFORMLY divided so its largest axis becomes this
+    (m) — shape/anisotropy preserved (NOT a per-axis clamp; NOT a cull). Reset well
+    BELOW the trigger (0.01 vs 0.05) so the splat starts small and regrows under the
+    loss instead of pinning at the boundary and immediately tripping again. Must be
+    < ``scale_clamp_max_m`` and > 0."""
+    scale_clamp_every_n: int = 10
+    """Apply the shrink every N training steps (projected-gradient cadence). Must
+    leave training steps AFTER the last application for the optimizer to re-cover.
+    Smaller N = less regrow-time after the last shrink (fewer/smaller residual
+    oversized splats) but less adaptation room between shrinks. Compute is negligible
+    (sub-ms/call — a few elementwise ops on the scales tensor — so cadence is free).
+    Measured maxes on zed_scene: every-100 → 313 mm tail; every-30 → 75 mm; tighten
+    toward every-step for a harder cap, at the risk of holes in the sparse far band
+    (densification is off, so very small splats can't be created to fill)."""
 
     # ---- Splatfacto schedule overrides (kept identical to dynamic-gs so
     # the trained scene is byte-comparable). ----
@@ -154,6 +196,74 @@ class StaticGSModel(SplatfactoModel):
     def __init__(self, config, metadata=None, **kwargs):
         self._optimizers_wrapper = None
         super().__init__(config=config, metadata=metadata, **kwargs)
+
+    def get_loss_dict(self, outputs, batch, metrics_dict=None):
+        """Static loss with a depth cutoff folded into the training mask.
+
+        Splatfacto multiplies gt+pred by ``batch["mask"]`` (gripper keep-mask).
+        Here we additionally AND in a depth-keep mask — pixels with sensor depth
+        outside ``(0.05, scene_depth_max_m]`` m are excluded — so the photometric
+        loss never fits color to far / no-return pixels (no seed Gaussians live
+        there, and real ZED depth is noisy past ~2 m). ``depth_image`` is injected
+        into every batch by DynamicGSDataManager (CPU-resident). Disabled when
+        ``scene_depth_max_m <= 0`` → falls back to the gripper-only mask."""
+        dmax = float(getattr(self.config, "scene_depth_max_m", 0.0))
+        depth = batch.get("depth_image")
+        if dmax > 0.0 and depth is not None:
+            d = depth.to(self.device).float()
+            if d.ndim == 2:
+                d = d[..., None]
+            depth_keep = ((d > 0.05) & (d < dmax)).float()
+            existing = batch.get("mask")
+            if existing is not None:
+                m = existing.to(self.device).float()
+                if m.ndim == 2:
+                    m = m[..., None]
+                combined = m * depth_keep
+            else:
+                combined = depth_keep
+            batch = {**batch, "mask": combined}
+        return super().get_loss_dict(outputs, batch, metrics_dict)
+
+    def get_training_callbacks(
+        self, training_callback_attributes: TrainingCallbackAttributes
+    ) -> List[TrainingCallback]:
+        cbs = super().get_training_callbacks(training_callback_attributes)
+        every = int(getattr(self.config, "scale_clamp_every_n", 0))
+        clamp_m = float(getattr(self.config, "scale_clamp_max_m", 0.0))
+        if every > 0 and clamp_m > 0.0:
+            cbs.append(
+                TrainingCallback(
+                    [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                    self._shrink_oversized_scales_cb,
+                    update_every_num_iters=every,
+                )
+            )
+        return cbs
+
+    def _shrink_oversized_scales_cb(self, step: int) -> None:
+        """Mid-training scale RESET with hysteresis, every ``scale_clamp_every_n``
+        steps: any Gaussian whose largest WORLD axis exceeds ``scale_clamp_max_m``
+        (the trigger) is UNIFORMLY shrunk so its largest axis becomes
+        ``scale_reset_value_m`` (the reset target, well below the trigger) — all three
+        log-scales reduced by the SAME amount, so shape/anisotropy is preserved (not a
+        per-axis clamp, not a cull). Resetting below the trigger lets the splat regrow
+        under the loss instead of pinning at the boundary. Mid-training (not the end)
+        so the optimizer re-covers the exposed area instead of leaving a hole."""
+        import math
+        trigger = float(self.config.scale_clamp_max_m)
+        reset_to = float(self.config.scale_reset_value_m)
+        if trigger <= 0.0 or reset_to <= 0.0:
+            return
+        log_trigger, log_reset = math.log(trigger), math.log(reset_to)
+        with torch.no_grad():
+            s = self.gauss_params["scales"]                  # (N, 3) log-scale
+            log_max = s.max(dim=1, keepdim=True).values      # (N, 1) largest axis (log)
+            # oversized → shift each by (log_max - log_reset) so max-axis = reset_to;
+            # others → 0. Uniform across the 3 axes (aspect preserved).
+            shift = torch.where(log_max > log_trigger, log_max - log_reset,
+                                torch.zeros_like(log_max))
+            s.sub_(shift)
 
     # ------------------------------------------------------------------
     # Module setup

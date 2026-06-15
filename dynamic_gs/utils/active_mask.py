@@ -13,7 +13,11 @@ from scipy.ndimage import label as _scipy_label
 OFFICIAL_RGB_MSSSIM_THRESHOLD = 0.07
 OFFICIAL_FILTER_CLOSE_RADIUS = 10
 OFFICIAL_FILTER_OPEN_RADIUS = 3
-OFFICIAL_FILTER_MIN_AREA = 760
+# Min connected-component area for the CDN cleanup recipe, in POOLED grid pixels
+# (the cleanup runs on the MS-SSIM downsample grid, ds≈10 at 1920×1200, so 1 pooled
+# px ≈ ds² full-res px). Lowered 760→76 (2026-06-15) so small revealed surfaces
+# (~7.6k full-res px instead of ~76k) are detectable, not just large change blobs.
+OFFICIAL_FILTER_MIN_AREA = 76
 
 # Default per-pixel absolute depth-difference threshold (metres) for the
 # depth-only CDN mode of `build_change_mask`. 2 cm matches the sensor depth

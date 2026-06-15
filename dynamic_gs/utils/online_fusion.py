@@ -63,7 +63,17 @@ import open3d as o3d
 TSDF_VOXEL_M = float(os.environ.get("DGS_TSDF_VOXEL_M", "0.002"))
 TSDF_TRUNC_M = 0.008         # ~4× voxel
 DEPTH_SCALE = 1000.0         # uint16 mm → m
-DEPTH_MIN_M, DEPTH_MAX_M = 0.05, 3.0
+DEPTH_MIN_M = 0.05
+# Static-seed depth cutoff (m). Default 2.0 (2026-06-15): the real ZED depth error
+# grows to ~5 cm avg beyond ~2 m, and capping here bounds the INITIAL static
+# reconstruction — only depth in (0.05, 2.0] m is TSDF-integrated, so no seed
+# Gaussians (and thus, with densification off, no static Gaussians) exist past the
+# cutoff. Fewer Gaussians + no far depth-noise junk. Keep this EQUAL to the static
+# model's ``scene_depth_max_m`` (which masks the same band out of the training
+# loss). Also a GPU-OOM guard: at 2 mm voxel / 1920x1200, raising it allocates more
+# VoxelBlockGrid blocks → OOM (raise DGS_TSDF_VOXEL_M too). Sensor on disk goes to
+# 65 m (publisher clips only to uint16 mm); the cap is ours. Env: DGS_TSDF_DEPTH_MAX_M.
+DEPTH_MAX_M = float(os.environ.get("DGS_TSDF_DEPTH_MAX_M", "2.0"))
 
 ICP_SRC_STRIDE = 4           # decimate depth for ICP source (TSDF still full)
 ICP_VOXEL_M = 0.01           # ICP source + model voxel

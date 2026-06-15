@@ -45,11 +45,21 @@ class ChangeMaskConfig:
     every uncovered pixel — this manifests as a huge 'change' band above the
     object on viewpoints where the camera looks beyond the warm-cache scene.
     Pixels with ``accumulation < threshold`` are treated as 'don't know' and
-    AND'd out of valid_mask, so CDN never flags them. ``0.0`` disables this
+    AND'd out of valid_mask, so CDN never flags them — UNLESS the live sensor
+    sees a real near surface there (``live_depth_min_m..live_depth_max_m``), in
+    which case the pixel is a fillable HOLE and is kept. ``0.0`` disables this
     gating."""
     """CDN comparison mode for ``build_change_mask``: 'rgb' (MS-SSIM luminance)
     or 'depth' (per-pixel |pred-gt| in metres). Mirrors
     ``DynamicGSModelConfig.change_mask_mode``."""
+    live_depth_min_m: float = 0.05
+    live_depth_max_m: float = 3.0
+    """Live-sensor valid-depth band (m). An UNCOVERED pixel (rendered alpha below
+    ``scene_coverage_threshold`` → no Gaussians → renders background) is kept as a
+    fillable HOLE when the live depth falls in this band (a real near surface the
+    static scene is missing). Outside the band (sky / no return → 0, or beyond
+    range) it stays the genuine void the coverage gate was built to drop. Matches
+    ``DEPTH_MIN_M``/``DEPTH_MAX_M`` in ``utils/online_fusion.py``."""
     blur_kernel_size: int = 5
     blur_sigma: float = 1.0
     filter_radius: int = 1
@@ -59,6 +69,14 @@ class ChangeMaskConfig:
     """Erode the gripper KEEP mask by this many px (= grow the gripper
     exclusion) so the leak ring of gripper-coloured pixels just outside the
     silhouette is dropped from CDN. 0 = off."""
+    block_valid_min_frac: float = 0.5
+    """Downsample block-validity threshold. A pooled MS-SSIM block is kept when at
+    least this FRACTION of its source pixels were valid (not gripper/object). The
+    block colour is already the masked mean of only the valid pixels, so a
+    mostly-valid block is uncontaminated. Replaces the old strict rule (drop the
+    whole block if ANY source pixel was excluded), which carved a ~downsample-px
+    dead halo around the object/gripper and hid change right next to the tracked
+    object. ``1.0`` restores the strict behaviour; lower keeps more boundary blocks."""
 
 
 def _resize_mask_to(mask: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
@@ -158,7 +176,22 @@ def compute_change_mask(
         if cov.ndim == 2:
             cov = cov[..., None]
         cov = _resize_mask_to(cov, target_h, target_w)
-        coverage_keep = (cov > cov_thr).float()
+        coverage_keep = cov > cov_thr
+        # An uncovered pixel (no Gaussians → rendered = background) is a FILLABLE
+        # HOLE — not junk — when the live sensor sees a real near surface there
+        # (e.g. table revealed once the grasped object lifts off it; the static
+        # scene never saw under the object). Keep those so the CDN flags them for
+        # feedforward. Only the genuine void (camera looking past the scene → live
+        # ALSO has no depth: sky / 0 / beyond range) stays dropped — which is the
+        # spurious-band case the coverage gate was built for.
+        if gt_depth is not None:
+            d = gt_depth.float().to(device)
+            if d.ndim == 2:
+                d = d[..., None]
+            d = _resize_mask_to(d, target_h, target_w)
+            live_valid = (d > float(config.live_depth_min_m)) & (d < float(config.live_depth_max_m))
+            coverage_keep = coverage_keep | live_valid
+        coverage_keep = coverage_keep.float()
         valid_mask = coverage_keep * valid_mask if valid_mask is not None else coverage_keep
 
     # Optional masked-avg-pool downsample of inputs. Invalid pixels (gripper,
@@ -170,9 +203,6 @@ def compute_change_mask(
     if ds > 1:
         def _avg_pool(t):
             return TF.avg_pool2d(t, kernel_size=ds, stride=ds, ceil_mode=False)
-
-        def _max_pool(t):
-            return TF.max_pool2d(t, kernel_size=ds, stride=ds, ceil_mode=False)
 
         if valid_mask is not None:
             valid_chw = valid_mask.permute(2, 0, 1).unsqueeze(0)
@@ -200,10 +230,17 @@ def compute_change_mask(
         live_rgb_use = _masked_avg_rgb(live_rgb)
         rendered_depth_use = _masked_depth(rendered_depth)
         gt_depth_use = _masked_depth(gt_depth)
-        # Strict block validity: 1 iff EVERY source pixel was valid (so a
-        # block straddling the gripper boundary is dropped from MSSIM).
-        invalid_block = _max_pool(1.0 - valid_chw)
-        valid_block = (1.0 - invalid_block).clamp(0.0, 1.0)
+        # Block validity: keep a pooled block when at least ``block_valid_min_frac``
+        # of its source pixels were valid — NOT the old strict "drop if ANY source
+        # pixel is excluded" (= max_pool), which discarded a full block, a
+        # ~downsample-px halo around the object/gripper, whenever a single pixel
+        # touched the mask and hid change right beside the tracked object. The
+        # block colour above is the masked mean of the VALID pixels only, so a
+        # mostly-valid block is already uncontaminated; only mostly-excluded blocks
+        # drop. (``block_valid_min_frac=1.0`` reproduces the old strict rule.)
+        valid_frac = _avg_pool(valid_chw)
+        thr = float(getattr(config, "block_valid_min_frac", 0.5))
+        valid_block = (valid_frac >= thr).float()
         valid_mask_use = valid_block.squeeze(0).permute(1, 2, 0)
     else:
         rendered_rgb_use = rendered_rgb
