@@ -66,7 +66,6 @@ _REPO_ROOT = _THIS_DIR.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from dynamic_gs.utils.fusion_runner import ConcurrentFusionRunner  # noqa: E402
 from dynamic_gs.utils.live_shm_reader import LiveShmSubscriber, LiveFrame  # noqa: E402
 
 IMAGE_NAME_PREFIX = "frame"
@@ -159,7 +158,7 @@ def main() -> None:
     print(f"  capture_only :: {data_dir}")
     print(f"  static dedup : {args.static_translation_m * 100:.1f} cm  OR  {args.static_rotation_deg:.0f}°")
     print(f"  dynamic fps  : {args.dynamic_fps:.0f}")
-    print(f"  fusion       : {'OFF' if args.no_fusion else 'ON (concurrent ICP+TSDF)'}")
+    print(f"  fusion       : {'OFF' if args.no_fusion else 'ON (GPU TSDF subprocess @ static end, 3mm)'}")
     print(f"========================================================\n")
 
     # ------------------------------------------------------------------
@@ -201,11 +200,17 @@ def _run_capture(sub, args, data_dir: Path) -> None:
     # ------------------------------------------------------------------
     static_dir = data_dir / "static_scene"
 
-    fusion_runner: ConcurrentFusionRunner | None = None
+    # No in-process fusion during the sweep — mirror the LIVE flow instead: record
+    # the static sweep, then build the seed with the GPU TSDF batch pass in a
+    # CONTAINED SUBPROCESS at STATIC end (see below). Why not the in-process
+    # concurrent worker: the GPU VoxelBlockGrid corrupts Open3D's CUDA cache and
+    # ABORTS the process at teardown at 1920x1200 — the whole capture dies even when
+    # the work succeeded. A subprocess contains that abort (and we fall back to CPU
+    # cleanly), which is exactly why live recordings never crash here.
     if not args.no_fusion:
-        fusion_runner = ConcurrentFusionRunner(static_dir, intrinsics)
-        fusion_runner.start()
-        print("[capture] online fusion thread armed", flush=True)
+        print("[capture] fusion → contained GPU subprocess at STATIC end "
+              "(mirrors live; in-process VoxelBlockGrid would crash the capture)",
+              flush=True)
 
     bootstrap_anchor = sub.capture_anchor()
     sub.start_recording(bootstrap_anchor)
@@ -217,9 +222,38 @@ def _run_capture(sub, args, data_dir: Path) -> None:
     n_static = sub.stop_recording()
     print(f"[capture] STATIC done — {n_static} keyframes written to {static_dir}/", flush=True)
 
-    # Drain + finalize fusion (blocks until ICP+TSDF has caught up).
-    if fusion_runner is not None:
-        fusion_runner.stop_and_finalize()
+    # Build the seed: GPU TSDF batch in a CONTAINED subprocess at 3 mm (mirrors
+    # live), CPU build_tsdf_seed fallback. The subprocess isolates the GPU
+    # VoxelBlockGrid teardown-abort so it can never kill this capture; 3 mm fits the
+    # 16 GB GPU at 1200p (2 mm OOMs even with ~12 GB free).
+    if not args.no_fusion:
+        import subprocess as _sp
+        seed_ply = static_dir / "depth_camera_init_points.ply"
+        env = dict(os.environ)
+        env.setdefault("DGS_TSDF_VOXEL_M", "0.003")
+        print("[capture] building TSDF seed — GPU subprocess (3 mm)...", flush=True)
+        ok = False
+        try:
+            r = _sp.run(
+                [sys.executable, "-m", "dynamic_gs.utils.online_fusion", str(static_dir)],
+                env=env, capture_output=True, text=True, timeout=600,
+            )
+            ok = r.returncode == 0 and seed_ply.exists()
+            if not ok:
+                print(f"[capture] GPU TSDF subprocess failed (rc={r.returncode}): "
+                      f"{(r.stderr or '')[-300:]}", flush=True)
+        except Exception as exc:
+            print(f"[capture] GPU TSDF subprocess error: {exc}", flush=True)
+        if ok:
+            print("[capture] GPU TSDF seed built.", flush=True)
+        else:
+            print("[capture] falling back to CPU build_tsdf_seed...", flush=True)
+            try:
+                from dynamic_gs.utils.rgbd_fusion_init import build_tsdf_seed
+                build_tsdf_seed(data_dir, force=True, verbose=True)
+                print("[capture] CPU seed built.", flush=True)
+            except Exception as exc:
+                print(f"[capture] CPU seed also failed: {exc}", flush=True)
 
     # ------------------------------------------------------------------
     # DYNAMIC phase — reader-side polling, no dedup, fixed FPS

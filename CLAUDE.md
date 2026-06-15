@@ -114,6 +114,10 @@ These are hard rules the pipeline depends on. If a change appears to require bre
 
 ## Notes
 
+### capture-only seed fusion now mirrors live (contained GPU subprocess @ 3mm) (2026-06-15)
+
+`capture_only.py` was the ONLY flow that crashed on 1200p capture: `[fusion] frame N failed: … illegal memory access` then `MemoryCache::Free … should have been recorded` → `Aborted (core dumped)`, intermittently (clean→some-frames→crash across runs). Root cause: it started the **in-process per-frame concurrent `ConcurrentFusionRunner`** (GPU `_GpuOnlineFusion` VoxelBlockGrid) at **2 mm**, which at 1920×1200 OOMs the hashmap (even with ~12 GB free) → CUDA illegal access → the teardown-abort killed the WHOLE capture. Live never hit this because it does something different: `live_session` defaults `DGS_LIVE_DEFER_TSDF=1` → **never starts the concurrent worker**, and builds the seed via the GPU TSDF batch in a **SUBPROCESS** at **`DGS_TSDF_VOXEL_M=0.003` (3 mm)** (`live_session.py` ~L1118: `subprocess.run([... -m dynamic_gs.utils.online_fusion, static_dir])`). The subprocess CONTAINS the teardown-abort (kills only the subprocess, not the session) and 3 mm fits 16 GB; 2 mm doesn't. **Fix:** [`capture_only.py`](scripts/capture_only.py) now removes the in-process concurrent worker and builds the seed at STATIC end exactly like live — GPU `online_fusion` subprocess at 3 mm, CPU `build_tsdf_seed` fallback. NOTE the near/far split (`adaptive_downsample`: near<1m at integrate density, far>1m→`FAR_VOXEL_M=0.01`) is a POST-fusion OUTPUT downsample — it does NOT reduce the (uniform) TSDF integrate voxel, so it can't fix the OOM; only the integrate `TSDF_VOXEL_M` (→3 mm) does. Open3D's VoxelBlockGrid is single-resolution (no per-distance integrate voxel).
+
 ### NEXT-SESSION CHECKLIST (queued 2026-06-15)
 
 User's tomorrow list (details in the dated notes below):
