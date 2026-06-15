@@ -182,6 +182,24 @@ IMAGE_NAME_PREFIX = _REC.IMAGE_NAME_PREFIX
 
 
 # ---------------------------------------------------------------------------
+# Sim-to-real ZED-X depth-error model (loaded via importlib like the recorder,
+# since this file is run as a standalone script, not as a package).
+# ---------------------------------------------------------------------------
+def _load_zed_depth_noise():
+    path = Path(__file__).resolve().parent / "zed_depth_noise.py"
+    spec = importlib.util.spec_from_file_location("_dgs_zed_depth_noise", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load zed_depth_noise from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_dgs_zed_depth_noise"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_ZED_NOISE = _load_zed_depth_noise()
+
+
+# ---------------------------------------------------------------------------
 # Shared-memory layout
 # ---------------------------------------------------------------------------
 
@@ -549,6 +567,14 @@ class LivePublisher:
             translation_thresh_m=keyframe_translation_m,
             rotation_thresh_deg=keyframe_rotation_deg,
         )
+
+        # Sim-to-real ZED-X depth-error model (OFF unless DGS_SIM_ZED_NOISE=1).
+        self._zed_noise_rng = np.random.default_rng()
+        if _ZED_NOISE.enabled():
+            rospy.loginfo("[live] sim ZED-X depth-noise model ENABLED "
+                          "(Ortiz et al. 2018, res=%s a=%s b=%s hole=%s)"
+                          % (_ZED_NOISE._RES, _ZED_NOISE._A,
+                             _ZED_NOISE._B, _ZED_NOISE._HOLE_RATE))
 
         # Shared memory allocation. Sized once H/W are known.
         slot_bytes, offsets = _slot_layout(self.intrinsics.height, self.intrinsics.width)
@@ -944,6 +970,8 @@ class LivePublisher:
 
         rgb_bgr = self._decode_compressed_rgb(image_msg)
         depth_m = self._decode_raw_depth(depth_msg)
+        if _ZED_NOISE.enabled():
+            depth_m = _ZED_NOISE.apply_zed_depth_noise(depth_m, self._zed_noise_rng)
 
         should_write = False
         if self._record_active:

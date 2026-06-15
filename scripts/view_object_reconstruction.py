@@ -96,44 +96,56 @@ def world_tracing_cloud(wt_pkl: Path):
     return np.concatenate(pts).astype(np.float32), np.concatenate(cols).astype(np.float32)
 
 
-def place_wt_into_scene(pts_cam_rdf: np.ndarray, c2w: np.ndarray, gt_pts: np.ndarray, do_icp: bool):
-    """RDF camera-space -> OpenGL scene world (rough), then ICP-refine onto GT.
+def _rigid_init_to_gt(pts_cam_rdf: np.ndarray, c2w: np.ndarray, gt_pts: np.ndarray):
+    """RDF camera-space -> OpenGL scene world, then bbox-scale + centroid onto GT.
 
-    The WT camera is the model's reframed crop camera, not arm_00026, and its
-    metric scale is a learned prior — so the rigid placement below is only an
-    initialization; the ICP is the stand-in for the NDP registration the model
-    does NOT provide. Returns (pts_world, info).
+    Mirrors the rigid init the SAM3D pipeline bakes into ``scaled_source`` before
+    NDP. Returns (pts_init (N,3) float64, scale).
     """
     pts_gl = pts_cam_rdf * np.array([1.0, -1.0, -1.0], np.float32)  # OpenCV/RDF -> OpenGL cam axes
     R, t = c2w[:3, :3], c2w[:3, 3]
-    pts0 = pts_gl @ R.T + t
+    pts0 = (pts_gl @ R.T + t).astype(np.float64)
+    gt = gt_pts.astype(np.float64)
+    diag = lambda p: float(np.linalg.norm(p.max(0) - p.min(0)) + 1e-9)
+    s = diag(gt) / diag(pts0)
+    return ((pts0 - pts0.mean(0)) * s + gt.mean(0)), s
 
-    info = {"icp": False}
-    if not do_icp or gt_pts.shape[0] < 10:
-        return pts0.astype(np.float32), info
 
-    # init: match centroid + isotropic scale (bbox-diagonal ratio) to GT
-    c_src, c_dst = pts0.mean(0), gt_pts.mean(0)
-    diag = lambda p: np.linalg.norm(p.max(0) - p.min(0)) + 1e-9
-    s = diag(gt_pts) / diag(pts0)
-    pts_init = (pts0 - c_src) * s + c_dst
+def place_wt_into_scene(pts_cam_rdf: np.ndarray, c2w: np.ndarray, gt_pts: np.ndarray, method: str):
+    """Place the WT object cloud into the scene world frame.
 
-    try:
-        import open3d as o3d
-        src = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts_init.astype(np.float64)))
-        dst = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(gt_pts.astype(np.float64)))
-        thr = 0.02
-        reg = o3d.pipelines.registration.registration_icp(
-            src, dst, thr, np.eye(4),
-            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=60),
-        )
-        pts_ref = (np.asarray(src.transform(reg.transformation).points)).astype(np.float32)
-        info.update({"icp": True, "init_scale": float(s), "fitness": float(reg.fitness), "inlier_rmse": float(reg.inlier_rmse)})
-        return pts_ref, info
-    except Exception as e:  # pragma: no cover
-        info["icp_error"] = str(e)
+    method:
+      'rigid' — bbox-scale + centroid onto GT only (no refinement).
+      'icp'   — rigid init + point-to-point ICP onto GT.
+      'ndp'   — rigid init + the EXACT pipeline NDP non-rigid registration
+                (``deform_source_to_target`` with the default ``_NDP_CONFIG``:
+                Sim3, m=9, iters=500, lr=0.01, samples=6000, w_reg=1.0) — i.e.
+                the same registration SAM3D output goes through in Phase-0b.
+    Returns (pts_world (N,3) float32, info dict).
+    """
+    pts_init, s = _rigid_init_to_gt(pts_cam_rdf, c2w, gt_pts)
+    info = {"method": method, "init_scale": s}
+    if method == "rigid" or gt_pts.shape[0] < 10:
         return pts_init.astype(np.float32), info
+
+    if method == "ndp":
+        from dynamic_gs.utils.ndp_register import deform_source_to_target, _NDP_CONFIG
+        warped, meta = deform_source_to_target(pts_init.astype(np.float64), gt_pts.astype(np.float64))
+        info["ndp_config"] = {k: _NDP_CONFIG[k] for k in ("motion_type", "m", "iters", "lr", "samples", "w_reg")}
+        info.update({k: v for k, v in meta.items() if np.isscalar(v) or isinstance(v, (int, float, str))})
+        return warped.astype(np.float32), info
+
+    import open3d as o3d  # method == "icp"
+    src = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts_init))
+    dst = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(gt_pts.astype(np.float64)))
+    reg = o3d.pipelines.registration.registration_icp(
+        src, dst, 0.02, np.eye(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=60),
+    )
+    pts_ref = np.asarray(src.transform(reg.transformation).points).astype(np.float32)
+    info.update({"fitness": float(reg.fitness), "inlier_rmse": float(reg.inlier_rmse)})
+    return pts_ref, info
 
 
 # --------------------------------------------------------------------------- #
@@ -186,7 +198,10 @@ def main() -> None:
     ap.add_argument("--no-backdrop", action="store_true", help="hide the static-scene context")
     ap.add_argument("--hide-existing-object", type=int, default=None, metavar="ID",
                     help="drop this object_instance_id from the backdrop (e.g. 1 = the SAM3D screwdriver)")
-    ap.add_argument("--no-icp", action="store_true", help="skip ICP refine of WT onto GT")
+    ap.add_argument("--no-icp", action="store_true", help="(deprecated) alias for --placement rigid")
+    ap.add_argument("--placement", choices=["icp", "ndp", "rigid"], default="icp",
+                    help="WT->scene registration: icp (default), ndp (the EXACT Phase-0b NDP "
+                         "non-rigid registration SAM3D goes through), or rigid (init only)")
     ap.add_argument("--gt-radius", type=float, default=0.0012)
     ap.add_argument("--wt-radius", type=float, default=0.0012)
     ap.add_argument("--gt-tint", default=None, help="R,G,B in [0,1] to recolor GT (default: real colors)")
@@ -209,7 +224,8 @@ def main() -> None:
     wt_g = None
     if args.wt_pkl:
         wt_cam, wt_cols = world_tracing_cloud(args.wt_pkl)
-        wt_pts, info = place_wt_into_scene(wt_cam, c2w, gt_pts, not args.no_icp)
+        method = "rigid" if args.no_icp else args.placement
+        wt_pts, info = place_wt_into_scene(wt_cam, c2w, gt_pts, method)
         print(f"[obj-view] WT cloud: {wt_pts.shape[0]} pts; placement={info}")
         wt_g = points_to_gauss(wt_pts, wt_cols, args.wt_radius, 0.99, parse_tint(args.wt_tint))
 
