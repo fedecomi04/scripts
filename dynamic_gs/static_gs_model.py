@@ -78,14 +78,14 @@ class StaticGSModelConfig(SplatfactoModelConfig):
 
     # ---- Phase 0a (SAM3 text-prompted segmentation) ----
     use_sam3_graspable_prefusion: bool = True
-    sam3_prompt_text: str = "the can of coke on the table"
+    sam3_prompt_text: str = "coke can"  # bare noun only — no articles/prepositions (CLIP/SAM3 prompt rule)
     sam3_conda_env_name: str = "sam3_dynamic_gs"
     sam3_candidate_min_area_ratio: float = 0.002
     sam3_candidate_max_area_ratio: float = 0.25
     sam3_candidate_dedup_iou: float = 0.6
     sam3_candidate_max_objects: int = 8
     sam3_confidence_threshold: float = 0.3
-    sam3_min_score: float = 0.2
+    sam3_min_score: float = 0.0  # absolute softmax floor DISABLED — gating is the auto-gate cliff + containment-dedup (see fastsam_segmentation.infer); under evaluation
     sam3_reuse_cached: bool = True
 
     # ---- Segmentation backend (SAM3 vs FastSAM) ----

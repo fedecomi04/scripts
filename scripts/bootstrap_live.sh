@@ -24,7 +24,7 @@
 set -euo pipefail
 
 DATA_DIR="${1:-}"
-SAM3_PROMPT="${2:-the can of coke on the table}"
+SAM3_PROMPT="${2:-coke can}"  # bare noun only — no articles/prepositions (CLIP/SAM3 prompt rule)
 
 if [[ -z "$DATA_DIR" ]]; then
   echo "usage: $(basename "$0") <data_dir> [sam3_prompt]" >&2
@@ -37,14 +37,51 @@ DATA_DIR="$(realpath -m "$DATA_DIR")"
 # only place that sees the whole capture→train→go-live span across THREE
 # separate processes (each resets its own in-process timing ledger), so it
 # stamps real wall-clock boundaries into a sidecar. The dynamic-gs-live process
-# reads this on the FIRST tracked frame, emits the end-to-end section in
-# timing_report.txt, then DELETES the sidecar (so a later resume_live.sh on the
-# same dir — which never stamps it — correctly skips the section). resume_live
-# / capture_only never write this file, so the section is bootstrap-only.
+# reads this on the FIRST tracked frame, appends the final "go-live → first
+# frame" + total to timing_static_sequence.txt, then DELETES the sidecar (so a
+# later resume_live.sh on the same dir — which never stamps it — won't re-emit).
+#
+# INCREMENTAL by design: dgs_stamp_seq writes the human-readable DURATION of the
+# stage that just finished to timing_static_sequence.txt the moment each boundary
+# is hit — so if the pipeline is killed mid-run (e.g. before go-live), the file
+# still shows every stage that completed. (The old design only assembled the
+# durations on the first tracked frame + flushed at exit, so an early kill lost
+# everything even though the raw timestamps were saved.)
 SEQ_T0="$DATA_DIR/.static_sequence_t0"
+SEQ_TXT="$DATA_DIR/timing_static_sequence.txt"
 mkdir -p "$DATA_DIR"
 : > "$SEQ_T0"
-dgs_stamp_seq() { echo "$1=$(date +%s.%N)" >> "$SEQ_T0"; }
+# Human-readable label for the stage that ENDS at each boundary (i.e. the span
+# from the previous stamp to this one).
+dgs_seq_label() {
+  case "$1" in
+    t1_capture_start) echo "Launch → capture start (env + cleanup + preflight)" ;;
+    t2_capture_end)   echo "Capture + segmentation + SAM3D + TSDF seed" ;;
+    t3_fit_start)     echo "ICP TSDF-seed refine (idempotent)" ;;
+    t4_golive_start)  echo "Static training + Phase 0b fusion" ;;
+    *)                echo "$1" ;;
+  esac
+}
+_seq_prev_t=""
+dgs_stamp_seq() {
+  local now; now=$(date +%s.%N)
+  echo "$1=$now" >> "$SEQ_T0"
+  if [[ -z "$_seq_prev_t" ]]; then
+    # First stamp (t0_command): write the header + start the readable file.
+    {
+      echo "STATIC SEQUENCE FROM SCRATCH — written incrementally as each stage finishes"
+      echo "(full command→first-tracked-frame total is appended by dynamic-gs-live)"
+      echo "------------------------------------------------------------------------------"
+    } > "$SEQ_TXT"
+  else
+    local d cum
+    d=$(awk "BEGIN{printf \"%.1f\", $now-$_seq_prev_t}")
+    cum=$(awk "BEGIN{printf \"%.1f\", $now-$_seq_t0}")
+    printf "  %-46s %8ss   (cumulative %ss)\n" "$(dgs_seq_label "$1")" "$d" "$cum" >> "$SEQ_TXT"
+  fi
+  [[ -z "$_seq_prev_t" ]] && _seq_t0="$now"
+  _seq_prev_t="$now"
+}
 dgs_stamp_seq t0_command
 
 # Env setup -- pin the train env on PATH + LD_LIBRARY_PATH so the
@@ -111,6 +148,9 @@ dgs_check_sim_alive || exit 1
 # reserved and the pipeline runs on 4-23. See _ros_cleanup.sh.
 dgs_export_thread_caps
 DGS_PIN="$(dgs_cpu_pin_prefix)"
+# ...and lock the dVRK RT console ONTO the reserved cores (the pin above only
+# keeps the pipeline OFF them). See dgs_isolate_dvrk / _dvrk_cpuset_watch.sh.
+dgs_isolate_dvrk
 
 # ---------------------------------------------------------------- 1/3
 echo
@@ -172,11 +212,15 @@ dgs_stamp_seq t4_golive_start
 # Re-run dynamic-gs-live in non-destructive mode (live_wipe_root=False is
 # already the default, but we set it explicitly so this script documents
 # the intent -- we just spent stage 1 + 2 building this dir, don't wipe it).
+# Per-FF-call CDN debug dump (-> <data>/dynamic_scene/_ff_debug/). OFF by
+# default; enable for diagnosing change-detection churn:
+#   DGS_FF_DEBUG=1 scripts/bootstrap_live.sh <dir> [prompt]
+[[ "${DGS_FF_DEBUG:-0}" == "1" ]] && SAVE_DBG=True || SAVE_DBG=False
 exec $DGS_PIN "$NS_TRAIN" dynamic-gs-live \
   --data "$DATA_DIR" \
   --output-dir "$OUTPUT_DIR" \
   --vis tensorboard \
   --pipeline.enable_viser_direct=True \
   --pipeline.enable-feedforward-inpaint=anysplat_decode \
-  --pipeline.save-debug-images=False \
+  --pipeline.save-debug-images="$SAVE_DBG" \
   --pipeline.live-wipe-root=False

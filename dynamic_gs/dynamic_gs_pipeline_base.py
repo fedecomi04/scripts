@@ -711,6 +711,23 @@ class DynamicGSPipelineBase(VanillaPipeline):
         self._static_sequence_section = self._render_static_sequence_section(
             now - t0, rows
         )
+        # Also APPEND the final go-live→first-frame + total to the standalone
+        # human-readable file the shell has been writing incrementally, so the
+        # full end-to-end timing lands on disk NOW (on the first tracked frame),
+        # independent of whether the dynamic timing_report.txt is ever written
+        # (e.g. an early kill before exit). Best-effort.
+        try:
+            golive = stamps.get("t4_golive_start")
+            seq_txt = data_root / "timing_static_sequence.txt"
+            with seq_txt.open("a", encoding="utf-8") as fh:
+                if golive is not None and now >= golive:
+                    fh.write(f"  {'Go-live load → first tracked frame':<46s} "
+                             f"{now - golive:7.1f}s   (cumulative {now - t0:.1f}s)\n")
+                fh.write("-" * 78 + "\n")
+                fh.write(f"  {'FULL (command entered → first frame tracked)':<46s} "
+                         f"{now - t0:7.1f}s\n")
+        except Exception:
+            pass
 
     @staticmethod
     def _render_static_sequence_section(total_s: float, rows: list) -> str:

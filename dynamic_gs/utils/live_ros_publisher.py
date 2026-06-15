@@ -1331,8 +1331,21 @@ def _send_response(payload):
 
 
 def _wipe_live_root(live_root: Path) -> None:
+    # Preserve the cross-process timing metadata that bootstrap_live.sh stamps
+    # into live_root BEFORE capture (.static_sequence_t0 sidecar +
+    # timing_static_sequence.txt). A blind rmtree would delete t0_command /
+    # t1_capture_start, which breaks the from-scratch end-to-end timing AND the
+    # static-sequence report section (t0_command goes missing → it bails). Clear
+    # everything else so capture still starts from a clean dataset dir.
+    _PRESERVE = {".static_sequence_t0", "timing_static_sequence.txt"}
     if live_root.exists():
-        shutil.rmtree(live_root)
+        for entry in live_root.iterdir():
+            if entry.name in _PRESERVE:
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
     (live_root / "static_scene").mkdir(parents=True, exist_ok=True)
     (live_root / "dynamic_scene").mkdir(parents=True, exist_ok=True)
 

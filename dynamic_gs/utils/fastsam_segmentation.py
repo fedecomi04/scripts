@@ -264,6 +264,51 @@ class FastSamTextSegmenter:
             return np.zeros((0, H, W), dtype=bool), np.zeros((0, 4), dtype=np.float32)
         return np.array(comp_masks, dtype=bool), np.array(comp_boxes, dtype=np.float32)
 
+    def _save_components_debug(self, image_rgb: np.ndarray, masks: np.ndarray,
+                               cosines: np.ndarray, surv_set: set, keep_set: set,
+                               out_path: "Path", topk: int = 20) -> None:
+        """Overlay the top-K post-split components (by CLIP cosine) on the RGB,
+        each colored + labeled ``rank:cosX.XX:<KEPT|surv|filt>``, so a partial
+        mask (object split into multiple components, only the best KEPT) is
+        visible at a glance. KEPT = made the final cut; surv = passed the
+        area/border filter but lost the score gate; filt = filtered earlier."""
+        import cv2
+        if masks.shape[0] == 0:
+            return
+        order = np.argsort(-np.asarray(cosines, dtype=np.float64))[:topk]
+        palette = [(255, 0, 0), (0, 255, 0), (0, 128, 255), (255, 255, 0),
+                   (255, 0, 255), (0, 255, 255), (255, 128, 0), (128, 0, 255)]
+        vis = image_rgb.copy()
+        for rank, i in enumerate(order.tolist()):
+            m = masks[i].astype(bool)
+            if not m.any():
+                continue
+            col = palette[rank % len(palette)]
+            vis[m] = (0.55 * vis[m] + 0.45 * np.array(col)).astype(np.uint8)
+            ys, xs = np.where(m)
+            x0, y0 = int(xs.min()), int(ys.min())
+            tag = "KEPT" if i in keep_set else ("surv" if i in surv_set else "filt")
+            cv2.putText(vis, f"{rank}:cos{float(cosines[i]):.2f}:{tag}",
+                        (x0, max(y0 - 4, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2)
+        Image.fromarray(vis).save(str(out_path))
+        # Machine-readable sidecar: per-component raw cosine + area + bbox + tag,
+        # so the merge-by-cosine decision can be judged on numbers (the PNG labels
+        # are hard to read in a busy scene).
+        try:
+            rows = []
+            for rank, i in enumerate(order.tolist()):
+                m = masks[i].astype(bool)
+                if not m.any():
+                    continue
+                ys, xs = np.where(m)
+                rows.append({"rank": rank, "cosine": round(float(cosines[i]), 4),
+                             "area": int(m.sum()),
+                             "bbox": [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())],
+                             "tag": "KEPT" if i in keep_set else ("surv" if i in surv_set else "filt")})
+            Path(str(out_path).replace(".png", ".json")).write_text(json.dumps(rows, indent=2))
+        except Exception:
+            pass
+
     # -- public API (mirrors sam_worker.sam3_infer / sam3_infer_raw) --------
 
     def infer(self, *,
@@ -341,12 +386,36 @@ class FastSamTextSegmenter:
                 "mask_area": int(masks[i].sum()),
             })
 
-        candidates.sort(key=lambda c: c["score"], reverse=True)
+        # Containment-aware dedup. FastSAM emits the SAME object at multiple
+        # extents — e.g. a screwdriver as a tight shaft mask (high CLIP score,
+        # 0.76 softmax) AND a full shaft+handle mask (lower, 0.20). We want the
+        # FULLEST. Process LARGEST-area first and drop any later candidate that is
+        # (a) high-IoU with, or (b) >=80% CONTAINED in, an already-kept larger one.
+        # So the full screwdriver is kept and the contained sub-part is dropped.
+        # This is also the JUNK discriminator the lowered min_score floor gave up:
+        # a real fuller mask CONTAINS the confident sub-part; an unrelated false
+        # positive is a disjoint blob that contains nothing kept, so it is NOT
+        # collapsed here — it stays a separate candidate (rejected upstream only
+        # if its own score is below the floor). Disjoint distinct objects (the
+        # split-contamination case) don't contain each other → both survive,
+        # exactly as before.
+        candidates.sort(key=lambda c: c["mask_area"], reverse=True)
         deduped: List[Dict[str, Any]] = []
         for c in candidates:
-            if any(_compute_iou(c["mask"], k["mask"]) > dedup_iou for k in deduped):
-                continue
-            deduped.append(c)
+            cm = c["mask"] > 0
+            c_area = float(c["mask_area"])
+            redundant = False
+            for k in deduped:  # k came first → k is larger-or-equal area
+                km = k["mask"] > 0
+                inter = float(np.logical_and(cm, km).sum())
+                iou = inter / (float(np.logical_or(cm, km).sum()) + 1e-9)
+                contained = inter / (c_area + 1e-9)  # fraction of c inside k
+                if iou > dedup_iou or contained >= 0.8:
+                    redundant = True
+                    break
+            if not redundant:
+                deduped.append(c)
+        deduped.sort(key=lambda c: c["score"], reverse=True)  # output ordered by score
         deduped = deduped[:max_objects]
 
         if auto_threshold and diag:
@@ -356,6 +425,19 @@ class FastSamTextSegmenter:
 
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        # DEBUG: dump every post-split component (top-K by CLIP cosine) so a
+        # PARTIAL mask is visible — e.g. a screwdriver split by _split_into_components
+        # into handle + shaft where only the best-scoring component is KEPT. Shows
+        # each component colored + labeled with its cosine + KEPT/surv/filt tag, so
+        # you can see what was split off and why it lost. Best-effort.
+        try:
+            self._save_components_debug(
+                image_rgb, masks, cosines, set(surv), set(keep),
+                out_dir / f"{output_stem}_fastsam_components.png")
+        except Exception as _exc:
+            print(f"[fastsam] component debug dump failed: {_exc}", flush=True)
+
         results: List[Dict[str, Any]] = []
         for obj_idx, c in enumerate(deduped):
             mask_path = out_dir / f"{output_stem}_obj_{obj_idx:02d}_mask.png"

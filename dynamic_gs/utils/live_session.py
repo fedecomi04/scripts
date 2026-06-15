@@ -151,7 +151,7 @@ atexit.register(_atexit_unpause)
 
 # Hardcoded SAM3 defaults (kept here, not in the model config, because
 # the live workflow expects to override them via the user prompt).
-DEFAULT_SAM3_PROMPT = "oobject table"
+DEFAULT_SAM3_PROMPT = "object"  # bare noun only — no articles/prepositions (CLIP/SAM3 prompt rule)
 SAM3_CONDA_ENV = "sam3_dynamic_gs"
 # Segmentation backend: "fastsam" (default — ~0.85 GB, co-resides with SAM3D so
 # SAM3D can load during the capture tail) or "sam3". Env-overridable so
@@ -162,7 +162,14 @@ SAM3_CANDIDATE_MAX_AREA_RATIO = 0.25
 SAM3_CANDIDATE_DEDUP_IOU = 0.6
 SAM3_CANDIDATE_MAX_OBJECTS = 8
 SAM3_CONFIDENCE_THRESHOLD = 0.3
-SAM3_MIN_SCORE = 0.2
+SAM3_MIN_SCORE = 0.0  # absolute softmax floor DISABLED (0.0 -> skipped entirely).
+# Removed 2026-06-14 (was 0.4, briefly 0.05) so gating relies ONLY on the FastSAM
+# auto-gate cliff (select_kept_indices: largest log-prob gap + cosine-presence) and
+# the containment-aware dedup in fastsam_segmentation.infer. Reason: any absolute
+# floor that's low enough to keep a split object's full-mask proposal (~0.20 softmax)
+# is too low to reject standalone junk (~0.2-0.28), so the floor couldn't do both —
+# containment-dedup is the real same-object collapser and the cliff handles "how
+# many". Under evaluation on multiple objects. See [[feedback_sam3_prompt]].
 
 
 def _wipe_live_root() -> None:
@@ -226,6 +233,121 @@ def _save_anchor_intrinsics_and_depth(anchor: LiveFrame, intrinsics, artifact_di
     # decides to read it as uint16 mm (the recorded layout's depth
     # convention), values will be off by 1000x silently. SAM3D itself
     # reads it correctly from the same path used today.
+
+
+def _append_anchor_as_static_keyframe(anchor: LiveFrame, intrinsics, static_dir: Path) -> Optional[str]:
+    """Append the SAM3-segmented ANCHOR as the FINAL static keyframe.
+
+    FRAME-CONSISTENCY FIX. The SAM3/FastSAM mask + SAM3D run on this freshly
+    captured anchor, but the anchor was never a recorded sweep keyframe. Phase-0
+    (in ``ns-train static-gs``) operates on ``cached_train[-1]`` = the LAST
+    RECORDED sweep keyframe (a *different* camera pose, ~cm away), and
+    ``sam3_reuse_cached`` reuses the anchor's mask against THAT frame's depth +
+    camera. A correct mask applied to the wrong frame's geometry lands on the
+    table -> the back-projected registration target is ~half table -> the
+    centroid-seeded NDP fit drags the SAM3D object a few cm off ("offset to the
+    right", on every object). Writing the anchor as the last keyframe makes the
+    dataparser sort it to ``cached_train[-1]`` (it argsorts ``file_path`` and
+    ``arm_00040`` > ``arm_00039`` lexicographically with the 5-digit pad), so
+    the mask, depth, camera, pose AND the back-projection target are all the
+    SAME frame — and that frame is the best head-on view, which is exactly what
+    Phase-0 wants. Also feeds the TSDF seed this view (called before the build).
+
+    Byte-matches the publisher recorder (``live_ros_publisher._write_frame_to_disk``):
+    BGR rgb, uint16-mm depth, uint8 keep-mask, ``c2w_4x4`` written raw (it is
+    already OpenGL c2w), atomic transforms.json swap. Safe after
+    ``sub.stop_recording()`` (recorder quiesced -> no transforms.json race) and
+    before the seed build.
+    """
+    transforms_path = static_dir / "transforms.json"
+    if transforms_path.exists():
+        meta = json.loads(transforms_path.read_text())
+    else:
+        meta = {
+            "fl_x": float(intrinsics.fx), "fl_y": float(intrinsics.fy),
+            "cx": float(intrinsics.cx), "cy": float(intrinsics.cy),
+            "w": int(intrinsics.width), "h": int(intrinsics.height),
+            "frames": [],
+        }
+    frames = meta.setdefault("frames", [])
+    # Continue the recorder's own <prefix>_%05d numbering so the new frame sorts
+    # LAST (dataparser argsorts file_path; 5-digit pad keeps numeric==lexical).
+    # Derive the prefix from the existing frames so it tracks the recorder even
+    # if it ever changes; fall back to "arm" for an empty/missing transforms.
+    prefix = "arm"
+    if frames:
+        prefix = Path(frames[-1]["file_path"]).stem.rsplit("_", 1)[0] or "arm"
+    stem = f"{prefix}_{len(frames):05d}"
+
+    for sub_dir in ("rgb", "depth", "masks"):
+        (static_dir / sub_dir).mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(static_dir / "rgb" / f"{stem}.png"), anchor.rgb_bgr)
+    depth_mm_u16 = np.clip(anchor.depth_m * 1000.0, 0.0, 65535.0).astype(np.uint16)
+    cv2.imwrite(str(static_dir / "depth" / f"{stem}.tiff"), depth_mm_u16)
+    cv2.imwrite(str(static_dir / "masks" / f"{stem}.png"), anchor.mask_keep)
+
+    frames.append({
+        "file_path": f"./rgb/{stem}.png",
+        "depth_file_path": f"./depth/{stem}.tiff",
+        "mask_path": f"./masks/{stem}.png",
+        "transform_matrix": np.asarray(anchor.c2w_4x4).tolist(),
+    })
+    tmp_path = transforms_path.with_name(f".{transforms_path.name}.tmp")
+    tmp_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_path, transforms_path)
+    return stem
+
+
+def _write_anchor_ref(anchor: LiveFrame, sam3_objects: list, intrinsics, static_dir: Path) -> Path:
+    """Write the CANONICAL anchor reference to ``<static>/anchor_ref/`` — the
+    EXACT (image, mask(s), depth, intrinsics, pose) the SAM3 mask + SAM3D were
+    computed on, in ONE self-contained folder. Phase-0 reads its reference frame
+    from here instead of re-deriving "the last static frame" (a DIFFERENT
+    capture), which is what made a correct mask get force-applied to the wrong
+    image -> table leakage / misalignment. Written once at segmentation time.
+
+    Files: ``rgb.png`` (RGB), ``mask_NN.png`` (per object), ``depth.tiff``
+    (uint16 mm — same convention as the dataset depth), ``intrinsics.json``,
+    ``c2w.json`` (OpenGL c2w 4x4), ``overlay.png`` (masks drawn on rgb — the
+    one image that is GUARANTEED to show the mask on the frame it belongs to).
+    """
+    ref = static_dir / "anchor_ref"
+    ref.mkdir(parents=True, exist_ok=True)
+
+    # The EXACT image SAM3/SAM3D saw: anchor RGB with the gripper blacked out
+    # (mirrors _save_anchor_for_sam3), so the mask aligns with it by construction.
+    rgb_rgb = cv2.cvtColor(anchor.rgb_bgr, cv2.COLOR_BGR2RGB).copy()
+    keep = anchor.mask_keep > 0
+    if keep.shape != rgb_rgb.shape[:2]:
+        keep = np.array(Image.fromarray(keep.astype(np.uint8) * 255).resize(
+            (rgb_rgb.shape[1], rgb_rgb.shape[0]), Image.NEAREST)) > 127
+    rgb_rgb[~keep] = 0
+    Image.fromarray(rgb_rgb).save(ref / "rgb.png")
+    depth_mm_u16 = np.clip(anchor.depth_m * 1000.0, 0.0, 65535.0).astype(np.uint16)
+    cv2.imwrite(str(ref / "depth.tiff"), depth_mm_u16)
+    (ref / "intrinsics.json").write_text(json.dumps({
+        "fx": float(intrinsics.fx), "fy": float(intrinsics.fy),
+        "cx": float(intrinsics.cx), "cy": float(intrinsics.cy),
+        "w": int(intrinsics.width), "h": int(intrinsics.height),
+    }, indent=2) + "\n")
+    (ref / "c2w.json").write_text(json.dumps(np.asarray(anchor.c2w_4x4).tolist(), indent=2) + "\n")
+
+    overlay = rgb_rgb.astype(np.float32)
+    mask_rel = []
+    for i, obj in enumerate(sam3_objects):
+        src = obj.get("mask_path")
+        if not src:
+            continue
+        m = np.array(Image.open(src).convert("L"))
+        if m.shape != rgb_rgb.shape[:2]:
+            m = np.array(Image.fromarray(m).resize((rgb_rgb.shape[1], rgb_rgb.shape[0]), Image.NEAREST))
+        Image.fromarray(m).save(ref / f"mask_{i:02d}.png")
+        mask_rel.append(f"mask_{i:02d}.png")
+        sel = m > 127
+        overlay[sel] = overlay[sel] * 0.5 + np.array([255, 0, 0], np.float32) * 0.5
+    Image.fromarray(overlay.clip(0, 255).astype(np.uint8)).save(ref / "overlay.png")
+    (ref / "manifest.json").write_text(json.dumps({"masks": mask_rel}, indent=2) + "\n")
+    return ref
 
 
 def _prompt_user(prompt_text: str) -> str:
@@ -760,6 +882,30 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
                f"operator sweep ({n_static} keyframes)", "infer",
                _t_capture_start, _t_capture_end)
 
+    # FRAME-CONSISTENCY FIX: write the segmented anchor as the FINAL static
+    # keyframe so Phase-0's cached_train[-1] IS the frame the mask + SAM3D were
+    # built on (see _append_anchor_as_static_keyframe). Without this, Phase-0
+    # reuses the anchor mask against the last *sweep* keyframe's depth/camera (a
+    # different pose) -> mask falls on the table -> inserted object offset.
+    # Done after stop_recording (recorder quiesced) and before the seed build
+    # below (so the seed gets this best head-on view).
+    try:
+        _kf_stem = _append_anchor_as_static_keyframe(anchor, sub.intrinsics, static_dir)
+        print(f"[live] anchor written as final static keyframe: {_kf_stem}", flush=True)
+    except Exception as _exc:
+        print(f"[live] WARNING: failed to append anchor keyframe ({_exc}); "
+              f"Phase-0 will fall back to the last sweep frame (may offset insert)",
+              flush=True)
+
+    # Canonical anchor reference (the EXACT image+mask+depth+pose SAM3D used).
+    # Phase-0 reads its reference frame from here, so the correct mask is applied
+    # to the frame it belongs to (not "the last static frame", a different capture).
+    try:
+        _ref = _write_anchor_ref(anchor, sam3_objects, sub.intrinsics, static_dir)
+        print(f"[live] canonical anchor reference written: {_ref}", flush=True)
+    except Exception as _exc:
+        print(f"[live] WARNING: failed to write anchor_ref ({_exc})", flush=True)
+
     # Pause Gazebo physics from here through the end of the init-PLY
     # build. The window covers SAM3D subprocess and the depth-back-
     # projection PLY assembly — both compete with gzserver for CPU/GPU.
@@ -767,11 +913,11 @@ def run_live_capture_session(sam3_prompt_text: Optional[str] = None) -> Path:
     try:
         # Persist the measured SAM3 duration to a sidecar JSON. The
         # pipeline reads this in ``_run_sam3_and_sam3d_generation`` and
-        # re-injects it into ``self._timing["S0.1_sam3_segmentation"]``
+        # re-injects it into ``self._timing["S0.1_fastsam_segmentation"]``
         # so the timing report shows the real subprocess wall-clock.
         live_timings_path = artifact_dir / "live_sam3_timings.json"
         live_timings_path.write_text(json.dumps({
-            "S0.1_sam3_segmentation": float(sam3_duration),
+            "S0.1_fastsam_segmentation": float(sam3_duration),
         }, indent=2) + "\n")
 
         gc.collect()

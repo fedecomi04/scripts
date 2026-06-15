@@ -33,7 +33,7 @@ _NDP_CONFIG = dict(
     k0=-8,
     depth=3,
     width=128,
-    w_reg=0.0,
+    w_reg=1.0,
 )
 
 
@@ -122,8 +122,18 @@ def deform_source_to_target(
         break_counter = 0
         loss_prev = 1e6
         for _ in range(cfg["iters"]):
-            s_warped, _ = ndp.warp(s_sample, max_level=level, min_level=level)
+            s_warped, warp_data = ndp.warp(s_sample, max_level=level, min_level=level)
             loss = _truncated_chamfer(s_warped[None], t_sample[None], trunc=1e9)
+            # Non-rigidity regularization — RESTORED from DeformationPyramid/
+            # shape_transfer.py (the vendored port had dropped this term, leaving
+            # w_reg inert: it only toggled nonrigidity_est, never weighted a loss).
+            # BCE pulls the per-point nonrigidity gate toward 0 (rigid); higher
+            # w_reg = stiffer = less deformation. Level 0 (global xform) has no gate.
+            if level > 0 and cfg["w_reg"] > 0:
+                nr = warp_data[level][1]
+                if nr is not None:
+                    loss = loss + cfg["w_reg"] * torch.nn.functional.binary_cross_entropy(
+                        nr, torch.zeros_like(nr))
             if loss.item() < 1e-4:
                 break
             if abs(loss_prev - loss.item()) < loss_prev * cfg["break_threshold_ratio"]:

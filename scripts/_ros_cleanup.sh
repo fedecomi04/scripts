@@ -25,6 +25,14 @@
 # motion, so cores 0-3 are reserved for it and the pipeline is pinned to
 # cores 4-23 (20 of 24). This is a CPU-latency fix, not GPU (the GPU was
 # ~18% busy at fault time and the dVRK never touches it).
+#
+# The reservation has TWO sides and you need BOTH:
+#   * dgs_cpu_pin_prefix  -- keeps the PIPELINE OFF cores 0-3 (taskset 4-23).
+#   * dgs_isolate_dvrk    -- locks the dVRK ONTO cores 0-3 (cgroup cpuset).
+# Pinning only the pipeline is NOT enough: the dVRK loop is SCHED_OTHER with
+# affinity 0-23, so the scheduler still drops it onto 4-23 next to the gsplat
+# compile storm and starves it (observed 2026-06-14: arms latched "not ready"
+# mid-JIT even with the pipeline correctly pinned). dgs_isolate_dvrk closes it.
 
 # Cores reserved for the dVRK/Gazebo/controllers RT domain. Override with
 # DGS_RT_RESERVED_CORES; the pipeline gets every other core.
@@ -71,6 +79,56 @@ dgs_export_thread_caps() {
   # gsplat's first-run CUDA JIT spawns a cicc compiler per core; cap the
   # nvcc build parallelism so the compile storm can't peg every core.
   export MAX_JOBS="${MAX_JOBS:-8}"
+}
+
+# Lock the dVRK real-time console ONTO the reserved cores. This is the
+# counterpart to dgs_cpu_pin_prefix: that keeps the pipeline OFF cores 0-3, but
+# nothing kept the dVRK ON them -- its mtsRobotIO1394 1 kHz loop runs
+# SCHED_OTHER with affinity 0-23, so the scheduler still co-located it with the
+# gsplat compile storm on 4-23 and starved it (MEASURED 2026-06-14: arms latched
+# "body_servo_cf, arm not ready" during the JIT build even with the pipeline
+# pinned). Starts a persistent ROOT watchdog (cgroup v1 cpuset, see
+# _dvrk_cpuset_watch.sh) that confines every current + future dvrk_console_json
+# thread to DGS_RT_RESERVED_CORES and survives operator restarts of the console.
+# Needs sudo (one prompt per launch, cached after). Non-fatal: if sudo/cpuset is
+# unavailable it warns and continues. Skipped when no dVRK console is running
+# (pure recorded runs) or DGS_NO_CPU_PIN=1.
+dgs_isolate_dvrk() {
+  if [[ "${DGS_NO_CPU_PIN:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ ! -d /sys/fs/cgroup/cpuset ]]; then
+    echo "[dvrk-isolate] cpuset cgroup v1 not present; skipping dVRK isolation" >&2
+    return 0
+  fi
+  if ! pgrep -f dvrk_console_json >/dev/null 2>&1; then
+    echo "[dvrk-isolate] no dVRK console running; skipping (start the dVRK first if teleoperating)" >&2
+    return 0
+  fi
+  local watch
+  watch="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_dvrk_cpuset_watch.sh"
+  if [[ ! -x "$watch" ]]; then
+    echo "[dvrk-isolate] watchdog missing/not executable: $watch -- skipping" >&2
+    return 0
+  fi
+  echo "==> [dvrk-isolate] locking dVRK RT console to cores ${DGS_RT_RESERVED_CORES} (sudo; one prompt)"
+  # Run the watchdog as a persistent ROOT daemon. Prefer a systemd transient
+  # unit -- it survives reliably; a bare `setsid ... &` under `sudo bash -c`
+  # gets reaped when sudo returns (verified 2026-06-14), so new dVRK threads
+  # then escape the cpuset. Fall back to setsid+disown if systemd-run is absent.
+  if command -v systemd-run >/dev/null 2>&1; then
+    if sudo sh -c "systemctl reset-failed dvrk-cpuset.service 2>/dev/null; systemctl stop dvrk-cpuset.service 2>/dev/null; systemd-run --quiet --unit=dvrk-cpuset --description='Lock dVRK RT console to reserved CPU cores' '$watch' '$DGS_RT_RESERVED_CORES'"; then
+      echo "==> [dvrk-isolate] OK -- dVRK confined to ${DGS_RT_RESERVED_CORES} (systemd unit dvrk-cpuset; catches restarts)"
+    else
+      echo "[dvrk-isolate] WARNING: sudo/systemd-run failed -- dVRK NOT isolated; RT loop may be starved" >&2
+    fi
+  else
+    if sudo bash -c "pkill -f _dvrk_cpuset_watch.sh 2>/dev/null; setsid '$watch' '$DGS_RT_RESERVED_CORES' </dev/null >/dev/null 2>&1 & disown"; then
+      echo "==> [dvrk-isolate] OK -- dVRK confined to ${DGS_RT_RESERVED_CORES} (setsid watchdog; catches restarts)"
+    else
+      echo "[dvrk-isolate] WARNING: sudo failed -- dVRK NOT isolated; RT loop may be starved" >&2
+    fi
+  fi
 }
 
 # Run a ROS CLI command (rostopic/rosnode/rosservice) with the conda

@@ -292,17 +292,21 @@ def prepare_cropped_sam3d_inputs(
     output_dir: Path,
     output_stem: str,
     image_dir: Path | None = None,
-    padding: int = 32,
-    min_crop_side: int = 300,
+    padding: int = 100,
+    min_crop_side: int = 800,
     depth_path: Path | None = None,
     depth_scale: float = 1.0,
     camera_intrinsics: dict | None = None,
 ) -> Dict[str, Path]:
     """Crop the SAM3D inputs tightly around the object mask for lighter inference.
 
-    ``min_crop_side`` ensures the object doesn't fill the entire crop, which
-    would cause SAM3D to generate an extremely dense sparse structure that
-    OOMs on 8 GB GPUs.  A value of 300 keeps sparse coord counts manageable.
+    ``min_crop_side`` ensures the object doesn't fill the entire crop. A larger
+    value gives SAM3D MORE scene context around the object (better reconstruction)
+    AND keeps the sparse-structure density lower (object fills less of the frame),
+    so it's also OOM-safer. Raised to 800 (+padding 100) on 2026-06-14 — a tight
+    32px/300px crop starved SAM3D of context and produced a stubby/elongated
+    reconstruction. Note: SAM3D still downsamples the crop to max_side(=518), so a
+    big crop trades object pixel-resolution for context.
 
     When ``depth_path`` is given, also crop the metric depth image and write
     out an intrinsics sidecar (focal length + principal point shifted by the

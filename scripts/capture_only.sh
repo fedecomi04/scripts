@@ -57,4 +57,7 @@ dgs_check_sim_alive || exit 1
 # thread pools. Prevents the gsplat CUDA JIT / CUDA-sync threads from
 # starving the dVRK loop -> "power is unexpectedly off". See _ros_cleanup.sh.
 dgs_export_thread_caps
+# Lock the dVRK RT console ONTO the reserved cores (the pin only keeps the
+# pipeline OFF them). See dgs_isolate_dvrk / _dvrk_cpuset_watch.sh.
+dgs_isolate_dvrk
 exec $(dgs_cpu_pin_prefix) "$PY" -u "$(dirname "$0")/capture_only.py" "$DATA_DIR" "${@:2}"

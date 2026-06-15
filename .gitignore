@@ -34,3 +34,7 @@ data_teleoperation/
 # outputs). Not version-controlled; previously-tracked scripts were untracked
 # via `git rm --cached`.
 experiments/
+
+# Model weights (large binaries; e.g. weights/clip/ViT-B-32.pt is 338 MB —
+# over GitHub's 100 MB limit). Fetch from upstream, don't commit.
+weights/

@@ -59,6 +59,8 @@ def backproject_mask_to_world(
     depth_image: torch.Tensor,
     rgb_image: torch.Tensor,
     camera,
+    max_object_slope_deg: float = 70.0,
+    near_surface_window_frac: float = 0.012,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Back-project an image-plane mask through a depth image into world 3D points.
 
@@ -67,6 +69,14 @@ def backproject_mask_to_world(
         depth_image: (H, W) depth in meters (CPU tensor).
         rgb_image: (H, W, 3) uint8 or float RGB (CPU or GPU tensor).
         camera: ``Cameras`` with at least one element (we use index 0).
+        max_object_slope_deg: local near-surface filter — the steepest object
+            surface (tilt from frontal) to PRESERVE. The drop tolerance is
+            derived per pixel from this angle + the window + depth + intrinsics
+            (no hardcoded distance); anything farther behind the local object
+            surface than a ``max_object_slope_deg`` surface could account for is
+            treated as table/see-through and dropped. >= 90 disables.
+        near_surface_window_frac: filter window size as a fraction of the image
+            short side (sets the spatial reach for finding the local surface).
 
     Returns:
         ``(points_np, colors_np)`` where ``points_np`` is ``(N, 3)`` float32
@@ -135,6 +145,34 @@ def backproject_mask_to_world(
         fy *= sy
         cx *= sx
         cy *= sy
+
+    # Local near-surface filter (registration-target border cleanup). The mask
+    # silhouette overshoots onto the table/background, and at the edge the depth
+    # sensor sees PAST the object to far surfaces; both pollute the target and
+    # bias the centroid/bbox the registration init keys on. Within a window the
+    # object's own surface is the local MINIMUM depth, so a masked pixel sitting
+    # FARTHER than the local min is a depth step (object→table edge) or see-
+    # through. The keep tolerance is NOT a hardcoded distance: a genuine object
+    # surface tilted up to ``max_object_slope_deg`` can only drop by
+    # (half_window_px · z / fx · tan(slope)) across the half-window at this
+    # pixel's depth, so anything beyond that is not the object. Derived per
+    # pixel from window+depth+intrinsics (only the slope angle is a choice).
+    # Safe for thin/smooth objects (interior == local min → kept) and leaves
+    # benign coplanar leakage (a flat object on the table has no depth step).
+    # Asymmetric complement to the MAD scrub above; >= 90° disables.
+    if max_object_slope_deg < 90.0 and ys.size >= 3:
+        from scipy.ndimage import minimum_filter
+
+        win = max(7, (int(round(near_surface_window_frac * min(H, W))) | 1))
+        d_masked = np.full((H, W), np.inf, dtype=np.float32)
+        d_masked[ys, xs] = z
+        local_min = minimum_filter(d_masked, size=win, mode="nearest")
+        allow = (win // 2) * (z / fx) * float(np.tan(np.radians(max_object_slope_deg)))
+        near_keep = (z - local_min[ys, xs]) <= allow
+        if near_keep.sum() >= 3:
+            ys = ys[near_keep]
+            xs = xs[near_keep]
+            z = z[near_keep]
 
     # Back-project in Nerfstudio/OpenGL camera frame (x right, y up, z back).
     x_cam = (xs.astype(np.float32) - cx) / fx * z
@@ -209,6 +247,51 @@ def cull_points_in_front(
     has_surface = np.isfinite(d_surf)
     in_front = has_surface & (z < d_surf - float(band_m))
     return ~in_front
+
+
+def load_anchor_reference(static_dir: Path, device) -> Optional[dict]:
+    """Load the CANONICAL anchor reference written by
+    ``live_session._write_anchor_ref`` (``<static>/anchor_ref/``): the EXACT
+    (image, depth, intrinsics, pose) the SAM3 mask + SAM3D were computed on.
+
+    Phase-0 uses this as its reference frame so the (correct) mask is back-
+    projected through the SAME frame's depth+camera it belongs to — instead of
+    "the last static frame" (``cached_train[-1]``), a DIFFERENT live capture
+    that made the mask land on the table. Returns ``None`` (→ caller falls back
+    to ``cached_train[-1]``) when the folder is absent, e.g. recorded datasets
+    where phase-0a segments ``cached_train[-1]`` directly (already consistent).
+
+    Returns ``{image: HxWx3 uint8 tensor, depth_m: HxW float32 tensor,
+    camera: Cameras(1) on device}``.
+    """
+    ref = Path(static_dir) / "anchor_ref"
+    rgb_p, depth_p = ref / "rgb.png", ref / "depth.tiff"
+    intr_p, c2w_p = ref / "intrinsics.json", ref / "c2w.json"
+    if not all(p.exists() for p in (rgb_p, depth_p, intr_p, c2w_p)):
+        return None
+    try:
+        from nerfstudio.cameras.cameras import Cameras, CameraType
+
+        intr = json.loads(intr_p.read_text())
+        c2w = np.asarray(json.loads(c2w_p.read_text()), dtype=np.float32)
+        rgb = np.array(Image.open(rgb_p).convert("RGB"), dtype=np.uint8)
+        depth_m = np.array(Image.open(depth_p)).astype(np.float32) * 1e-3  # uint16 mm -> m
+        camera = Cameras(
+            camera_to_worlds=torch.from_numpy(c2w[:3, :4]).unsqueeze(0),
+            fx=float(intr["fx"]), fy=float(intr["fy"]),
+            cx=float(intr["cx"]), cy=float(intr["cy"]),
+            width=int(intr["w"]), height=int(intr["h"]),
+            camera_type=CameraType.PERSPECTIVE,
+        ).to(device)
+        CONSOLE.log(f"[phase-0] using canonical anchor_ref ({ref}) as the reference frame")
+        return {
+            "image": torch.from_numpy(rgb),
+            "depth_m": torch.from_numpy(depth_m),
+            "camera": camera,
+        }
+    except Exception as exc:
+        CONSOLE.log(f"[phase-0] anchor_ref present but failed to load ({exc}); falling back")
+        return None
 
 
 def save_sam3_debug_plots(
@@ -335,7 +418,7 @@ def run_phase0a_sam3_and_sam3d(
             ``dynamic_manager``, ``get_initialization_debug_dir()``, and
             ``get_initialization_artifact_dir()``.
         timing: optional dict accumulating per-step durations (keys
-            ``S0.1_sam3_segmentation``, ``S0.2_sam3d_multi_generation``,
+            ``S0.1_fastsam_segmentation``, ``S0.2_fastsam3d_generation``,
             ``S0.4a_generation_total``). Pass ``None`` to skip timing.
 
     Returns:
@@ -362,6 +445,9 @@ def run_phase0a_sam3_and_sam3d(
     # its reference viewpoint. ``frame_idx_0`` (kept name for the downstream
     # depth/intrinsics lookups) is read from the chosen batch's own
     # ``image_idx`` so everything stays consistent.
+    # LIVE FLOW: the SAM3 anchor is written as the LAST keyframe by
+    # live_session._append_anchor_as_static_keyframe, so cached_train[-1] here IS
+    # the exact frame the cached mask was segmented on (mask/depth/camera all match).
     batch = datamanager.static_manager.cached_train[-1]
     static_image = batch["image"]
 
@@ -385,26 +471,41 @@ def run_phase0a_sam3_and_sam3d(
         "cy": float(static_ds.cameras.cy[frame_idx_0].item()),
     }
 
-    static_image_path = debug_dir / "static0_rgb.png"
-    img_cpu = static_image.cpu()
-    if img_cpu.dtype == torch.uint8:
-        static_np = img_cpu.numpy()
+    # Canonical anchor image: if the live stage wrote anchor_ref/rgb.png (the
+    # EXACT gripper-blacked image SAM3/SAM3D used), REFERENCE it — don't overwrite
+    # it with a different "last static frame" capture. That overwrite is what made
+    # the (correct) mask appear on the wrong image. Falls back to writing
+    # static0_rgb from cached_train[-1] for recorded datasets with no anchor_ref.
+    _anchor_static_dir = (
+        Path(depth_filenames[0]).resolve().parent.parent if depth_filenames else None
+    )
+    _anchor_rgb = (
+        _anchor_static_dir / "anchor_ref" / "rgb.png" if _anchor_static_dir else None
+    )
+    if _anchor_rgb is not None and _anchor_rgb.exists():
+        static_image_path = _anchor_rgb
+        CONSOLE.log(f"[phase-0] segmentation/overlay reference = canonical anchor_ref ({_anchor_rgb})")
     else:
-        static_np = (img_cpu.numpy() * 255).clip(0, 255).astype(np.uint8)
-    gripper_mask_t = batch.get("mask")
-    if gripper_mask_t is not None:
-        m = gripper_mask_t.detach().cpu()
-        if m.ndim == 3 and m.shape[-1] == 1:
-            m = m.squeeze(-1)
-        keep = (m > 0.5).numpy()
-        if keep.shape != static_np.shape[:2]:
-            resized = Image.fromarray(keep.astype(np.uint8) * 255).resize(
-                (static_np.shape[1], static_np.shape[0]), Image.NEAREST
-            )
-            keep = np.array(resized) > 127
-        static_np = static_np.copy()
-        static_np[~keep] = 0
-    Image.fromarray(static_np).save(static_image_path)
+        static_image_path = debug_dir / "static0_rgb.png"
+        img_cpu = static_image.cpu()
+        if img_cpu.dtype == torch.uint8:
+            static_np = img_cpu.numpy()
+        else:
+            static_np = (img_cpu.numpy() * 255).clip(0, 255).astype(np.uint8)
+        gripper_mask_t = batch.get("mask")
+        if gripper_mask_t is not None:
+            m = gripper_mask_t.detach().cpu()
+            if m.ndim == 3 and m.shape[-1] == 1:
+                m = m.squeeze(-1)
+            keep = (m > 0.5).numpy()
+            if keep.shape != static_np.shape[:2]:
+                resized = Image.fromarray(keep.astype(np.uint8) * 255).resize(
+                    (static_np.shape[1], static_np.shape[0]), Image.NEAREST
+                )
+                keep = np.array(resized) > 127
+            static_np = static_np.copy()
+            static_np[~keep] = 0
+        Image.fromarray(static_np).save(static_image_path)
 
     results_json = debug_dir / "static0_sam3_results.json"
     sam3_cached = model_cfg.sam3_reuse_cached and results_json.exists()
@@ -484,7 +585,7 @@ def run_phase0a_sam3_and_sam3d(
                     confidence_threshold=model_cfg.sam3_confidence_threshold,
                     min_score=model_cfg.sam3_min_score,
                 )
-        timing.setdefault("S0.1_sam3_segmentation", []).append(time.time() - t_sam3)
+        timing.setdefault("S0.1_fastsam_segmentation", []).append(time.time() - t_sam3)
 
         # In live mode the real SAM3 subprocess ran in a separate helper
         # before the pipeline was constructed; the inline timer above only
@@ -494,9 +595,9 @@ def run_phase0a_sam3_and_sam3d(
             live_timings_path = artifact_dir / "live_sam3_timings.json"
             if live_timings_path.is_file():
                 live_timings = json.loads(live_timings_path.read_text())
-                if "S0.1_sam3_segmentation" in live_timings:
-                    timing["S0.1_sam3_segmentation"] = [
-                        float(live_timings["S0.1_sam3_segmentation"]),
+                if "S0.1_fastsam_segmentation" in live_timings:
+                    timing["S0.1_fastsam_segmentation"] = [
+                        float(live_timings["S0.1_fastsam_segmentation"]),
                     ]
         except Exception as _exc:
             CONSOLE.log(f"[phase-0] could not read live SAM3 timing sidecar: {_exc}")
@@ -515,7 +616,7 @@ def run_phase0a_sam3_and_sam3d(
                 else:
                     # no split sidecar (e.g. SAM3) — record the whole call as infer
                     _tl.record(_data_root, "segmentation", _seg_name, "infer",
-                               t_sam3, t_sam3 + float(timing["S0.1_sam3_segmentation"][-1]))
+                               t_sam3, t_sam3 + float(timing["S0.1_fastsam_segmentation"][-1]))
             except Exception:
                 pass
 
@@ -598,7 +699,7 @@ def run_phase0a_sam3_and_sam3d(
                     CONSOLE.log(f"[phase-0] object {idx}: SAM3D failed (empty result)")
 
         sam3d_results = [r if r else {} for r in sam3d_results]
-        timing.setdefault("S0.2_sam3d_multi_generation", []).append(time.time() - t_sam3d)
+        timing.setdefault("S0.2_fastsam3d_generation", []).append(time.time() - t_sam3d)
         # --- timing ledger: SAM3D import/load/infer split (from the sidecar) ---
         try:
             _sd_sc = artifact_dir / "_sam3d_timing.json"
@@ -709,43 +810,56 @@ def run_phase0b_fusion(
     debug_dir = datamanager.get_initialization_debug_dir()
     artifact_dir = datamanager.get_initialization_artifact_dir()
 
-    # MUST match the frame Phase 0a segmented (the LAST static frame) — Phase 0b
-    # reprojects the SAM3D-generated object against this camera, so a mismatch
-    # would misalign the fusion. See the note in run_phase0a_sam3_and_sam3d.
-    batch = datamanager.static_manager.cached_train[-1]
-    static_image = batch["image"]
-    frame_idx_0 = int(batch.get("image_idx", len(datamanager.static_manager.cached_train) - 1))
-    camera = datamanager.static_manager.train_dataset.cameras[
-        frame_idx_0 : frame_idx_0 + 1
-    ].to(device)
-
-    # Apply the post-static camera-optimizer offset to the fusion camera so
-    # ``get_outputs``, the back-projection, and ``register_and_fuse_sam3d_object``
-    # all see the optimized pose.
-    camera.metadata = dict(camera.metadata or {})
-    camera.metadata["cam_idx"] = frame_idx_0
-    if (
-        model.camera_optimizer.config.mode != "off"
-        and 0 <= frame_idx_0 < model.camera_optimizer.num_cameras
-    ):
-        optimized_c2w = model.camera_optimizer.apply_to_camera(camera).detach()
-        if optimized_c2w.shape == camera.camera_to_worlds.shape:
-            camera.camera_to_worlds = optimized_c2w
-            CONSOLE.log(
-                f"[phase-0] using post-static optimized pose for cam_idx={frame_idx_0}"
-            )
-
     static_ds = datamanager.static_manager.train_dataset
     depth_filenames = static_ds.metadata.get("depth_filenames")
     depth_scale = float(static_ds.metadata.get("depth_unit_scale_factor", 1.0))
-    static_depth_m = None
-    if depth_filenames is not None and frame_idx_0 < len(depth_filenames):
-        try:
-            depth_pil = Image.open(Path(depth_filenames[frame_idx_0]))
-            depth_np = np.array(depth_pil).astype(np.float32) * depth_scale
-            static_depth_m = torch.from_numpy(depth_np)
-        except Exception as exc:
-            CONSOLE.log(f"[phase-0] warning: failed to load static depth ({exc}); falling back to SfM targets")
+
+    # The reference frame for the mask back-projection MUST be the frame the
+    # SAM3 mask + SAM3D were computed on. CANONICAL ANCHOR REFERENCE first
+    # (live_session._write_anchor_ref → <static>/anchor_ref/): the exact image +
+    # depth + camera SAM3D used, so the correct mask is back-projected through
+    # the frame it belongs to. Falls back to cached_train[-1] ("the last static
+    # frame") only for recorded datasets with no anchor_ref — there phase-0a
+    # segments cached_train[-1] directly, so it is already consistent.
+    static_dir = (
+        Path(depth_filenames[0]).resolve().parent.parent if depth_filenames else None
+    )
+    ref = load_anchor_reference(static_dir, device) if static_dir is not None else None
+
+    if ref is not None:
+        static_image = ref["image"]
+        static_depth_m = ref["depth_m"]
+        camera = ref["camera"]
+        camera.metadata = dict(camera.metadata or {})
+    else:
+        batch = datamanager.static_manager.cached_train[-1]
+        static_image = batch["image"]
+        frame_idx_0 = int(batch.get("image_idx", len(datamanager.static_manager.cached_train) - 1))
+        camera = datamanager.static_manager.train_dataset.cameras[
+            frame_idx_0 : frame_idx_0 + 1
+        ].to(device)
+        # Apply the post-static camera-optimizer offset (mode="off" in static-gs,
+        # so this is a no-op there) so get_outputs / back-projection see it.
+        camera.metadata = dict(camera.metadata or {})
+        camera.metadata["cam_idx"] = frame_idx_0
+        if (
+            model.camera_optimizer.config.mode != "off"
+            and 0 <= frame_idx_0 < model.camera_optimizer.num_cameras
+        ):
+            optimized_c2w = model.camera_optimizer.apply_to_camera(camera).detach()
+            if optimized_c2w.shape == camera.camera_to_worlds.shape:
+                camera.camera_to_worlds = optimized_c2w
+                CONSOLE.log(
+                    f"[phase-0] using post-static optimized pose for cam_idx={frame_idx_0}"
+                )
+        static_depth_m = None
+        if depth_filenames is not None and frame_idx_0 < len(depth_filenames):
+            try:
+                depth_pil = Image.open(Path(depth_filenames[frame_idx_0]))
+                depth_np = np.array(depth_pil).astype(np.float32) * depth_scale
+                static_depth_m = torch.from_numpy(depth_np)
+            except Exception as exc:
+                CONSOLE.log(f"[phase-0] warning: failed to load static depth ({exc}); falling back to SfM targets")
 
     manifest: dict = {}
     n_objs = len(sam3_objects)

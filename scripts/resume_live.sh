@@ -61,11 +61,18 @@ dgs_check_sim_alive || exit 1
 # so the tracker/AnySplat/CUDA-sync load can't starve the dVRK 1 kHz loop
 # ("power is unexpectedly off"). See _ros_cleanup.sh.
 dgs_export_thread_caps
+# Lock the dVRK RT console ONTO the reserved cores (the pin only keeps the
+# pipeline OFF them). See dgs_isolate_dvrk / _dvrk_cpuset_watch.sh.
+dgs_isolate_dvrk
+# Per-FF-call CDN debug dump (-> <data>/dynamic_scene/_ff_debug/, the ordered
+# _1..._7 frames). OFF by default (extra renders on the FF thread); enable for
+# diagnosing change-detection churn:  DGS_FF_DEBUG=1 scripts/resume_live.sh <dir>
+[[ "${DGS_FF_DEBUG:-0}" == "1" ]] && SAVE_DBG=True || SAVE_DBG=False
 exec $(dgs_cpu_pin_prefix) "$NS_TRAIN" dynamic-gs-live \
   --data "$DATA_DIR" \
   --output-dir "$OUTPUT_DIR" \
   --vis tensorboard \
   --pipeline.enable_viser_direct=True \
   --pipeline.enable-feedforward-inpaint=anysplat_decode \
-  --pipeline.save-debug-images=False \
+  --pipeline.save-debug-images="$SAVE_DBG" \
   --pipeline.live-wipe-root=False
