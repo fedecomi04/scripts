@@ -72,6 +72,8 @@ exec $(dgs_cpu_pin_prefix) "$NS_TRAIN" dynamic-gs-live \
   --data "$DATA_DIR" \
   --output-dir "$OUTPUT_DIR" \
   --vis tensorboard \
+  --logging.local-writer.enable False \
+  --logging.profiler none \
   --pipeline.enable_viser_direct=True \
   --pipeline.enable-feedforward-inpaint=anysplat_decode \
   --pipeline.save-debug-images="$SAVE_DBG" \

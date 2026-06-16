@@ -85,6 +85,8 @@ class _FusionWorker(threading.Thread):
                 if depth is None:
                     raise RuntimeError(f"failed to read depth {depth_path}")
                 depth = depth.astype(np.uint16).copy()
+                # NOTE: depth is NOT filtered here — the publisher filters it as it's
+                # saved (depth/ is pre-filtered). Filtering again would double-apply.
                 if mask_path is not None:
                     m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
                     if m is not None:

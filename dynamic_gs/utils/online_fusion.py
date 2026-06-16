@@ -596,6 +596,10 @@ def fuse_recorded_dataset(static_dir: Path) -> Path:
         mask_path = static_dir / fr["mask_path"].lstrip("./") if fr.get("mask_path") else None
         rgb_path = static_dir / fr["file_path"].lstrip("./")
         depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED).astype(np.uint16).copy()
+        # NOTE: depth is NOT filtered here. Live capture filters the depth at the
+        # publisher as it's saved (depth/ is pre-filtered, raw kept in depth_raw/),
+        # so filtering again would double-apply. Recorded datasets use whatever
+        # depth/ holds. See dynamic_gs.utils.depth_filter + live_ros_publisher.
         if mask_path and mask_path.exists():
             m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             depth[m == 0] = 0

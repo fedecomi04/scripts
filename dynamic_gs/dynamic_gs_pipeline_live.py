@@ -112,6 +112,10 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
             grad_scaler=grad_scaler,
         )
 
+        # Live: tracker runs on RAW depth; the depth filter is applied ONLY at the FF
+        # call (off the tracker thread). See _batch_from_live_frame + the FF-site gate.
+        self._filter_depth_at_ff = True
+
         # Switch datamanager to dynamic phase so any state checks pass
         # (the live pipeline doesn't actually pull from the datamanager
         # at runtime, but the model + datamanager initialization paths
@@ -525,7 +529,12 @@ class LiveDynamicGSPipeline(DynamicGSPipelineBase):
         """
         rgb_uint8 = frame.rgb_bgr[..., ::-1]  # BGR -> RGB, no copy
         rgb_t = torch.from_numpy(np.ascontiguousarray(rgb_uint8)).to(device).float() / 255.0
-        depth_t = torch.from_numpy(frame.depth_m).to(device).float().unsqueeze(-1)
+        # RAW depth for the tracker (live): the tracker is fine on raw depth (operator-
+        # confirmed) and RANSAC+Kabsch average per-point jitter, so it doesn't pay the
+        # filter cost on its critical path. The depth filter is applied ONLY at the FF
+        # call (off the tracker thread) — see _anysplat_bg_run. So batch["depth_image"]
+        # stays raw here; _get_gt_depth(batch) feeds the FF, which filters it itself.
+        depth_t = torch.from_numpy(np.ascontiguousarray(frame.depth_m)).to(device).float().unsqueeze(-1)
         mask_t = torch.from_numpy(frame.mask_keep).to(device).bool().unsqueeze(-1)
         return {
             "image": rgb_t,

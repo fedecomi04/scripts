@@ -196,7 +196,19 @@ def _load_zed_depth_noise():
     return module
 
 
+def _load_depth_filter():
+    path = Path(__file__).resolve().parent / "depth_filter.py"
+    spec = importlib.util.spec_from_file_location("_dgs_depth_filter", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load depth_filter from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_dgs_depth_filter"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 _ZED_NOISE = _load_zed_depth_noise()
+_DEPTH_FILTER = _load_depth_filter()  # CPU cv2 path; ROS env has cv2+numpy
 
 
 # ---------------------------------------------------------------------------
@@ -1108,7 +1120,18 @@ class LivePublisher:
             mask_path = record_dir / "masks" / "{}.png".format(stem)
 
             cv2.imwrite(str(rgb_path), frame.rgb_bgr)
+            # Median+bilateral filter the depth HERE, as it's saved (in parallel with
+            # the operator's sweep), so the end-of-recording seed build + the dynamic
+            # phase read pre-filtered depth — no post-recording dead time. The RAW
+            # depth is preserved in depth_raw/ (for A/B / re-filter); the pipeline-read
+            # `depth/` folder name is unchanged. DGS_DEPTH_FILTER=0 disables.
             depth_mm_u16 = np.clip(frame.depth_m * 1000.0, 0.0, 65535.0).astype(np.uint16)
+            if _DEPTH_FILTER.enabled():
+                raw_path = record_dir / "depth_raw" / "{}.tiff".format(stem)
+                raw_path.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(raw_path), depth_mm_u16)
+                _filt_m = _DEPTH_FILTER.filter_depth(frame.depth_m.astype(np.float32))
+                depth_mm_u16 = np.clip(_filt_m * 1000.0, 0.0, 65535.0).astype(np.uint16)
             cv2.imwrite(str(depth_path), depth_mm_u16)
             cv2.imwrite(str(mask_path), frame.mask_keep)
 

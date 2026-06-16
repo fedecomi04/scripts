@@ -324,6 +324,17 @@ class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
     — sub-mm specks that are pure count bloat. 0 (default) disables; set e.g.
     0.0005 to cull. Env A/B: ``DGS_FF_MIN_SCALE_M``."""
 
+    depth_filter_enabled: bool = True
+    """Median+bilateral filter the per-tick SENSOR DEPTH before BOTH the tracker
+    and feedforward use it (applied once at the batch source — see
+    :func:`dynamic_gs.utils.depth_filter.filter_depth`). The median kills stereo
+    FLYING-PIXELS at depth discontinuities (silhouette pixels whose depth jumped to
+    the background → AnySplat gaussians floating off-surface), the bilateral smooths
+    residual axial jitter while preserving real depth steps. A/B-chosen on a static
+    banana reprojection (2026-06-16). Disable everywhere with env ``DGS_DEPTH_FILTER=0``;
+    kernel/sigma knobs are env-overridable (``DGS_DEPTH_MEDIAN_KSIZE``,
+    ``DGS_DEPTH_BILATERAL_SIGMA_COLOR_M``, …) in the depth_filter module."""
+
 
 # ============================================================================
 # Pipeline base
@@ -479,6 +490,13 @@ class DynamicGSPipelineBase(VanillaPipeline):
         # StaticGSPipeline is a different class without this attr, so static
         # training correctly keeps the full train step.
         self.current_phase = "dynamic"
+
+        # Depth-filter policy: when True, the median+bilateral depth filter is applied
+        # at the FF call (FF bg thread) and the tracker uses RAW depth. When False, the
+        # subclass is expected to have filtered the batch depth already (tracker + FF
+        # both filtered). Live sets True (tracker raw, FF-only filter); recorded leaves
+        # it False (filters at the batch). See depth_filter + the FF-site gate.
+        self._filter_depth_at_ff = False
 
         # Build datamanager + model (cold model with SfM-seed Gaussians).
         super().__init__(
@@ -3087,6 +3105,9 @@ class DynamicGSPipelineBase(VanillaPipeline):
             return
         image_paths = [image_paths[0]]
 
+        # NOTE: depth is already median+bilateral filtered upstream at the batch
+        # source (_filter_batch_depth in the tracker tick), so gt_depth here is
+        # the filtered depth — no per-FF re-filter needed (would double-apply).
         sensor_depth_np = gt_depth.detach().cpu().numpy().astype(np.float32)
         if sensor_depth_np.ndim == 3:
             sensor_depth_np = sensor_depth_np[..., 0]
@@ -3214,6 +3235,23 @@ class DynamicGSPipelineBase(VanillaPipeline):
         try:
             import pickle
             import cv2 as _cv2
+
+            # Depth filtering policy (median+bilateral, see depth_filter):
+            #   * LIVE: the tracker runs on RAW depth (batch is unfiltered); the filter
+            #     is applied HERE, at the FF call, on the FF bg thread — so the tracker's
+            #     critical path pays nothing and only the FF inserts get cleaned depth.
+            #   * RECORDED: the batch was already filtered in _tracker_tick, so this is
+            #     skipped (would double-apply).
+            # Gated by `_filter_depth_at_ff` (set per subclass). Off entirely if
+            # DGS_DEPTH_FILTER=0.
+            from .utils import depth_filter as _depth_filter
+            if getattr(self, "_filter_depth_at_ff", False) and _depth_filter.enabled():
+                import torch as _torch
+                _sd = _torch.from_numpy(np.ascontiguousarray(sensor_depth_np)).float()
+                if _torch.cuda.is_available():
+                    _sd = _sd.cuda()
+                _sd = _depth_filter.filter_depth_torch(_sd)
+                sensor_depth_np = _sd.cpu().numpy().astype(np.float32)
 
             # --- Frustum-cull scene cloud + ICP-refine scene_c2w (ONCE per FF call, on GPU) ---
             # The frustum cull and ICP are component-agnostic: align the whole visible

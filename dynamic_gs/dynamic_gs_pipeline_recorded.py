@@ -33,6 +33,7 @@ from .dynamic_gs_pipeline_base import (
     DynamicGSPipelineBaseConfig,
     TrackerFrame,
 )
+from .utils import depth_filter as _depth_filter
 
 
 @dataclass
@@ -188,6 +189,11 @@ class RecordedDynamicGSPipeline(DynamicGSPipelineBase):
         # Pin datamanager to this frame and pull the batch.
         self.datamanager.set_dynamic_frame_idx(frame_idx)
         camera, batch = self.datamanager.get_current_dynamic_train_batch()
+        # Median+bilateral filter the sensor depth ONCE here so BOTH the tracker and
+        # feedforward (model._get_gt_depth(batch)) consume cleaned depth — parity with
+        # the live path. On-GPU. See depth_filter.
+        if self.config.depth_filter_enabled and _depth_filter.enabled() and batch.get("depth_image") is not None:
+            batch["depth_image"] = _depth_filter.filter_depth_torch(batch["depth_image"])
         # New frame/camera → invalidate the per-tick object-mask cache so this
         # tick's first consumer renders it once and the rest reuse it.
         self._invalidate_object_mask_cache()
