@@ -65,8 +65,19 @@ def main():
     ap.add_argument("--svo", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--settings", default=None, help="optional_settings_path (calib dir)")
-    ap.add_argument("--depth-mode", default="ULTRA",
+    ap.add_argument("--depth-mode", default="NEURAL",
                     choices=["PERFORMANCE", "QUALITY", "ULTRA", "NEURAL", "NEURAL_PLUS"])
+    ap.add_argument("--confidence", type=int, default=75,
+                    help="SDK confidence_threshold 1..100; LOWER discards MORE depth (keeps only "
+                         "high-confidence points -> fewer points, fewer ghosts). On NEURAL the "
+                         "score saturates: 65/75/90 give ~the same ~69%% coverage on zed_scene. "
+                         "Default 75 (tuned on zed_scene, clean + dense).")
+    ap.add_argument("--texture-confidence", type=int, default=100,
+                    help="SDK texture_confidence_threshold 1..100; LOWER rejects depth on "
+                         "low-texture surfaces. Default 100 (reject nothing on texture). On NEURAL "
+                         "keep at 100 (NEURAL INFERS textureless depth well; lowering it deletes "
+                         "good inferred depth). Measured cliff on zed_scene @conf75: "
+                         "tex100->68.9%% tex99->50.4%% tex95->18.1%%.")
     ap.add_argument("--every", type=int, default=1, help="keep every Nth grabbed frame")
     ap.add_argument("--min-depth", type=float, default=0.3, help="metres (ZED X 2.2mm min ~0.3)")
     ap.add_argument("--max-depth", type=float, default=20.0, help="metres")
@@ -107,6 +118,11 @@ def main():
 
     img, depth, pose = sl.Mat(), sl.Mat(), sl.Pose()
     rt = sl.RuntimeParameters()
+    if args.confidence is not None:
+        rt.confidence_threshold = args.confidence
+    if args.texture_confidence is not None:
+        rt.texture_confidence_threshold = args.texture_confidence
+    valid_pcts = []
     frames = []
     grabbed = -1
     kept = 0
@@ -131,6 +147,7 @@ def main():
         d = depth.get_data().astype(np.float32)                     # metres; NaN/Inf invalid
         dmm = np.clip(np.nan_to_num(d * 1000.0, nan=0.0, posinf=0.0, neginf=0.0),
                       0, 65535).astype(np.uint16)                   # uint16 mm, 0 = invalid
+        valid_pcts.append(100.0 * float((dmm > 0).mean()))          # depth-coverage %
 
         name = "%s%06d" % (args.prefix, kept)
         if _HAVE_CV2:
@@ -160,7 +177,11 @@ def main():
     }
     with open(os.path.join(args.out, "transforms.json"), "w") as f:
         json.dump(meta, f, indent=2)
+    vp = np.array(valid_pcts) if valid_pcts else np.array([0.0])
     print("wrote %d frames (%d VIO-OK) -> %s" % (kept, n_tracked, args.out))
+    print("depth coverage: mean %.1f%% valid (min %.1f%%, max %.1f%%)  "
+          "[lower confidence -> lower %% but fewer ghosts]"
+          % (vp.mean(), vp.min(), vp.max()))
 
 
 if __name__ == "__main__":
