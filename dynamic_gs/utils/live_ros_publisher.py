@@ -572,9 +572,8 @@ class LivePublisher:
         self._zed_noise_rng = np.random.default_rng()
         if _ZED_NOISE.enabled():
             rospy.loginfo("[live] sim ZED-X depth-noise model ENABLED "
-                          "(Ortiz et al. 2018, res=%s a=%s b=%s hole=%s)"
-                          % (_ZED_NOISE._RES, _ZED_NOISE._A,
-                             _ZED_NOISE._B, _ZED_NOISE._HOLE_RATE))
+                          "(measured fit sigma=%.4f+%.6f*z^2 m, hole=%s)"
+                          % (_ZED_NOISE._SIGMA0, _ZED_NOISE._K, _ZED_NOISE._HOLE_RATE))
 
         # Shared memory allocation. Sized once H/W are known.
         slot_bytes, offsets = _slot_layout(self.intrinsics.height, self.intrinsics.width)
