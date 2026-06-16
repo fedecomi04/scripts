@@ -532,6 +532,7 @@ def icp_refine_scene_c2w(
     max_dist_m: float = 0.02,
     stride: int = 4,
     min_pts: int = 1000,
+    target_voxel_m: float = 0.0,
 ) -> tuple[np.ndarray, dict]:
     """GPU point-to-plane ICP of the live sensor cloud against a caller-supplied
     (frustum-culled) target tensor on GPU. Component-agnostic.
@@ -585,6 +586,19 @@ def icp_refine_scene_c2w(
 
     tgt_t = o3d.t.geometry.PointCloud(cuda_dev)
     tgt_t.point.positions = o3c.Tensor.from_dlpack(torch.utils.dlpack.to_dlpack(target_xyz_gpu.contiguous().to(torch.float32)))
+    # Voxel-downsample the target BEFORE normals + ICP. The target is the full
+    # frustum-culled scene (~hundreds of k pts, grows with FF inserts); the
+    # per-iteration NN search (open3d::core::nns) dominated dynamic-phase GPU
+    # (~52% / 466 ms per call, 2026-06-16 profile). A rigid pose ICP doesn't need
+    # full density — a ~1.5 cm voxel keeps the surface shape, cuts the count
+    # 10-50x, and makes both estimate_normals AND the ICP NN cheaper. The
+    # one-time downsample cost is paid once per FF call vs the NN cost paid every
+    # ICP iteration, so it's a net win. 0 disables.
+    if target_voxel_m and target_voxel_m > 0.0:
+        n_before = int(tgt_t.point.positions.shape[0])
+        tgt_t = tgt_t.voxel_down_sample(float(target_voxel_m))
+        info["n_tgt_voxel"] = int(tgt_t.point.positions.shape[0])
+        info["n_tgt_before_voxel"] = n_before
     # Estimate normals on the target (point-to-plane needs them)
     tgt_t.estimate_normals(max_nn=30, radius=0.02)
 

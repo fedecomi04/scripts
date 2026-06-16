@@ -11,13 +11,22 @@ the stereo physics predicts (sigma_z proportional to z^2, from Z = f*B/disparity
 
         sigma_z(z) = sigma0 + k * z^2      [metres, z in metres]
 
-**Calibrated to our ACTUAL ZED-X**, not a generic paper. Measured per-pixel
-roughness on dataset ZED/zed_validate2 (HD1200 NEURAL conf=50): residual std to
-a local plane fit over 41,927 flat 9x9 windows across 30 frames:
-    0.4m: 0.29mm   0.6m: 0.32mm   0.8m: 0.39mm   1.0m: 0.48mm
-    1.25m: 0.44mm  1.55m: 0.73mm  1.9m: 2.15mm
-Least-squares fit -> sigma0 ~= 0 (we keep a tiny 0.05mm quantization floor),
-k = 0.477 mm/m^2. So sigma is SUB-MILLIMETRE out to ~1.5m and ~1.7mm at 1.9m.
+**Calibrated to our ACTUAL ZED-X as an UPPER BOUND**, not a generic paper, and
+deliberately tuned to the NOISIEST real capture so the sim trains the pipeline
+against worst-case sensor noise (robustness). Measured per-pixel roughness
+(residual std to a local plane fit over flat 9x9 windows, the SAME metric) on
+three real HD1200 NEURAL captures showed the rough one, ZED/scene_dataset, runs
+~2-3x noisier than ZED/zed_validate2:
+    scene_dataset mean  : 0.4m 0.50mm  0.6m 0.72mm  1.0m 1.25mm  1.4m 1.94mm  2.4m 2.49mm
+    scene_dataset p90   : 0.4m 0.84mm  0.6m 1.26mm  1.0m 2.20mm  1.4m 3.25mm  2.4m 3.66mm
+    zed_validate2 mean  : 0.4m 0.29mm  0.6m 0.32mm  1.0m 0.48mm  1.6m 0.81mm  2.4m 1.15mm
+Least-squares z^2 fit to the scene_dataset **p90** (the upper envelope) ->
+sigma0 = 1.47mm (a FLAT term so noise is visible even at near range, unlike the
+old pure-z^2 fit which was invisible <1.5m), k = 0.500 mm/m^2. So sigma is
+~1.5mm at 0.3m, ~2.0mm at 1.0m, ~3mm at 1.75m.
+*History: the first real fit (2026-06-15) was the zed_validate2 MEAN -> sigma0~=0,
+k=0.477; that was the typical-case low end and near-invisible at tabletop range.
+Switched 2026-06-16 to the scene_dataset p90 upper bound for robustness.*
 
 WHY NOT the Ortiz et al. 2018 exponential f(Z)=a*exp(b*Z): that is the paper's
 WHOLE-FRAME RMS *error* (bias + calibration + edge/flying-pixel effects averaged
@@ -38,10 +47,10 @@ realistic sim default); set DGS_SIM_ZED_NOISE=0 to disable (clean sim depth).
 import os
 import numpy as np
 
-# Per-pixel axial-noise fit to the real ZED-X (ZED/zed_validate2, see module doc):
-#   sigma_z(z) = SIGMA0 + K * z^2   [metres]
-_SIGMA0 = float(os.environ.get("DGS_SIM_ZED_SIGMA0_M", "0.00005"))  # 0.05 mm quantization floor
-_K = float(os.environ.get("DGS_SIM_ZED_K_M", "0.000477"))          # 0.477 mm/m^2 (measured)
+# Per-pixel axial-noise upper-bound fit to the real ZED-X (ZED/scene_dataset p90,
+# see module doc):  sigma_z(z) = SIGMA0 + K * z^2   [metres]
+_SIGMA0 = float(os.environ.get("DGS_SIM_ZED_SIGMA0_M", "0.00147"))  # 1.47 mm flat term (near-range visible)
+_K = float(os.environ.get("DGS_SIM_ZED_K_M", "0.000500"))          # 0.500 mm/m^2 (p90 upper bound)
 # Random invalid/null-pixel rate (clean-surface holes; edges add more, not modeled).
 _HOLE_RATE = float(os.environ.get("DGS_SIM_ZED_HOLE_RATE", "0.01"))
 # Range gate (metres) — matches online_fusion.py DEPTH_MIN_M / DEPTH_MAX_M

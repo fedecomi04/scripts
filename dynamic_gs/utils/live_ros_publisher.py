@@ -568,7 +568,7 @@ class LivePublisher:
             rotation_thresh_deg=keyframe_rotation_deg,
         )
 
-        # Sim-to-real ZED-X depth-error model (OFF unless DGS_SIM_ZED_NOISE=1).
+        # Sim-to-real ZED-X depth-error model (ON by default; DGS_SIM_ZED_NOISE=0 disables).
         self._zed_noise_rng = np.random.default_rng()
         if _ZED_NOISE.enabled():
             rospy.loginfo("[live] sim ZED-X depth-noise model ENABLED "

@@ -300,6 +300,19 @@ class DynamicGSPipelineBaseConfig(VanillaPipelineConfig):
     observe — bounds cost AND avoids occluded-point bias."""
     feedforward_anysplat_icp_max_iters: int = 30
     feedforward_anysplat_icp_max_dist_m: float = 0.02
+    feedforward_anysplat_icp_target_voxel_m: float = 0.0
+    """Voxel-downsample the frustum-culled scene cloud to this cell size (metres)
+    BEFORE ICP. **OFF by default (0.0 = full-density target = original trusted
+    behaviour).** OPT-IN via env ``DGS_FF_ICP_VOXEL_M`` for A/B. Motivation: the
+    ICP target is the full visible scene (~hundreds of k pts, grows with FF
+    inserts) → the per-iteration nearest-neighbour search (``open3d::core::nns``)
+    was MEASURED at ~52% of dynamic-phase GPU time / 466 ms per FF call
+    (2026-06-16 live profile), starving the tracker on the shared GPU. A
+    rigid-pose ICP doesn't need full density — ~1.5 cm cut ICP 466→82 ms (5.6×)
+    in one test. NOT YET VALIDATED on good data that the coarser target keeps
+    inserts crisp (the test dataset had the wrong/over-noisy depth model), so it
+    stays OFF until an A/B on a clean recording proves a value that's both fast
+    AND accurate; promote that value to the default then."""
     feedforward_anysplat_max_scale_m: float = 0.05
     """Clamp each FF-inserted gaussian's per-axis WORLD scale to <= this (metres).
     A single oversized AnySplat insert (worst far from the camera) otherwise lands
@@ -354,6 +367,11 @@ class DynamicGSPipelineBase(VanillaPipeline):
         # State that subclasses may read in their own __init__ overrides
         # BEFORE super().__init__ runs.
         self._timing: defaultdict[str, list] = defaultdict(list)
+        # torch.profiler (CPU+CUDA op-level), gated by DGS_TORCH_PROFILE=1.
+        # Lazily built on the first dynamic tick (so model/device exist). See
+        # _maybe_torch_profile_step / _finalize_torch_profile.
+        self._torch_profiler = None
+        self._torch_profiler_done = False
         # Fresh timing ledger for this teleop session (the static run already
         # rendered its own to timing_report_static.txt).
         try:
@@ -451,6 +469,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
         atexit.register(self._cleanup_feedforward_video_writer)
         atexit.register(self._save_final_snapshot_if_enabled)
         atexit.register(self._write_timing_report)
+        atexit.register(self._finalize_torch_profile)  # dump profiler even on early kill
         self._final_snapshot_written: bool = False
         self._timing_report_written: bool = False
         # Marks this as the tracker-only dynamic runtime so DynamicGSTrainer
@@ -945,6 +964,7 @@ class DynamicGSPipelineBase(VanillaPipeline):
         3. Return a zero-loss dummy.
         """
         self._dynamic_step_counter += 1
+        self._maybe_torch_profile_step()  # CPU+CUDA op profiler (DGS_TORCH_PROFILE=1)
         self._tracker_tick(step)
         if (
             self.config.feedforward_oneshot_step > 0
@@ -959,6 +979,89 @@ class DynamicGSPipelineBase(VanillaPipeline):
             self._feedforward_oneshot_done = True
         zero = torch.zeros((), device=self.device, requires_grad=True)
         return {}, {"main_loss": zero}, {}
+
+    # ====================================================================
+    # torch.profiler (op-level CPU+CUDA) — gated by DGS_TORCH_PROFILE=1
+    # ====================================================================
+
+    def _maybe_torch_profile_step(self) -> None:
+        """Build (lazily) + step the torch profiler once per dynamic tick.
+
+        Gated by env ``DGS_TORCH_PROFILE=1`` (off by default — zero overhead
+        when unset). Uses a schedule: skip the first ``DGS_TPROF_WAIT`` ticks
+        (warmup / model load), then record ``DGS_TPROF_ACTIVE`` ticks, then
+        emit. Writes a chrome trace + a top-ops table to ``<data>/profiling/``.
+        Stepping past the active window is a cheap no-op, so it's safe to call
+        every tick. CUDA activity is captured cross-thread, so the FF bg
+        thread's kernels show up too."""
+        if os.environ.get("DGS_TORCH_PROFILE", "0") != "1":
+            return
+        if self._torch_profiler_done:
+            return
+        if self._torch_profiler is None:
+            try:
+                from torch.profiler import profile, ProfilerActivity, schedule
+                wait = int(os.environ.get("DGS_TPROF_WAIT", "30"))
+                active = int(os.environ.get("DGS_TPROF_ACTIVE", "120"))
+                self._tprof_wait = wait
+                self._tprof_active = active
+                self._torch_profiler = profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    schedule=schedule(wait=wait, warmup=5, active=active, repeat=1),
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_stack=False,
+                )
+                self._torch_profiler.start()
+                self._tprof_steps = 0
+                CONSOLE.log(
+                    f"[profile] torch.profiler ON — wait {wait} / warmup 5 / "
+                    f"active {active} ticks, then write to <data>/profiling/"
+                )
+            except Exception as exc:  # noqa: BLE001
+                CONSOLE.log(f"[profile] torch.profiler init failed: {exc}")
+                self._torch_profiler_done = True
+                return
+        try:
+            self._torch_profiler.step()
+            self._tprof_steps += 1
+            # wait + warmup + active windows are done -> finalize once.
+            if self._tprof_steps >= (self._tprof_wait + 5 + self._tprof_active):
+                self._finalize_torch_profile()
+        except Exception as exc:  # noqa: BLE001
+            CONSOLE.log(f"[profile] torch.profiler step failed: {exc}")
+            self._torch_profiler_done = True
+
+    def _finalize_torch_profile(self) -> None:
+        """Stop the profiler, dump chrome trace + top-ops tables (CPU + CUDA
+        self-time) to ``<data>/profiling/``. Idempotent."""
+        if self._torch_profiler_done or self._torch_profiler is None:
+            return
+        self._torch_profiler_done = True
+        prof = self._torch_profiler
+        try:
+            prof.stop()
+        except Exception:
+            pass
+        try:
+            out_dir = Path(self.datamanager.config.data) / "profiling"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            trace = out_dir / "dynamic_torch_trace.json"
+            prof.export_chrome_trace(str(trace))
+            ka = prof.key_averages()
+            tables = []
+            tables.append("=== TOP OPS BY CUDA SELF TIME ===")
+            tables.append(ka.table(sort_by="self_cuda_time_total", row_limit=40))
+            tables.append("\n=== TOP OPS BY CPU SELF TIME ===")
+            tables.append(ka.table(sort_by="self_cpu_time_total", row_limit=40))
+            txt = out_dir / "dynamic_torch_profile.txt"
+            txt.write_text("\n".join(tables))
+            CONSOLE.log(
+                f"[profile] torch.profiler written → {txt} (+ chrome trace "
+                f"{trace.name}); open the trace at chrome://tracing or perfetto.dev"
+            )
+        except Exception as exc:  # noqa: BLE001
+            CONSOLE.log(f"[profile] torch.profiler dump failed: {exc}")
 
     def get_training_callbacks(self, training_callback_attributes: TrainingCallbackAttributes):
         """Stash trainer back-ref so the pipeline can force viewer re-renders.
@@ -1546,8 +1649,19 @@ class DynamicGSPipelineBase(VanillaPipeline):
             # Under the model lock: a concurrent FF bg insert re-allocates
             # gauss_params, so an unlocked read tears (instance_ids at the old
             # N vs means at the new N -> IndexError mid-rasterize).
-            with self._viser_lock_ctx():
+            # PROFILING: time how long the tick BLOCKS waiting to acquire the
+            # shared model lock — the FF bg thread holds it for the whole
+            # CDN-render + AnySplat-insert, so this is where the tick stalls
+            # under FF contention (the otherwise-invisible per-tick gap between
+            # DN.3_estimate_total and the measured wall-clock tracker Hz).
+            _t_lock = time.time()
+            lock = self._viser_lock_ctx()
+            lock.acquire()
+            self._timing["DN.3k_model_lock_wait"].append(time.time() - _t_lock)
+            try:
                 self._obj_mask_cache = self.model.render_object_mask(camera)
+            finally:
+                lock.release()
         return self._obj_mask_cache
 
     def _invalidate_object_mask_cache(self) -> None:
@@ -3162,12 +3276,18 @@ class DynamicGSPipelineBase(VanillaPipeline):
 
                 # ICP runs in Open3D Tensor API on CUDA when available.
                 t_icp0 = time.time()
+                _icp_voxel = os.environ.get("DGS_FF_ICP_VOXEL_M")
+                _icp_voxel = (
+                    float(_icp_voxel) if _icp_voxel is not None
+                    else float(self.config.feedforward_anysplat_icp_target_voxel_m)
+                )
                 scene_c2w_refined, icp_info = icp_refine_scene_c2w(
                     sensor_depth_m=sensor_depth_np, scene_c2w=scene_c2w_np,
                     scene_intr=scene_intr,
                     target_xyz_gpu=target_xyz_t,  # GPU tensor in
                     max_iters=int(self.config.feedforward_anysplat_icp_max_iters),
                     max_dist_m=float(self.config.feedforward_anysplat_icp_max_dist_m),
+                    target_voxel_m=_icp_voxel,
                 )
                 self._timing["FF.3a.icp_refine"].append(time.time() - t_icp0)
                 CONSOLE.log(
