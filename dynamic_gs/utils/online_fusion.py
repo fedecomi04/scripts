@@ -297,6 +297,11 @@ class _CpuOnlineFusion:
             T = reg.transformation
         assert reg is not None
         refined = T @ c2w_cv if reg.fitness >= ICP_FITNESS_MIN else c2w_cv
+        if os.environ.get("DGS_FUSION_DEBUG") == "1":
+            dpose = float(np.linalg.norm((refined - c2w_cv)[:3, 3]) * 1000.0)
+            print(f"[fuse-cpu] idx={self.idx} fit={reg.fitness:.3f} "
+                  f"rmse={reg.inlier_rmse*1000:.1f}mm dpose={dpose:.1f}mm "
+                  f"{'FK-fallback' if reg.fitness < ICP_FITNESS_MIN else 'icp'}", flush=True)
         self._integrate(depth_u16, rgb_u8, refined)
         src.transform(refined @ np.linalg.inv(c2w_cv))
         self._pend.append(src)
@@ -399,10 +404,19 @@ class _GpuOnlineFusion:
         frustum = self._slam.voxel_grid.compute_unique_block_coordinates(
             depth_img, self._intrinsic_t, extr_t, DEPTH_SCALE, DEPTH_MAX_M,
         )
+        # trunc_voxel_multiplier MUST be set so the GPU truncation matches the
+        # CPU ScalableTSDFVolume's FIXED TSDF_TRUNC_M. Open3D's default is 8.0
+        # (→ 8×voxel = 16 mm at 2 mm voxel, 24 mm at 3 mm) — 2-3× larger than the
+        # CPU's 8 mm. That over-large truncation smears the SDF along the ray and
+        # carves a spurious 2nd zero-crossing at grazing/far edges → the far-edge
+        # "doubling" that the CPU path never shows (verified 2026-06-16: same
+        # clean depth, CPU clean / GPU doubled, ICP fitness ~1.0 so it's the
+        # integration, not the pose). Match CPU: trunc = TSDF_TRUNC_M.
+        trunc_mult = float(TSDF_TRUNC_M / TSDF_VOXEL_M)
         self._slam.voxel_grid.integrate(
             frustum, depth_img, rgb_img,
             self._intrinsic_t, self._intrinsic_t,
-            extr_t, DEPTH_SCALE, DEPTH_MAX_M,
+            extr_t, DEPTH_SCALE, DEPTH_MAX_M, trunc_mult,
         )
 
     def add_frame(
@@ -430,6 +444,12 @@ class _GpuOnlineFusion:
         T = reg.transformation.cpu().numpy()
         fitness = float(reg.fitness)
         refined = T @ c2w_cv if fitness >= ICP_FITNESS_MIN else c2w_cv
+        if os.environ.get("DGS_FUSION_DEBUG") == "1":
+            dpose = float(np.linalg.norm((refined - c2w_cv)[:3, 3]) * 1000.0)
+            rmse = float(reg.inlier_rmse) * 1000.0
+            print(f"[fuse-gpu] idx={self.idx} fit={fitness:.3f} "
+                  f"rmse={rmse:.1f}mm dpose={dpose:.1f}mm "
+                  f"{'FK-fallback' if fitness < ICP_FITNESS_MIN else 'icp'}", flush=True)
         self._integrate(depth_u16, rgb_u8, refined)
         src.transform(o3c.Tensor((refined @ np.linalg.inv(c2w_cv)).astype(np.float64), o3c.Dtype.Float64))
         self._pend.append(src)
