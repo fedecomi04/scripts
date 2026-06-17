@@ -67,6 +67,18 @@ disjunction (a frame is *redundant* only if it is close in **both** translation
 and rotation) retains viewpoint-diverse frames during slow sweeps while
 suppressing near-duplicates.
 
+**Simulated-sensor noise.** When the workspace is captured in simulation the depth
+sensor returns a noise-free $z$-buffer, which would create a sim-to-real gap. To
+bridge it, the captured depth is corrupted at the publisher by a noise model
+calibrated to our real stereo camera (a ZED&nbsp;X): per-pixel zero-mean axial
+Gaussian noise with depth-dependent standard deviation
+$\sigma_z(z) = \sigma_0 + k\,z^2$ ($\sigma_0 \approx 1.5\,\text{mm}$,
+$k \approx 0.5\,\text{mm/m}^2$, an upper-bound fit to the noisiest real capture),
+plus $\sim$1% random dropouts and a range gate. The model is enabled by default
+and reproduces the grainy, range-dependent character of real stereo depth, so the
+depth filtering and range gating described below are exercised under realistic
+conditions rather than on idealised geometry.
+
 ### 1.2 Incremental Geometric Fusion
 
 The retained keyframes are fused online into a single metric point cloud that
@@ -81,7 +93,7 @@ T^{\text{cv}} = T^{\text{gl}} \cdot \mathrm{diag}(1, -1, -1, 1).
 $$
 
 **Pose refinement (ICP).** For each frame the valid depth pixels
-($0.05\,\text{m} < D_t < 3.0\,\text{m}$) are back-projected to a world-frame point
+($0.05\,\text{m} < D_t < 2.0\,\text{m}$, the working-range cap) are back-projected to a world-frame point
 cloud, decimated (stride 4) and voxel-downsampled at $1\,\text{cm}$, and aligned
 to the running global model by coarse-to-fine **point-to-plane ICP** with
 correspondence thresholds and iteration budgets $\{(5\,\text{cm}, 6),
@@ -96,9 +108,15 @@ training requires no per-image camera-pose optimisation.
 depth (and colour) frame is integrated into a truncated signed-distance field on
 a GPU voxel-block grid with voxel size $2\,\text{mm}$ and truncation $8\,\text{mm}$.
 The global ICP model is re-voxelised and its normals re-estimated every five
-frames. When capture stops, the TSDF is meshed-to-points and exported as the
+frames. Only depth within the $[0.05, 2.0]\,\text{m}$ working range is integrated
+(`depth_trunc` $= 2\,\text{m}$): the $2\,\text{m}$ far cap deliberately excludes
+distant background, both because the real stereo sensor's error grows
+quadratically with range (Section&nbsp;1.1) and to bound the seed Gaussian count.
+When capture stops, the TSDF is meshed-to-points and exported as the
 **seed point cloud** $\mathcal{P}$ (each surface point carrying a fused RGB
-colour).
+colour). The seed is *not* depth-filtered before integration; TSDF's multi-view
+averaging and the millimetre voxel quantisation already suppress the per-frame
+jitter, so explicit filtering would not change the fused surface.
 
 ### 1.3 Density-Adaptive Seed Thinning
 
@@ -155,6 +173,20 @@ exponential moving average of the loss
 below $0.02$ for $8$ consecutive steps (after a $100$-step warm-up), which avoids
 over-spending the budget on trivially-converged scenes while letting harder scenes
 train to the full budget.
+
+The photometric loss is additionally masked to the working depth range: pixels
+whose sensor depth falls outside $(0.05, 2.0]\,\text{m}$ are excluded from the loss
+(the same $2\,\text{m}$ cap as the seed, Section&nbsp;1.2), so colour is never fit
+to distant or no-return pixels where the seed places no Gaussians. Two
+geometry-hygiene steps run alongside training. Because densification is off,
+Splatfacto's own scale pruning never fires, so a periodic callback (every $10$
+steps) **uniformly shrinks** any Gaussian whose largest world-axis exceeds
+$5\,\text{cm}$ down to a $1\,\text{cm}$ target, preserving its shape while removing
+the few oversized splats that smear the sparse far band. At the end of training a
+one-shot **opacity purge** deletes Gaussians with $\mathrm{sigmoid}(\alpha) < 0.05$
+(typically a $25$–$40\%$ reduction with no visible change), leaving a leaner scene
+for the dynamic phase. Both operations subset all six appearance tensors and all
+four identity buffers in lockstep so the per-Gaussian identity stays consistent.
 
 ### 1.5 Object Discovery and Single-View 3D Reconstruction (Phase 0a)
 
@@ -278,7 +310,7 @@ zero), so the scene changes only through the tracker's rigid update and
 feed-forward insertion. This is essential — gradient descent during tracking would
 fight the rigid estimator. Algorithm&nbsp;2 summarises one tick.
 
-### 2.1 Warm Initialisation
+### 2.1 Warm Initialisation and Depth Conditioning
 
 The snapshot `static_state.pt` is loaded, restoring the Gaussian appearance
 parameters and the four identity buffers. One global runtime setting is enforced:
@@ -290,6 +322,20 @@ extraction from $\sim$14&nbsp;ms to several hundred milliseconds per tick. The
 frame source is abstracted so that the same runtime serves both a recorded
 dataset (iterating stored frames) and a live stream (lock-free polling of a
 shared-memory ring buffer fed by the camera-publisher process).
+
+**Depth filtering.** Each incoming depth frame is cleaned by a hole-aware
+$5\times5$ **median** followed by a weight-corrected **bilateral** filter (invalid
+zero-depth pixels are held out so they are never bled into valid neighbours). The
+median removes stereo *flying pixels* — silhouette pixels whose depth jumps to the
+background and would otherwise back-project to a Gaussian floating off the surface
+— and the bilateral pass smooths residual surface jitter while preserving edges.
+The filter is enabled by default. Its placement is rate-aware: in recorded mode it
+is applied once at the batch source, so the tracker *and* the feed-forward decoder
+both consume the cleaned depth; in live mode it is applied **off the tracker
+thread**, at the feed-forward site, so it never adds latency to the tracking loop
+(the tracker there runs on the raw sensor depth, whose per-pixel jitter the robust
+RANSAC solve already tolerates). The static seed is not filtered, for the reason
+given in Section&nbsp;1.2.
 
 ### 2.2 Sparse Feature Tracking
 
@@ -424,7 +470,15 @@ back). A change-detection module (CDN) localises these regions by comparing the
 *rendered* scene to the *live* image at the current camera. The model is rendered
 at the live pose to obtain $\hat{I}_t$; the live image $I_t$ and render are
 compared over the **valid region** only — excluding the gripper (via $M_t$) and
-the tracked object's footprint, both of which are expected to differ. Comparison
+the tracked object's footprint, both of which are expected to differ. A pixel that
+the model renders as empty background (accumulated alpha below $0.5$) is, in
+general, ambiguous: it may be a *fillable hole* — a real near surface the static
+model simply never reconstructed — or *genuine void* beyond the scene. The two are
+disambiguated by the **live sensor depth**: a low-coverage pixel is admitted to
+the change region only when the live depth is a valid near surface
+($0.05$–$3.0\,\text{m}$); true void (zero/sky/out-of-range depth) is gated out. This
+lets the system flag and later fill the workspace surfaces revealed under a lifted
+object without firing spuriously on the empty space above the scene. Comparison
 uses a multi-scale structural-dissimilarity score on the luminance channel, built
 as a three-level pyramid with **coarse-heavy** weights $(0.15, 0.30, 0.55)$ from
 fine to coarse. The coarse weighting is deliberate: the rendered scene is
@@ -435,8 +489,9 @@ texture noise while genuine content changes survive.
 
 Pixels whose dissimilarity exceeds $0.07$ form a raw change mask, which is cleaned
 by morphological closing (radius $10$), opening (radius $3$), and a minimum-area
-connected-component filter ($760\,\text{px}$), then re-intersected with the valid
-region. To prevent a compounding feedback loop — where a few spurious specks are
+connected-component filter ($76\,\text{px}$ at the pooled comparison grid, which
+keeps every component above the area floor rather than only the largest), then
+re-intersected with the valid region. To prevent a compounding feedback loop — where a few spurious specks are
 inserted, render worse on the next tick, and flag a larger region — the cleanup
 returns an **empty** mask rather than the raw mask when cleaning removes
 everything. Finally the dilated object footprint is subtracted, so only true
@@ -460,9 +515,13 @@ AnySplat path the predicted cloud is reprojected into the world frame using the
 *scene* intrinsics (after an ICP refinement of the local scene-to-sensor
 alignment), with per-Gaussian scales enlarged by a factor of $2.0$ and voxel
 de-duplication disabled, a combination tuned to produce gap-free yet smooth fills.
-In the RGB-D path, each masked pixel is instead back-projected to a disc-shaped
-Gaussian oriented by the local depth normal, with depth-discontinuity ("cliff")
-and sensor-leak pixels removed.
+Every inserted batch passes a scale-hygiene filter: any Gaussian whose largest axis
+exceeds $5\,\text{cm}$ is **uniformly shrunk** to that cap (preserving aspect, so
+anisotropic splats are not flattened), which prevents the occasional far/background
+prediction with a huge scale from smearing the scene. In the RGB-D path, each
+masked pixel is instead back-projected to a disc-shaped Gaussian oriented by the
+local depth normal, with depth-discontinuity ("cliff") and sensor-leak pixels
+removed.
 
 The decoded Gaussians are inserted into $\mathcal{G}$ with a reserved instance id
 ($999$), with the object and inserted flags set. This identity makes them
@@ -474,13 +533,20 @@ manipulation proceeds.
 
 ### 2.8 Visualisation
 
-The live scene is streamed to a browser client by pushing Gaussian splat handles
-directly to a client-side WebGL renderer, rather than rasterising server-side.
-Each tick, the object's transformed Gaussians and any newly inserted feed-forward
-Gaussians are pushed to the client, which performs the splatting locally. This
-avoids the server-side render that would otherwise contend with the tracker and
-decoder for the GPU, and decouples viewer interaction (camera motion) from the
-tracking loop.
+The live scene is streamed to a browser client following the server-side
+rasterise-and-push pattern. The browser holds no native splat handles; instead a
+background render thread reads each connected client's 6-DoF camera pose, renders
+the current Gaussian scene server-side (the same rasteriser used for change
+detection), and pushes the resulting full-frame RGB image to that client as a
+background image. One atomic full-frame replacement per push means there is no
+intermediate scene-rebuild state, eliminating the per-write flicker that the
+alternative client-side splat-handle path exhibited (its WebGL renderer remounts
+the canvas on every property write). A shared model lock — held by the pipeline
+around every tracker write and feed-forward insertion, and by the render thread
+around each render — prevents the viewer from observing a half-updated scene. The
+trade-off is that the same GPU now also serves viewer frames; this is acceptable
+because the render is decoupled onto its own thread and only fires while a client
+is connected.
 
 > **Algorithm 2 — Per-Frame Dynamic Update**
 > **Input:** live/recorded frame $(I_t, D_t, M_t, T_t)$, warm scene $\mathcal{G}$, anchor pool $\mathcal{A}$
@@ -512,9 +578,13 @@ tracking loop.
 | TSDF voxel, truncation | fusion grid resolution | $2\,\text{mm}$ / $8\,\text{mm}$ |
 | ICP stages, fitness gate | coarse-to-fine point-to-plane ICP | $\{(5\text{cm},6),(2\text{cm},12)\}$, $0.30$ |
 | $r_{\text{near}},\ v_{\text{far}}$ | adaptive-thin near radius / far voxel | $1\,\text{m}$ / $1\,\text{cm}$ |
+| depth working range | seed + training-mask cap (min / max) | $0.05\,\text{m}$ / $2.0\,\text{m}$ |
+| sim depth noise | $\sigma_0$ / $k$ in $\sigma_z=\sigma_0+kz^2$ | $1.5\,\text{mm}$ / $0.5\,\text{mm/m}^2$ |
+| depth filter | median / bilateral, on by default | $5\times5$ / edge-preserving |
 | static steps, early-stop | Splatfacto budget / EMA loss gate | $500$ / $\bar{\mathcal L}<0.02$ for $8$ |
 | means LR (static / dynamic) | Gaussian-position learning rate | $0$ / $0$ |
 | background colour | render/composite sky colour | $(0.86, 0.92, 1.0)$ |
+| static hygiene | scale-shrink cap / opacity purge | $5\to1\,\text{cm}$ / $\alpha<0.05$ |
 | CLIP gate | count cliff ratio / presence margin | $2.5$ / $0.04$ |
 | NDP | levels / iters / subsample | $3$ / $500$ / $6000$ |
 | cull $\tau$ / in-front band | proximity / occlusion cull | $\max(1.3\bar s, 3\text{mm})$ / $0\,\text{mm}$ |
@@ -522,5 +592,7 @@ tracking loop.
 | RANSAC iters / inlier / min | rigid solve robustness | $32$ / $25\,\text{mm}$ / $12$ |
 | anchor gates | new-anchor rotation / scale | $22.5^\circ$ / $1.3$ |
 | static-hold | window / trans / rot gate | $15$ / $18\,\text{mm}$ / $6^\circ$ |
-| CDN | pyramid weights / threshold / min-area | $(0.15,0.30,0.55)$ / $0.07$ / $760\,\text{px}$ |
+| CDN | pyramid weights / threshold / min-area | $(0.15,0.30,0.55)$ / $0.07$ / $76\,\text{px}$ |
+| CDN coverage gate | live-depth near-surface band | $0.05$–$3.0\,\text{m}$ |
 | feed-forward | cadence / top-$N$ / AnySplat scale | every $10$ ticks / $3$ / $\times 2.0$ |
+| FF insert clamp | max Gaussian axis (uniform shrink) | $5\,\text{cm}$ |
