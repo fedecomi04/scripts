@@ -64,6 +64,7 @@ class DynamicLoop:
         self.on_render = on_render
         self._tick = 0
         self._seeded = False
+        self._filter_depth = bool(getattr(getattr(cfg, "depth", None), "filter_enabled", True))
 
     def _object_mask(self, camera, snap) -> torch.Tensor:
         inst = (snap.buffers["object_instance_ids"][:, 0] == self.d0_id)
@@ -101,7 +102,19 @@ class DynamicLoop:
         cam = camera_from_frame(frame, intr, self.device)
         rgb = _rgb_gpu(frame, self.device)
         depth = _depth_gpu(frame, self.device)
-        keep = torch.from_numpy(np.ascontiguousarray(frame.mask_keep)).to(self.device)
+        keep = torch.from_numpy(np.ascontiguousarray(frame.mask_keep)).to(self.device).float()
+        # Match old recorded path: filter depth (median+bilateral) at the batch source so the
+        # tracker's RANSAC-Kabsch 3D points are clean, and composite the gripper-masked region
+        # with the scene background so the tracker can't lock onto gripper texture.
+        if self._filter_depth:
+            try:
+                from dynamic_gs.utils.depth_filter import filter_depth_torch
+                depth = filter_depth_torch(depth)
+            except Exception:
+                pass
+        km = keep if keep.ndim == 2 else keep[..., 0]
+        bg = self.sm._get_background_color().to(self.device).view(1, 1, -1)
+        rgb = rgb * km[..., None] + bg * (1.0 - km[..., None])
         snap = self.g.snapshot()
         objmask = self._object_mask(cam, snap)
 
