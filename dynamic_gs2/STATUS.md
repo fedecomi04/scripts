@@ -87,6 +87,28 @@ dynamic_gs2/replay_ab.sh "<dataset>" transforms_313_trimmed.json
 dynamic_gs2/resume_live.sh "<dataset>" [--ff]
 ```
 
+## FF-on (AnySplat) — VALIDATED live 2026-06-18
+`view_dynamic.sh --ff` on screwdriver: tracker + AnySplat FF run together, scene 458k→~954k
+/episode (bounded, no crash, resets on loop). Two first-run bugs fixed: `opacity_min` missing
+config field (blocked all inserts) + `write_object_pose` race vs the concurrent FF append
+(stale-snapshot mask padded to current count). Periodic purge (`dynamic_purge_every_n_ff`) is
+OFF by default → the per-episode +496k growth is the "insert much less" tuning lever.
+
+## DESIGN GOAL — any resolution
+The pipeline must work at ANY camera resolution; the ONLY caveat is that a resolution HIGHER
+than the current working one does not guarantee real-time. Mostly satisfied already: processing
+resolution is read dynamically from the SHM header / `transforms.json` intrinsics everywhere
+(camera build, crop-bbox, CDN downsample = `sqrt(H*W)/target_side`, AnySplat un-crop). TO AUDIT:
+`dynamic_viz` render_size + `visualize.py` width (render-output sizes, not processing) + any fixed
+res literals. Smaller-fixes pass: add a 960×600 vs 1920×1200 A/B test.
+
+## Hz note
+View mode is paced at `--fps` (default 10) → the viewer is capped at ~10 Hz for watchability,
+NOT the tracker's real speed. Real tracker throughput (FF off, recorded, no sleep) = **12.78 Hz**,
+≈ the old pipeline's ~10.8–13.8. FF-on tracker Hz under viser+FF GPU contention is unprofiled —
+smaller-fixes pass: profile the tick (depth-filter/gripper-composite/object-mask-render/viser
+contention), don't conflate the `--fps` cap with tracker capability.
+
 ## Honest caveats / known gaps
 - Tracker pose is **functionally** equivalent, not bit-identical (match-set variance +
   crop-bbox source differs: new uses the rendered object-mask bbox, old projected means).
