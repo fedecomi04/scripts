@@ -16,9 +16,9 @@ Track every module as it lands.
 | `config.py` (typed frozen config) | ~335 | ✅ written + test PASSES (#17 sim/real, env overrides, fingerprint, reload whitelist, validation; MethodSpecs deferred to pipeline.py) |
 | `shm_channel.py` (ShmProducer/ShmConsumer lifecycle over frame codec) | ~145 | ✅ written + round-trip/never-unlink/close-safe/stale-reclaim test PASSES |
 | `tests/test_frame.py` + `test_config.py` + `test_shm_channel.py` | ~230 | ✅ all green |
-| **running total (excl tests)** | **~645** | **leaves DONE**; target < 10,000 |
-| `gaussian_set.py` | — | NEXT (core — SSOT + locked surgery + snapshot; adversarial review) |
-| `scene_model.py` | — | TODO (core — WRAP render/train) |
+| `gaussian_set.py` (SSOT — locked surgery + snapshot + insert/cull/pose-write + reload + helpers) | ~290 | ✅ written + CPU test PASSES (vs fake model); adversarial review NEXT |
+| **running total (excl tests)** | **~935** | leaves DONE, core in progress; target < 10,000 |
+| `scene_model.py` | — | NEXT (core — WRAP render/train SplatfactoModel) |
 | static/* dynamic/* pipeline | — | TODO |
 
 > Update this table as each module lands. Re-measure with:
