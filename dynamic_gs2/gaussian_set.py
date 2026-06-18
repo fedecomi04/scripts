@@ -111,7 +111,11 @@ class GaussianSet:
         for name, dt in IDENTITY_BUFFER_SPECS:
             shape = (n, 1)
             self._buffers[name] = torch.zeros(shape, dtype=dt, device=dev)
-            setattr(self._model, name, self._buffers[name])   # accessible as model.<name>
+            # GaussianSet (not the nn.Module) is the SSOT for identity buffers: persistence
+            # goes through state_dict()/reload_from_state_dict() here, NOT model.state_dict()
+            # (static_persist drops model.state_dict()). setattr is only a convenience accessor
+            # (model.<name>); buffers are allocated on the model's device, so no .to() skew.
+            setattr(self._model, name, self._buffers[name])
         self._assert_invariant()
 
     # ----- internal access to the model's live param dict (mutable) -----
@@ -229,8 +233,9 @@ class GaussianSet:
             assert quats_subset.shape[0] == rows, f"quats subset {quats_subset.shape[0]} != {rows}"
             assert torch.isfinite(means_subset).all() and torch.isfinite(quats_subset).all(), "non-finite pose"
             with torch.no_grad():
-                self._params()["means"][mask] = means_subset.to(self._params()["means"].dtype)
-                self._params()["quats"][mask] = quats_subset.to(self._params()["quats"].dtype)
+                mp, qp = self._params()["means"], self._params()["quats"]
+                mp[mask] = means_subset.to(device=mp.device, dtype=mp.dtype)   # device too (adversarial review: cross-device guard)
+                qp[mask] = quats_subset.to(device=qp.device, dtype=qp.dtype)
             self._bump()
             return rows
 

@@ -18,8 +18,9 @@ Track every module as it lands.
 | `tests/test_frame.py` + `test_config.py` + `test_shm_channel.py` | ~230 | ✅ all green |
 | `gaussian_set.py` (SSOT — locked surgery + snapshot + insert/cull/pose-write + reload + helpers) | ~290 | ✅ CPU test PASSES; features_dc contract fixed to (N,3); adversarial review running |
 | `scene_model.py` (WRAP SplatfactoModel — render/object-mask/rebind/phase-LR) | ~185 | ✅ GPU test PASSES: build→render→SSOT-insert→rebind→render→object-mask→cull→render |
-| **running total (excl tests)** | **~1120** | **CORE DONE (WRAP proven)**; target < 10,000 |
-| `adapters_source.py` | — | NEXT (ReplaySource disk→SHM + ROS source + ShmRing reader + camera_from_frame) |
+| `adapters_source.py` (ReplaySource paced/fast + ShmRing + camera_from_frame + Ros1Source spawner) | ~355 | ✅ written + round-trip test PASSES (fast frame-exact + paced thread; camera built) |
+| **running total (excl tests, measured)** | **1474** | **CORE+INGEST DONE**; adversarial review of SSOT clean (0 high/critical); target < 10,000 |
+| `static_*` + `dynamic_*` + `pipeline.py` + helpers | — | NEXT |
 | static/* dynamic/* pipeline | — | TODO |
 
 > Update this table as each module lands. Re-measure with:
