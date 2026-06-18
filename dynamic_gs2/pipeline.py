@@ -231,6 +231,82 @@ def run_recorded_trace(data_dir, cfg, device, out_trace: str, *, ff_enabled: boo
     return summary
 
 
+# --------------------------------------------------------------- recorded VIEW (validate w/ viewer, no sim)
+def run_view_recorded(data_dir, cfg, device, *, transforms_name: str = "transforms.json",
+                      fps: float = 10.0, ff_enabled: bool = False, loop_forever: bool = True,
+                      cache_name: str = static_persist.DEFAULT_CACHE_NAME) -> None:
+    """Replay a recorded dataset through the pipeline at ~fps WITH the viser-direct viewer up,
+    so the operator can orbit and watch the tracker drive the scene — visual validation with
+    NO live sim. Open http://localhost:<viser.port>. Ctrl-C to stop."""
+    from .dynamic_viz import ViserBridge
+    data_dir = Path(data_dir)
+    cache = static_persist.warm_cache_path(data_dir, cache_name)
+    sm, gset, lock = static_persist.build_loaded_scene(cfg, device, cache, phase="dynamic")
+    d0_id = pick_d0_instance_id(gset)
+    ref = ReferenceObjectPose(d0_instance_id=d0_id)
+    tracker = XFeatTracker(device, cfg.tracker, cfg.pose_filter)
+
+    ff = None
+    if ff_enabled:
+        from .dynamic_ff_backends import make_cdn_fn, make_decode_fn, AnysplatHandle
+
+    src = ReplaySource(data_dir, mode="fast", transforms_name=transforms_name)
+    src.attach("dgs2_view_shm")
+    ring = ShmRing("dgs2_view_shm")
+    intr = ring.intrinsics()
+    if ff_enabled:
+        anysplat = AnysplatHandle(device)
+        ff = FeedforwardWorker(gset, lock, cfg.feedforward, cfg.budget,
+                               cdn_fn=make_cdn_fn(sm, lock, cfg, intr),
+                               decode_fn=make_decode_fn(anysplat, cfg, intr))
+    loop = DynamicLoop(sm, gset, lock, tracker, ref, d0_id, cfg, device, ff_worker=ff)
+    loop.tracker_intr = intr
+
+    def render_fn(cam):
+        with lock:
+            rgb, _, _ = sm.render(cam)
+        return rgb
+
+    bridge = ViserBridge(cfg.viser, device=device)
+    bridge.attach(render_fn)
+    frames = src._frames
+    if frames:
+        bridge.set_initial_camera(np.asarray(frames[-1]["transform_matrix"], float))  # operator's final view
+    print(f"[pipeline] VIEW: d0={d0_id}, {gset.num_points} gaussians. Open http://localhost:{cfg.viser.port} and orbit.")
+    dt = 1.0 / max(fps, 0.1)
+    try:
+        while True:
+            src._idx = 0
+            src._seq = 0
+            loop._seeded = False
+            loop._tick = 0
+            ref._ref_means = None
+            while True:
+                fr = src.next_frame()
+                if fr is None:
+                    break
+                ring_fr = ring.peek_latest() or fr
+                row = loop.step(ring_fr)
+                bridge.update_camera_feed(ring_fr.rgb_bgr)
+                bridge.update_tracked_camera(ring_fr.c2w_4x4)
+                bridge.request_render()
+                time.sleep(dt)
+            if not loop_forever:
+                break
+            print("[pipeline] VIEW: episode end — resetting scene + replaying (Ctrl-C to stop)")
+            # reload the SAME gset from the warm cache (keeps render_fn's tensor binding valid
+            # via sm.rebind inside reload); re-seed the tracker on the next frame.
+            static_persist.load_warm_cache(gset, cache, cfg)
+    except KeyboardInterrupt:
+        print("[pipeline] VIEW: stopped")
+    finally:
+        if ff is not None:
+            ff.close()
+        bridge.close()
+        ring.close()
+        src.close()
+
+
 # --------------------------------------------------------------- live driver (operator step 4)
 def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enabled: bool = False,
              max_seconds: Optional[float] = None, cache_name: str = static_persist.DEFAULT_CACHE_NAME,
@@ -260,6 +336,15 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
 
     loop = DynamicLoop(sm, gset, lock, tracker, ref, d0_id, cfg, device, ff_worker=ff)
     loop.tracker_intr = ring.intrinsics()
+
+    from .dynamic_viz import ViserBridge
+    def _render_fn(cam):
+        with lock:
+            rgb, _, _ = sm.render(cam)
+        return rgb
+    bridge = ViserBridge(cfg.viser, device=device)
+    bridge.attach(_render_fn)
+
     print(f"[pipeline] LIVE: d0_instance_id={d0_id}, scene={gset.num_points} gaussians, source={source_kind}")
     last_seq, t0 = -1, time.time()
     try:
@@ -274,11 +359,15 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
                 continue
             last_seq = int(fr.seq)
             loop.step(fr)
+            bridge.update_camera_feed(fr.rgb_bgr)
+            bridge.update_tracked_camera(fr.c2w_4x4)
+            bridge.request_render()
     except KeyboardInterrupt:
         print("[pipeline] LIVE: interrupted by operator")
     finally:
         if ff is not None:
             ff.close()
+        bridge.close()
         ring.close()
         src.close()
         static_persist.save_warm_cache(gset, data_dir, cfg, filename="post_dynamic_state.pt")
@@ -290,21 +379,26 @@ def _main():
     import argparse
     from . import config as _C
     ap = argparse.ArgumentParser(description="dynamic_gs2 dynamic-phase runner")
-    ap.add_argument("--mode", choices=["recorded", "live"], required=True)
+    ap.add_argument("--mode", choices=["recorded", "live", "view"], required=True)
     ap.add_argument("--data", required=True, help="dataset dir (with static_scene/static_state.pt)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--ff", action="store_true", help="enable feedforward (needs AnySplat worker)")
     ap.add_argument("--source", default="live_bridge", help="live source kind (live_bridge|ros1)")
-    ap.add_argument("--transforms", default="transforms.json", help="recorded: transforms json name")
+    ap.add_argument("--transforms", default="transforms.json", help="recorded/view: transforms json name")
     ap.add_argument("--out-trace", default=None, help="recorded: new_trace.jsonl path")
     ap.add_argument("--max-frames", type=int, default=None)
     ap.add_argument("--max-seconds", type=float, default=None)
+    ap.add_argument("--fps", type=float, default=10.0, help="view: replay rate")
+    ap.add_argument("--once", action="store_true", help="view: play once instead of looping")
     args = ap.parse_args()
     cfg = _C.load_runtime_config()
     if args.mode == "recorded":
         out = args.out_trace or str(Path(args.data) / "new_trace.jsonl")
         run_recorded_trace(args.data, cfg, args.device, out, ff_enabled=args.ff,
                            transforms_name=args.transforms, max_frames=args.max_frames)
+    elif args.mode == "view":
+        run_view_recorded(args.data, cfg, args.device, transforms_name=args.transforms,
+                          fps=args.fps, ff_enabled=args.ff, loop_forever=not args.once)
     else:
         run_live(args.data, cfg, args.device, source_kind=args.source,
                  ff_enabled=args.ff, max_seconds=args.max_seconds)

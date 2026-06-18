@@ -70,14 +70,20 @@ code is written and the testable halves are validated; see "Operator next steps"
 
 ## Operator next steps
 ```bash
+# VISUAL VALIDATION with the viser viewer — NO sim needed (replays recorded through the
+# pipeline at ~10fps with the viewer up). Open http://localhost:8081 and orbit:
+dynamic_gs2/view_dynamic.sh "<dataset>" transforms_313_trimmed.json
+#   loops until Ctrl-C; add --once to play once; add --ff for feedforward.
+
+# Non-interactive: side-by-side [live | render] mp4 of the tracking:
+python -m dynamic_gs2.visualize "<dataset>" --transforms transforms_313_trimmed.json
+#   -> <dataset>/dynamic_gs2_viz.mp4
+
 # Recorded A/B (unattended-validated path; FF off):
 dynamic_gs2/replay_ab.sh "<dataset>" transforms_313_trimmed.json
 #   -> writes <dataset>/new_trace.jsonl + prints the old-vs-new verdict
 
-# FF-on recorded (needs AnySplat worker):
-dynamic_gs2/replay_ab.sh "<dataset>" transforms_313_trimmed.json --ff
-
-# LIVE (step 4 — needs the sim up):
+# LIVE (step 4 — needs the sim up; viser viewer auto-starts on :8081):
 dynamic_gs2/resume_live.sh "<dataset>" [--ff]
 ```
 
@@ -85,8 +91,10 @@ dynamic_gs2/resume_live.sh "<dataset>" [--ff]
 - Tracker pose is **functionally** equivalent, not bit-identical (match-set variance +
   crop-bbox source differs: new uses the rendered object-mask bbox, old projected means).
   Endpoint match is the trustworthy signal.
-- `dynamic_viz.py` (viser-direct) is **not yet built** — live runs are headless for now
-  (the render hook is stubbed in DynamicLoop via `on_render`).
+- `dynamic_viz.py` (viser-direct viewer) **IS built** (server-side rasterize + push-image,
+  Inv #9; reuses the proven viser↔OpenGL camera conversion). Verified headless: server binds
+  :8081, scene loads, tracking runs, client connects, no errors. The in-browser image push
+  reuses the validated render path; confirm visually via `view_dynamic.sh`.
 - `Ros1Source` (from-scratch publisher spawner) exists but `LiveBridgeSource` is the
   recommended, proven-reuse live path.
 - The `KeyError: '/dgs_...'` printed at the end of some runs is a benign same-process
