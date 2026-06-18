@@ -1,0 +1,218 @@
+"""pipeline.py — the dynamic-phase orchestrator (god-file).
+
+Wires source -> warm-loaded scene -> tracker -> (optional) FF worker, owns the ONE
+_model_lock and the per-tick DynamicLoop. Recorded + live collapse into one loop fed
+by a FrameSource adapter (ReplaySource or Ros1Source) through the SHM ring.
+
+This module also provides run_recorded_trace(): a headless A/B driver that replays a
+recorded dataset (fast, frame-exact) through the new pipeline and writes a per-tick
+new_trace.jsonl (rigid transform + FF counts) for comparison against the old pipeline's
+old_trace.jsonl (rewrite_spec/VERIFICATION.md).
+"""
+from __future__ import annotations
+
+import json
+import threading
+import time
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+
+from . import static_persist
+from .adapters_source import ReplaySource, ShmRing, camera_from_frame
+from .dynamic_feedforward import FeedforwardDispatch, FeedforwardWorker
+from .dynamic_track import ReferenceObjectPose, TrackerInputs, XFeatTracker
+
+
+# --------------------------------------------------------------- D0 helpers
+def pick_d0_instance_id(gset) -> int:
+    """The tracked object = the most-common non-zero object_instance_id in the loaded scene."""
+    ids = gset.snapshot().buffers["object_instance_ids"][:, 0]
+    nz = ids[ids > 0]
+    if nz.numel() == 0:
+        return -1
+    vals, counts = torch.unique(nz, return_counts=True)
+    return int(vals[int(counts.argmax())].item())
+
+
+def _rgb_gpu(frame, device) -> torch.Tensor:
+    return torch.from_numpy(np.ascontiguousarray(frame.rgb_bgr[..., ::-1])).float().to(device) / 255.0
+
+
+def _depth_gpu(frame, device) -> torch.Tensor:
+    return torch.from_numpy(np.ascontiguousarray(frame.depth_m)).to(device)
+
+
+# --------------------------------------------------------------- the loop
+class DynamicLoop:
+    """Per-tick: tracker tick (render object-mask under lock, track, write pose) + optional FF.
+    Single-threaded driving for the recorded A/B; the FF worker is the only bg thread."""
+
+    def __init__(self, scene_model, gset, lock, tracker, ref_pose, d0_id, cfg, device,
+                 ff_worker: Optional[FeedforwardWorker] = None, on_render=None):
+        self.sm = scene_model
+        self.g = gset
+        self.lock = lock
+        self.tracker = tracker
+        self.ref = ref_pose
+        self.d0_id = d0_id
+        self.cfg = cfg
+        self.device = device
+        self.ff = ff_worker
+        self.on_render = on_render
+        self._tick = 0
+        self._seeded = False
+
+    def _object_mask(self, camera, snap) -> torch.Tensor:
+        inst = (snap.buffers["object_instance_ids"][:, 0] == self.d0_id)
+        with self.lock:
+            return self.sm.render_object_mask(camera, inst)
+
+    @staticmethod
+    def _bbox_from_mask(objmask, pad, W, H):
+        ys, xs = torch.where(objmask)
+        if xs.numel() == 0:
+            return None
+        x0 = max(0, int(xs.min()) - pad); y0 = max(0, int(ys.min()) - pad)
+        x1 = min(W, int(xs.max()) + pad + 1); y1 = min(H, int(ys.max()) + pad + 1)
+        if (x1 - x0) < 16 or (y1 - y0) < 16:
+            return None
+        return x0, y0, x1, y1
+
+    def _crop(self, rgb, depth, keep, objmask, cam, bbox, intr):
+        """Crop rgb/depth/keep/objmask to bbox + rebuild a Cameras with cx/cy shifted
+        (fx/fy unchanged so depth backprojection stays metric). Matches old _crop_for_xfeat."""
+        from nerfstudio.cameras.cameras import Cameras, CameraType
+        x0, y0, x1, y1 = bbox
+        c2w = cam.camera_to_worlds[0] if cam.camera_to_worlds.ndim == 3 else cam.camera_to_worlds
+        cam_c = Cameras(camera_to_worlds=c2w.unsqueeze(0).cpu(),
+                        fx=intr.fx, fy=intr.fy, cx=intr.cx - x0, cy=intr.cy - y0,
+                        width=int(x1 - x0), height=int(y1 - y0),
+                        camera_type=CameraType.PERSPECTIVE).to(self.device)
+        return (rgb[y0:y1, x0:x1].contiguous(), depth[y0:y1, x0:x1].contiguous(),
+                keep[y0:y1, x0:x1].contiguous(), objmask[y0:y1, x0:x1].contiguous(), cam_c)
+
+    def step(self, frame) -> dict:
+        """One tick on a Frame. Returns a trace row (tick, frame_seq, R, t, ok, inliers, ff_*)."""
+        self._tick += 1
+        intr = self.tracker_intr
+        cam = camera_from_frame(frame, intr, self.device)
+        rgb = _rgb_gpu(frame, self.device)
+        depth = _depth_gpu(frame, self.device)
+        keep = torch.from_numpy(np.ascontiguousarray(frame.mask_keep)).to(self.device)
+        snap = self.g.snapshot()
+        objmask = self._object_mask(cam, snap)
+
+        # Crop tracker inputs to the object bbox so XFeat's top_k keypoints land ON the
+        # (small) object instead of being spread over the full 1200p frame (matches old
+        # _object_crop_bbox/_crop_for_xfeat). World-frame R,t is crop-invariant.
+        t_rgb, t_depth, t_keep, t_objmask, t_cam = rgb, depth, keep, objmask, cam
+        if getattr(self.cfg.tracker, "crop_to_object_bbox", True):
+            bbox = self._bbox_from_mask(objmask, int(self.cfg.tracker.crop_padding_px),
+                                        intr.width, intr.height)
+            if bbox is not None:
+                t_rgb, t_depth, t_keep, t_objmask, t_cam = self._crop(
+                    rgb, depth, keep, objmask, cam, bbox, intr)
+
+        inp = TrackerInputs(rgb=t_rgb, depth=t_depth, camera=t_cam, keep_mask=t_keep,
+                            object_mask=t_objmask, stamp_sec=frame.stamp_sec)
+
+        row = {"tick": self._tick, "frame_seq": int(frame.seq), "ff_fired": False,
+               "ff_inserted": 0, "ff_culled": 0}
+        if not self._seeded:
+            self.ref.capture(snap)
+            kept = self.tracker.seed(inp)
+            self._seeded = self.tracker.ready
+            row.update(seed=int(kept), tracking_ok=False,
+                       R=np.eye(3).tolist(), t=[0, 0, 0], inliers=0,
+                       total_gauss=self.g.num_points)
+            return row
+
+        est = self.tracker.track(inp)
+        row["tracking_ok"] = bool(est.success)
+        row["inliers"] = int(est.inlier_count)
+        row["R"] = np.asarray(est.rotation, float).tolist()
+        row["t"] = np.asarray(est.translation, float).reshape(3).tolist()
+        if est.success:
+            out = self.ref.apply(est.rotation, est.translation, snap)
+            if out is not None:
+                ms, qs, mask = out
+                self.g.write_object_pose(ms, qs, mask)
+
+        if self.ff is not None and self.ff.due(self._tick):
+            d = FeedforwardDispatch(
+                seq=int(frame.seq), camera=cam, rgb_bgr=frame.rgb_bgr.copy(),
+                depth_m=depth, object_mask=objmask, gripper_keep=keep,
+                scene_intr={"fl_x": self.tracker_intr.fx, "fl_y": self.tracker_intr.fy,
+                            "cx": self.tracker_intr.cx, "cy": self.tracker_intr.cy,
+                            "w": self.tracker_intr.width, "h": self.tracker_intr.height},
+                d0_instance_id=self.d0_id)
+            row["ff_fired"] = self.ff.dispatch(d)
+        row["ff_inserted"] = int(getattr(self.ff, "last_inserted", 0)) if self.ff else 0
+        row["ff_culled"] = int(getattr(self.ff, "last_culled", 0)) if self.ff else 0
+        row["total_gauss"] = self.g.num_points
+        if self.on_render is not None:
+            self.on_render(cam)
+        return row
+
+
+# --------------------------------------------------------------- recorded A/B driver
+def run_recorded_trace(data_dir, cfg, device, out_trace: str, *, ff_enabled: bool = False,
+                       transforms_name: str = "transforms.json", max_frames: Optional[int] = None,
+                       cache_name: str = static_persist.DEFAULT_CACHE_NAME,
+                       shm_name: str = "dgs_dynamic_gs2_ab") -> dict:
+    """Replay a recorded dataset (fast, frame-exact) through the new pipeline; write a
+    per-tick trace. ff_enabled=False validates the tracker pose path (no AnySplat needed)."""
+    data_dir = Path(data_dir)
+    cache = static_persist.warm_cache_path(data_dir, cache_name)
+    sm, gset, lock = static_persist.build_loaded_scene(cfg, device, cache, phase="dynamic")
+    d0_id = pick_d0_instance_id(gset)
+    ref = ReferenceObjectPose(d0_instance_id=d0_id)
+    tracker = XFeatTracker(device, cfg.tracker, cfg.pose_filter)
+
+    src = ReplaySource(data_dir, mode="fast", transforms_name=transforms_name)
+    src.attach(shm_name)
+    ring = ShmRing(shm_name)
+    intr = ring.intrinsics()
+
+    ff = None
+    if ff_enabled:
+        from .dynamic_ff_backends import make_cdn_fn, make_decode_fn, AnysplatHandle
+        anysplat = AnysplatHandle(device)
+        ff = FeedforwardWorker(gset, lock, cfg.feedforward, cfg.budget,
+                               cdn_fn=make_cdn_fn(sm, lock, cfg, intr),
+                               decode_fn=make_decode_fn(anysplat, cfg, intr))
+
+    loop = DynamicLoop(sm, gset, lock, tracker, ref, d0_id, cfg, device, ff_worker=ff)
+    loop.tracker_intr = intr
+
+    n = 0
+    t0 = time.time()
+    rows = []
+    out = open(out_trace, "w")
+    try:
+        while True:
+            fr = src.next_frame()
+            if fr is None or (max_frames is not None and n >= max_frames):
+                break
+            ring_fr = ring.peek_latest()
+            row = loop.step(ring_fr if ring_fr is not None else fr)
+            out.write(json.dumps(row) + "\n")
+            rows.append(row)
+            n += 1
+        if ff is not None:
+            ff.close()
+    finally:
+        out.close()
+        ring.close()
+        src.close()
+    dt = time.time() - t0
+    ok = sum(1 for r in rows if r.get("tracking_ok"))
+    summary = {"frames": n, "tracking_ok": ok, "final_gauss": gset.num_points,
+               "ff_inserts_total": sum(r["ff_inserted"] for r in rows),
+               "wall_s": round(dt, 1), "hz": round(n / dt, 2) if dt > 0 else 0,
+               "d0_instance_id": d0_id}
+    print(f"[pipeline] recorded trace -> {out_trace}: {summary}")
+    return summary
