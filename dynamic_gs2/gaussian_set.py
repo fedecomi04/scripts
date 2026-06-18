@@ -77,10 +77,10 @@ class GaussTensors:
         assert self.means.shape[1:] == (3,), f"means {self.means.shape}"
         assert self.scales.shape == (n, 3), f"scales {self.scales.shape}"
         assert self.quats.shape == (n, 4), f"quats {self.quats.shape}"
-        # features_dc: (n,1,3) canonical
-        if self.features_dc.dim() == 2:
-            self.features_dc = self.features_dc.unsqueeze(1)
-        assert self.features_dc.shape == (n, 1, 3), f"features_dc {self.features_dc.shape}"
+        # features_dc: (n,3) canonical — matches nerfstudio SplatfactoModel + the old insert path
+        if self.features_dc.dim() == 3 and self.features_dc.shape[1] == 1:
+            self.features_dc = self.features_dc.reshape(n, 3)
+        assert self.features_dc.shape == (n, 3), f"features_dc {self.features_dc.shape}"
         # features_rest: (n, sh_rest_dim, 3); coerce empty/short width
         fr = self.features_rest
         if fr.numel() == 0 or fr.shape[1] != sh_rest_dim:
@@ -334,7 +334,7 @@ def build_default_gauss_tensors(new_xyz, new_rgb, *, sh_degree: int, sh_rest_dim
     n = xyz.shape[0]
     spacing = _knn_mean_dist(xyz)
     log_scales = torch.log(spacing).unsqueeze(1).repeat(1, 3)
-    features_dc = ((rgb - 0.5) / _RGB2SH_C0).reshape(n, 1, 3)
+    features_dc = ((rgb - 0.5) / _RGB2SH_C0).reshape(n, 3)
     features_rest = torch.zeros((n, sh_rest_dim, 3), device=device, dtype=dtype)
     quats = torch.zeros((n, 4), device=device, dtype=dtype); quats[:, 0] = 1.0
     opacities = torch.full((n, 1), -2.1972246, device=device, dtype=dtype)   # logit(0.1)

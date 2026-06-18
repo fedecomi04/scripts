@@ -20,7 +20,7 @@ class FakeSceneModel:
         self.rebind_calls = 0
         g = {}
         g["means"] = torch.nn.Parameter(torch.randn(n, 3))
-        g["features_dc"] = torch.nn.Parameter(torch.randn(n, 1, 3))
+        g["features_dc"] = torch.nn.Parameter(torch.randn(n, 3))
         g["features_rest"] = torch.nn.Parameter(torch.randn(n, sh_rest_dim, 3))
         g["scales"] = torch.nn.Parameter(torch.randn(n, 3))
         g["quats"] = torch.nn.Parameter(torch.randn(n, 4))
@@ -38,7 +38,7 @@ class FakeSceneModel:
 def _mk_tensors(m, sh_rest_dim=15):
     return GaussTensors(
         means=torch.randn(m, 3),
-        features_dc=torch.randn(m, 1, 3),
+        features_dc=torch.randn(m, 3),
         features_rest=torch.randn(m, sh_rest_dim, 3),
         scales=torch.randn(m, 3),
         quats=torch.randn(m, 4),
@@ -146,11 +146,11 @@ def main():
     assert abs(float(torch.sigmoid(gt.opacities[0]) - 0.1)) < 1e-4
 
     # GaussTensors.validate coerces a short features_rest + 1-D opacity
-    bad = GaussTensors(means=torch.randn(4, 3), features_dc=torch.randn(4, 3),
+    bad = GaussTensors(means=torch.randn(4, 3), features_dc=torch.randn(4, 1, 3),
                        features_rest=torch.zeros(4, 0), scales=torch.randn(4, 3),
                        quats=torch.randn(4, 4), opacities=torch.randn(4))
     bad.validate(15)
-    assert bad.features_dc.shape == (4, 1, 3)
+    assert bad.features_dc.shape == (4, 3)   # (n,1,3) coerced to (n,3)
     assert bad.features_rest.shape == (4, 15, 3)
     assert bad.opacities.shape == (4, 1)
 
