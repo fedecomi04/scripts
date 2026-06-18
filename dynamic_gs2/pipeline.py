@@ -229,3 +229,86 @@ def run_recorded_trace(data_dir, cfg, device, out_trace: str, *, ff_enabled: boo
                "d0_instance_id": d0_id}
     print(f"[pipeline] recorded trace -> {out_trace}: {summary}")
     return summary
+
+
+# --------------------------------------------------------------- live driver (operator step 4)
+def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enabled: bool = False,
+             max_seconds: Optional[float] = None, cache_name: str = static_persist.DEFAULT_CACHE_NAME,
+             **source_opts) -> None:
+    """Live dynamic phase: warm-load the scene, open a live source (default the bridge over
+    the proven ROS publisher), and tick the tracker on the freshest SHM frame until shutdown.
+
+    NOTE: requires a live Gazebo/ROS stack — validated by the OPERATOR (pipeline step 4).
+    The recorded path (run_recorded_trace) is the unattended-validated one."""
+    from .adapters_source import open_source
+    data_dir = Path(data_dir)
+    cache = static_persist.warm_cache_path(data_dir, cache_name)
+    sm, gset, lock = static_persist.build_loaded_scene(cfg, device, cache, phase="dynamic")
+    d0_id = pick_d0_instance_id(gset)
+    ref = ReferenceObjectPose(d0_instance_id=d0_id)
+    tracker = XFeatTracker(device, cfg.tracker, cfg.pose_filter)
+
+    ff = None
+    src = open_source(source_kind, shm_name=cfg.shm_name, attach=True, **source_opts)
+    ring = ShmRing(cfg.shm_name)
+    if ff_enabled:
+        from .dynamic_ff_backends import make_cdn_fn, make_decode_fn, AnysplatHandle
+        anysplat = AnysplatHandle(device)
+        ff = FeedforwardWorker(gset, lock, cfg.feedforward, cfg.budget,
+                               cdn_fn=make_cdn_fn(sm, lock, cfg, ring.intrinsics()),
+                               decode_fn=make_decode_fn(anysplat, cfg, ring.intrinsics()))
+
+    loop = DynamicLoop(sm, gset, lock, tracker, ref, d0_id, cfg, device, ff_worker=ff)
+    loop.tracker_intr = ring.intrinsics()
+    print(f"[pipeline] LIVE: d0_instance_id={d0_id}, scene={gset.num_points} gaussians, source={source_kind}")
+    last_seq, t0 = -1, time.time()
+    try:
+        while True:
+            if max_seconds is not None and time.time() - t0 > max_seconds:
+                break
+            fr = ring.peek_latest()
+            if fr is None or int(fr.seq) == last_seq:
+                time.sleep(0.002)
+                if ring.is_shutdown():
+                    break
+                continue
+            last_seq = int(fr.seq)
+            loop.step(fr)
+    except KeyboardInterrupt:
+        print("[pipeline] LIVE: interrupted by operator")
+    finally:
+        if ff is not None:
+            ff.close()
+        ring.close()
+        src.close()
+        static_persist.save_warm_cache(gset, data_dir, cfg, filename="post_dynamic_state.pt")
+        print(f"[pipeline] LIVE: saved post_dynamic_state.pt ({gset.num_points} gaussians)")
+
+
+# --------------------------------------------------------------- CLI
+def _main():
+    import argparse
+    from . import config as _C
+    ap = argparse.ArgumentParser(description="dynamic_gs2 dynamic-phase runner")
+    ap.add_argument("--mode", choices=["recorded", "live"], required=True)
+    ap.add_argument("--data", required=True, help="dataset dir (with static_scene/static_state.pt)")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--ff", action="store_true", help="enable feedforward (needs AnySplat worker)")
+    ap.add_argument("--source", default="live_bridge", help="live source kind (live_bridge|ros1)")
+    ap.add_argument("--transforms", default="transforms.json", help="recorded: transforms json name")
+    ap.add_argument("--out-trace", default=None, help="recorded: new_trace.jsonl path")
+    ap.add_argument("--max-frames", type=int, default=None)
+    ap.add_argument("--max-seconds", type=float, default=None)
+    args = ap.parse_args()
+    cfg = _C.load_runtime_config()
+    if args.mode == "recorded":
+        out = args.out_trace or str(Path(args.data) / "new_trace.jsonl")
+        run_recorded_trace(args.data, cfg, args.device, out, ff_enabled=args.ff,
+                           transforms_name=args.transforms, max_frames=args.max_frames)
+    else:
+        run_live(args.data, cfg, args.device, source_kind=args.source,
+                 ff_enabled=args.ff, max_seconds=args.max_seconds)
+
+
+if __name__ == "__main__":
+    _main()

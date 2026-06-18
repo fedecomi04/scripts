@@ -278,6 +278,75 @@ class Ros1Source:
             self._log_fd = None
 
 
+# --------------------------------------------------------------- live (bridge over proven publisher)
+class LiveBridgeSource:
+    """RECOMMENDED live producer: reuses the proven old ROS publisher + reader
+    (dynamic_gs.utils.live_shm_reader.LiveShmSubscriber, which spawns the validated
+    py3.8 publisher) and FORWARDS each frame into the NEW SHM layout. Zero new
+    rospy/FK/mask/decode code — the entire live stack that already works in production
+    is reused; only the byte layout is bridged. Runs in the dynamic_gs env.
+
+    NOTE: requires a live Gazebo/ROS stack; validated by the OPERATOR (pipeline step 4).
+    """
+
+    def __init__(self, *, old_shm_name: str = "dgs_live_shm", live_root=None,
+                 ready_timeout_s: float = 30.0, **sub_kwargs):
+        self.old_shm_name = old_shm_name
+        self.live_root = live_root
+        self.ready_timeout_s = ready_timeout_s
+        self._sub_kwargs = sub_kwargs
+        self._sub = None
+        self._prod: Optional[ShmProducer] = None
+        self._intr: Optional[Intrinsics] = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+
+    def attach(self, shm_name: str = DEFAULT_SHM_NAME) -> None:
+        from dynamic_gs.utils.live_shm_reader import LiveShmSubscriber
+        kw = dict(shm_name=self.old_shm_name, ready_timeout_s=self.ready_timeout_s, **self._sub_kwargs)
+        if self.live_root is not None:
+            kw["live_root"] = self.live_root
+        self._sub = LiveShmSubscriber(**kw)               # spawns the proven publisher
+        i = self._sub.intrinsics()
+        self._intr = Intrinsics(width=int(i.width), height=int(i.height),
+                                fx=float(i.fx), fy=float(i.fy), cx=float(i.cx), cy=float(i.cy))
+        self._prod = ShmProducer(self._intr, name=shm_name)   # NEW layout
+        self._thread = threading.Thread(target=self._forward, daemon=True)
+        self._thread.start()
+
+    def _forward(self) -> None:
+        last = -1
+        while not self._stop.is_set():
+            lf = self._sub.peek_latest()
+            if lf is None or int(lf.seq) == last:
+                self._stop.wait(0.002)
+                continue
+            last = int(lf.seq)
+            self._prod.write(Frame(seq=int(lf.seq), stamp_sec=float(lf.stamp_sec),
+                                   rgb_bgr=lf.rgb_bgr, depth_m=lf.depth_m,
+                                   mask_keep=lf.mask_keep, c2w_4x4=lf.c2w_4x4))
+
+    def intrinsics(self) -> Intrinsics:
+        if self._intr is None:
+            raise RuntimeError("LiveBridgeSource not attached")
+        return self._intr
+
+    def next_frame(self) -> Optional[Frame]:
+        return None                                       # forwarder thread drives SHM
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        if self._sub is not None:
+            try:
+                self._sub.close()
+            except Exception:
+                pass
+        if self._prod is not None:
+            self._prod.close(unlink=True)
+
+
 # --------------------------------------------------------------- factory
 def open_source(kind: str, data_dir=None, shm_name: str = DEFAULT_SHM_NAME,
                 replay_mode: str = "paced", attach: bool = True, **opts) -> FrameSource:
@@ -286,6 +355,8 @@ def open_source(kind: str, data_dir=None, shm_name: str = DEFAULT_SHM_NAME,
         if data_dir is None:
             raise ValueError("replay source needs data_dir")
         src = ReplaySource(data_dir, mode=replay_mode, **opts)
+    elif kind == "live_bridge":
+        src = LiveBridgeSource(**opts)
     elif kind == "ros1":
         src = Ros1Source(shm_name=shm_name, **opts)
     elif kind == "ros2":
