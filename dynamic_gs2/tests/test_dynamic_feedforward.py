@@ -64,7 +64,9 @@ def _wait_idle(w, timeout=5.0):
 
 def main():
     cfg = C.load_runtime_config()
-    ffc = dataclasses.replace(cfg.feedforward, cadence_ticks=10, insert_id=999)
+    # cull_before_decode off here: the cull needs a real camera+scene+depth (exercised in the
+    # integration/live path); this test validates the worker orchestration with a [True] CDN sentinel.
+    ffc = dataclasses.replace(cfg.feedforward, cadence_ticks=10, insert_id=999, cull_before_decode=False)
 
     # ---- due() gate ----
     g = GaussianSet(FakeModel(100), threading.RLock())

@@ -110,6 +110,7 @@ class FeedforwardConfig:
     voxel_dedup_far_m: float = 0.0
     object_mask_scale: float = 1.02
     object_mask_dilate_px: int = 0
+    cull_before_decode: bool = True   # in-front occlusion cull + CDN reclean before AnySplat decode
     cull_in_front_depth_tol_m: float = 0.0
     crop_pad_px: int = 50
     insert_id: int = 999

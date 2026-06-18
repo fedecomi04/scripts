@@ -23,6 +23,27 @@ from .gaussian_set import GaussTensors
 _H_ANY = _W_ANY = 448            # AnySplat fixed crop resolution
 
 
+def _clean_object_footprint(obj_bool: np.ndarray, scale: float, dilate_px: int) -> np.ndarray:
+    """Enlarge the tracked-object footprint by `scale` about its OWN centroid (+1.02 swallows
+    the rendered-vs-live misplacement ring) then dilate by `dilate_px`. Ported from the old
+    _scale_mask_about_centroid + dilate_binary_mask. Returns a bool mask (H,W)."""
+    import cv2
+    m = obj_bool.astype(np.uint8)
+    if scale is not None and abs(float(scale) - 1.0) > 1e-6:
+        ys, xs = np.where(m > 0)
+        if xs.size:
+            cx, cy = float(xs.mean()), float(ys.mean())
+            H, W = m.shape
+            s = float(scale)
+            M = np.array([[s, 0.0, cx * (1.0 - s)], [0.0, s, cy * (1.0 - s)]], np.float32)
+            warped = cv2.warpAffine(m, M, (W, H), flags=cv2.INTER_NEAREST)
+            m = np.maximum(m, warped)          # union so the enlarged mask CONTAINS the original
+    if dilate_px and dilate_px > 0:
+        k = np.ones((2 * int(dilate_px) + 1, 2 * int(dilate_px) + 1), np.uint8)
+        m = cv2.dilate(m, k)
+    return m > 0
+
+
 def _old_change_mask_config(cm):
     from dynamic_gs.change_detection.change_mask import ChangeMaskConfig as OldCMC
     return OldCMC(
@@ -38,7 +59,8 @@ def make_cdn_fn(scene_model, lock, cfg, intr) -> Callable:
     Renders the scene at the dispatch camera UNDER LOCK; scores MS-SSIM lock-free."""
     from dynamic_gs.change_detection.change_mask import compute_change_mask, resolve_downsample_factor
     old_cfg = _old_change_mask_config(cfg.change_mask)
-    bg = torch.tensor(cfg.background_color, dtype=torch.float32)
+    om_scale = float(cfg.feedforward.object_mask_scale)
+    om_dilate = int(cfg.feedforward.object_mask_dilate_px)
 
     def cdn_fn(d) -> List[np.ndarray]:
         dev = scene_model.device
@@ -55,6 +77,14 @@ def make_cdn_fn(scene_model, lock, cfg, intr) -> Callable:
             keep_largest_only=bool(cfg.change_mask.keep_largest_only))
         m = cdn.squeeze(-1) if cdn.ndim == 3 else cdn
         m_np = m.detach().cpu().numpy().astype(bool)
+        # CLEAN (ported _feedforward_clean_cdn): subtract the tracked object's footprint so FF
+        # never re-decodes a flat copy ONTO the tracked 3D object (the documented churn/smear).
+        if d.object_mask is not None:
+            obj = d.object_mask
+            obj = obj.squeeze(-1) if obj.ndim == 3 else obj
+            obj_np = obj.detach().cpu().numpy() > 0.5
+            obj_np = _clean_object_footprint(obj_np, om_scale, om_dilate)
+            m_np = m_np & ~obj_np
         return [m_np] if m_np.any() else []
 
     return cdn_fn
