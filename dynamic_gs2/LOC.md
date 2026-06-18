@@ -13,9 +13,10 @@ Track every module as it lands.
 | module | LOC | status |
 |---|---:|---|
 | `frame.py` (contract + SHM codec) | ~165 | ✅ written + round-trip test PASSES |
-| `tests/test_frame.py` | ~70 | ✅ green |
-| `config.py` | — | TODO (leaf) |
-| `shm_channel.py` | — | TODO (leaf — producer/consumer lifecycle over frame.py codec) |
+| `config.py` (typed frozen config) | ~335 | ✅ written + test PASSES (#17 sim/real, env overrides, fingerprint, reload whitelist, validation; MethodSpecs deferred to pipeline.py) |
+| `tests/test_frame.py` + `tests/test_config.py` | ~140 | ✅ both green |
+| `shm_channel.py` | — | NEXT (leaf — ShmProducer/ShmConsumer lifecycle over frame.py codec, per D1) |
+| **running total (excl tests)** | **500** | leaves nearly done; target < 10,000 |
 | `gaussian_set.py` | — | TODO (core — SSOT + locked surgery + snapshot) |
 | `scene_model.py` | — | TODO (core — WRAP render/train) |
 | static/* dynamic/* pipeline | — | TODO |

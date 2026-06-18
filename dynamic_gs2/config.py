@@ -1,0 +1,327 @@
+"""config.py — the single typed, frozen, env-overridable runtime config.
+
+Per rewrite_spec/config.md + 00_DECISIONS.md. The ONLY place os.environ is read.
+Every other module receives a frozen sub-config; none reaches back to os.environ.
+Immutable => safe to share read-only across the 3 threads with no lock (Principle #1).
+
+NOTE: the four nerfstudio MethodSpecifications (static-gs / -preseg / dynamic-gs /
+-live) are intentionally NOT here yet — they reference pipeline.py (built last).
+They get added once the orchestrator exists; the old dynamic_gs/ keeps owning the
+entry-points meanwhile, so nothing breaks.
+"""
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import os
+from dataclasses import dataclass, field, replace
+from typing import Tuple
+
+# --- module constants (carried verbatim from dynamic_gs_config.py) -----------
+STATIC_NUM_STEPS = 500
+DEFAULT_DYNAMIC_RECORDED_STEPS = 5000
+DEFAULT_DYNAMIC_LIVE_STEPS = 1_000_000
+
+
+def _envs(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+def _envf(name: str, default: float) -> float:
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def _envi(name: str, default: int) -> int:
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def _envb(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v != "0"
+
+
+# --- typed config trees (frozen; defaults = the shipped values) --------------
+@dataclass(frozen=True)
+class TrackerConfig:
+    top_k: int = 1024
+    ransac_iterations: int = 32
+    lighterglue_depth_confidence: float = -1.0
+    crop_to_object_bbox: bool = True
+    crop_padding_px: int = 150
+    object_mask_filter: bool = True
+    rotation_gate_deg: float = 22.5
+    scale_gate_ratio: float = 1.3
+    scale_select: bool = False
+    static_hold_window: int = 15
+    static_hold_trans_mm: float = 18.0
+    static_hold_rot_deg: float = 6.0
+    min_track_points: int = 12
+
+
+@dataclass(frozen=True)
+class PoseFilterConfig:
+    # VERIFIED tuned params from the old commits (2f5b8d9 -> 7cb4f18), NOT CLAUDE.md's
+    # stale 0.02/0.1. Default OFF to match the old ground-truth pipeline so the
+    # deterministic A/B is apples-to-apples; the operator enables it at the live
+    # (step-4) smoothness eval — the snap-gate handles reacquisition spikes, and
+    # fixed_fps feeds event-time dt so it's rate-invariant (the live-detune fix).
+    enabled: bool = False            # DGS_KF_ENABLED=1 to turn on
+    fixed_fps: float = 9.0           # rate-invariant dt (event-time, never time.time())
+    accel_sigma: float = 0.005       # final tuned (stronger smoothing than the 0.02 doc value)
+    alpha_sigma: float = 0.025       # final tuned
+    meas_trans_mm: float = 20.0
+    meas_rot_deg: float = 10.0
+    snap_trans_m: float = 0.05       # innovation gate: jumps > this are reacquisitions, snap
+    snap_rot_deg: float = 10.0
+
+
+@dataclass(frozen=True)
+class ChangeMaskConfig:
+    downsample_target_side: int = 150
+    rgb_threshold: float = 0.07
+    msssim_pyramid_weights: Tuple[float, float, float] = (0.15, 0.30, 0.55)
+    block_valid_min_frac: float = 0.5
+    min_component_area: int = 76
+    keep_largest_only: bool = False
+    scene_coverage_threshold: float = 0.5
+    live_depth_min_m: float = 0.05
+    live_depth_max_m: float = 3.0
+
+
+@dataclass(frozen=True)
+class FeedforwardConfig:
+    cadence_ticks: int = 10
+    icp_refine: bool = True
+    icp_voxel_m: float = 0.0
+    scale_multiplier: float = 2.0
+    max_scale_m: float = 0.05
+    min_scale_m: float = 0.0
+    voxel_dedup_m: float = 0.0
+    voxel_dedup_far_m: float = 0.0
+    object_mask_scale: float = 1.02
+    object_mask_dilate_px: int = 0
+    cull_in_front_depth_tol_m: float = 0.0
+    crop_pad_px: int = 50
+    insert_id: int = 999
+
+
+@dataclass(frozen=True)
+class GaussianBudgetConfig:
+    live_gaussian_ceiling: int = 2_000_000
+    dynamic_purge_every_n_ff: int = 0
+    dynamic_purge_opacity_below: float = 0.05
+    static_opacity_purge_threshold: float = 0.05
+    static_scale_clamp_max_m: float = 0.05
+    static_scale_reset_value_m: float = 0.01
+    static_scale_clamp_every_n: int = 10
+
+
+@dataclass(frozen=True)
+class DepthConfig:
+    filter_enabled: bool = True
+    median_ksize: int = 5
+    bilateral_sigma_color_m: float = 0.01
+    bilateral_sigma_space: float = 0.0
+    bilateral_d: int = 0
+    depth_min_m: float = 0.05
+    depth_max_m: float = 2.0
+    scene_depth_max_m: float = 2.0   # MUST equal depth_max_m (validated)
+
+
+@dataclass(frozen=True)
+class FusionConfig:
+    device: str = "auto"
+    tsdf_voxel_m: float = 0.002
+    far_voxel_m: float = 0.01
+    near_radius_m: float = 1.0
+    tsdf_trunc_m: float = 0.008
+    defer_tsdf: bool = True
+
+
+@dataclass(frozen=True)
+class SimNoiseConfig:
+    enabled: bool = True             # auto-derived from RuntimeConfig.source (sim->on, real->off)
+    sigma0_m: float = 0.00147
+    k_m: float = 0.000500
+    hole_rate: float = 0.01
+    z_min_m: float = 0.05
+    z_max_m: float = 3.0
+
+
+@dataclass(frozen=True)
+class SegmentationConfig:
+    backend: str = "fastsam"
+    prompt_text: str = ""
+    sam3d_no_trim: bool = False
+    sam3d_registration_backend: str = "ndp"
+    near_surface_max_object_slope_deg: float = 70.0
+    near_surface_window_frac: float = 0.012
+
+
+@dataclass(frozen=True)
+class ViserConfig:
+    enabled: bool = True
+    port: int = 8081
+
+
+@dataclass(frozen=True)
+class StaticTrainConfig:
+    num_steps: int = STATIC_NUM_STEPS
+    early_stop_enabled: bool = True
+    early_stop_loss: float = 0.02
+    early_stop_patience: int = 8
+    early_stop_min_steps: int = 100
+
+
+@dataclass(frozen=True)
+class DebugConfig:
+    enabled: bool = False            # DGS_DEBUG master (off-hot-path sink)
+    ff_debug_images: bool = False
+    fusion_debug: bool = False
+    track_traj_log: bool = False
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    source: str = "sim"              # "sim" | "real"  (#17: sim->noise on, real->off)
+    resolution: Tuple[int, int] = (1920, 1200)
+    background_color: Tuple[float, float, float] = (0.86, 0.92, 1.0)  # Inv #6 DO NOT CHANGE
+    shm_name: str = "dgs_frame_v1"
+    tracker: TrackerConfig = field(default_factory=TrackerConfig)
+    pose_filter: PoseFilterConfig = field(default_factory=PoseFilterConfig)
+    change_mask: ChangeMaskConfig = field(default_factory=ChangeMaskConfig)
+    feedforward: FeedforwardConfig = field(default_factory=FeedforwardConfig)
+    budget: GaussianBudgetConfig = field(default_factory=GaussianBudgetConfig)
+    depth: DepthConfig = field(default_factory=DepthConfig)
+    fusion: FusionConfig = field(default_factory=FusionConfig)
+    sim_noise: SimNoiseConfig = field(default_factory=SimNoiseConfig)
+    segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
+    viser: ViserConfig = field(default_factory=ViserConfig)
+    static_train: StaticTrainConfig = field(default_factory=StaticTrainConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
+
+
+# --- env-override knobs that change at RUNTIME (live A/B, no relaunch) --------
+# Only this whitelist is re-readable via reload_overrides(); everything else is
+# frozen at boot. (#5: keep live tuning for the knobs the operator A/Bs.)
+_RELOAD_WHITELIST = ("DGS_FF_ICP", "DGS_FF_MAX_SCALE_M", "DGS_FF_MIN_SCALE_M",
+                     "DGS_HOLD_WINDOW", "DGS_HOLD_TRANS_MM", "DGS_HOLD_ROT_DEG",
+                     "DGS_KF_ACCEL_SIGMA", "DGS_KF_ALPHA_SIGMA")
+
+
+def load_runtime_config() -> RuntimeConfig:
+    """Build the frozen RuntimeConfig: defaults overlaid with DGS_* env, parsed +
+    validated ONCE. The only place os.environ is read."""
+    source = _envs("DGS_SOURCE", "sim").lower()
+    tracker = TrackerConfig(
+        top_k=_envi("DGS_XFEAT_TOP_K", 1024),
+        scale_select=_envb("DGS_XFEAT_SCALE_SELECT", False),
+        static_hold_window=_envi("DGS_HOLD_WINDOW", 15),
+        static_hold_trans_mm=_envf("DGS_HOLD_TRANS_MM", 18.0),
+        static_hold_rot_deg=_envf("DGS_HOLD_ROT_DEG", 6.0),
+    )
+    pose_filter = PoseFilterConfig(
+        enabled=_envb("DGS_KF_ENABLED", False),
+        accel_sigma=_envf("DGS_KF_ACCEL_SIGMA", 0.005),
+        alpha_sigma=_envf("DGS_KF_ALPHA_SIGMA", 0.025),
+        meas_trans_mm=_envf("DGS_KF_MEAS_TRANS_MM", 20.0),
+        meas_rot_deg=_envf("DGS_KF_MEAS_ROT_DEG", 10.0),
+    )
+    change_mask = ChangeMaskConfig(downsample_target_side=_envi("DGS_CDN_TARGET_SIDE", 150))
+    feedforward = FeedforwardConfig(
+        icp_refine=_envb("DGS_FF_ICP", True),
+        max_scale_m=_envf("DGS_FF_MAX_SCALE_M", 0.05),
+        min_scale_m=_envf("DGS_FF_MIN_SCALE_M", 0.0),
+    )
+    depth_max = _envf("DGS_TSDF_DEPTH_MAX_M", 2.0)
+    depth = DepthConfig(
+        filter_enabled=_envb("DGS_DEPTH_FILTER", True),
+        median_ksize=_envi("DGS_DEPTH_MEDIAN_KSIZE", 5),
+        bilateral_sigma_color_m=_envf("DGS_DEPTH_BILATERAL_SIGMA_COLOR_M", 0.01),
+        depth_max_m=depth_max,
+        scene_depth_max_m=depth_max,                       # kept equal by construction
+    )
+    fusion = FusionConfig(
+        device=_envs("DGS_FUSION_DEVICE", "auto").lower(),
+        tsdf_voxel_m=_envf("DGS_TSDF_VOXEL_M", 0.002),
+        defer_tsdf=_envb("DGS_LIVE_DEFER_TSDF", True),
+    )
+    # #17: sim-noise enabled is DERIVED from source; DGS_SIM_ZED_NOISE can still force off.
+    noise_on = (source == "sim") and _envb("DGS_SIM_ZED_NOISE", True)
+    sim_noise = SimNoiseConfig(
+        enabled=noise_on,
+        sigma0_m=_envf("DGS_SIM_ZED_SIGMA0_M", 0.00147),
+        k_m=_envf("DGS_SIM_ZED_K_M", 0.000500),
+        hole_rate=_envf("DGS_SIM_ZED_HOLE_RATE", 0.01),
+    )
+    segmentation = SegmentationConfig(
+        backend=_envs("DGS_SEGMENTATION_BACKEND", "fastsam"),
+        prompt_text=_envs("DGS_SAM3_PROMPT", ""),
+        sam3d_no_trim=_envb("DGS_SAM3D_NO_TRIM", False),
+    )
+    static_train = StaticTrainConfig(
+        early_stop_enabled=_envb("DGS_STATIC_EARLY_STOP", True),
+        early_stop_loss=_envf("DGS_STATIC_EARLY_STOP_LOSS", 0.02),
+        early_stop_patience=_envi("DGS_STATIC_EARLY_STOP_PATIENCE", 8),
+        early_stop_min_steps=_envi("DGS_STATIC_EARLY_STOP_MIN_STEPS", 100),
+    )
+    debug = DebugConfig(
+        enabled=_envb("DGS_DEBUG", False),
+        ff_debug_images=_envb("DGS_FF_DEBUG", False),
+        fusion_debug=_envb("DGS_FUSION_DEBUG", False),
+        track_traj_log=_envb("DGS_TRACK_TRAJ_LOG", False),
+    )
+    cfg = RuntimeConfig(source=source, tracker=tracker, pose_filter=pose_filter,
+                        change_mask=change_mask, feedforward=feedforward, depth=depth,
+                        fusion=fusion, sim_noise=sim_noise, segmentation=segmentation,
+                        static_train=static_train, debug=debug)
+    _validate(cfg)
+    return cfg
+
+
+def _validate(cfg: RuntimeConfig) -> None:
+    if cfg.source not in ("sim", "real"):
+        raise ValueError("source must be 'sim' or 'real', got %r" % cfg.source)
+    if cfg.depth.scene_depth_max_m != cfg.depth.depth_max_m:
+        raise ValueError("depth.scene_depth_max_m must equal depth.depth_max_m (loss-mask invariant)")
+    if cfg.budget.static_scale_reset_value_m >= cfg.budget.static_scale_clamp_max_m:
+        raise ValueError("static_scale_reset must be BELOW clamp_max (avoid boundary re-trip)")
+    if cfg.source == "real" and cfg.sim_noise.enabled:
+        raise ValueError("sim_noise must be OFF on a real source (would double-noise real depth)")
+    if cfg.background_color != (0.86, 0.92, 1.0):
+        raise ValueError("background_color is Invariant #6 — must stay Gazebo sky")
+
+
+def config_fingerprint(cfg: RuntimeConfig) -> str:
+    """Stable hash of the config tree — stamped into the .pt warm-cache so a load
+    fails loudly on config drift (Principle #8)."""
+    blob = json.dumps(dataclasses.asdict(cfg), sort_keys=True, default=list)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def reload_overrides(cfg: RuntimeConfig) -> RuntimeConfig:
+    """Return a NEW frozen config with ONLY the live-A/B whitelist re-read from env
+    (#5). The caller atomically swaps it in; never mutates in place."""
+    new = replace(cfg,
+                  feedforward=replace(cfg.feedforward,
+                                      icp_refine=_envb("DGS_FF_ICP", cfg.feedforward.icp_refine),
+                                      max_scale_m=_envf("DGS_FF_MAX_SCALE_M", cfg.feedforward.max_scale_m),
+                                      min_scale_m=_envf("DGS_FF_MIN_SCALE_M", cfg.feedforward.min_scale_m)),
+                  tracker=replace(cfg.tracker,
+                                  static_hold_window=_envi("DGS_HOLD_WINDOW", cfg.tracker.static_hold_window),
+                                  static_hold_trans_mm=_envf("DGS_HOLD_TRANS_MM", cfg.tracker.static_hold_trans_mm),
+                                  static_hold_rot_deg=_envf("DGS_HOLD_ROT_DEG", cfg.tracker.static_hold_rot_deg)),
+                  pose_filter=replace(cfg.pose_filter,
+                                      accel_sigma=_envf("DGS_KF_ACCEL_SIGMA", cfg.pose_filter.accel_sigma),
+                                      alpha_sigma=_envf("DGS_KF_ALPHA_SIGMA", cfg.pose_filter.alpha_sigma)))
+    _validate(new)
+    return new
