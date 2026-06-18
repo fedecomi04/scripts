@@ -227,7 +227,14 @@ class GaussianSet:
         with self._lock:
             dev = self.device
             mask = torch.as_tensor(object_mask, device=dev).bool().flatten()
-            assert mask.shape[0] == self.num_points, "object_mask len mismatch"
+            # A concurrent FF insert (bg thread, instance_id=999) may have APPENDED to the tail
+            # since the caller built this mask from an older snapshot. FF only appends and never
+            # touches the tracked rows (id==d0, at the front), so pad the mask tail with False to
+            # the current count — keeps the tracker write race-free under FF growth.
+            n = self.num_points
+            if mask.shape[0] < n:
+                mask = torch.cat([mask, torch.zeros(n - mask.shape[0], dtype=torch.bool, device=dev)])
+            assert mask.shape[0] == n, f"object_mask len {mask.shape[0]} > num_points {n}"
             rows = int(mask.sum().item())
             assert means_subset.shape[0] == rows, f"means subset {means_subset.shape[0]} != {rows}"
             assert quats_subset.shape[0] == rows, f"quats subset {quats_subset.shape[0]} != {rows}"
