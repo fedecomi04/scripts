@@ -281,12 +281,18 @@ def run_view_recorded(data_dir, cfg, device, *, transforms_name: str = "transfor
             loop._seeded = False
             loop._tick = 0
             ref._ref_means = None
+            last_n = gset.num_points
             while True:
                 fr = src.next_frame()
                 if fr is None:
                     break
                 ring_fr = ring.peek_latest() or fr
                 row = loop.step(ring_fr)
+                n_now = int(row.get("total_gauss", last_n))
+                if ff is not None and n_now != last_n:                 # log only REAL scene-count changes
+                    print(f"[FF] tick {row['tick']}: scene {last_n} -> {n_now} "
+                          f"(+{n_now-last_n})", flush=True)
+                    last_n = n_now
                 bridge.update_camera_feed(ring_fr.rgb_bgr)
                 bridge.update_tracked_camera(ring_fr.c2w_4x4)
                 bridge.request_render()

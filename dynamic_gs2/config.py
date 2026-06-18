@@ -102,6 +102,7 @@ class FeedforwardConfig:
     cadence_ticks: int = 10
     icp_refine: bool = True
     icp_voxel_m: float = 0.0
+    opacity_min: float = 0.05        # AnySplat opacity-logit keep floor (reproject)
     scale_multiplier: float = 2.0
     max_scale_m: float = 0.05
     min_scale_m: float = 0.0
