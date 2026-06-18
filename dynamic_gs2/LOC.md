@@ -18,9 +18,14 @@ Track every module as it lands.
 | `tests/test_frame.py` + `test_config.py` + `test_shm_channel.py` | ~230 | ✅ all green |
 | `gaussian_set.py` (SSOT — locked surgery + snapshot + insert/cull/pose-write + reload + helpers) | ~290 | ✅ CPU test PASSES; features_dc contract fixed to (N,3); adversarial review running |
 | `scene_model.py` (WRAP SplatfactoModel — render/object-mask/rebind/phase-LR) | ~185 | ✅ GPU test PASSES: build→render→SSOT-insert→rebind→render→object-mask→cull→render |
-| `adapters_source.py` (ReplaySource paced/fast + ShmRing + camera_from_frame + Ros1Source spawner) | ~355 | ✅ written + round-trip test PASSES (fast frame-exact + paced thread; camera built) |
-| **running total (excl tests, measured)** | **1474** | **CORE+INGEST DONE**; adversarial review of SSOT clean (0 high/critical); target < 10,000 |
-| `static_*` + `dynamic_*` + `pipeline.py` + helpers | — | NEXT |
+| `adapters_source.py` (ReplaySource + ShmRing + camera + LiveBridgeSource + Ros1) | ~415 | ✅ round-trip test |
+| `static_persist.py` (warm-cache + build_loaded_scene) | ~95 | ✅ loads REAL 458k scene + renders + round-trips |
+| `dynamic_track.py` (XFeat WRAP + ReferenceObjectPose) | ~160 | ✅ smoke on real frames + deterministic math |
+| `dynamic_feedforward.py` (FF worker: P0 frozen-dispatch + load-shed) | ~165 | ✅ deterministic test + P0 grep-check |
+| `dynamic_ff_backends.py` (real CDN + AnySplat decode callbacks) | ~165 | ✅ CDN smoke-validated; decode operator-validated |
+| `pipeline.py` (orchestrator + recorded A/B + run_live + CLI) | ~290 | ✅ full episode 312/312 on real screwdriver |
+| `verify/compare_traces.py` (old-vs-new A/B) | ~95 | ✅ FUNCTIONAL EQUIVALENCE (endpoint 1.2mm) |
+| **FINAL total (excl tests, measured)** | **2582** | **DONE — 90.8% cut from 28,003; under 10k target. 9/9 tests green.** |
 | static/* dynamic/* pipeline | — | TODO |
 
 > Update this table as each module lands. Re-measure with:
