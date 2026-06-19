@@ -18,4 +18,9 @@ PY="$HOME/miniconda3/envs/dynamic_gs/bin/python"
 
 cd "$SCRIPTS_DIR"
 export LD_LIBRARY_PATH="$ENV_LIB:${LD_LIBRARY_PATH:-}"
+# Reduce CUDA fragmentation OOMs on the shared GPU (main proc + AnySplat worker contend for one
+# ~16GB card). expandable_segments lets the allocator hand freed memory back so the worker isn't
+# starved of its ~50MB. Read at CUDA init -> MUST be set before python starts. Default-on here;
+# override by exporting PYTORCH_CUDA_ALLOC_CONF before calling this script.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 exec "$PY" -m dynamic_gs2.pipeline --mode view --data "$DATA" --transforms "$TJ" $EXTRA

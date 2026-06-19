@@ -11,6 +11,23 @@ WRAP seam (D2): GaussianSet does the tensor surgery, then calls model.rebind()
 ONCE — scene_model owns optimizer refresh / means-grad re-hook / phase-LR policy
 (it knows nerfstudio internals; GaussianSet does not). GaussianSet never sets LRs
 and never renders.
+
+FREE-LIST (dynamic phase only): the gauss_params tensors are OVER-ALLOCATED to a
+capacity; the `_count` live rows are kept packed at [0:_count]. cull does swap-remove
+(move tail live rows into the deleted holes, _count -= k = O(deleted), no realloc);
+insert writes into the [_count:_count+m] dead region (O(m), no realloc) and only
+reallocs (grows capacity x2) on overflow. EVERY count/identity read slices [:_count]
+so the dead capacity rows [_count:] are invisible to readers, persistence, masks. The
+ONLY consumer that sees the full capacity tensor is the render — scene_model.render
+hands gsplat a [:_count] VIEW so dead rows never rasterize (render stays O(count)).
+Enabled when freelist=True (dynamic phase: LR=0 + no_grad render make the capacity
+Parameter safe); static phase keeps the exact reallocating path (it trains WITH grad).
+
+STABLE GAUSSIAN ID (`gauss_uid` buffer): because swap-remove / insert REORDER rows, no
+consumer may rely on row position being stable across surgeries. Every row carries a unique
+`gauss_uid` (int64) assigned at insert/load and carried through every move. The tracked-object
+correspondence (ReferenceObjectPose) is keyed by THIS uid, not by row index — so reordering is
+harmless.
 """
 from __future__ import annotations
 
@@ -100,12 +117,17 @@ class GaussTensors:
 class GaussianSet:
     """Owns the 6 params + 4 buffers + the ONE chokepoint for all surgery."""
 
-    def __init__(self, model, lock: "threading.RLock") -> None:
+    def __init__(self, model, lock: "threading.RLock", *, freelist: bool = False) -> None:
         self._model = model
         self._lock = lock
         self._version = 0
+        # Free-list: dynamic phase over-allocates + keeps a live `_count` (swap-remove cull /
+        # tail-write insert = O(changed)). Static phase keeps the exact reallocating path.
+        self._freelist = bool(freelist)
         # Adopt the model's gauss_params as the SSOT (same Parameter objects; no copy).
         n = self._params()["means"].shape[0]
+        self._count = n              # live row count; == shape[0] when NOT freelist
+        self._capacity = n           # allocated rows; == _count until an insert grows it
         dev = self.device
         self._buffers: Dict[str, torch.Tensor] = {}
         for name, dt in IDENTITY_BUFFER_SPECS:
@@ -116,6 +138,12 @@ class GaussianSet:
             # (static_persist drops model.state_dict()). setattr is only a convenience accessor
             # (model.<name>); buffers are allocated on the model's device, so no .to() skew.
             setattr(self._model, name, self._buffers[name])
+        # Stable per-row uid (int64): unique + carried through every reorder/insert so the tracked
+        # object can be matched by identity, not row position (ReferenceObjectPose). NOT persisted
+        # (rebuilt fresh each load — the reference is captured at runtime). Lives alongside the
+        # 6 params + 4 buffers and is moved in lockstep by every surgery (_uid_all() helpers).
+        self._uid = torch.arange(n, dtype=torch.long, device=dev).reshape(n, 1)
+        self._next_uid = n
         self._assert_invariant()
 
     # ----- internal access to the model's live param dict (mutable) -----
@@ -128,7 +156,12 @@ class GaussianSet:
 
     @property
     def num_points(self) -> int:
-        return self._params()["means"].shape[0]
+        return self._count       # live rows only; dead capacity rows [_count:] are invisible
+
+    @property
+    def count(self) -> int:
+        """Live row count — scene_model slices gauss_params[:count] for the render."""
+        return self._count
 
     def version(self) -> int:
         return self._version
@@ -139,11 +172,16 @@ class GaussianSet:
 
     # ----- invariant -----
     def _assert_invariant(self) -> None:
-        n = self._params()["means"].shape[0]
+        # All param + buffer tensors share ONE physical length (= capacity); _count <= capacity;
+        # live rows are packed at [0:_count]. (When not freelist, _count == capacity == shape[0].)
+        cap = self._params()["means"].shape[0]
+        assert self._capacity == cap, f"capacity {self._capacity} != means physical len {cap}"
+        assert 0 <= self._count <= cap, f"count {self._count} out of [0,{cap}]"
+        assert self._uid.shape[0] == cap, f"uid len {self._uid.shape[0]} != capacity {cap}"
         for k in PARAM_NAMES:
-            assert self._params()[k].shape[0] == n, f"param {k} len {self._params()[k].shape[0]} != {n}"
+            assert self._params()[k].shape[0] == cap, f"param {k} len {self._params()[k].shape[0]} != {cap}"
         for k in _BUFFER_NAMES:
-            assert self._buffers[k].shape[0] == n, f"buffer {k} len {self._buffers[k].shape[0]} != {n}"
+            assert self._buffers[k].shape[0] == cap, f"buffer {k} len {self._buffers[k].shape[0]} != {cap}"
 
     def _set_param(self, name: str, tensor: torch.Tensor) -> None:
         """Replace a param in the model's dict, preserving requires_grad as a leaf Parameter."""
@@ -160,104 +198,263 @@ class GaussianSet:
     # ----- reads -----
     def snapshot(self) -> GaussianSnapshot:
         with self._lock:
-            params = {k: self._params()[k].detach() for k in PARAM_NAMES}
-            buffers = {k: self._buffers[k].detach() for k in _BUFFER_NAMES}
+            c = self._count
+            params = {k: self._params()[k].detach()[:c] for k in PARAM_NAMES}
+            buffers = {k: self._buffers[k].detach()[:c] for k in _BUFFER_NAMES}
+            buffers["gauss_uid"] = self._uid.detach()[:c]   # stable per-row id (identity-keyed match)
             return GaussianSnapshot(params=params, buffers=buffers,
-                                    num_points=params["means"].shape[0],
-                                    version=self._version)
+                                    num_points=c, version=self._version)
 
     # ----- surgery (all lock + assert invariant at exit) -----
     def cull(self, indices: torch.Tensor, *, protect_mask: Optional[torch.Tensor] = None) -> int:
         with self._lock:
-            n = self.num_points
+            n = self._count
             dev = self.device
             idx = torch.as_tensor(indices, device=dev).long().flatten()
             if idx.numel() == 0:
                 return 0
             idx = idx[(idx >= 0) & (idx < n)].unique()
-            if protect_mask is not None:
+            if protect_mask is not None and idx.numel():
                 pm = torch.as_tensor(protect_mask, device=dev).bool().flatten()
                 assert pm.shape[0] == n, "protect_mask len mismatch"
-                keep_protected = pm[idx]
-                idx = idx[~keep_protected]            # silent-drop protected (spec open-Q#5: safer for FF purge)
+                idx = idx[~pm[idx]]                   # silent-drop protected (spec open-Q#5: safer for FF purge)
             if idx.numel() == 0:
                 return 0
-            keep = torch.ones(n, dtype=torch.bool, device=dev)
-            keep[idx] = False
-            for k in PARAM_NAMES:
-                self._set_param(k, self._params()[k].detach()[keep])
-            for k in _BUFFER_NAMES:
-                self._buffers[k] = self._buffers[k][keep]
+            k = int(idx.numel())
+            if self._freelist:
+                self._cull_swap_remove(idx, n, k)     # O(deleted): no realloc
+            else:
+                keep = torch.ones(n, dtype=torch.bool, device=dev)
+                keep[idx] = False
+                for name in PARAM_NAMES:
+                    self._set_param(name, self._params()[name].detach()[keep])
+                for name in _BUFFER_NAMES:
+                    self._buffers[name] = self._buffers[name][keep]
+                self._uid = self._uid[keep]           # carry stable uids through the cull
+                self._capacity = self._count = n - k
             self._sync_buffer_attr()
             self._model.rebind()
             self._assert_invariant()
             self._bump()
-            return int(idx.numel())
+            return k
+
+    def _cull_swap_remove(self, idx: torch.Tensor, n: int, k: int) -> None:
+        """Swap-remove: move the live rows from the tail [n-k:n] into the holes left by `idx`
+        in the kept region [0:n-k], then drop _count by k. Copies <= k rows (O(deleted)),
+        never reallocates. Live rows stay packed at [0:new_count]; dead rows [new_count:] are
+        left as stale data (invisible to every reader, which slices [:_count]). REORDERS rows —
+        safe because consumers match by gauss_uid (carried below), never by row index."""
+        new_n = n - k
+        dev = self.device
+        del_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+        del_mask[idx] = True
+        holes = idx[idx < new_n]                       # deleted positions that survive the truncation
+        tail = torch.arange(new_n, n, device=dev)      # the k rows about to fall off the end
+        tail_keep = tail[~del_mask[tail]]              # of those, the ones still LIVE -> move them down
+        # |holes| == |tail_keep| by construction (every deleted-in-kept-region hole is backfilled
+        # by a live tail row; deleted tail rows just vanish with the truncation).
+        if holes.numel() > 0:
+            for name in PARAM_NAMES:
+                p = self._params()[name]
+                with torch.no_grad():
+                    p[holes] = p[tail_keep]
+            for name in _BUFFER_NAMES:
+                b = self._buffers[name]
+                b[holes] = b[tail_keep]
+            self._uid[holes] = self._uid[tail_keep]    # carry stable uids through the swap-remove
+        self._count = new_n
 
     def insert(self, tensors: GaussTensors, *, object_flag: float, instance_id: int) -> torch.Tensor:
         with self._lock:
-            old = self.num_points
-            dev, dt = self.device, self._params()["means"].dtype
+            old = self._count
+            dev = self.device
             t = tensors.validate(self.sh_rest_dim)
             add = t.as_dict()
             m = add["means"].shape[0]
-            for k in PARAM_NAMES:
-                cur = self._params()[k].detach()
-                new = add[k].to(device=dev, dtype=cur.dtype)
-                self._set_param(k, torch.cat([cur, new], dim=0))
-            # grow buffers + write identity on the new tail
-            for name, bdt in IDENTITY_BUFFER_SPECS:
-                tail = torch.zeros((m, 1), dtype=bdt, device=dev)
-                if name == "object_flags":
-                    tail.fill_(float(object_flag))
-                elif name == "object_instance_ids":
-                    tail.fill_(int(instance_id))
-                elif name == "inserted_flags":
-                    tail.fill_(1.0)
-                # sam3d_init_target_flags stays 0 (no value-writer, Inv #8)
-                self._buffers[name] = torch.cat([self._buffers[name], tail], dim=0)
+            if m == 0:
+                return torch.arange(old, old, device=dev)
+            id_vals = {"object_flags": float(object_flag),
+                       "object_instance_ids": int(instance_id),
+                       "inserted_flags": 1.0}   # sam3d_init_target_flags stays 0 (Inv #8)
+            if self._freelist:
+                self._insert_tail_write(add, m, id_vals)     # grow-if-needed + write [count:count+m]
+            else:
+                for name in PARAM_NAMES:
+                    cur = self._params()[name].detach()
+                    new = add[name].to(device=dev, dtype=cur.dtype)
+                    self._set_param(name, torch.cat([cur, new], dim=0))
+                for name, bdt in IDENTITY_BUFFER_SPECS:
+                    tail = torch.full((m, 1), id_vals.get(name, 0.0), dtype=bdt, device=dev)
+                    self._buffers[name] = torch.cat([self._buffers[name], tail], dim=0)
+                self._uid = torch.cat([self._uid, self._fresh_uids(m)], dim=0)
+                self._capacity = self._count = old + m
             self._sync_buffer_attr()
             self._model.rebind()
             self._assert_invariant()
             self._bump()
             return torch.arange(old, old + m, device=dev)
 
-    def write_object_pose(self, means_subset: torch.Tensor, quats_subset: torch.Tensor,
-                          object_mask: torch.Tensor) -> int:
+    def _fresh_uids(self, m: int) -> torch.Tensor:
+        """m new globally-unique row ids (monotonic counter, never reused). Shape (m,1) int64."""
+        u = torch.arange(self._next_uid, self._next_uid + m, dtype=torch.long,
+                         device=self.device).reshape(m, 1)
+        self._next_uid += m
+        return u
+
+    def _insert_tail_write(self, add: Dict[str, torch.Tensor], m: int, id_vals: dict) -> None:
+        """Free-list insert core (NO lock/rebind — caller owns those): grow capacity if needed,
+        then write the m new rows into the [count:count+m] dead region + their identity. O(m)."""
+        old = self._count
+        dev = self.device
+        if old + m > self._capacity:
+            self._grow_capacity(old + m)                     # realloc x2 (amortized O(1))
+        for name in PARAM_NAMES:
+            p = self._params()[name]
+            with torch.no_grad():
+                p[old:old + m] = add[name].to(device=dev, dtype=p.dtype)
+        for name, bdt in IDENTITY_BUFFER_SPECS:
+            self._buffers[name][old:old + m] = id_vals.get(name, 0.0)
+        self._uid[old:old + m] = self._fresh_uids(m)         # assign stable ids to the new rows
+        self._count = old + m
+
+    def _grow_capacity(self, need: int) -> None:
+        """Reallocate params + buffers to at least `need` rows (grow x2, amortized O(1) inserts).
+        Copies the live [0:_count] rows into the front of the new storage; rows [_count:] are
+        uninitialized (params: stale/zero — overwritten by the insert; buffers: zero-filled)."""
+        new_cap = max(int(need), self._capacity * 2, 1)
+        dev = self.device
+        c = self._count
+        for name in PARAM_NAMES:
+            cur = self._params()[name].detach()
+            big = torch.zeros((new_cap, *cur.shape[1:]), dtype=cur.dtype, device=dev)
+            big[:c] = cur[:c]
+            self._set_param(name, big)
+        for name, bdt in IDENTITY_BUFFER_SPECS:
+            cur = self._buffers[name]
+            big = torch.zeros((new_cap, 1), dtype=bdt, device=dev)
+            big[:c] = cur[:c]
+            self._buffers[name] = big
+        big_uid = torch.zeros((new_cap, 1), dtype=torch.long, device=dev)
+        big_uid[:c] = self._uid[:c]
+        self._uid = big_uid
+        self._capacity = new_cap
+
+    def cull_and_insert(self, cull_indices: torch.Tensor, tensors: GaussTensors, *,
+                        object_flag: float, instance_id: int,
+                        protect_mask: Optional[torch.Tensor] = None):
+        """ATOMIC cull + insert in ONE locked surgery + ONE rebind. Used by the FF Option-A flow so
+        nothing ever observes a culled-but-not-yet-filled scene (no flicker). _count is written EXACTLY
+        ONCE at the end — even a LOCKLESS num_points poll never sees the cull dip (the render is atomic
+        regardless, since it holds the lock for the whole op). Returns (n_culled, inserted_index_range,
+        in POST-cull coordinates). Free-list: row moves run with _count pinned at its old value."""
         with self._lock:
             dev = self.device
-            mask = torch.as_tensor(object_mask, device=dev).bool().flatten()
-            # A concurrent FF insert (bg thread, instance_id=999) may have APPENDED to the tail
-            # since the caller built this mask from an older snapshot. FF only appends and never
-            # touches the tracked rows (id==d0, at the front), so pad the mask tail with False to
-            # the current count — keeps the tracker write race-free under FF growth.
-            n = self.num_points
-            if mask.shape[0] < n:
-                mask = torch.cat([mask, torch.zeros(n - mask.shape[0], dtype=torch.bool, device=dev)])
-            assert mask.shape[0] == n, f"object_mask len {mask.shape[0]} > num_points {n}"
-            rows = int(mask.sum().item())
-            assert means_subset.shape[0] == rows, f"means subset {means_subset.shape[0]} != {rows}"
-            assert quats_subset.shape[0] == rows, f"quats subset {quats_subset.shape[0]} != {rows}"
-            assert torch.isfinite(means_subset).all() and torch.isfinite(quats_subset).all(), "non-finite pose"
-            with torch.no_grad():
-                mp, qp = self._params()["means"], self._params()["quats"]
-                mp[mask] = means_subset.to(device=mp.device, dtype=mp.dtype)   # device too (adversarial review: cross-device guard)
-                qp[mask] = quats_subset.to(device=qp.device, dtype=qp.dtype)
+            n = self._count
+            idx = torch.as_tensor(cull_indices, device=dev).long().flatten()
+            idx = idx[(idx >= 0) & (idx < n)].unique() if idx.numel() else idx
+            if protect_mask is not None and idx.numel():
+                pm = torch.as_tensor(protect_mask, device=dev).bool().flatten()
+                assert pm.shape[0] == n, "protect_mask len mismatch"
+                idx = idx[~pm[idx]]
+            k = int(idx.numel())
+            t = tensors.validate(self.sh_rest_dim)
+            add = t.as_dict()
+            m = add["means"].shape[0]
+            id_vals = {"object_flags": float(object_flag),
+                       "object_instance_ids": int(instance_id), "inserted_flags": 1.0}
+            new_count = n - k
+            if self._freelist:
+                # 1) swap-remove DATA moves only — _count stays pinned at n until the final write.
+                if k > 0:
+                    del_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+                    del_mask[idx] = True
+                    holes = idx[idx < new_count]
+                    tail = torch.arange(new_count, n, device=dev)
+                    tail_keep = tail[~del_mask[tail]]
+                    if holes.numel() > 0:
+                        for name in PARAM_NAMES:
+                            with torch.no_grad():
+                                self._params()[name][holes] = self._params()[name][tail_keep]
+                        for name in _BUFFER_NAMES:
+                            self._buffers[name][holes] = self._buffers[name][tail_keep]
+                        self._uid[holes] = self._uid[tail_keep]   # carry uids through swap-remove
+                # 2) grow if needed, then write the inserts at [new_count : new_count+m].
+                if new_count + m > self._capacity:
+                    self._grow_capacity(new_count + m)
+                if m > 0:
+                    for name in PARAM_NAMES:
+                        with torch.no_grad():
+                            self._params()[name][new_count:new_count + m] = add[name].to(dev, self._params()[name].dtype)
+                    for name, bdt in IDENTITY_BUFFER_SPECS:
+                        self._buffers[name][new_count:new_count + m] = id_vals.get(name, 0.0)
+                    self._uid[new_count:new_count + m] = self._fresh_uids(m)   # uids for the new rows
+                self._count = new_count + m                    # SINGLE count write (atomic, no dip)
+            else:
+                if k > 0:
+                    keep = torch.ones(n, dtype=torch.bool, device=dev)
+                    keep[idx] = False
+                    for name in PARAM_NAMES:
+                        self._set_param(name, self._params()[name].detach()[keep])
+                    for name in _BUFFER_NAMES:
+                        self._buffers[name] = self._buffers[name][keep]
+                    self._uid = self._uid[keep]
+                if m > 0:
+                    for name in PARAM_NAMES:
+                        cur = self._params()[name].detach()
+                        self._set_param(name, torch.cat([cur, add[name].to(device=dev, dtype=cur.dtype)], dim=0))
+                    for name, bdt in IDENTITY_BUFFER_SPECS:
+                        tail = torch.full((m, 1), id_vals.get(name, 0.0), dtype=bdt, device=dev)
+                        self._buffers[name] = torch.cat([self._buffers[name], tail], dim=0)
+                    self._uid = torch.cat([self._uid, self._fresh_uids(m)], dim=0)
+                self._capacity = self._count = new_count + m
+            self._sync_buffer_attr()
+            self._model.rebind()                              # ONE rebind for the whole atomic op
+            self._assert_invariant()
             self._bump()
-            return rows
+            return k, torch.arange(new_count, new_count + m, device=dev)
+
+    def write_object_pose(self, means_subset: torch.Tensor, quats_subset: torch.Tensor,
+                          subset_uid: torch.Tensor) -> int:
+        """Write the tracked object's transformed pose onto its LIVE rows, matched by stable gauss_uid.
+        subset_uid[i] is the uid the means_subset[i]/quats_subset[i] row belongs to. We resolve uid->row
+        HERE under the lock against the live _uid, so any FF cull/insert/reorder that ran since the caller
+        snapshotted is harmless: a culled uid is simply skipped, and reordering can't misplace the pose."""
+        with self._lock:
+            dev = self.device
+            n = self.num_points
+            want = torch.as_tensor(subset_uid, device=dev).flatten()
+            assert means_subset.shape[0] == want.shape[0], f"means subset {means_subset.shape[0]} != uids {want.shape[0]}"
+            assert quats_subset.shape[0] == want.shape[0], f"quats subset {quats_subset.shape[0]} != uids {want.shape[0]}"
+            assert torch.isfinite(means_subset).all() and torch.isfinite(quats_subset).all(), "non-finite pose"
+            live_uid = self._uid[:n, 0]
+            # row[i] = live index whose uid == want[i]; -1 if that uid was culled since the snapshot.
+            order = torch.argsort(live_uid)
+            pos = torch.searchsorted(live_uid[order], want).clamp(max=n - 1)
+            rows = order[pos]
+            valid = live_uid[rows] == want                       # drop uids no longer present (FF-culled)
+            if not bool(valid.all()):
+                rows, means_subset, quats_subset = rows[valid], means_subset[valid], quats_subset[valid]
+            with torch.no_grad():
+                mp, qp = self._params()["means"][:n], self._params()["quats"][:n]
+                mp[rows] = means_subset.to(device=mp.device, dtype=mp.dtype)
+                qp[rows] = quats_subset.to(device=qp.device, dtype=qp.dtype)
+            self._bump()
+            return int(rows.shape[0])
 
     def set_object_flags(self, mask: torch.Tensor, value: float) -> None:
         with self._lock:
+            c = self._count
             m = torch.as_tensor(mask, device=self.device).bool().flatten()
-            assert m.shape[0] == self.num_points, "mask len mismatch"
-            self._buffers["object_flags"][m] = float(value)
+            assert m.shape[0] == c, "mask len mismatch"
+            self._buffers["object_flags"][:c][m] = float(value)   # [:c] view -> writes the live rows
             self._bump()
 
     def write_instance_ids(self, mask: torch.Tensor, instance_id: int) -> None:
         with self._lock:
+            c = self._count
             m = torch.as_tensor(mask, device=self.device).bool().flatten()
-            assert m.shape[0] == self.num_points, "mask len mismatch"
-            self._buffers["object_instance_ids"][m] = int(instance_id)
+            assert m.shape[0] == c, "mask len mismatch"
+            self._buffers["object_instance_ids"][:c][m] = int(instance_id)   # [:c] view -> live rows
             self._bump()
 
     # ----- warm-cache reload -----
@@ -282,17 +479,24 @@ class GaussianSet:
                     self._buffers[name] = b
                 else:
                     self._buffers[name] = torch.zeros((num_points, 1), dtype=bdt, device=dev)
+            # Reload packs exactly num_points live rows at full capacity (no dead tail yet;
+            # the first freelist insert will over-allocate from here).
+            self._capacity = self._count = num_points
+            self._uid = torch.arange(num_points, dtype=torch.long, device=dev).reshape(num_points, 1)
+            self._next_uid = num_points
             self._sync_buffer_attr()
             self._model.rebind()
             self._assert_invariant()
             self._bump()
 
     def state_dict(self) -> dict:
-        """Detached SSOT export for the warm-cache writer (params + buffers)."""
+        """Detached SSOT export for the warm-cache writer (params + buffers). Exports only the
+        [:count] live rows — dead capacity rows are never persisted."""
         with self._lock:
-            out = {f"gauss_params.{k}": self._params()[k].detach().cpu() for k in PARAM_NAMES}
+            c = self._count
+            out = {f"gauss_params.{k}": self._params()[k].detach()[:c].cpu() for k in PARAM_NAMES}
             for k in _BUFFER_NAMES:
-                out[k] = self._buffers[k].detach().cpu()
+                out[k] = self._buffers[k].detach()[:c].cpu()
             return out
 
 

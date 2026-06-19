@@ -18,11 +18,14 @@ from dynamic_gs2.gaussian_set import GaussianSnapshot
 DATASET = Path("/home/mrc-cuhk/Documents/dynamic_gaussian_splat/data_teleoperation/datasets/screwdriver recorded full")
 
 
-def _fake_snapshot(means, quats, ids):
+def _fake_snapshot(means, quats, ids, uid=None):
+    n = means.shape[0]
+    if uid is None:
+        uid = torch.arange(n, dtype=torch.long)
     return GaussianSnapshot(
         params={"means": means, "quats": quats},
-        buffers={"object_instance_ids": ids.reshape(-1, 1)},
-        num_points=means.shape[0], version=0)
+        buffers={"object_instance_ids": ids.reshape(-1, 1), "gauss_uid": uid.reshape(-1, 1)},
+        num_points=n, version=0)
 
 
 def test_reference_pose():
@@ -35,12 +38,14 @@ def test_reference_pose():
     ref = ReferenceObjectPose(d0_instance_id=5)
     assert ref.capture(snap) == 3
 
-    # identity -> subset unchanged
+    # identity -> subset unchanged. apply() now returns subset_uid (NOT a positional mask): the stable
+    # gauss_uid of each tracked row, in ascending-row order. For this snapshot tracked rows are [0,1,3].
+    bmask = ids == 5
     out = ref.apply(np.eye(3), np.zeros(3), snap)
     assert out is not None
-    ms, qs, mask = out
-    assert mask.tolist() == [True, True, False, True]
-    assert torch.allclose(ms, means[mask], atol=1e-6)
+    ms, qs, subset_uid = out
+    assert subset_uid.tolist() == snap.buffers["gauss_uid"][:, 0][bmask].tolist()
+    assert torch.allclose(ms, means[bmask], atol=1e-6)
 
     # 90deg about z + translation: (1,0,0)->(0,1,0)+t
     Rz = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], np.float32)
@@ -54,7 +59,28 @@ def test_reference_pose():
     quats_grown = torch.cat([quats, quats[:1]], 0)
     ids_grown = torch.cat([ids, torch.tensor([5])], 0)   # 4th tracked row appears
     assert ref.apply(np.eye(3), np.zeros(3), _fake_snapshot(means_grown, quats_grown, ids_grown)) is None
-    print("[dynamic_track] ReferenceObjectPose OK")
+
+    # REORDER-INDEPENDENCE (the Fix-2 guarantee): captured at uids [0,1,3] for the 3 tracked rows;
+    # now hand apply() a snapshot where the SAME data+uids are in a DIFFERENT row order. The result
+    # must still match each gaussian's own rest-pose (matched by uid), not by position.
+    # capture order: tracked rows were means[0]=(1,0,0) uid0, means[1]=(0,1,0) uid1, means[3]=(0,0,1) uid3.
+    # Build a reordered scene: rows = [uid3, id9-filler, uid0, uid1] with means following their uids.
+    re_means = torch.tensor([[0., 0, 1.], [9., 9, 9], [1., 0, 0], [0, 1., 0]])
+    re_quats = torch.tensor([[1., 0, 0, 0]]).repeat(4, 1)
+    re_ids = torch.tensor([5, 9, 5, 5])
+    re_uid = torch.tensor([3, 99, 0, 1])                 # uids preserved, rows permuted
+    snap_re = _fake_snapshot(re_means, re_quats, re_ids, uid=re_uid)
+    out_re = ref.apply(Rz, t, snap_re)
+    assert out_re is not None, "reordered apply must succeed (uid match)"
+    ms_re, _, uid_re = out_re
+    # the masked rows (ascending index) are rows 0,2,3 -> uids [3,0,1]; subset_uid follows that order.
+    assert uid_re.tolist() == [3, 0, 1], uid_re.tolist()
+    # row 0 of the masked output is uid3 = rest (0,0,1) -> Rz@(0,0,1)+t = (0.5,0,1)
+    assert torch.allclose(ms_re[0], torch.tensor([0.5, 0.0, 1.0]), atol=1e-5), ms_re[0]
+    # row 1 (next masked) is uid0 = rest (1,0,0) -> (0.5,1,0); row 2 is uid1=(0,1,0) -> (-0.5,0,0)
+    assert torch.allclose(ms_re[1], torch.tensor([0.5, 1.0, 0.0]), atol=1e-5), ms_re[1]
+    assert torch.allclose(ms_re[2], torch.tensor([-0.5, 0.0, 0.0]), atol=1e-5), ms_re[2]
+    print("[dynamic_track] ReferenceObjectPose OK (uid-keyed, reorder-independent)")
 
 
 def test_xfeat_smoke():

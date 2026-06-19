@@ -90,21 +90,26 @@ def main():
     assert gset.num_points == n - 2
     assert model.rebind_calls == 3
 
-    # write_object_pose: in-place, no count change, values written
+    # write_object_pose: uid-keyed (resolves uid->live row under the lock), in-place, no count change
     n = gset.num_points
-    mask = torch.zeros(n, dtype=torch.bool); mask[0:4] = True
+    uids = gset.snapshot().buffers["gauss_uid"][:, 0][0:4]   # write to the first 4 rows BY uid
     new_means = torch.full((4, 3), 9.0)
     new_quats = torch.tensor([[1.0, 0, 0, 0]]).repeat(4, 1)
-    rows = gset.write_object_pose(new_means, new_quats, mask)
+    rows = gset.write_object_pose(new_means, new_quats, uids)
     assert rows == 4 and gset.num_points == n
     assert torch.allclose(gset._params()["means"][0:4], new_means)
 
     # mismatched subset raises
     try:
-        gset.write_object_pose(torch.zeros(3, 3), torch.zeros(3, 4), mask)
+        gset.write_object_pose(torch.zeros(3, 3), torch.zeros(3, 4), uids)
         raise AssertionError("expected row-count mismatch")
     except AssertionError as e:
         assert "subset" in str(e) or "!=" in str(e)
+
+    # a uid culled since the snapshot is silently skipped (FF-race safety)
+    uids5 = torch.cat([uids, torch.tensor([10_000_000], dtype=uids.dtype)])  # one bogus/absent uid
+    rows = gset.write_object_pose(torch.full((5, 3), 1.0), torch.tensor([[1., 0, 0, 0]]).repeat(5, 1), uids5)
+    assert rows == 4, f"absent uid skipped, wrote {rows} (expected 4)"
 
     # set_object_flags / write_instance_ids in place
     fmask = torch.zeros(gset.num_points, dtype=torch.bool); fmask[5:8] = True

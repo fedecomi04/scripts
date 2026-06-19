@@ -131,29 +131,36 @@ def rotation_matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
 class ReferenceObjectPose:
     """Snapshot the tracked object's D0 means/quats; apply (R,t) -> transformed subset.
 
-    The mask (object_instance_ids == d0_id) is recomputed from the CURRENT snapshot each
-    tick — FF inserts (id=999) append to the tail so the tracked rows keep their indices
-    and the count stays fixed (matches the reference). (old apply_rigid_object_transform_from_reference.)
+    IDENTITY-KEYED (not position-keyed). The GaussianSet free-list REORDERS rows (swap-remove /
+    insert), so row position is NOT stable across ticks. Each tracked row carries a stable `gauss_uid`;
+    capture() stores the reference rest-pose KEYED BY uid, and apply() returns the transformed subset
+    together with each row's uid. write_object_pose then resolves uid->live row under the lock, so the
+    pose always lands on the right gaussian regardless of any reordering.
     """
 
     def __init__(self, d0_instance_id: int):
         self.d0_id = int(d0_instance_id)
         self._ref_means: Optional[torch.Tensor] = None
         self._ref_quats: Optional[torch.Tensor] = None
+        self._ref_uid: Optional[torch.Tensor] = None      # uid of each ref row (same order as _ref_*)
 
     def capture(self, snapshot) -> int:
         ids = snapshot.buffers["object_instance_ids"][:, 0]
         mask = ids == self.d0_id
         c = int(mask.sum().item())
         if c == 0:
-            self._ref_means = self._ref_quats = None
+            self._ref_means = self._ref_quats = self._ref_uid = None
             return 0
         self._ref_means = snapshot.params["means"][mask].detach().clone()
         self._ref_quats = snapshot.params["quats"][mask].detach().clone()
+        self._ref_uid = snapshot.buffers["gauss_uid"][:, 0][mask].detach().clone()
         return c
 
     def apply(self, rotation, translation, snapshot):
-        """-> (means_subset, quats_subset, object_mask) or None if not capturable/mismatched."""
+        """-> (means_subset, quats_subset, subset_uid) or None if not capturable/mismatched.
+        means_subset/quats_subset are the transformed rest-pose; subset_uid[i] is the stable gauss_uid of
+        the gaussian row i belongs to. write_object_pose resolves uid->live row under its own lock, so a
+        concurrent FF cull/insert/reorder between this snapshot and the write can't misplace the pose."""
         if self._ref_means is None:
             return None
         ids = snapshot.buffers["object_instance_ids"][:, 0]
@@ -161,12 +168,24 @@ class ReferenceObjectPose:
         c = int(mask.sum().item())
         if c != self._ref_means.shape[0]:
             return None
-        dev, dt = self._ref_means.device, self._ref_means.dtype
+        cur_uid = snapshot.buffers["gauss_uid"][:, 0][mask]      # uids in current mask order
+        # reorder the reference rows so ref row r corresponds to the gaussian at current row r:
+        # gather[r] = index into _ref_* whose uid == cur_uid[r].
+        dev = self._ref_means.device
+        ref_uid = self._ref_uid.to(cur_uid.device)
+        order = torch.argsort(ref_uid)                          # ref rows sorted by uid
+        pos = torch.searchsorted(ref_uid[order], cur_uid)       # where each cur uid sits in sorted ref
+        if int(pos.max()) >= ref_uid.shape[0] or not torch.equal(ref_uid[order][pos], cur_uid):
+            return None                                         # uid set drifted (shouldn't happen)
+        gather = order[pos].to(dev)                             # ref-row index for each current row
+        ref_means = self._ref_means[gather]
+        ref_quats = self._ref_quats[gather]
+        dt = self._ref_means.dtype
         R = torch.as_tensor(rotation, device=dev, dtype=dt).reshape(3, 3)
         t = torch.as_tensor(translation, device=dev, dtype=dt).reshape(3)
         if not torch.isfinite(R).all() or not torch.isfinite(t).all():
             return None
-        means_sub = self._ref_means @ R.transpose(0, 1) + t[None, :]
+        means_sub = ref_means @ R.transpose(0, 1) + t[None, :]
         dq = rotation_matrix_to_quaternion(R).to(dev).expand(c, -1)
-        quats_sub = _normalize_quats(_quat_mul(dq, self._ref_quats))
-        return means_sub, quats_sub, mask
+        quats_sub = _normalize_quats(_quat_mul(dq, ref_quats))
+        return means_sub, quats_sub, cur_uid.detach().clone()      # uid-keyed, NOT a positional mask

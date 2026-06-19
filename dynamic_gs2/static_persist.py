@@ -86,6 +86,9 @@ def build_loaded_scene(cfg, device, cache_path, *, phase: str = "dynamic",
     seed_xyz, seed_rgb = _read_cache_seed(cache_path)
     sm = SceneModel(cfg, device, seed_xyz=seed_xyz, seed_rgb=seed_rgb, phase=phase)
     sm.attach_render_lock(lock)
-    gset = GaussianSet(sm, lock)
+    freelist = (phase == "dynamic")          # dynamic: LR=0 + no_grad render make the capacity buffer safe
+    gset = GaussianSet(sm, lock, freelist=freelist)
+    if freelist:
+        sm.set_count_provider(lambda: gset.count)   # render [:count] -> dead capacity rows never rasterize
     load_warm_cache(gset, cache_path, cfg=cfg)
     return sm, gset, lock

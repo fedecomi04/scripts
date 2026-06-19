@@ -88,6 +88,54 @@ def main():
     assert torch.isfinite(rgb3).all()
     print(f"[scene_model] cull+rebind+render OK: N={gset.num_points}")
 
+    # ---- FREE-LIST render equivalence: dead capacity rows must NOT affect the image ----
+    # Build a freelist set, insert then cull so live rows < physical capacity (dead tail exists),
+    # render it, and compare to a SEPARATE packed model rendered from the SAME live rows. Equal
+    # image => the [:count] render-slice correctly excludes the dead rows on REAL gsplat.
+    torch.manual_seed(1)
+    fx = (torch.rand(1500, 3) - 0.5) * 0.6
+    fr = torch.rand(1500, 3)
+    sm_f = SceneModel(_Cfg(), device, seed_xyz=fx, seed_rgb=fr, phase="dynamic")
+    lock_f = threading.RLock(); sm_f.attach_render_lock(lock_f)
+    gset_f = GaussianSet(sm_f, lock_f, freelist=True)
+    sm_f.set_count_provider(lambda: gset_f.count)
+    add = build_default_gauss_tensors((torch.rand(500, 3) - 0.5) * 0.6, torch.rand(500, 3),
+                                      sh_degree=3, sh_rest_dim=15, device=device, dtype=torch.float32)
+    gset_f.insert(add, object_flag=1.0, instance_id=9)          # count 2000 (capacity grows x2 on overflow)
+    gset_f.cull(torch.arange(0, 400, device=device))            # count 1600 -> dead tail below capacity
+    phys = sm_f.gauss_params["means"].shape[0]
+    assert gset_f.count == 1600 and phys > 1600, f"dead tail exists (count 1600 < capacity {phys})"
+    with lock_f:
+        rgb_free, _, _ = sm_f.render(cam)
+
+    # packed reference: a fresh model seeded with EXACTLY the 1600 live rows
+    snap_f = gset_f.snapshot()
+    sm_p = SceneModel(_Cfg(), device, seed_xyz=snap_f.params["means"], seed_rgb=torch.rand(1600, 3),
+                      phase="dynamic")
+    lock_p = threading.RLock(); sm_p.attach_render_lock(lock_p)
+    with torch.no_grad():
+        for k in ("means", "features_dc", "features_rest", "scales", "quats", "opacities"):
+            sm_p.gauss_params[k] = torch.nn.Parameter(snap_f.params[k].clone(), requires_grad=False)
+    with lock_p:
+        rgb_packed, _, _ = sm_p.render(cam)
+    max_diff = float((rgb_free - rgb_packed).abs().max())
+    assert max_diff < 1e-4, f"free-list render != packed render (dead rows leaked!) max_diff={max_diff}"
+    print(f"[scene_model] free-list render == packed render OK: dead=400, max_diff={max_diff:.2e}")
+
+    # ---- virtual-hide (FF Option A): hidden rows vanish from the image; unhide restores ----
+    with lock_f:
+        rgb_before, _, _ = sm_f.render(cam)
+    hide = torch.arange(0, 800, device=device)           # hide a chunk of the live rows
+    with lock_f:
+        sm_f.set_hidden_indices(hide)
+        rgb_hidden, _, _ = sm_f.render(cam)
+        sm_f.set_hidden_indices(None)
+        rgb_after, _, _ = sm_f.render(cam)
+    assert float((rgb_before - rgb_hidden).abs().max()) > 1e-3, "hiding 800 rows must change the image"
+    assert float((rgb_before - rgb_after).abs().max()) < 1e-5, "unhide must restore the exact image"
+    assert gset_f.count == 1600, "virtual-hide must NOT delete rows from the SSOT"
+    print(f"[scene_model] virtual-hide OK: hidden changes image, unhide restores, count unchanged")
+
     print("test_scene_model OK")
 
 

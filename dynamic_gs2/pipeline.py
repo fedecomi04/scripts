@@ -151,8 +151,8 @@ class DynamicLoop:
         if est.success:
             out = self.ref.apply(est.rotation, est.translation, snap)
             if out is not None:
-                ms, qs, mask = out
-                self.g.write_object_pose(ms, qs, mask)
+                ms, qs, uids = out                       # uids: stable gauss_uid per subset row (NOT a mask)
+                self.g.write_object_pose(ms, qs, uids)   # resolves uid->live row under the lock (FF-race-safe)
 
         if self.ff is not None and self.ff.due(self._tick):
             d = FeedforwardDispatch(
@@ -195,8 +195,9 @@ def run_recorded_trace(data_dir, cfg, device, out_trace: str, *, ff_enabled: boo
         from .dynamic_ff_backends import make_cdn_fn, make_decode_fn, AnysplatHandle
         anysplat = AnysplatHandle(device)
         ff = FeedforwardWorker(gset, lock, cfg.feedforward, cfg.budget,
-                               cdn_fn=make_cdn_fn(sm, lock, cfg, intr),
-                               decode_fn=make_decode_fn(anysplat, cfg, intr))
+                               cdn_fn=make_cdn_fn(sm, lock, cfg, intr, data_dir=data_dir),
+                               decode_fn=make_decode_fn(anysplat, cfg, intr),
+                               set_hidden_fn=sm.set_hidden_indices)   # Option A: defer cull
 
     loop = DynamicLoop(sm, gset, lock, tracker, ref, d0_id, cfg, device, ff_worker=ff)
     loop.tracker_intr = intr
@@ -257,8 +258,9 @@ def run_view_recorded(data_dir, cfg, device, *, transforms_name: str = "transfor
     if ff_enabled:
         anysplat = AnysplatHandle(device)
         ff = FeedforwardWorker(gset, lock, cfg.feedforward, cfg.budget,
-                               cdn_fn=make_cdn_fn(sm, lock, cfg, intr),
-                               decode_fn=make_decode_fn(anysplat, cfg, intr))
+                               cdn_fn=make_cdn_fn(sm, lock, cfg, intr, data_dir=data_dir),
+                               decode_fn=make_decode_fn(anysplat, cfg, intr),
+                               set_hidden_fn=sm.set_hidden_indices)   # Option A: defer cull
     loop = DynamicLoop(sm, gset, lock, tracker, ref, d0_id, cfg, device, ff_worker=ff)
     loop.tracker_intr = intr
 
@@ -331,14 +333,19 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
     tracker = XFeatTracker(device, cfg.tracker, cfg.pose_filter)
 
     ff = None
+    # The 'replay' source needs the dataset dir (it paces recorded frames into SHM like the live
+    # publisher); pass our resolved data_dir through.
+    if source_kind == "replay":
+        source_opts.setdefault("data_dir", data_dir)
     src = open_source(source_kind, shm_name=cfg.shm_name, attach=True, **source_opts)
     ring = ShmRing(cfg.shm_name)
     if ff_enabled:
         from .dynamic_ff_backends import make_cdn_fn, make_decode_fn, AnysplatHandle
         anysplat = AnysplatHandle(device)
         ff = FeedforwardWorker(gset, lock, cfg.feedforward, cfg.budget,
-                               cdn_fn=make_cdn_fn(sm, lock, cfg, ring.intrinsics()),
-                               decode_fn=make_decode_fn(anysplat, cfg, ring.intrinsics()))
+                               cdn_fn=make_cdn_fn(sm, lock, cfg, ring.intrinsics(), data_dir=data_dir),
+                               decode_fn=make_decode_fn(anysplat, cfg, ring.intrinsics()),
+                               set_hidden_fn=sm.set_hidden_indices)   # Option A: defer cull
 
     loop = DynamicLoop(sm, gset, lock, tracker, ref, d0_id, cfg, device, ff_worker=ff)
     loop.tracker_intr = ring.intrinsics()
@@ -396,8 +403,16 @@ def _main():
     ap.add_argument("--max-seconds", type=float, default=None)
     ap.add_argument("--fps", type=float, default=10.0, help="view: replay rate")
     ap.add_argument("--once", action="store_true", help="view: play once instead of looping")
+    ap.add_argument("--replaced-cull", dest="replaced_cull", action="store_true", default=None,
+                    help="FF: cull the thin slab of old geometry the insert overwrites (caps growth)")
+    ap.add_argument("--no-replaced-cull", dest="replaced_cull", action="store_false",
+                    help="FF: disable the replaced-surface cull (insert-only)")
     args = ap.parse_args()
     cfg = _C.load_runtime_config()
+    if args.replaced_cull is not None:                       # CLI overrides the config/env default
+        import dataclasses as _dc
+        cfg = _dc.replace(cfg, feedforward=_dc.replace(cfg.feedforward,
+                                                        cull_replaced_enabled=bool(args.replaced_cull)))
     if args.mode == "recorded":
         out = args.out_trace or str(Path(args.data) / "new_trace.jsonl")
         run_recorded_trace(args.data, cfg, args.device, out, ff_enabled=args.ff,
@@ -406,8 +421,14 @@ def _main():
         run_view_recorded(args.data, cfg, args.device, transforms_name=args.transforms,
                           fps=args.fps, ff_enabled=args.ff, loop_forever=not args.once)
     else:
+        # 'replay' simulates live: a producer thread paces recorded frames into SHM on their capture
+        # schedule and the tracker reads the freshest (dropping stale frames if it falls behind) —
+        # an honest real-time test without a Gazebo/ROS stack.
+        src_opts = {}
+        if args.source == "replay":
+            src_opts = dict(replay_mode="paced", transforms_name=args.transforms, replay_fps=args.fps)
         run_live(args.data, cfg, args.device, source_kind=args.source,
-                 ff_enabled=args.ff, max_seconds=args.max_seconds)
+                 ff_enabled=args.ff, max_seconds=args.max_seconds, **src_opts)
 
 
 if __name__ == "__main__":

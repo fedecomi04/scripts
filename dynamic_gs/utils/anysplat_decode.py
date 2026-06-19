@@ -68,6 +68,9 @@ class PersistentAnysplatWorker:
         env = os.environ.copy()
         env["LD_LIBRARY_PATH"] = (str(env_prefix / "lib") + ":" + env.get("LD_LIBRARY_PATH", "")).rstrip(":")
         env["PYTHONUNBUFFERED"] = "1"
+        # Shared-GPU fragmentation: the worker contends with the main proc for one card and can OOM
+        # on a 50MB alloc when fragmented. expandable_segments lets the allocator hand memory back.
+        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
         cmd = [
             str(env_python), "-u", str(_WORKER_SCRIPT),

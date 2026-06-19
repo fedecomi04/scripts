@@ -20,6 +20,7 @@ OUT="$DATA/new_trace.jsonl"
 
 cd "$SCRIPTS_DIR"
 export LD_LIBRARY_PATH="$ENV_LIB:${LD_LIBRARY_PATH:-}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"  # shared-GPU defrag
 echo "[replay_ab] new-pipeline replay ($TJ) $FF_FLAG -> $OUT"
 "$PY" -m dynamic_gs2.pipeline --mode recorded --data "$DATA" --transforms "$TJ" --out-trace "$OUT" $FF_FLAG
 echo "[replay_ab] comparing vs old motion logs"

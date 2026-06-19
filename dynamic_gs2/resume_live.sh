@@ -25,5 +25,6 @@ fi
 
 cd "$SCRIPTS_DIR"
 export LD_LIBRARY_PATH="$ENV_LIB:${LD_LIBRARY_PATH:-}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"  # shared-GPU defrag
 echo "[resume_live] LIVE dynamic phase on $DATA  $FF_FLAG"
 exec "$PY" -m dynamic_gs2.pipeline --mode live --data "$DATA" --source live_bridge $FF_FLAG
