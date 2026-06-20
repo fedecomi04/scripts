@@ -666,23 +666,19 @@ def reproject_anysplat_to_scene(
     if not _HAS_CV2:
         raise RuntimeError("cv2 required for sensor depth resize")
 
-    # --- Opacity filter ---
-    opac = 1.0 / (1.0 + np.exp(-opacity_logits))
-    keep = opac >= opacity_min
-    means_canonical = means_canonical[keep]; log_scales = log_scales[keep]; quats_wxyz = quats_wxyz[keep]
-    opacity_logits = opacity_logits[keep]; features_dc = features_dc[keep]; features_rest = features_rest[keep]
-
-    # --- Background-color filter ---
+    # --- Compose ALL discard gates into ONE boolean mask, then slice the six heavy
+    # arrays a SINGLE time. Opacity + background depend only on logits/colour; the
+    # component-mask + sensor-depth gates depend on the pred-pixel projection, which is
+    # cheap (N,3) math run on the full set up-front. Filtering once (instead of opacity,
+    # then bg, then component each re-indexing all six arrays) avoids three redundant
+    # copies of features_rest (N,15,3) — the dominant memory move at ~50k rows.
     SH_C0 = 0.28209479177387814
+    opac = 1.0 / (1.0 + np.exp(-opacity_logits))
     rgb_pred = features_dc * SH_C0 + 0.5
     keep_bg = ~np.all(np.abs(rgb_pred - np.asarray(background_rgb, dtype=np.float32)) <= background_tol, axis=-1)
-    means_canonical = means_canonical[keep_bg]; log_scales = log_scales[keep_bg]; quats_wxyz = quats_wxyz[keep_bg]
-    opacity_logits = opacity_logits[keep_bg]; features_dc = features_dc[keep_bg]; features_rest = features_rest[keep_bg]
-    N = means_canonical.shape[0]
-    if N == 0:
-        return {"xyz": np.empty((0, 3), dtype=np.float32)}
+    keep = (opac >= opacity_min) & keep_bg
 
-    # --- Pred-camera position + pred-pixel for each gaussian ---
+    # --- Pred-camera position + pred-pixel for each gaussian (full set) ---
     pred_c2w_0 = pred_c2w_0.astype(np.float64)
     R_pred = pred_c2w_0[:3, :3]; t_pred = pred_c2w_0[:3, 3]
     p_cam_cv = ((means_canonical - t_pred) @ R_pred).astype(np.float64)
@@ -719,7 +715,7 @@ def reproject_anysplat_to_scene(
         u_scene = (u + crop_left) / crop_scale
         v_scene = (v + crop_top)  / crop_scale
 
-    # --- Sensor depth at FULL scene resolution + per-gauss lookup ---
+    # --- Sensor depth at FULL scene resolution + per-gauss lookup (full set) ---
     Hs, Ws = sensor_depth_m.shape[:2]
     sensor_full = sensor_depth_m.astype(np.float32)
     us_idx = np.clip(np.round(u_scene).astype(np.int64), 0, Ws - 1)
@@ -727,36 +723,35 @@ def reproject_anysplat_to_scene(
     sensor_per_gauss = np.where(in_image, sensor_full[vs_idx, us_idx], 0.0).astype(np.float64)
     valid_sensor = in_image & (sensor_per_gauss > 0.01)
 
-    if drop_no_sensor_depth:
-        keep_d = valid_sensor
-        means_canonical = means_canonical[keep_d]; log_scales = log_scales[keep_d]; quats_wxyz = quats_wxyz[keep_d]
-        opacity_logits = opacity_logits[keep_d]; features_dc = features_dc[keep_d]; features_rest = features_rest[keep_d]
-        u_scene = u_scene[keep_d]; v_scene = v_scene[keep_d]; z_cam = z_cam[keep_d]
-        d_per_gauss = sensor_per_gauss[keep_d]
-        N = means_canonical.shape[0]
-    else:
-        if global_s_fallback is None:
-            global_s_fallback = float(np.median(sensor_per_gauss[valid_sensor] / z_cam[valid_sensor])) if valid_sensor.any() else 1.0
-        d_per_gauss = np.where(valid_sensor, sensor_per_gauss, z_cam * global_s_fallback)
-    if N == 0:
-        return {"xyz": np.empty((0, 3), dtype=np.float32)}
-
-    # --- Optional CDN component mask filter (indexed at SCENE resolution) ---
+    # --- Fold the projection-dependent gates into the same keep mask ---
     if component_mask is not None:
+        # CDN component mask, indexed at SCENE resolution (us_idx/vs_idx reuse the
+        # sensor-lookup pixel indices — same projection, no recompute).
         mask_np = component_mask if isinstance(component_mask, np.ndarray) else np.asarray(component_mask)
         if mask_np.ndim == 3: mask_np = mask_np[..., 0]
         mask_bool = mask_np.astype(np.uint8) > 0
         if mask_bool.shape[:2] != (Hs, Ws):
             mask_bool = cv2.resize(mask_bool.astype(np.uint8), (Ws, Hs), interpolation=cv2.INTER_NEAREST).astype(bool)
-        usc = np.clip(np.round(u_scene).astype(np.int64), 0, Ws - 1)
-        vsc = np.clip(np.round(v_scene).astype(np.int64), 0, Hs - 1)
-        keep_c = mask_bool[vsc, usc]
-        means_canonical = means_canonical[keep_c]; log_scales = log_scales[keep_c]; quats_wxyz = quats_wxyz[keep_c]
-        opacity_logits = opacity_logits[keep_c]; features_dc = features_dc[keep_c]; features_rest = features_rest[keep_c]
-        u_scene = u_scene[keep_c]; v_scene = v_scene[keep_c]; z_cam = z_cam[keep_c]; d_per_gauss = d_per_gauss[keep_c]
-        N = means_canonical.shape[0]
-        if N == 0:
-            return {"xyz": np.empty((0, 3), dtype=np.float32)}
+        keep = keep & mask_bool[vs_idx, us_idx]
+    if drop_no_sensor_depth:
+        keep = keep & valid_sensor
+
+    # --- Apply the composed mask ONCE to every per-gauss array ---
+    means_canonical = means_canonical[keep]; log_scales = log_scales[keep]; quats_wxyz = quats_wxyz[keep]
+    opacity_logits = opacity_logits[keep]; features_dc = features_dc[keep]; features_rest = features_rest[keep]
+    z_cam = z_cam[keep]; u_scene = u_scene[keep]; v_scene = v_scene[keep]
+    sensor_per_gauss = sensor_per_gauss[keep]; valid_sensor = valid_sensor[keep]
+    N = means_canonical.shape[0]
+    if N == 0:
+        return {"xyz": np.empty((0, 3), dtype=np.float32)}
+
+    # --- Per-gauss metric depth: sensor reading where valid, else scaled fallback ---
+    if drop_no_sensor_depth:
+        d_per_gauss = sensor_per_gauss  # only valid-sensor rows survived the keep mask
+    else:
+        if global_s_fallback is None:
+            global_s_fallback = float(np.median(sensor_per_gauss[valid_sensor] / z_cam[valid_sensor])) if valid_sensor.any() else 1.0
+        d_per_gauss = np.where(valid_sensor, sensor_per_gauss, z_cam * global_s_fallback)
 
     # --- Back-project (u_scene, v_scene, d) through FULL SCENE intrinsics ---
     fx_s = float(scene_intr["fl_x"]); fy_s = float(scene_intr["fl_y"])

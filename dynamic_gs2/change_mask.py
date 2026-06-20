@@ -150,10 +150,12 @@ def resolve_downsample_factor(rgb_or_shape, target_side: int) -> int:
 def compute_change_mask(*, rendered_rgb: torch.Tensor, live_rgb: torch.Tensor,
                         rendered_alpha: Optional[torch.Tensor], gt_depth: Optional[torch.Tensor],
                         gripper_keep: Optional[torch.Tensor], object_mask: Optional[torch.Tensor],
-                        cfg, keep_largest_only: bool = False) -> torch.Tensor:
+                        cfg, keep_largest_only: bool = False,
+                        debug_out: Optional[dict] = None) -> torch.Tensor:
     """Single-scale RGB CDN. All RGB (H,W,3) in [0,1]; depth/alpha (H,W) or (H,W,1).
     gripper_keep = KEEP mask (1=keep). object_mask = EXCLUDE mask (1=exclude). cfg = ChangeMaskConfig.
-    Returns (H,W,1) {0,1} float on rendered_rgb's device."""
+    Returns (H,W,1) {0,1} float on rendered_rgb's device. If debug_out (a dict) is given, stashes the
+    per-pixel SSIM dissimilarity `score` (H,W native-res, [0,1]) under key 'score' for a heatmap dump."""
     dev = rendered_rgb.device
     H, W = rendered_rgb.shape[:2]
 
@@ -205,13 +207,16 @@ def compute_change_mask(*, rendered_rgb: torch.Tensor, live_rgb: torch.Tensor,
     score = _ssim_dissim(pg, lg, int(getattr(cfg, "ssim_window", 11)))
     if region is not None:
         score = score * region.float()
+    if debug_out is not None:                             # per-pixel 1-SSIM, upsampled to native for the heatmap
+        s = score[..., None]
+        debug_out["score"] = (_resize_to(s, H, W) if ds > 1 else s)[..., 0].detach()
 
     # ---- 4. threshold + cleanup (close/open/min-area, keep-all or largest) + AND-to-valid
     binary = (torch.isfinite(score) & (score > float(cfg.rgb_threshold))).float()[..., None]
     if valid_use is not None:
         binary = binary * valid_use
-    cleaned = _close(binary, 10)
-    cleaned = _open(cleaned, 3)
+    cleaned = _close(binary, int(getattr(cfg, "morph_close_px", 2)))
+    cleaned = _open(cleaned, int(getattr(cfg, "morph_open_px", 1)))
     cleaned = _keep_components(cleaned, int(cfg.min_component_area), largest_only=keep_largest_only)
     if valid_use is not None:
         cleaned = cleaned * valid_use

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import threading
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -58,6 +59,7 @@ def make_cdn_fn(scene_model, lock, cfg, intr, data_dir=None) -> Callable:
     When cfg.debug.ff_debug_images is on, every CDN render dumps the live RGB / rendered scene / change
     mask (raw + cleaned) to <data_dir>/dynamic_scene/_ff_debug/ for visual inspection."""
     from .change_mask import compute_change_mask
+    from .timing import get_ledger
     cm = cfg.change_mask
     om_scale = float(cfg.feedforward.object_mask_scale)
     om_dilate = int(cfg.feedforward.object_mask_dilate_px)
@@ -67,50 +69,61 @@ def make_cdn_fn(scene_model, lock, cfg, intr, data_dir=None) -> Callable:
     if dbg_dir is not None:
         dbg_dir.mkdir(parents=True, exist_ok=True)
     dbg_n = [0]                                          # CDN-call counter (closure-mutable)
+    tm = get_ledger()
 
     def cdn_fn(d, restrict_to: Optional[np.ndarray] = None) -> List[np.ndarray]:
         dev = scene_model.device
+        # first full CDN -> "cdn.*" steps; region-restricted re-CDN -> "recdn.*" steps.
+        is_recdn = restrict_to is not None
+        render_step = "recdn.render" if is_recdn else "cdn.render"
         restrict_idx = None
-        if restrict_to is not None:
+        if is_recdn:
             ys, xs = np.where(restrict_to)
             if xs.size == 0:
                 return []                                # first region empty -> nothing to re-check
             bbox = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
         with lock:
-            if restrict_to is not None:                  # restrict the render to the changed-region bbox
-                restrict_idx = scene_model.means_in_bbox_idx(d.camera, bbox, pad=pad)
-            rgb_r, _depth_r, alpha_r = scene_model.render(d.camera, restrict_idx=restrict_idx)
+            with tm.stage(render_step):
+                if is_recdn:                             # restrict the render to the changed-region bbox
+                    restrict_idx = scene_model.means_in_bbox_idx(d.camera, bbox, pad=pad)
+                rgb_r, _depth_r, alpha_r = scene_model.render(d.camera, restrict_idx=restrict_idx)
         live_rgb = torch.from_numpy(np.ascontiguousarray(d.rgb_bgr[..., ::-1])).float().to(dev) / 255.0
         gt_depth = d.depth_m if torch.is_tensor(d.depth_m) else torch.from_numpy(d.depth_m).to(dev)
+        dbg_out = {} if dbg_dir is not None else None
         cdn = compute_change_mask(
             rendered_rgb=rgb_r, rendered_alpha=alpha_r, live_rgb=live_rgb, gt_depth=gt_depth,
             gripper_keep=d.gripper_keep, object_mask=d.object_mask, cfg=cm,
-            keep_largest_only=bool(cm.keep_largest_only))
+            keep_largest_only=bool(cm.keep_largest_only), debug_out=dbg_out)
         m = cdn.squeeze(-1) if cdn.ndim == 3 else cdn
         raw_np = m.detach().cpu().numpy().astype(bool)
         m_np = raw_np
-        # CLEAN: subtract the tracked object's footprint so a flat copy is never re-decoded ONTO the
-        # tracked 3D object (which would smear it).
-        if d.object_mask is not None:
-            obj = d.object_mask
-            obj = obj.squeeze(-1) if obj.ndim == 3 else obj
-            obj_np = obj.detach().cpu().numpy() > 0.5
-            obj_np = _clean_object_footprint(obj_np, om_scale, om_dilate)
-            m_np = m_np & ~obj_np
-        if restrict_to is not None:                      # AND-gate: keep ONLY change inside the first region
-            m_np = m_np & restrict_to
+        # CLEAN (first CDN): subtract the tracked object's footprint so a flat copy is never re-decoded
+        # ONTO the tracked 3D object (which would smear it). AND-GATE (re-CDN): intersect with the first
+        # region so change outside the originally-detected area can never be flagged.
+        with tm.stage("recdn.gate" if is_recdn else "cdn.clean"):
+            if d.object_mask is not None:
+                obj = d.object_mask
+                obj = obj.squeeze(-1) if obj.ndim == 3 else obj
+                obj_np = obj.detach().cpu().numpy() > 0.5
+                obj_np = _clean_object_footprint(obj_np, om_scale, om_dilate)
+                m_np = m_np & ~obj_np
+            if is_recdn:                                 # AND-gate: keep ONLY change inside the first region
+                m_np = m_np & restrict_to
         if dbg_dir is not None:
-            _dump_ff_debug(dbg_dir, dbg_n[0], d, rgb_r, raw_np, m_np, restrict_to is not None)
+            with tm.stage("ff_debug.dump"):
+                score = dbg_out.get("score") if dbg_out else None
+                _dump_ff_debug(dbg_dir, dbg_n[0], d, rgb_r, raw_np, m_np, is_recdn, score=score)
             dbg_n[0] += 1
         return [m_np] if m_np.any() else []
 
     return cdn_fn
 
 
-def _dump_ff_debug(dbg_dir, n, d, rgb_r, raw_mask, clean_mask, is_recdn) -> None:
+def _dump_ff_debug(dbg_dir, n, d, rgb_r, raw_mask, clean_mask, is_recdn, score=None) -> None:
     """Write one CDN call's images for visual inspection (when cfg.debug.ff_debug_images is on):
-    live RGB, rendered scene, raw change mask, cleaned change mask. `cdnB` = the second (region-
-    restricted, AND-gated) re-CDN; `cdnA` = the first full CDN. Numbered so they sort in call order."""
+    live RGB, rendered scene, the per-pixel SSIM-dissimilarity HEATMAP (continuous, before threshold),
+    raw change mask, cleaned change mask. `cdnB` = the second (region-restricted, AND-gated) re-CDN;
+    `cdnA` = the first full CDN. Numbered so they sort in call order."""
     import cv2
     tag = "cdnB" if is_recdn else "cdnA"
     stem = f"{n:04d}_{tag}"
@@ -118,8 +131,11 @@ def _dump_ff_debug(dbg_dir, n, d, rgb_r, raw_mask, clean_mask, is_recdn) -> None
         return cv2.cvtColor((t.clamp(0, 1) * 255).byte().cpu().numpy(), cv2.COLOR_RGB2BGR)
     cv2.imwrite(str(dbg_dir / f"{stem}_1_live.png"), d.rgb_bgr)
     cv2.imwrite(str(dbg_dir / f"{stem}_2_rendered.png"), _u8_rgb(rgb_r))
-    cv2.imwrite(str(dbg_dir / f"{stem}_3_mask_raw.png"), raw_mask.astype(np.uint8) * 255)
-    cv2.imwrite(str(dbg_dir / f"{stem}_4_mask_clean.png"), clean_mask.astype(np.uint8) * 255)
+    if score is not None:                                # per-pixel 1-SSIM as a JET heatmap (blue=0 .. red=1)
+        s = (score.clamp(0, 1) * 255).byte().cpu().numpy()
+        cv2.imwrite(str(dbg_dir / f"{stem}_3_score_heatmap.png"), cv2.applyColorMap(s, cv2.COLORMAP_JET))
+    cv2.imwrite(str(dbg_dir / f"{stem}_4_mask_raw.png"), raw_mask.astype(np.uint8) * 255)
+    cv2.imwrite(str(dbg_dir / f"{stem}_5_mask_clean.png"), clean_mask.astype(np.uint8) * 255)
 
 
 def _crop_windows(cdn_np: np.ndarray, pad: int) -> List[tuple]:
@@ -145,25 +161,64 @@ def _crop_windows(cdn_np: np.ndarray, pad: int) -> List[tuple]:
 
 
 class AnysplatHandle:
-    """Lazy wrapper over the persistent AnySplat worker (anysplat_dynamic_gs env)."""
+    """Wrapper over the persistent AnySplat worker (anysplat_dynamic_gs env).
+
+    Spawn pays the worker's model load (~17 s) + a one-time first-inference warm-up (the worker
+    script runs a dummy 448x448 forward before it reports ready, so the FIRST real decode isn't a
+    ~20 s cold-start). prewarm() does that spawn in a background thread at pipeline startup so it
+    overlaps the scene warm-load instead of stalling the first FF cycle's decode. _ensure() is
+    idempotent + lock-guarded, so prewarm() and the first inference() race safely."""
 
     def __init__(self, device, conda_env: str = "anysplat_dynamic_gs", timeout_s: float = 60.0):
         self.device = device
         self.conda_env = conda_env
         self.timeout_s = timeout_s
         self._worker = None
+        self._spawn_lock = threading.Lock()
+        self._prewarm_thread = None
 
     def _ensure(self):
-        if self._worker is None:
-            from dynamic_gs.utils.anysplat_decode import PersistentAnysplatWorker
-            self._worker = PersistentAnysplatWorker(conda_env=self.conda_env,
-                                                    startup_timeout_s=self.timeout_s)
-        return self._worker
+        # Lock so a concurrent prewarm() thread + the first inference() can't both spawn a worker.
+        with self._spawn_lock:
+            if self._worker is None:
+                from dynamic_gs.utils.anysplat_decode import PersistentAnysplatWorker
+                self._worker = PersistentAnysplatWorker(conda_env=self.conda_env,
+                                                        startup_timeout_s=self.timeout_s)
+            return self._worker
+
+    def prewarm(self) -> None:
+        """Spawn + load + self-warm the worker on a background thread (non-blocking). Call once at
+        startup right after the static cache is warm-loaded so the ~17 s load + warm-up overlaps the
+        rest of pipeline setup; by the first FF decode the worker is ready (no cold-start stall)."""
+        if self._worker is not None or self._prewarm_thread is not None:
+            return
+        def _go():
+            try:
+                self._ensure()
+                print("[ff-decode] AnySplat worker pre-warmed (ready for first decode)", flush=True)
+            except Exception as e:
+                print(f"[ff-decode] AnySplat pre-warm failed (will spawn lazily): {e}", flush=True)
+        self._prewarm_thread = threading.Thread(target=_go, name="anysplat-prewarm", daemon=True)
+        self._prewarm_thread.start()
+
+    def wait_ready(self) -> None:
+        """Block until the (pre-warming) worker has finished loading. Call once before the dynamic
+        loop starts consuming frames so the ~17 s model load is honest STARTUP latency, not a stall
+        that lands mid-episode on the first decode. If prewarm() wasn't called, this spawns+loads now
+        (still blocking) — either way the first decode finds a ready worker."""
+        if self._prewarm_thread is not None:
+            self._prewarm_thread.join()          # wait out the in-flight load
+            self._prewarm_thread = None
+        if self._worker is None:                 # prewarm not used (or it failed) -> load synchronously
+            self._ensure()
 
     def inference(self, crop_png: Path, out_npz: Path) -> dict:
         return self._ensure().inference([crop_png], out_npz, timeout_s=self.timeout_s)
 
     def close(self):
+        if self._prewarm_thread is not None:
+            self._prewarm_thread.join(timeout=self.timeout_s + 5.0)
+            self._prewarm_thread = None
         if self._worker is not None:
             try:
                 self._worker.close()
@@ -172,12 +227,40 @@ class AnysplatHandle:
             self._worker = None
 
 
+def _project_downsample(means: torch.Tensor, c2w, intr: dict, stride: int = 4) -> torch.Tensor:
+    """Render the full-scene ICP target into the SAME front-surface depth image the source is: project
+    means through the scene camera (OpenGL, forward=-z), keep only IN-FRAME points (the sensor can't
+    see off-screen geometry), and per stride-spaced pixel cell keep the camera-NEAREST gaussian (the
+    front surface, like a depth sensor — not an arbitrary point along the ray). ~600k -> tens of k."""
+    c2w_t = torch.as_tensor(c2w, dtype=torch.float32, device=means.device)
+    p_cam = (means - c2w_t[:3, 3]) @ c2w_t[:3, :3]                 # world->camera = R^T (x - t)
+    z = -p_cam[:, 2]                                               # OpenGL forward = -z
+    fx, fy, cx, cy = (float(intr["fl_x"]), float(intr["fl_y"]), float(intr["cx"]), float(intr["cy"]))
+    W, H = int(intr["w"]), int(intr["h"])
+    zc = z.clamp_min(1e-6)
+    u = (fx * p_cam[:, 0] / zc + cx).long()
+    v = (-fy * p_cam[:, 1] / zc + cy).long()
+    vis = (z > 1e-6) & (u >= 0) & (u < W) & (v >= 0) & (v < H)     # in front AND inside the frame
+    if not bool(vis.any()):
+        return means                                              # nothing in view -> let ICP use all
+    vm, zv = means[vis], z[vis]
+    cell = (u[vis] // stride) * (H // stride + 2) + (v[vis] // stride)   # int64 cell id
+    znear = torch.argsort(zv)                                     # nearest-first; stable lexsort below
+    cs = cell[znear]
+    order = znear[torch.argsort(cs, stable=True)]                # group by cell, nearest kept first in each
+    cg = cell[order]
+    first = torch.ones_like(cg, dtype=torch.bool); first[1:] = cg[1:] != cg[:-1]   # 1st per cell = nearest
+    return vm[order[first]]
+
+
 def make_decode_fn(anysplat: AnysplatHandle, cfg, intr) -> Callable:
     """Return decode_fn(dispatch, regions, snapshot) -> GaussTensors. OPERATOR-VALIDATED:
     runs the AnySplat subprocess + reproject (the proven anysplat_decode path)."""
     from dynamic_gs.utils.anysplat_decode import reproject_anysplat_to_scene, icp_refine_scene_c2w
+    from .timing import get_ledger
     ff = cfg.feedforward
     scene_intr = {"fl_x": intr.fx, "fl_y": intr.fy, "cx": intr.cx, "cy": intr.cy, "w": intr.width, "h": intr.height}
+    tm = get_ledger()
 
     def decode_fn(d, regions, snap) -> Optional[GaussTensors]:
         cdn_np = regions[0]
@@ -190,9 +273,13 @@ def make_decode_fn(anysplat: AnysplatHandle, cfg, intr) -> Callable:
         scene_c2w = np.eye(4, dtype=np.float64); scene_c2w[:3, :4] = c2w
         if ff.icp_refine:
             try:
-                tgt = snap.params["means"].to(anysplat.device)
-                scene_c2w, _ = icp_refine_scene_c2w(sensor_depth_m=depth_np, scene_c2w=scene_c2w,
-                                                    scene_intr=scene_intr, target_xyz_gpu=tgt)
+                tgt = _project_downsample(snap.params["means"].to(anysplat.device),
+                                          scene_c2w, scene_intr, stride=ff.icp_stride)
+                with tm.stage("decode.icp"):
+                    scene_c2w, info = icp_refine_scene_c2w(sensor_depth_m=depth_np, scene_c2w=scene_c2w,
+                                                           scene_intr=scene_intr, target_xyz_gpu=tgt,
+                                                           stride=ff.icp_stride)
+                tm.gauge("icp_n_src", info.get("n_src", 0)); tm.gauge("icp_n_tgt", info.get("n_tgt", 0))
             except Exception as e:
                 print(f"[ff-decode] ICP skipped: {e}")
         import cv2
@@ -202,20 +289,27 @@ def make_decode_fn(anysplat: AnysplatHandle, cfg, intr) -> Callable:
             crop_png = Path(f"/dev/shm/dgs2_ff_crop_{pid}_{wi}.png")
             out_npz = Path(f"/dev/shm/dgs2_ff_ipc_{pid}_{wi}.npz")
             try:
-                cv2.imwrite(str(crop_png), src_bgr[top:top + size, left:left + size])
-                anysplat.inference(crop_png, out_npz)
-                with open(out_npz, "rb") as f:
-                    data = pickle.load(f)
-                dec = reproject_anysplat_to_scene(
-                    means_canonical=data["means_canonical"], log_scales=data["log_scales"],
-                    quats_wxyz=data["quats_wxyz"], opacity_logits=data["opacity_logits"],
-                    features_dc=data["features_dc"], features_rest=data["features_rest"],
-                    pred_c2w_0=data["pred_extrinsic_c2w"][0], pred_K_norm=data["pred_intrinsic_norm"][0],
-                    pred_image_hw=(_H_ANY, _W_ANY), sensor_depth_m=depth_np, scene_c2w=scene_c2w,
-                    scene_intr=scene_intr, opacity_min=float(ff.opacity_min), component_mask=cdn_np,
-                    scene_crop=(left, top, size), scale_multiplier=float(ff.scale_multiplier),
-                    max_scale_m=float(ff.max_scale_m), min_scale_m=float(ff.min_scale_m),
-                    voxel_dedup_m=0.0)   # density shaping (merge/grow/corner) is applied below, not here
+                # crop write + worker IPC round-trip (the wall the FF thread blocks on); the worker's
+                # OWN forward time rides back in the result dict and is recorded as decode.worker_forward
+                # so the in-subprocess GPU cost is visible separately from the IPC/pickle overhead.
+                with tm.stage("decode.crop_ipc"):
+                    cv2.imwrite(str(crop_png), src_bgr[top:top + size, left:left + size])
+                    info = anysplat.inference(crop_png, out_npz)
+                    with open(out_npz, "rb") as f:
+                        data = pickle.load(f)
+                if isinstance(info, dict) and info.get("t_forward_ms"):
+                    tm.record_ms("decode.worker_forward", float(info["t_forward_ms"]))
+                with tm.stage("decode.reproject"):
+                    dec = reproject_anysplat_to_scene(
+                        means_canonical=data["means_canonical"], log_scales=data["log_scales"],
+                        quats_wxyz=data["quats_wxyz"], opacity_logits=data["opacity_logits"],
+                        features_dc=data["features_dc"], features_rest=data["features_rest"],
+                        pred_c2w_0=data["pred_extrinsic_c2w"][0], pred_K_norm=data["pred_intrinsic_norm"][0],
+                        pred_image_hw=(_H_ANY, _W_ANY), sensor_depth_m=depth_np, scene_c2w=scene_c2w,
+                        scene_intr=scene_intr, opacity_min=float(ff.opacity_min), component_mask=cdn_np,
+                        scene_crop=(left, top, size), scale_multiplier=float(ff.scale_multiplier),
+                        max_scale_m=float(ff.max_scale_m), min_scale_m=float(ff.min_scale_m),
+                        voxel_dedup_m=0.0)   # density shaping (merge/grow/corner) is applied below, not here
                 if int(dec["xyz"].shape[0]) > 0:
                     parts.append(dec)
             except Exception as e:
@@ -245,35 +339,45 @@ def make_decode_fn(anysplat: AnysplatHandle, cfg, intr) -> Callable:
         # only flat surfaces are downsampled + hole-filled.
         vm = float(getattr(ff, "voxel_merge_m", 0.0))
         gf = float(getattr(ff, "grow_inplane_factor", 1.0))
-        if (vm > 0.0 or gf > 1.0) and g["means"].shape[0] > int(ff.corner_knn_k):
-            ck = int(ff.corner_knn_k); halo_k = int(getattr(ff, "corner_halo_k", 0))
-            knn = _knn_indices(g["means"], max(ck, halo_k))        # ONE cKDTree build, shared below
-            cs = _corner_score(g["means"], ck, float(ff.corner_var_scale),
-                               float(getattr(ff, "corner_boundary_scale", 3.0)), knn=knn)
-            is_corner = cs >= float(ff.corner_merge_threshold)
-            # HALO (decoupled from detection): a point is also treated as corner if any of its
-            # corner_halo_k nearest neighbours is a detected corner. ONE non-iterative hop (never fed
-            # back -> no cascade). Lets the halo width be tuned independently of the detection k.
-            if halo_k > 0 and bool(is_corner.any()) and not bool(is_corner.all()):
-                is_corner = _dilate_corner_mask(g["means"], is_corner, halo_k, knn=knn)
-            if os.environ.get("DGS_CORNER_DEBUG") == "1":
-                csf = cs.detach().float()
-                print(f"[corner-dbg] N={cs.shape[0]} score p50/p90/max="
-                      f"{float(csf.quantile(0.5)):.2f}/{float(csf.quantile(0.9)):.2f}/{float(csf.max()):.2f} "
-                      f"flagged_corner={float(is_corner.float().mean())*100:.0f}% (thr={float(ff.corner_merge_threshold)})",
-                      flush=True)
-            flat = {k: v[~is_corner] for k, v in g.items()}        # merge + grow these
-            corner = {k: v[is_corner] for k, v in g.items()}       # pass raw, untouched
-            if vm > 0.0 and flat["means"].shape[0] > 0:
-                flat = voxel_merge(flat, vm)
-            if gf > 1.0 and flat["means"].shape[0] > 0:
-                flat["scales"] = _grow_inplane(flat["scales"], gf)  # uniform — all flat now
-            g = {k: torch.cat([flat[k], corner[k]], 0) for k in g} if corner["means"].shape[0] else flat
-        elif vm > 0.0 and g["means"].shape[0] > 0:                 # too few pts for cornerness -> just merge
-            g = voxel_merge(g, vm)
+        with tm.stage("decode.density_shape"):
+            # Bound the corner-detection kNN input: the GPU kNN is O(N^2) and spikes to seconds on a
+            # large revealed-region insert (starving the tracker). Density shaping is cosmetic flat-fill,
+            # so subsample to density_max_points first — bounds the worst case without a visible change.
+            cap = int(getattr(ff, "density_max_points", 0))
+            tm.gauge("ff_density_n", g["means"].shape[0])
+            if cap > 0 and g["means"].shape[0] > cap:
+                sel = torch.randperm(g["means"].shape[0], device=g["means"].device)[:cap]
+                g = {k: v[sel] for k, v in g.items()}
+            if (vm > 0.0 or gf > 1.0) and g["means"].shape[0] > int(ff.corner_knn_k):
+                ck = int(ff.corner_knn_k); halo_k = int(getattr(ff, "corner_halo_k", 0))
+                knn = _knn_indices(g["means"], max(ck, halo_k))        # ONE cKDTree build, shared below
+                cs = _corner_score(g["means"], ck, float(ff.corner_var_scale),
+                                   float(getattr(ff, "corner_boundary_scale", 3.0)), knn=knn)
+                is_corner = cs >= float(ff.corner_merge_threshold)
+                # HALO (decoupled from detection): a point is also treated as corner if any of its
+                # corner_halo_k nearest neighbours is a detected corner. ONE non-iterative hop (never fed
+                # back -> no cascade). Lets the halo width be tuned independently of the detection k.
+                if halo_k > 0 and bool(is_corner.any()) and not bool(is_corner.all()):
+                    is_corner = _dilate_corner_mask(g["means"], is_corner, halo_k, knn=knn)
+                if os.environ.get("DGS_CORNER_DEBUG") == "1":
+                    csf = cs.detach().float()
+                    print(f"[corner-dbg] N={cs.shape[0]} score p50/p90/max="
+                          f"{float(csf.quantile(0.5)):.2f}/{float(csf.quantile(0.9)):.2f}/{float(csf.max()):.2f} "
+                          f"flagged_corner={float(is_corner.float().mean())*100:.0f}% (thr={float(ff.corner_merge_threshold)})",
+                          flush=True)
+                flat = {k: v[~is_corner] for k, v in g.items()}        # merge + grow these
+                corner = {k: v[is_corner] for k, v in g.items()}       # pass raw, untouched
+                if vm > 0.0 and flat["means"].shape[0] > 0:
+                    flat = voxel_merge(flat, vm)
+                if gf > 1.0 and flat["means"].shape[0] > 0:
+                    flat["scales"] = _grow_inplane(flat["scales"], gf)  # uniform — all flat now
+                g = {k: torch.cat([flat[k], corner[k]], 0) for k in g} if corner["means"].shape[0] else flat
+            elif vm > 0.0 and g["means"].shape[0] > 0:                 # too few pts for cornerness -> just merge
+                g = voxel_merge(g, vm)
         # Final HARD clamp at the insert boundary: guarantee no gaussian exceeds max_scale_m,
         # whatever upstream produced (definitive cap; warns once if anything was over).
-        g["scales"] = _clamp_log_scale(g["scales"], float(ff.max_scale_m))
+        with tm.stage("decode.clamp"):
+            g["scales"] = _clamp_log_scale(g["scales"], float(ff.max_scale_m))
         if g["means"].shape[0] == 0:
             return None
         return GaussTensors(means=g["means"], features_dc=g["features_dc"],
@@ -297,13 +401,21 @@ def _grow_inplane(log_scales: torch.Tensor, factor: float) -> torch.Tensor:
 
 
 def _knn_indices(means: torch.Tensor, k: int) -> torch.Tensor:
-    """ONE cKDTree build + query -> (N, k+1) neighbour indices (incl. self at col 0). Both _corner_score
-    and _dilate_corner_mask take a SLICE of this so the tree is built ONCE per insert. CPU, O(N log N)."""
-    from scipy.spatial import cKDTree
+    """ONE GPU kNN build + query -> (N, k+1) neighbour indices (incl. self at col 0). Both _corner_score
+    and _dilate_corner_mask take a SLICE of this so the tree is built ONCE per insert. Open3D CUDA NN
+    (no GPU->CPU copy, no scipy single-core cKDTree — measured ~3-6x faster on insert-sized clouds; the
+    index set is identical to scipy). Falls back to CPU cKDTree only when CUDA NN is unavailable."""
+    import open3d as o3d, open3d.core as o3c
     n = means.shape[0]
-    pts = torch.nan_to_num(means, nan=0.0, posinf=0.0, neginf=0.0).detach().cpu().numpy()
-    idx = cKDTree(pts).query(pts, k=min(k + 1, n))[1]
-    return torch.as_tensor(idx, device=means.device, dtype=torch.long)
+    pts = torch.nan_to_num(means, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
+    if pts.is_cuda:
+        t = o3c.Tensor.from_dlpack(torch.utils.dlpack.to_dlpack(pts))
+        nns = o3d.core.nns.NearestNeighborSearch(t); nns.knn_index()
+        idx, _ = nns.knn_search(t, min(k + 1, n))
+        return torch.utils.dlpack.from_dlpack(idx.to_dlpack()).long()
+    from scipy.spatial import cKDTree
+    cpu = pts.cpu().numpy()
+    return torch.as_tensor(cKDTree(cpu).query(cpu, k=min(k + 1, n))[1], device=means.device, dtype=torch.long)
 
 
 def _corner_score(means: torch.Tensor, k: int, var_scale: float,

@@ -87,30 +87,57 @@ class PoseFilterConfig:
 @dataclass(frozen=True)
 class ChangeMaskConfig:
     downsample_target_side: int = 150
-    rgb_threshold: float = 0.15
-    blur_sigma: float = 0.6            # Gaussian pre-blur on the downsampled SSIM input (0 = none)
+    rgb_threshold: float = 0.2        # 1-SSIM cutoff on the per-pixel SSIM dissimilarity (see the score
+                                      # heatmap debug dump). Pairs with the small morph_close_px=2 so a
+                                      # low threshold no longer bridges scattered detections into a square.
+    blur_sigma: float = 0.75           # Gaussian pre-blur on the downsampled SSIM input (0 = none)
     blur_kernel_size: int = 5
-    ssim_window: int = 11             # SSIM Gaussian window size (single-scale; no pyramid)
-    block_valid_min_frac: float = 0.5
-    min_component_area: int = 76
+    ssim_window: int = 5              # SSIM Gaussian window size (single-scale; no pyramid). Runs on the
+                                      # ds-downsampled grid, so a large window halos the detected region
+                                      # (window 11 @ ds=10 -> ~50px full-res bleed); 5 keeps it tight.
+    block_valid_min_frac: float = 0.0   # OFF: keep every pooled block that has any valid pixel (the
+                                        # per-mask erosion already accounts for partial-validity blocks).
+    min_component_area: int = 40        # drop change components smaller than this many downsampled-grid
+                                        # cells (76 = ~87x87px full-res was too large; 10 too small/noisy).
+    morph_close_px: int = 2           # fill holes INSIDE a detected region (downsampled-grid radius). Was
+                                      # 10 = a 21x21 kernel that BRIDGED scattered faint detections into a
+                                      # filled square; 2 fills genuine 1-2px holes only. (DGS_CDN_CLOSE_PX)
+    morph_open_px: int = 1            # remove isolated speckle (downsampled-grid radius). Was 3 = a 7x7
+                                      # erode that WIPED thin real change (<7 grid-cells wide, e.g. object
+                                      # edges); only survived before because close=10 fattened regions
+                                      # first. 1 removes single-px speckle only; min_component_area culls
+                                      # the rest. (DGS_CDN_OPEN_PX)
     keep_largest_only: bool = False
     scene_coverage_threshold: float = 0.5
     live_depth_min_m: float = 0.05
     live_depth_max_m: float = 3.0
+    gripper_erode_px: int = 6         # enlarge the gripper EXCLUSION in the CDN only (erode the keep-mask
+                                      # by this many full-res px so the gripper silhouette never leaks into
+                                      # the change region). FF-only: the tracker reads the raw keep mask.
+                                      # 0 = off. (DGS_CDN_GRIPPER_ERODE_PX)
 
 
 @dataclass(frozen=True)
 class FeedforwardConfig:
     cadence_ticks: int = 10
     icp_refine: bool = True
-    icp_voxel_m: float = 0.0
+    icp_stride: int = 4              # pixel stride for BOTH ICP clouds (source depth + projected scene
+                                     # target). Measured 1920x1200: stride 4 -> src 139k/tgt 255k @ ~32ms;
+                                     # stride 8 -> src 35k/tgt 107k but SLOWER (~47ms) — the target NN
+                                     # search dominates and the target is geometry-bound (barely shrinks
+                                     # with stride), so 4 is the sweet spot here. (DGS_FF_ICP_STRIDE)
     opacity_min: float = 0.05        # AnySplat opacity-logit keep floor (reproject)
     scale_multiplier: float = 1.0    # insert scales as predicted, no inflation
     max_scale_m: float = 0.02        # hard cap per insert axis (uniform-shrink gross outliers, e.g. 0.2/0.5m blobs)
     min_scale_m: float = 0.0         # tiny-splat cull floor (0 = off)
     voxel_merge_m: float = 0.001     # downsample inserts by moment-match MERGE per voxel (fuse cluster
                                      # -> 1 gaussian sized to its extent: thins WITHOUT holes). 0 = off.
-    grow_inplane_factor: float = 1.5  # after merge, grow the 2 in-plane (surface) axes by this, leaving
+    density_max_points: int = 80000  # CEILING on the corner-detection kNN input: a large revealed region
+                                     # can yield 150k+ inserts and the O(N^2) GPU kNN then spikes to
+                                     # seconds, starving the tracker (measured 2s freeze). Density shaping
+                                     # is cosmetic flat-surface hole-fill, so subsample to this before the
+                                     # kNN — bounds the worst case. 0 = no cap. (DGS_FF_DENSITY_MAX_PTS)
+    grow_inplane_factor: float = 2.0  # after merge, grow the 2 in-plane (surface) axes by this, leaving
                                       # the normal axis (fills sub-splat surface holes, no blur). 1=off.
     # The in-plane grow is CORNERNESS-GATED (kNN-PCA): full grow on flat surfaces, tapering to no-grow
     # at corners/edges + their neighbours so the fill doesn't leak past edges. ONLY gates the grow.
@@ -133,14 +160,18 @@ class FeedforwardConfig:
     object_mask_scale: float = 1.1
     object_mask_dilate_px: int = 0
     cull_before_decode: bool = True   # in-front occlusion cull + CDN reclean before AnySplat decode
-    cull_in_front_depth_tol_m: float = 0.0
+    cull_in_front_depth_tol_m: float = 0.01   # in-front occlusion cull margin: delete an eligible
+                                     # gaussian only if it sits MORE than this in front of the live surface
+                                     # (depths_g < sensor - tol). 0 had no margin, so depth noise at a
+                                     # static object's silhouette (e.g. the droid) deleted real geometry;
+                                     # 10mm only culls clear floaters well in front of the surface.
     cull_replaced_enabled: bool = True  # MASTER toggle for the replaced-surface cull (the SECOND cull):
                                         # delete the thin slab of old geometry the fresh insert overwrites.
                                         # True caps cumulative growth; False = insert-only (no replaced cull).
-    cull_replaced_depth_tol_m: float = 0.0005  # cull eligible (non-tracked) gaussians whose MEAN projects
+    cull_replaced_depth_tol_m: float = 0.0   # cull eligible (non-tracked) gaussians whose MEAN projects
                                               # into the (second/re-CDN) changed region AND lies in a THIN
                                               # slab JUST BEHIND the live surface: sensor <= depth_g <
-                                              # sensor + this (0.5mm). Just the OLD surface the fresh insert
+                                              # sensor + this (0 = OFF, no old-surface removal). The insert
                                               # overwrites — NOT the whole column behind it (that culls deep
                                               # walls -> whole scene vanishes), NOT in front (in-front cull's
                                               # job). This value IS the slab thickness.
@@ -272,16 +303,21 @@ def load_runtime_config() -> RuntimeConfig:
     )
     change_mask = ChangeMaskConfig(
         downsample_target_side=_envi("DGS_CDN_TARGET_SIDE", 150),
-        rgb_threshold=_envf("DGS_CDN_RGB_THRESHOLD", 0.15),
-        blur_sigma=_envf("DGS_CDN_BLUR_SIGMA", 0.6),
+        rgb_threshold=_envf("DGS_CDN_RGB_THRESHOLD", ChangeMaskConfig.rgb_threshold),
+        blur_sigma=_envf("DGS_CDN_BLUR_SIGMA", ChangeMaskConfig.blur_sigma),
         blur_kernel_size=_envi("DGS_CDN_BLUR_KERNEL_SIZE", ChangeMaskConfig.blur_kernel_size),
         ssim_window=_envi("DGS_CDN_SSIM_WINDOW", ChangeMaskConfig.ssim_window),
+        gripper_erode_px=_envi("DGS_CDN_GRIPPER_ERODE_PX", ChangeMaskConfig.gripper_erode_px),
+        morph_close_px=_envi("DGS_CDN_CLOSE_PX", ChangeMaskConfig.morph_close_px),
+        morph_open_px=_envi("DGS_CDN_OPEN_PX", ChangeMaskConfig.morph_open_px),
     )
     feedforward = FeedforwardConfig(
         icp_refine=_envb("DGS_FF_ICP", True),
+        icp_stride=_envi("DGS_FF_ICP_STRIDE", FeedforwardConfig.icp_stride),
         max_scale_m=_envf("DGS_FF_MAX_SCALE_M", FeedforwardConfig.max_scale_m),
         min_scale_m=_envf("DGS_FF_MIN_SCALE_M", FeedforwardConfig.min_scale_m),
         voxel_merge_m=_envf("DGS_FF_VOXEL_MERGE_M", FeedforwardConfig.voxel_merge_m),
+        density_max_points=_envi("DGS_FF_DENSITY_MAX_PTS", FeedforwardConfig.density_max_points),
         grow_inplane_factor=_envf("DGS_FF_GROW_INPLANE", FeedforwardConfig.grow_inplane_factor),
         corner_knn_k=_envi("DGS_FF_CORNER_KNN_K", FeedforwardConfig.corner_knn_k),
         corner_halo_k=_envi("DGS_FF_CORNER_HALO_K", FeedforwardConfig.corner_halo_k),

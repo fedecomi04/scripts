@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 from . import static_persist
+from . import timing as _timing
 from .adapters_source import ReplaySource, ShmRing, camera_from_frame
 from .dynamic_feedforward import FeedforwardDispatch, FeedforwardWorker
 from .dynamic_track import ReferenceObjectPose, TrackerInputs, XFeatTracker
@@ -66,10 +67,29 @@ class DynamicLoop:
         self._seeded = False
         self._filter_depth = bool(getattr(getattr(cfg, "depth", None), "filter_enabled", True))
 
-    def _object_mask(self, camera, snap) -> torch.Tensor:
-        inst = (snap.buffers["object_instance_ids"][:, 0] == self.d0_id)
+    def _object_mask(self, camera) -> torch.Tensor:
+        # Build the instance mask and render it under ONE lock hold: a fresh snapshot taken inside
+        # the lock keeps the mask length == the live count, so a concurrent FF insert can't make the
+        # mask (count N) disagree with the rendered params (count N') -> torn read -> IndexError.
         with self.lock:
+            inst = (self.g.snapshot().buffers["object_instance_ids"][:, 0] == self.d0_id)
             return self.sm.render_object_mask(camera, inst)
+
+    def reset_for_loop(self) -> None:
+        """Replay wrapped to frame 0: restore the dynamic state so each pass is identical.
+        Object gaussians -> D0 rest pose, all FF inserts dropped, deferred-cull hides cleared, and
+        the tracker re-seeded on the next frame (initialize() clears anchors + KF + cumulative pose).
+        ref is re-captured at the restored rest pose, so it stays the original D0 reference."""
+        snap = self.g.snapshot()
+        out = self.ref.apply(np.eye(3, dtype=np.float32), np.zeros(3, dtype=np.float32), snap)
+        if out is not None:
+            self.g.write_object_pose(*out)                    # tracked object back to its D0 rest pose
+        ids = self.g.snapshot().buffers["object_instance_ids"][:, 0]
+        ins = torch.nonzero(ids == int(self.cfg.feedforward.insert_id), as_tuple=False).flatten()
+        if ins.numel() > 0:
+            self.g.cull(ins)                                  # drop every FF insert (instance_id == insert_id)
+        self.sm.set_hidden_indices(None)                      # un-hide the deferred-cull rows
+        self._seeded = False                                  # next frame re-seeds the tracker from frame 0
 
     @staticmethod
     def _bbox_from_mask(objmask, pad, W, H):
@@ -98,6 +118,10 @@ class DynamicLoop:
     def step(self, frame) -> dict:
         """One tick on a Frame. Returns a trace row (tick, frame_seq, R, t, ok, inliers, ff_*)."""
         self._tick += 1
+        # Stamp a tracker-tick marker so the FF report can show WHERE the tracker ticked inside an
+        # FF cycle (it can tick several times during the long lock-free AnySplat decode) — i.e. it
+        # proves the FF bg thread isn't blocking the tracker.
+        _timing.get_ledger().event("tracker_tick", tick=self._tick)
         intr = self.tracker_intr
         cam = camera_from_frame(frame, intr, self.device)
         rgb = _rgb_gpu(frame, self.device)
@@ -116,7 +140,7 @@ class DynamicLoop:
         bg = self.sm._get_background_color().to(self.device).view(1, 1, -1)
         rgb = rgb * km[..., None] + bg * (1.0 - km[..., None])
         snap = self.g.snapshot()
-        objmask = self._object_mask(cam, snap)
+        objmask = self._object_mask(cam)
 
         # Crop tracker inputs to the object bbox so XFeat's top_k keypoints land ON the
         # (small) object instead of being spread over the full 1200p frame (matches old
@@ -194,6 +218,7 @@ def run_recorded_trace(data_dir, cfg, device, out_trace: str, *, ff_enabled: boo
     if ff_enabled:
         from .dynamic_ff_backends import make_cdn_fn, make_decode_fn, AnysplatHandle
         anysplat = AnysplatHandle(device)
+        anysplat.prewarm()       # warm-start AnySplat at load time so the first decode isn't a cold-start
         ff = FeedforwardWorker(gset, lock, cfg.feedforward, cfg.budget,
                                cdn_fn=make_cdn_fn(sm, lock, cfg, intr, data_dir=data_dir),
                                decode_fn=make_decode_fn(anysplat, cfg, intr),
@@ -257,6 +282,7 @@ def run_view_recorded(data_dir, cfg, device, *, transforms_name: str = "transfor
     intr = ring.intrinsics()
     if ff_enabled:
         anysplat = AnysplatHandle(device)
+        anysplat.prewarm()       # warm-start AnySplat at load time so the first decode isn't a cold-start
         ff = FeedforwardWorker(gset, lock, cfg.feedforward, cfg.budget,
                                cdn_fn=make_cdn_fn(sm, lock, cfg, intr, data_dir=data_dir),
                                decode_fn=make_decode_fn(anysplat, cfg, intr),
@@ -333,6 +359,17 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
     tracker = XFeatTracker(device, cfg.tracker, cfg.pose_filter)
 
     ff = None
+    # Warm-start AnySplat BEFORE the source starts: its ~17s model load + first-inference warm-up must
+    # finish before any frames flow, otherwise the first decode stalls ~16s mid-episode (and for paced
+    # replay the episode wall-clock — started by open_source's producer thread — would advance through
+    # the whole load). So spawn the worker now, then wait_ready() just before open_source: the load
+    # overlaps the scene warm-load above and becomes honest startup latency, never a mid-run stall.
+    anysplat = None
+    if ff_enabled:
+        from .dynamic_ff_backends import make_cdn_fn, make_decode_fn, AnysplatHandle
+        anysplat = AnysplatHandle(device)
+        anysplat.prewarm()
+        anysplat.wait_ready()    # block until loaded; producer clock (next line) starts on a ready worker
     # The 'replay' source needs the dataset dir (it paces recorded frames into SHM like the live
     # publisher); pass our resolved data_dir through.
     if source_kind == "replay":
@@ -340,8 +377,6 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
     src = open_source(source_kind, shm_name=cfg.shm_name, attach=True, **source_opts)
     ring = ShmRing(cfg.shm_name)
     if ff_enabled:
-        from .dynamic_ff_backends import make_cdn_fn, make_decode_fn, AnysplatHandle
-        anysplat = AnysplatHandle(device)
         ff = FeedforwardWorker(gset, lock, cfg.feedforward, cfg.budget,
                                cdn_fn=make_cdn_fn(sm, lock, cfg, ring.intrinsics(), data_dir=data_dir),
                                decode_fn=make_decode_fn(anysplat, cfg, ring.intrinsics()),
@@ -359,7 +394,7 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
     bridge.attach(_render_fn)
 
     print(f"[pipeline] LIVE: d0_instance_id={d0_id}, scene={gset.num_points} gaussians, source={source_kind}")
-    last_seq, t0 = -1, time.time()
+    last_seq, last_stamp, t0 = -1, None, time.time()
     try:
         while True:
             if max_seconds is not None and time.time() - t0 > max_seconds:
@@ -371,6 +406,11 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
                     break
                 continue
             last_seq = int(fr.seq)
+            # Looping replay: a big backward jump in the capture stamp means the episode wrapped to
+            # frame 0 -> reset the dynamic state so every pass starts from the same D0 scene/tracker.
+            if last_stamp is not None and fr.stamp_sec < last_stamp - 0.5:
+                loop.reset_for_loop()
+            last_stamp = fr.stamp_sec
             loop.step(fr)
             bridge.update_camera_feed(fr.rgb_bgr)
             bridge.update_tracked_camera(fr.c2w_4x4)
@@ -385,6 +425,10 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
         src.close()
         static_persist.save_warm_cache(gset, data_dir, cfg, filename="post_dynamic_state.pt")
         print(f"[pipeline] LIVE: saved post_dynamic_state.pt ({gset.num_points} gaussians)")
+        if ff_enabled:                                       # FF timing report (always-on; written once at end)
+            report_path = Path(data_dir) / "timing_report_ff.txt"
+            _timing.get_ledger().write(report_path)
+            print(f"[pipeline] LIVE: wrote FF timing report -> {report_path}")
 
 
 # --------------------------------------------------------------- CLI
@@ -395,7 +439,8 @@ def _main():
     ap.add_argument("--mode", choices=["recorded", "live", "view"], required=True)
     ap.add_argument("--data", required=True, help="dataset dir (with static_scene/static_state.pt)")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--ff", action="store_true", help="enable feedforward (needs AnySplat worker)")
+    ap.add_argument("--ff", action=argparse.BooleanOptionalAction, default=True,
+                    help="feedforward (needs AnySplat worker); ON by default, --no-ff disables")
     ap.add_argument("--source", default="live_bridge", help="live source kind (live_bridge|ros1)")
     ap.add_argument("--transforms", default="transforms.json", help="recorded/view: transforms json name")
     ap.add_argument("--out-trace", default=None, help="recorded: new_trace.jsonl path")
@@ -403,6 +448,8 @@ def _main():
     ap.add_argument("--max-seconds", type=float, default=None)
     ap.add_argument("--fps", type=float, default=10.0, help="view: replay rate")
     ap.add_argument("--once", action="store_true", help="view: play once instead of looping")
+    ap.add_argument("--loop", action="store_true",
+                    help="replay-as-live: replay the episode forever (Ctrl-C to stop); tracker snap-resets at each wrap")
     ap.add_argument("--replaced-cull", dest="replaced_cull", action="store_true", default=None,
                     help="FF: cull the thin slab of old geometry the insert overwrites (caps growth)")
     ap.add_argument("--no-replaced-cull", dest="replaced_cull", action="store_false",
@@ -426,7 +473,8 @@ def _main():
         # an honest real-time test without a Gazebo/ROS stack.
         src_opts = {}
         if args.source == "replay":
-            src_opts = dict(replay_mode="paced", transforms_name=args.transforms, replay_fps=args.fps)
+            src_opts = dict(replay_mode="paced", transforms_name=args.transforms,
+                            replay_fps=args.fps, loop=args.loop)
         run_live(args.data, cfg, args.device, source_kind=args.source,
                  ff_enabled=args.ff, max_seconds=args.max_seconds, **src_opts)
 

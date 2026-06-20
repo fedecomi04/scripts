@@ -29,6 +29,7 @@ import numpy as np
 import torch
 
 from .gaussian_set import GaussTensors, GaussianSet, activated_opacity
+from .timing import get_ledger
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ class FeedforwardWorker:
         self._ff_calls = 0
         self.last_inserted = 0
         self.last_culled = 0
+        self._t = get_ledger()          # always-on timing ledger (FF stages + gaussian-count gauge)
 
     # ---- checks when to run (called on the main thread, every tick) ----
     def due(self, tick: int, now_s: float = 0.0) -> bool:
@@ -238,8 +240,11 @@ class FeedforwardWorker:
         the in-front cull commits on its own surgery before the decode instead."""
         self.last_inserted = 0
         self.last_culled = 0
+        self._t.cycle(self._ff_calls)                    # tag every stage below with THIS FF cycle id
+        # CDN render + clean (steps 1-2 are timed inside cdn_fn under this cycle).
         regions = self._cdn_fn(d)                        # render + score + CLEAN (object-footprint subtract)
         if not regions:
+            self._t.event("ff_skipped", reason="no_cdn")
             return
         deferred = self.cfg.cull_before_decode and self._set_hidden_fn is not None
         first_region = regions[0]                        # the FIRST CDN region — the re-CDN is restricted
@@ -247,32 +252,41 @@ class FeedforwardWorker:
         cull_idx = None
         protect = None
         if self.cfg.cull_before_decode:
-            cull_idx, protect = self._compute_cull_in_front(d, first_region)
+            with self._t.stage("cull_infront.compute"):
+                cull_idx, protect = self._compute_cull_in_front(d, first_region)
             if cull_idx.numel() == 0:
                 cull_idx = None
             elif deferred:
                 # hide the to-be-culled rows for the re-CDN ONLY (held under the lock so the render
                 # honors it), then unhide — the real delete waits for the atomic commit below.
                 with self.lock:
-                    self._set_hidden_fn(cull_idx)
+                    with self._t.stage("cull_infront.hide"):
+                        self._set_hidden_fn(cull_idx)
                     regions = self._cdn_fn(d, restrict_to=first_region)   # re-CDN: as-if-culled, region-restricted
                     self._set_hidden_fn(None)
                 if not regions:
+                    self._t.event("ff_skipped", reason="no_recdn")
                     return
             else:                                        # no deferral: commit the cull on its own surgery
-                self.last_culled = self.g.cull(cull_idx, protect_mask=protect)
+                with self._t.stage("surgery.cull_insert"):
+                    self.last_culled = self.g.cull(cull_idx, protect_mask=protect)
                 cull_idx = None
                 regions = self._cdn_fn(d, restrict_to=first_region)
                 if not regions:
+                    self._t.event("ff_skipped", reason="no_recdn")
                     return
         snap = self.g.snapshot()                         # atomic detached read for ICP target + count
+        # AnySplat decode + density shaping + clamp (steps 7-9 timed inside decode_fn).
         tensors = self._decode_fn(d, regions, snap)      # ~400ms, LOCK-FREE
         if tensors is None or tensors.means.shape[0] == 0:
+            self._t.event("ff_skipped", reason="empty_decode")
             return
-        tensors, shed = self._enforce_ceiling(tensors, d.d0_instance_id)
+        with self._t.stage("enforce_ceiling"):
+            tensors, shed = self._enforce_ceiling(tensors, d.d0_instance_id)
         if tensors is None or tensors.means.shape[0] == 0:
             if shed:
                 print(f"[FF] ceiling reached ({self.g.num_points}/{self.budget.live_gaussian_ceiling}); shed {shed}")
+            self._t.event("ff_skipped", reason="ceiling")
             return
         n = int(self.budget.dynamic_purge_every_n_ff)
         purge_due = n > 0 and (self._ff_calls % n == 0)
@@ -284,7 +298,8 @@ class FeedforwardWorker:
             #     and the deletion is invisible (new replaces old in the same surgery), and
             #  3. (when due) the periodic low-opacity purge.
             idx = cull_idx if cull_idx is not None else torch.empty(0, dtype=torch.long, device=self.g.device)
-            replaced = self._compute_cull_replaced(d, regions[0])
+            with self._t.stage("cull_replaced.compute"):
+                replaced = self._compute_cull_replaced(d, regions[0])
             if replaced.numel():
                 idx = torch.cat([idx, replaced.to(idx.device)]).unique()
             if purge_due:
@@ -295,15 +310,18 @@ class FeedforwardWorker:
             # So the indices stay valid; still, build protect fresh here so it matches the commit state.
             if idx.numel():
                 protect = self.g.snapshot().buffers["object_instance_ids"][:, 0] == int(d.d0_instance_id)
-            n_culled, rng = self.g.cull_and_insert(
-                idx, tensors, object_flag=1.0, instance_id=int(self.cfg.insert_id),
-                protect_mask=protect)
+            with self._t.stage("surgery.cull_insert"):
+                n_culled, rng = self.g.cull_and_insert(
+                    idx, tensors, object_flag=1.0, instance_id=int(self.cfg.insert_id),
+                    protect_mask=protect)
             self.last_culled = n_culled
         else:
             rng = self.g.insert(tensors, object_flag=1.0, instance_id=int(self.cfg.insert_id))   # UNDER lock
             if purge_due:
                 self.last_culled += self._purge_ff_inserts(d.d0_instance_id)   # separate surgery (non-deferred path)
         self.last_inserted = int(rng.numel())
+        self._t.event("ff_inserted", n=self.last_inserted, culled=self.last_culled)
+        self._t.gauge("gaussian_count", self.g.num_points)   # bounded-growth watchdog
         if self._on_insert is not None:
             self._on_insert(rng)
 

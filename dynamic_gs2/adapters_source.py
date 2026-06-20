@@ -89,11 +89,13 @@ class ReplaySource:
     """
 
     def __init__(self, data_dir, *, mode: str = "paced", replay_fps: float = 15.0,
-                 transforms_name: str = "transforms.json", num_slots: int = DEFAULT_NUM_SLOTS):
+                 transforms_name: str = "transforms.json", num_slots: int = DEFAULT_NUM_SLOTS,
+                 loop: bool = False):
         self.data_dir = Path(data_dir)
         self.mode = mode
         self.replay_fps = float(replay_fps)
         self._slots = num_slots
+        self._loop = bool(loop)   # paced: replay the episode forever (tracker snap-resets at each wrap)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._prod: Optional[ShmProducer] = None
@@ -157,17 +159,22 @@ class ReplaySource:
             self._thread.start()
 
     def _paced_loop(self) -> None:
-        start_wall = time.time()
         t0 = self._rel_t[0] if self._rel_t else 0.0
-        while not self._stop.is_set() and self._idx < len(self._frames):
-            target = start_wall + (self._rel_t[self._idx] - t0)
-            dt = target - time.time()
-            if dt > 0:
-                self._stop.wait(dt)
-            if self._stop.is_set():
+        n = len(self._frames)
+        while not self._stop.is_set():
+            start_wall = time.time()   # restart the pacing clock at the top of each pass
+            while not self._stop.is_set() and self._idx < n:
+                target = start_wall + (self._rel_t[self._idx] - t0)
+                dt = target - time.time()
+                if dt > 0:
+                    self._stop.wait(dt)
+                if self._stop.is_set():
+                    break
+                self._prod.write(self._load(self._idx))
+                self._idx += 1
+            if not self._loop or self._stop.is_set():
                 break
-            self._prod.write(self._load(self._idx))
-            self._idx += 1
+            self._idx = 0              # wrap: republish from frame 0 (object jumps back to its D0 pose)
         if self._prod is not None and not self._stop.is_set():
             self._prod.mark_shutdown()
 

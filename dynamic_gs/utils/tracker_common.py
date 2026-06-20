@@ -384,6 +384,18 @@ class PoseKalmanFilter:
         _snap_r = os.environ.get("DGS_KF_SNAP_ROT_DEG")
         self._snap_trans_m = float(_snap_t) if _snap_t else float(snap_trans_m)
         self._snap_rot_rad = float(np.radians(float(_snap_r))) if _snap_r else float(snap_rot_rad)
+        # dt-aware gate scaling. Both gates that key on the innovation magnitude
+        # (the hard snap-reset gate and the soft robust-R spike gate) add an
+        # EXPECTED-MOTION term = k * |velocity| * dt on top of their fixed floor.
+        # Rationale: the innovation legitimately grows with how far the object
+        # actually moves this tick (|velocity| * real dt). A fixed pose-distance
+        # threshold mis-reads a long-dt or fast-motion tick's legit displacement
+        # as a spike -> the update is suppressed -> lag -> catch-up shake. Tying
+        # the floor to |v|*dt makes both gates self-scale with dt and speed.
+        #   DGS_KF_SNAP_MOTION_K  — multiple of |v|*dt allowed before a snap-reset
+        #   DGS_KF_SPIKE_MOTION_K — |v|*dt weight added to the 3-sigma spike floor
+        self._snap_motion_k = float(os.environ.get("DGS_KF_SNAP_MOTION_K", "3.0"))
+        self._spike_motion_k = float(os.environ.get("DGS_KF_SPIKE_MOTION_K", "1.0"))
         self.reset()
 
     def reset(self) -> None:
@@ -465,13 +477,22 @@ class PoseKalmanFilter:
             _so3_log(R_meas64 @ self._R_nom.T),
         ])
 
+        # Expected motion THIS tick from the current velocity estimate over the
+        # real dt — the dt-aware floor shared by both innovation gates below.
+        move_t = float(np.linalg.norm(self._x[3:6])) * dt
+        move_r = float(np.linalg.norm(self._x[9:12])) * dt
+
         # Innovation gate: discontinuity (reacquisition after the object
         # left the view, or an anchor-pool jump) — snap to the
         # measurement and restart the velocity estimate instead of
-        # smoothing through it (which would overshoot).
+        # smoothing through it (which would overshoot). The threshold is the
+        # fixed teleport floor PLUS k * expected-motion-this-tick, so legit fast
+        # motion over a long dt is not mistaken for a reacquisition jump.
+        snap_trans_eff = self._snap_trans_m + self._snap_motion_k * move_t
+        snap_rot_eff = self._snap_rot_rad + self._snap_motion_k * move_r
         if (
-            np.linalg.norm(y[0:3]) > self._snap_trans_m
-            or np.linalg.norm(y[3:6]) > self._snap_rot_rad
+            np.linalg.norm(y[0:3]) > snap_trans_eff
+            or np.linalg.norm(y[3:6]) > snap_rot_eff
         ):
             self._t_nom = t_meas64.copy()
             self._R_nom = R_meas64.copy()
@@ -494,10 +515,14 @@ class PoseKalmanFilter:
         # (degenerate match set), not real motion the velocity state missed.
         # Inflate R quadratically past 3 sigma so the filter coasts through it.
         # Spikes measured at 8+ sigma carried 36% of jitter RMS on the fixture.
+        # The spike floor is 3 sigma of MEASUREMENT noise plus the expected
+        # motion this tick (k * |v| * dt): an innovation within "noise + what the
+        # object could have moved" is real motion, not a spike, so it must NOT
+        # inflate R (which would lag the tracker on every fast/long-dt tick).
         _sig_t = max(self._meas_trans_var ** 0.5, 1e-9)
         _sig_r = max(self._meas_rot_var ** 0.5, 1e-9)
-        _nt = float(np.linalg.norm(y[0:3])) / (3.0 * _sig_t)
-        _nr = float(np.linalg.norm(y[3:6])) / (3.0 * _sig_r)
+        _nt = float(np.linalg.norm(y[0:3])) / (3.0 * _sig_t + self._spike_motion_k * move_t)
+        _nr = float(np.linalg.norm(y[3:6])) / (3.0 * _sig_r + self._spike_motion_k * move_r)
         _rob = max(1.0, max(_nt, _nr)) ** 2
         _ms2 = _ms2 * _rob
         R_noise = np.diag([self._meas_trans_var * _ms2] * 3 + [self._meas_rot_var * _ms2] * 3)

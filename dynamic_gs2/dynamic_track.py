@@ -83,6 +83,7 @@ class XFeatTracker:
         e = self._est.estimate_and_advance(
             current_rgb=inp.rgb, current_depth=inp.depth, current_camera=inp.camera,
             current_mask=inp.keep_mask, current_object_mask=inp.object_mask,
+            current_stamp_sec=inp.stamp_sec,   # capture event-time -> KF dt = real gap between used frames
         )
         return MotionEstimate(
             success=bool(e.success), ready=bool(e.ready),

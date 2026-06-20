@@ -582,6 +582,7 @@ class XFeatMotionEstimator:
         current_camera: "Cameras",
         current_mask: Tensor | None = None,
         current_object_mask: Tensor | None = None,
+        current_stamp_sec: float | None = None,
     ) -> CoTrackerMotionEstimate:
         identity = np.eye(3, dtype=np.float32)
         zero = np.zeros((3,), dtype=np.float32)
@@ -877,18 +878,27 @@ class XFeatMotionEstimator:
                 # measurement noise as inliers drop below the healthy norm.
                 _inl = max(int(inlier_count), 1)
                 _scale = min(4.0, max(1.0, (80.0 / _inl) ** 0.5))
-                # RATE-INVARIANCE: feed the KF a FIXED synthetic dt every tick
-                # instead of wall-clock dt, so the tracker rate (CDN gating,
-                # debug renders, scene size, FPS) can never detune the filter
-                # (Q ~ accel_sigma^2 * dt^4 — a faster tracker = smaller dt =
-                # collapsed Q = over-smoothing/lag). Priority: env override
-                # (offline tuning) > config fixed_fps (the default, ~9 Hz =
-                # the cadence the sigmas were tuned at) > wall-clock fallback.
+                # KF timestamp = the CAPTURE event-time of THIS frame, so the filter's internal
+                # dt = (this frame's stamp - the previously-filtered frame's stamp) = the REAL time
+                # between the two frames it is filtering. This is correct under frame-drop (replay/live
+                # read the freshest SHM frame + drop stale ones), where consecutive ticks are NOT
+                # consecutive captures: the stamp delta reports the true gap so the constant-velocity
+                # predict extrapolates over the real elapsed time. It is event-time (sensor clock), NOT
+                # processing time, so tracker-compute-rate variation can't detune it (the wall-clock-dt
+                # detuning trap). The filter clamps dt to (0, 0.5)s, falling back to 1/20s for a
+                # post-tracking-loss huge gap or a duplicate/zero stamp.
+                # Priority: DGS_KF_SYNTHETIC_FPS (explicit synthetic override for offline tuning) >
+                # real capture stamp (the default) > config fixed_fps (fallback when no stamp threaded,
+                # e.g. unit tests) > wall-clock.
                 _sfps_env = os.environ.get("DGS_KF_SYNTHETIC_FPS")
-                _sfps = float(_sfps_env) if _sfps_env else self._pose_filter_fixed_fps
-                if _sfps and _sfps > 0.0:
+                if _sfps_env and float(_sfps_env) > 0.0:
                     self._kf_tick = getattr(self, "_kf_tick", 0) + 1
-                    _ts = self._kf_tick / _sfps
+                    _ts = self._kf_tick / float(_sfps_env)
+                elif current_stamp_sec is not None and current_stamp_sec > 0.0:
+                    _ts = float(current_stamp_sec)
+                elif self._pose_filter_fixed_fps and self._pose_filter_fixed_fps > 0.0:
+                    self._kf_tick = getattr(self, "_kf_tick", 0) + 1
+                    _ts = self._kf_tick / self._pose_filter_fixed_fps
                 else:
                     _ts = time.time()
                 rotation_out, translation_out = self._pose_filter.filter(
