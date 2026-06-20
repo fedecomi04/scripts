@@ -117,7 +117,10 @@ class ReplaySource:
         self._frames = frames
         # capture stamps -> relative seconds; synth from fps if absent (principle #5)
         stamps = [f.get("stamp_wall") for f in frames]
-        if all(s is not None for s in stamps) and len(stamps) > 1:
+        # Pace on the REAL capture stamps when present (honest variable-dt replay). DGS_REPLAY_UNIFORM_FPS=1
+        # overrides them with a fixed replay_fps cadence (--fps), e.g. to remove the capture jitter.
+        force_fps = os.environ.get("DGS_REPLAY_UNIFORM_FPS") == "1"
+        if (not force_fps) and all(s is not None for s in stamps) and len(stamps) > 1:
             s0 = stamps[0]
             self._rel_t = [float(s - s0) for s in stamps]
         else:

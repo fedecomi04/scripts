@@ -53,7 +53,8 @@ def _envb(name: str, default: bool) -> bool:
 @dataclass(frozen=True)
 class TrackerConfig:
     top_k: int = 1024
-    ransac_iterations: int = 32
+    ransac_iterations: int = 68          # tuned: stabler inlier consensus, fewer flick-backs
+    ransac_inlier_threshold: float = 0.004   # m; tuned: stricter inliers (cleaner pose) ↓ = stricter
     lighterglue_depth_confidence: float = -1.0
     crop_to_object_bbox: bool = True
     crop_padding_px: int = 150
@@ -62,8 +63,8 @@ class TrackerConfig:
     scale_gate_ratio: float = 1.3
     scale_select: bool = False
     static_hold_window: int = 15
-    static_hold_trans_mm: float = 18.0
-    static_hold_rot_deg: float = 6.0
+    static_hold_trans_mm: float = 25.0   # tuned: wider stillness gate kills steady-state shake
+    static_hold_rot_deg: float = 10.0    # tuned
     min_track_points: int = 12
 
 
@@ -289,10 +290,12 @@ def load_runtime_config() -> RuntimeConfig:
     source = _envs("DGS_SOURCE", "sim").lower()
     tracker = TrackerConfig(
         top_k=_envi("DGS_XFEAT_TOP_K", 1024),
+        ransac_iterations=_envi("DGS_XFEAT_RANSAC_ITERS", 68),   # ↑ = stabler inlier consensus, less jitter
+        ransac_inlier_threshold=_envf("DGS_XFEAT_RANSAC_INLIER_M", 0.004),  # ↓ = stricter inliers
         scale_select=_envb("DGS_XFEAT_SCALE_SELECT", False),
         static_hold_window=_envi("DGS_HOLD_WINDOW", 15),
-        static_hold_trans_mm=_envf("DGS_HOLD_TRANS_MM", 18.0),
-        static_hold_rot_deg=_envf("DGS_HOLD_ROT_DEG", 6.0),
+        static_hold_trans_mm=_envf("DGS_HOLD_TRANS_MM", 25.0),
+        static_hold_rot_deg=_envf("DGS_HOLD_ROT_DEG", 10.0),
     )
     pose_filter = PoseFilterConfig(
         enabled=_envb("DGS_KF_ENABLED", False),

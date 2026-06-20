@@ -55,6 +55,7 @@ class XFeatTracker:
             top_k=tracker_cfg.top_k,
             min_track_points=tracker_cfg.min_track_points,
             ransac_iterations=tracker_cfg.ransac_iterations,
+            ransac_inlier_threshold=tracker_cfg.ransac_inlier_threshold,
             anchor_rotation_gate_deg=tracker_cfg.rotation_gate_deg,
             anchor_scale_gate=tracker_cfg.scale_gate_ratio,
             lighterglue_depth_confidence=tracker_cfg.lighterglue_depth_confidence,

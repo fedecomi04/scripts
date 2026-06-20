@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import os
 import numpy as np
 import torch
 
@@ -90,6 +91,27 @@ class DynamicLoop:
             self.g.cull(ins)                                  # drop every FF insert (instance_id == insert_id)
         self.sm.set_hidden_indices(None)                      # un-hide the deferred-cull rows
         self._seeded = False                                  # next frame re-seeds the tracker from frame 0
+
+    def _save_track_cmp(self, frame, cam) -> None:
+        """Opt-in debug (DGS_TRACK_CMP=1): write the live frame and the rendered scene as two separate
+        PNGs per tick so tracking quality can be scrubbed frame-by-frame, independent of the FF save
+        cadence. Renders under the lock (adds render cost to the tick — debug only, OFF by default)."""
+        import cv2
+        out = getattr(self, "_cmp_dir", None) or Path("/tmp/dgs2_track_cmp")
+        if not getattr(self, "_cmp_dir_ready", False):
+            import shutil
+            shutil.rmtree(out, ignore_errors=True)
+            out.mkdir(parents=True, exist_ok=True)
+            self._cmp_dir_ready = True
+        with self.lock:
+            rgb, _, _ = self.sm.render(cam)
+        rend_bgr = cv2.cvtColor((rgb.clamp(0, 1).detach().cpu().numpy() * 255.0).astype(np.uint8),
+                                cv2.COLOR_RGB2BGR)
+        live_bgr = np.ascontiguousarray(frame.rgb_bgr)
+        # Two SEPARATE files per tick (not side-by-side): per-tick sort keeps each live/rend pair
+        # adjacent (..._1_live, ..._2_rend) so you can step through and flip between them.
+        cv2.imwrite(str(out / f"{self._tick:06d}_1_live.png"), live_bgr)
+        cv2.imwrite(str(out / f"{self._tick:06d}_2_rend.png"), rend_bgr)
 
     @staticmethod
     def _bbox_from_mask(objmask, pad, W, H):
@@ -177,6 +199,9 @@ class DynamicLoop:
             if out is not None:
                 ms, qs, uids = out                       # uids: stable gauss_uid per subset row (NOT a mask)
                 self.g.write_object_pose(ms, qs, uids)   # resolves uid->live row under the lock (FF-race-safe)
+
+        if os.environ.get("DGS_TRACK_CMP") == "1":       # opt-in debug: per-tick live + rendered dump
+            self._save_track_cmp(frame, cam)
 
         if self.ff is not None and self.ff.due(self._tick):
             d = FeedforwardDispatch(
@@ -384,6 +409,7 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
 
     loop = DynamicLoop(sm, gset, lock, tracker, ref, d0_id, cfg, device, ff_worker=ff)
     loop.tracker_intr = ring.intrinsics()
+    loop._cmp_dir = Path(data_dir) / "dynamic_scene" / "_track_debug"   # DGS_TRACK_CMP per-tick debug dump
 
     from .dynamic_viz import ViserBridge
     def _render_fn(cam):

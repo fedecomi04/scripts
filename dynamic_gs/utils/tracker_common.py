@@ -396,6 +396,11 @@ class PoseKalmanFilter:
         #   DGS_KF_SPIKE_MOTION_K — |v|*dt weight added to the 3-sigma spike floor
         self._snap_motion_k = float(os.environ.get("DGS_KF_SNAP_MOTION_K", "3.0"))
         self._spike_motion_k = float(os.environ.get("DGS_KF_SPIKE_MOTION_K", "1.0"))
+        # Physics-plausibility outlier reject: a measurement implying the object moved faster than
+        # max_speed_mps is a bad match -> reject (hold) for up to outlier_confirm-1 ticks before
+        # accepting it as a genuine reacquisition. Operator bound: <= ~7 cm over 2 steps (~0.35 m/s).
+        self._max_speed_mps = float(os.environ.get("DGS_KF_MAX_SPEED_MPS", "0.4"))
+        self._outlier_confirm = int(os.environ.get("DGS_KF_OUTLIER_CONFIRM", "3"))
         self.reset()
 
     def reset(self) -> None:
@@ -405,6 +410,7 @@ class PoseKalmanFilter:
         self._x = np.zeros(12, dtype=np.float64)   # error/velocity state
         self._P = np.eye(12, dtype=np.float64)
         self._last_time: float = 0.0
+        self._outlier_run = 0   # consecutive physics-implausible measurements (for the reject gate)
 
     @property
     def initialized(self) -> bool:
@@ -448,6 +454,8 @@ class PoseKalmanFilter:
         if not (0.0 < dt < 0.5):
             dt = 1.0 / 20.0  # tick-rate fallback for clock hiccups
 
+        t_prev = self._t_nom.copy()   # last filtered position, for the physics-plausibility reject below
+
         # --- Predict (constant velocity) ---
         self._t_nom = self._t_nom + self._x[3:6] * dt
         self._R_nom = _so3_exp(self._x[9:12] * dt) @ self._R_nom
@@ -482,6 +490,20 @@ class PoseKalmanFilter:
         move_t = float(np.linalg.norm(self._x[3:6])) * dt
         move_r = float(np.linalg.norm(self._x[9:12])) * dt
 
+        # Physics-plausibility reject: the tracked object cannot translate faster than max_speed_mps,
+        # so a measurement implying a jump > max_speed*dt from the last filtered position is a bad match
+        # (a momentary anchor mis-match), NOT motion — snapping to it teleports the object to an old/wrong
+        # place. Reject transient outliers (hold the predicted pose); only after the large jump PERSISTS
+        # for outlier_confirm consecutive ticks do we accept it as a genuine reacquisition and fall through
+        # to the snap gate. Operator bound: <= ~7 cm over 2 steps. dt-aware via max_speed*dt.
+        step_disp = float(np.linalg.norm(t_meas64 - t_prev))
+        if step_disp > self._max_speed_mps * dt:
+            self._outlier_run += 1
+            if self._outlier_run < self._outlier_confirm:
+                return self.current()          # reject this measurement; keep the held (predicted) pose
+        else:
+            self._outlier_run = 0
+
         # Innovation gate: discontinuity (reacquisition after the object
         # left the view, or an anchor-pool jump) — snap to the
         # measurement and restart the velocity estimate instead of
@@ -501,6 +523,7 @@ class PoseKalmanFilter:
                 [self._meas_trans_var] * 3 + [1.0] * 3
                 + [self._meas_rot_var] * 3 + [10.0] * 3
             )
+            self._outlier_run = 0
             return self.current()
 
         H = np.zeros((6, 12))
