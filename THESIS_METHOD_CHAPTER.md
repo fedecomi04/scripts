@@ -213,16 +213,26 @@ many* objects to keep from *whether any* match the prompt:
   margin of $0.04$ above the median.
 
 Surviving masks are area-filtered, border-filtered, deduplicated by IoU, and
-capped, yielding for each object $k$ a record
-$(\text{mask}_k, \text{score}_k, \text{bbox}_k, \text{area}_k)$.
+capped. The deduplication is *containment-aware* — the same object is often
+proposed at several extents (e.g. a tight shaft mask and a full shaft-plus-handle
+mask), so candidates are processed largest-area first and any later one that is
+highly overlapping with, or mostly contained in, an already-kept mask is dropped,
+keeping the *fullest* extent of each object. This yields for each object $k$ a
+record $(\text{mask}_k, \text{score}_k, \text{bbox}_k, \text{area}_k)$.
 
-**Single-view 3D reconstruction.** For each accepted mask, a single-image 3D
-object generator (SAM3D) predicts a *complete* Gaussian point cloud of the object
-in a canonical object frame, together with a canonical-to-camera orientation. The
-generator is optionally conditioned on the metric depth back-projected inside the
-mask, anchoring the reconstruction to the real scale. The output is a dense,
-complete-but-approximate object cloud $\mathcal{S}_k$ and a canonical rotation
-$q_k^{\text{can}}$.
+**Single-view 3D reconstruction.** Each accepted mask is first enlarged through its
+bounding box before reconstruction: the SAM3D input is a *square* crop centred on
+the mask, with side $\max(\text{bbox}_w, \text{bbox}_h) + 2\,p$ ($p = 100\,\text{px}$
+padding, floored at $800\,\text{px}$), and the metric depth and intrinsics are
+cropped to match. The enlargement is deliberate — a crop tight to the silhouette
+starves the generator of surrounding scene context and yields stubby or elongated
+reconstructions, whereas the padded box supplies enough context for a faithful
+shape. On this crop, a single-image 3D object generator (SAM3D) predicts a
+*complete* Gaussian point cloud of the object in a canonical object frame, together
+with a canonical-to-camera orientation, optionally conditioned on the cropped
+metric depth (as a back-projected point map) to anchor the reconstruction to the
+real scale. The output is a dense, complete-but-approximate object cloud
+$\mathcal{S}_k$ and a canonical rotation $q_k^{\text{can}}$.
 
 ### 1.6 Non-Rigid Registration and Occlusion-Aware Fusion (Phase 0b)
 
