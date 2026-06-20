@@ -317,7 +317,7 @@ class LiveBridgeSource:
         if self.live_root is not None:
             kw["live_root"] = self.live_root
         self._sub = LiveShmSubscriber(**kw)               # spawns the proven publisher
-        i = self._sub.intrinsics()
+        i = self._sub.intrinsics                           # @property on LiveShmSubscriber (NOT a method)
         self._intr = Intrinsics(width=int(i.width), height=int(i.height),
                                 fx=float(i.fx), fy=float(i.fy), cx=float(i.cx), cy=float(i.cy))
         self._prod = ShmProducer(self._intr, name=shm_name)   # NEW layout

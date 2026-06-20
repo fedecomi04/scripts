@@ -39,6 +39,12 @@ StaticGS = MethodSpecification(
         steps_per_eval_all_images=1_000_000_000,
         steps_per_save=500,
         max_num_iterations=STATIC_NUM_STEPS,
+        # fp32 (NOT fp16). The 1/2-res-first-100 schedule below (num_downscales=1,
+        # resolution_schedule=100) is the live-static speedup. fp16 was tried + REVERTED:
+        # autocast on the gsplat rasterizer backward + SSIM loses too much precision and
+        # leaves the static scene blurry (measured on the dynamic_gs2 native port: ~17 dB
+        # masked PSNR fp16 vs ~26 dB fp32 — a blurry scene then starves the XFeat tracker).
+        # The static phase is a one-time cost, so correctness wins over the fp16 speedup.
         mixed_precision=False,
         pipeline=StaticGSPipelineConfig(
             static_num_steps=STATIC_NUM_STEPS,

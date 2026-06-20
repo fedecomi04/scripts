@@ -26,12 +26,14 @@ except Exception:                                  # pragma: no cover
 class ViserBridge:
     """Spin up once per dynamic run. attach(render_fn) then request_render() per mutation."""
 
-    def __init__(self, cfg, *, device="cuda", render_size=(960, 600), jpeg_quality: int = 88):
+    def __init__(self, cfg, *, device="cuda", render_size=(960, 600), jpeg_quality: int = 88,
+                 follow_default: bool = False):
         self.enabled = bool(getattr(cfg, "enabled", True)) and _HAVE_VISER
         self.port = int(getattr(cfg, "port", 8081))
         self.device = device
         self.render_w, self.render_h = render_size
         self.jpeg_quality = jpeg_quality
+        self._follow_default = bool(follow_default)
         self._render_fn: Optional[Callable] = None
         self._server = None
         self._thread: Optional[threading.Thread] = None
@@ -40,7 +42,7 @@ class ViserBridge:
         self._closing = False
         self._initial_c2w: Optional[np.ndarray] = None
         self._follow_c2w: Optional[np.ndarray] = None
-        self._follow = False
+        self._follow = bool(follow_default)
         self._feed_rgb: Optional[np.ndarray] = None
         self._feed_gui = None
         self._lock = threading.Lock()
@@ -56,7 +58,9 @@ class ViserBridge:
     # ---- GUI ----
     def _build_gui(self):
         with self._server.gui.add_folder("Tracker view"):
-            self._gui_follow = self._server.gui.add_checkbox("Follow tracked frame", False)
+            # Default ON for live: the rendered view follows the live camera so the (correctly-placed)
+            # object sits ON the camera-feed object — uncheck to free-orbit and inspect the scene.
+            self._gui_follow = self._server.gui.add_checkbox("Follow tracked frame", self._follow_default)
             self._gui_feed = self._server.gui.add_checkbox("Show camera feed", True)
 
             @self._gui_follow.on_update

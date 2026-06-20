@@ -184,6 +184,12 @@ class DynamicLoop:
             self.ref.capture(snap)
             kept = self.tracker.seed(inp)
             self._seeded = self.tracker.ready
+            # Dump the SEED-frame live+rendered pair too: tick 0 is the decisive frame for the
+            # "object inserted in wrong place" check — if the rendered object overlays the live object
+            # here (no motion yet), the placement is correct in world (any apparent offset is the
+            # viser-camera-alignment visual artifact, not geometry).
+            if os.environ.get("DGS_TRACK_CMP") == "1":
+                self._save_track_cmp(frame, cam)
             row.update(seed=int(kept), tracking_ok=False,
                        R=np.eye(3).tolist(), t=[0, 0, 0], inliers=0,
                        total_gauss=self.g.num_points)
@@ -369,19 +375,27 @@ def run_view_recorded(data_dir, cfg, device, *, transforms_name: str = "transfor
 # --------------------------------------------------------------- live driver (operator step 4)
 def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enabled: bool = False,
              max_seconds: Optional[float] = None, cache_name: str = static_persist.DEFAULT_CACHE_NAME,
-             **source_opts) -> None:
+             warm_scene=None, warm_anysplat=None, warm_tracker=None, **source_opts) -> None:
     """Live dynamic phase: warm-load the scene, open a live source (default the bridge over
     the proven ROS publisher), and tick the tracker on the freshest SHM frame until shutdown.
+
+    warm_scene=(sm,gset,lock) / warm_anysplat=AnysplatHandle / warm_tracker=XFeatTracker: when given
+    (the single-process static->dynamic hand-off, run_full_live), the scene + the ALREADY-WARM AnySplat
+    + XFeat are reused IN PLACE — no reload, no ~17s re-spawn — which is the whole point of warm-loading
+    them during the static phase. When None, the scene is warm-loaded from cache + AnySplat spawned here.
 
     NOTE: requires a live Gazebo/ROS stack — validated by the OPERATOR (pipeline step 4).
     The recorded path (run_recorded_trace) is the unattended-validated one."""
     from .adapters_source import open_source
     data_dir = Path(data_dir)
-    cache = static_persist.warm_cache_path(data_dir, cache_name)
-    sm, gset, lock = static_persist.build_loaded_scene(cfg, device, cache, phase="dynamic")
+    if warm_scene is not None:
+        sm, gset, lock = warm_scene                       # carried from the static phase (re-phased to dynamic)
+    else:
+        cache = static_persist.warm_cache_path(data_dir, cache_name)
+        sm, gset, lock = static_persist.build_loaded_scene(cfg, device, cache, phase="dynamic")
     d0_id = pick_d0_instance_id(gset)
     ref = ReferenceObjectPose(d0_instance_id=d0_id)
-    tracker = XFeatTracker(device, cfg.tracker, cfg.pose_filter)
+    tracker = warm_tracker if warm_tracker is not None else XFeatTracker(device, cfg.tracker, cfg.pose_filter)
 
     ff = None
     # Warm-start AnySplat BEFORE the source starts: its ~17s model load + first-inference warm-up must
@@ -392,9 +406,12 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
     anysplat = None
     if ff_enabled:
         from .dynamic_ff_backends import make_cdn_fn, make_decode_fn, AnysplatHandle
-        anysplat = AnysplatHandle(device)
-        anysplat.prewarm()
-        anysplat.wait_ready()    # block until loaded; producer clock (next line) starts on a ready worker
+        if warm_anysplat is not None:
+            anysplat = warm_anysplat          # already spawned+loaded during the static phase — reuse
+        else:
+            anysplat = AnysplatHandle(device)
+            anysplat.prewarm()
+        anysplat.wait_ready()    # idempotent; returns instantly if already warm. producer clock starts ready
     # The 'replay' source needs the dataset dir (it paces recorded frames into SHM like the live
     # publisher); pass our resolved data_dir through.
     if source_kind == "replay":
@@ -416,11 +433,16 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
         with lock:
             rgb, _, _ = sm.render(cam)
         return rgb
-    bridge = ViserBridge(cfg.viser, device=device)
+    # follow_default=True: the live viewer opens following the live camera, so the rendered object
+    # overlays the camera-feed object (uncheck "Follow tracked frame" in the GUI to free-orbit).
+    bridge = ViserBridge(cfg.viser, device=device, follow_default=True)
     bridge.attach(_render_fn)
 
     print(f"[pipeline] LIVE: d0_instance_id={d0_id}, scene={gset.num_points} gaussians, source={source_kind}")
     last_seq, last_stamp, t0 = -1, None, time.time()
+    _cam_init = False           # snap the viser camera to the FIRST live frame so the scene appears
+                                # at the live viewpoint (else viser opens at its arbitrary default pose
+                                # and the correctly-placed object LOOKS misplaced vs the feed thumbnail).
     try:
         while True:
             if max_seconds is not None and time.time() - t0 > max_seconds:
@@ -431,6 +453,9 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
                 if ring.is_shutdown():
                     break
                 continue
+            if not _cam_init:
+                bridge.set_initial_camera(fr.c2w_4x4)   # align the viewer with the live camera on frame 0
+                _cam_init = True
             last_seq = int(fr.seq)
             # Looping replay: a big backward jump in the capture stamp means the episode wrapped to
             # frame 0 -> reset the dynamic state so every pass starts from the same D0 scene/tracker.
@@ -457,14 +482,50 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
             print(f"[pipeline] LIVE: wrote FF timing report -> {report_path}")
 
 
+def run_full_live(data_dir, cfg, device, *, prompt_text: str = "", source_kind: str = "live_bridge",
+                  box_px: int = 350, ff_enabled: bool = True, max_seconds: Optional[float] = None) -> None:
+    """SINGLE-PROCESS whole pipeline: live static capture -> in-process hand-off -> live dynamic loop.
+
+    This is the point of warm-loading AnySplat/XFeat/LighterGlue during the static phase: the static
+    phase spawns + loads them (hidden under the sweep/train), then we carry the SAME warm handles AND
+    the in-memory scene straight into the dynamic loop — re-phasing the scene static->dynamic IN PLACE
+    (no reload) and reusing the already-warm AnySplat (no ~17s re-spawn). Two separate commands would
+    throw all that away (the warm worker dies with the static process)."""
+    from . import static_pipeline
+    data_dir = Path(data_dir)
+    # 1) live static capture (red-box sweep -> segment -> SAM3D -> train -> fuse), returning the
+    #    in-memory scene + the warm model registry.
+    _pt, (sm, gset, lock), reg = static_pipeline.run_static_live(
+        data_dir, cfg, device, prompt_text=prompt_text, source_kind=source_kind,
+        box_px=box_px, return_scene=True)
+    # 2) re-phase the scene static->dynamic IN PLACE (LR->0, means-grad hook, free-list + count-provider)
+    #    so it matches build_loaded_scene(phase='dynamic') without a reload.
+    sm.set_phase("dynamic")
+    gset.enable_freelist()
+    sm.set_count_provider(lambda: gset.count)
+    print(f"[pipeline] FULL-LIVE: re-phased scene to dynamic in place ({gset.num_points} gaussians); "
+          f"handing warm AnySplat/XFeat to the live loop", flush=True)
+    # 3) extract the ALREADY-WARM handles from the registry (raw AnysplatHandle + XFeatTracker).
+    warm_anysplat = reg["anysplat"].handle() if (ff_enabled and "anysplat" in reg) else None
+    warm_tracker = reg["xfeat"].tracker() if "xfeat" in reg else None
+    # 4) live dynamic loop reusing the in-memory scene + warm models (no reload, no re-spawn).
+    run_live(data_dir, cfg, device, source_kind=source_kind, ff_enabled=ff_enabled,
+             max_seconds=max_seconds, warm_scene=(sm, gset, lock),
+             warm_anysplat=warm_anysplat, warm_tracker=warm_tracker)
+
+
 # --------------------------------------------------------------- CLI
 def _main():
     import argparse
     from . import config as _C
     ap = argparse.ArgumentParser(description="dynamic_gs2 dynamic-phase runner")
-    ap.add_argument("--mode", choices=["recorded", "live", "view"], required=True)
+    ap.add_argument("--mode", choices=["recorded", "live", "view", "full"], required=True,
+                    help="full = SINGLE-PROCESS whole pipeline: live static capture -> in-process "
+                         "hand-off (warm AnySplat/XFeat reused) -> live dynamic loop")
     ap.add_argument("--data", required=True, help="dataset dir (with static_scene/static_state.pt)")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--prompt", default="", help="full: object text prompt (else cfg/DGS_SAM3_PROMPT)")
+    ap.add_argument("--box-px", type=int, default=350, help="full: red-box side in px")
     ap.add_argument("--ff", action=argparse.BooleanOptionalAction, default=True,
                     help="feedforward (needs AnySplat worker); ON by default, --no-ff disables")
     ap.add_argument("--source", default="live_bridge", help="live source kind (live_bridge|ros1)")
@@ -486,7 +547,10 @@ def _main():
         import dataclasses as _dc
         cfg = _dc.replace(cfg, feedforward=_dc.replace(cfg.feedforward,
                                                         cull_replaced_enabled=bool(args.replaced_cull)))
-    if args.mode == "recorded":
+    if args.mode == "full":
+        run_full_live(args.data, cfg, args.device, prompt_text=args.prompt, source_kind=args.source,
+                      box_px=args.box_px, ff_enabled=args.ff, max_seconds=args.max_seconds)
+    elif args.mode == "recorded":
         out = args.out_trace or str(Path(args.data) / "new_trace.jsonl")
         run_recorded_trace(args.data, cfg, args.device, out, ff_enabled=args.ff,
                            transforms_name=args.transforms, max_frames=args.max_frames)

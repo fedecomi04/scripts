@@ -36,9 +36,12 @@ class SceneModel:
 
     def __init__(self, cfg, device, *, seed_xyz: torch.Tensor, seed_rgb: torch.Tensor,
                  phase: str = "dynamic", num_train_data: int = 1,
-                 aabb_scale: float = 4.0):
+                 aabb_scale: float = 4.0, num_downscales: int = 0,
+                 resolution_schedule: int = 100):
         """cfg = RuntimeConfig (reads cfg.sh_degree via static_train). phase in {static,dynamic}.
-        seed_rgb is uint8 [0,255] or float [0,1] -> normalized to [0,255] for Splatfacto."""
+        seed_rgb is uint8 [0,255] or float [0,1] -> normalized to [0,255] for Splatfacto.
+        num_downscales/resolution_schedule drive the static train's coarse-to-fine resolution
+        (1 + 100 = half-res for the first 100 steps, then full); 0 = full-res always (render/dynamic)."""
         self.cfg = cfg
         self.phase = phase
         self._device = torch.device(device)
@@ -57,7 +60,9 @@ class SceneModel:
         a = max(ext * 1.0, 1.0) * aabb_scale
         scene_box = SceneBox(aabb=torch.tensor([[-a, -a, -a], [a, a, a]], dtype=torch.float32))
 
-        model_cfg = SplatfactoModelConfig(sh_degree=sh_degree, random_init=False)
+        model_cfg = SplatfactoModelConfig(sh_degree=sh_degree, random_init=False,
+                                          num_downscales=num_downscales,
+                                          resolution_schedule=resolution_schedule)
         self.model: SplatfactoModel = model_cfg.setup(
             scene_box=scene_box, num_train_data=num_train_data,
             metadata={"seed_points": (sxyz, srgb)},
@@ -65,6 +70,12 @@ class SceneModel:
         )
         self.model.to(self._device)
         self.model.set_background(torch.tensor(_GAZEBO_SKY, dtype=torch.float32, device=self._device))
+        # Force the FIXED Gazebo sky as the composite background even DURING training (Invariant #6).
+        # Splatfacto's default background_color="random" makes _get_background_color() return a RANDOM
+        # color while self.training — which would train the static scene against the wrong photometric
+        # bias. The old StaticGSModel overrode _get_background_color for exactly this; mirror it here.
+        _sky = self.model.background_color
+        self.model._get_background_color = lambda: _sky.to(self.model.device)
         # render-time: activate all SH bands; surgical count changes only.
         self.model.step = 30000
         self.model.crop_box = None
@@ -95,6 +106,15 @@ class SceneModel:
         of each gauss_param so the over-allocated dead rows [count:] never rasterize. None (default)
         = render the full tensor (static phase / no free-list)."""
         self._count_provider = fn
+
+    def set_phase(self, phase: str) -> None:
+        """Flip the phase IN PLACE (for the single-process static->dynamic hand-off, no rebuild):
+        re-bind the means-grad hook (dynamic hard-zeros means.grad) and re-assert the phase LR policy
+        (dynamic = ALL LRs 0). Pair with GaussianSet.enable_freelist() + set_count_provider() to reach
+        the exact state build_loaded_scene(phase='dynamic') produces, without reloading the scene."""
+        self.phase = phase
+        self._bind_means_grad_hook()
+        self.enforce_phase_lr()
 
     def set_hidden_indices(self, idx: Optional[torch.Tensor]) -> None:
         """Deferred-cull (FF Option A): rows whose OPACITY the render zeroes so they don't show,
@@ -240,6 +260,28 @@ class SceneModel:
         depth = out.get("depth")
         alpha = out.get("accumulation", out.get("alpha"))
         return rgb, depth, alpha
+
+    def get_outputs_with_info(self, camera):
+        """-> (outputs, info). Forward render that ALSO returns gsplat's per-gaussian meta dict
+        (means2d/radii/depths), which Phase-0b's subset/slab queries need (radius is ONLY in info).
+        No-grad, full-tensor render (static phase is freelist-off so count == physical N). MUST be
+        regenerated per object — insert() changes N and stales a prior info. MUST hold render_lock."""
+        cam = camera.to(self._device)
+        if cam.camera_to_worlds.dim() == 2:
+            cam = cam.reshape((1,))
+        self.model.eval()
+        with torch.no_grad():
+            out = self.model.get_outputs(cam)         # sets self.model.info as a side effect
+        info = self.model.info
+        c = int(self._count_provider()) if self._count_provider is not None else \
+            self.model.gauss_params["means"].shape[0]
+        radii = info.get("radii")
+        if radii is not None:
+            assert radii.reshape(-1).shape[0] == c, \
+                f"gsplat info N ({radii.reshape(-1).shape[0]}) != count ({c})"
+        return out, info
+    # Returns gsplat's projected (center,radius,depth) per gaussian so the native Phase-0b can
+    # reproduce the old model.info-based existing-object-subset / slab queries exactly.
 
     def render_object_mask(self, camera, instance_mask: torch.Tensor,
                            alpha_thr: float = 0.5) -> torch.Tensor:

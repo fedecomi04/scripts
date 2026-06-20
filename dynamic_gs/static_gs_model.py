@@ -111,12 +111,14 @@ class StaticGSModelConfig(SplatfactoModelConfig):
     output_depth_during_training: bool = True
     sh_degree_interval: int = 500
     resolution_schedule: int = 100
-    # Full-res from step 0 (no coarse-to-fine downscale). With the short
-    # early-stopped budget, the schedule's 1/4→1/2→1/1 ramp meant the loss
-    # never reached the full-res plateau before stopping; full-res-from-0 lets
-    # the EMA early-stop (main_loss~0.09) fire at ~step 100 / ~2.6s. Measured
-    # 2026-06-11: 21.4s→2.6s, PSNR 20.10→19.08 dB (~1 dB for ~19s).
-    num_downscales: int = 0
+    # Coarse-to-fine resolution: train at 1/2 res for the first 100 steps
+    # (resolution_schedule), then jump to full res. At 1200p the per-step cost
+    # is SSIM + rasterizer-backward bound, both pixel-count-scaled, so the first
+    # 100 steps run ~4x cheaper at 1/2 res. num_downscales=1 => 1/2 start (no
+    # 1/4 stage). This is the live-static speedup; the TrainerConfig keeps fp32
+    # (fp16 was tried + reverted — it blurs the gsplat+SSIM static fit). (Was 0
+    # = full-res-from-0; reverted for live, where full-res-from-0 is too slow.)
+    num_downscales: int = 1
 
     # ---- Phase 0a (SAM3 text-prompted segmentation) ----
     use_sam3_graspable_prefusion: bool = True

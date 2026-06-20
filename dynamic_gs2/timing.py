@@ -122,9 +122,27 @@ class TimingLedger:
             gauges = {k: list(v) for k, v in self._gauges.items()}
         return _render_report(intervals, events, counters, gauges, self._t_origin)
 
+    def render_static(self, dead_time_after: Optional[str] = None) -> str:
+        """Render the STATIC-phase report (a one-pass schedule, not repeating FF cycles):
+        per-bulletpoint stage durations + an absolute timeline that shows which stages
+        OVERLAPPED (the 'hidden under …' column the static schedule cares about) + the
+        headline post-trigger dead time. `dead_time_after` = the event name (e.g.
+        'sam3d_done') from which 'dead time' is measured to the last stage end."""
+        with self._lock:
+            intervals = list(self._intervals)
+            events = list(self._events)
+            counters = dict(self._counters)
+            gauges = {k: list(v) for k, v in self._gauges.items()}
+        return _render_static_report(intervals, events, counters, gauges,
+                                     self._t_origin, dead_time_after)
+
     def write(self, path) -> None:
         from pathlib import Path
         Path(path).write_text(self.render())
+
+    def write_static(self, path, dead_time_after: Optional[str] = None) -> None:
+        from pathlib import Path
+        Path(path).write_text(self.render_static(dead_time_after))
 
     def reset(self) -> None:
         with self._lock:
@@ -287,3 +305,116 @@ _LEDGER = TimingLedger()
 
 def get_ledger() -> TimingLedger:
     return _LEDGER
+
+
+def new_ledger() -> TimingLedger:
+    """A FRESH, independent ledger — the static phase uses its own so its one-pass schedule
+    timing never mixes with the dynamic FF ledger's repeating cycles."""
+    return TimingLedger()
+
+
+# --------------------------------------------------------- static-phase report
+# Stage order = the §1 schedule bulletpoints (rewrite_spec/static_phase.md). Each row is ONE
+# timed stage; the report reads top-to-bottom in schedule order. Stages not hit are skipped.
+_STATIC_STEP_ORDER = [
+    # SWEEP (operator moving; all overlap each other + continued recording)
+    "sweep.icp_per_frame",          # ICP-live refine per swept frame -> CPU pose list
+    "sweep.fastsam_load",           # FastSAM weights -> GPU (prewarm)
+    "sweep.sam3d_load",             # SAM3D build (subprocess spawn + ctor)
+    "sweep.dyn_models_prewarm",     # XFeat + LighterGlue (+AnySplat) -> load (prewarm)
+    # RED-BOX TRIGGER (object fills box; keep recording)
+    "trigger.snapshot_anchor",      # freeze rgb+depth+pose+intr
+    "trigger.fastsam_segment",      # FastSAM segment(anchor) -> mask
+    "trigger.write_seg_folder",     # segmentation/ folder + overlay
+    "trigger.sam3d_infer",          # SAM3D wake+infer(anchor) -> object PLY  (hidden under motion)
+    # AFTER SAM3D (GPU free)
+    "after.tsdf_integrate",         # integrate-only at the live poses -> finalize -> seed PLY
+    "after.splatfacto_load",        # build/instantiate the static train model
+    "after.splatfacto_train",       # 500-step Splatfacto fit
+    "after.anysplat_spawn",         # AnySplat worker spawn (overlaps train)
+    "after.ndp_register",           # NDP non-rigid register SAM3D PLY (overlaps train)
+    # END / HAND-OFF
+    "end.opacity_purge",            # one-shot low-opacity purge
+    "end.phase0b_fuse",             # insert + cull + instance-id propagate
+    "end.export_state",             # export post-fusion -> dynamic_gs2 static_state.pt
+    "end.wake_dynamic",             # XFeat/LighterGlue/AnySplat -> GPU for the live loop
+]
+
+
+def _render_static_report(intervals, events, counters, gauges, t_origin,
+                          dead_time_after: Optional[str]) -> str:
+    """Format the static-phase report: per-stage durations (schedule order) + an absolute
+    timeline that reveals which stages overlapped (= 'hidden under …') + the dead-time headline."""
+    out: List[str] = []
+    out.append("=" * 78)
+    out.append("STATIC-PHASE TIMING REPORT  (perf_counter, seconds; one-pass schedule.")
+    out.append("Stages whose [start..end] windows overlap ran CONCURRENTLY = 'hidden' under each other.)")
+    out.append("=" * 78)
+
+    # ---- counters (headline events: objects found, skips) ----
+    if counters:
+        out.append("")
+        out.append("EVENTS / COUNTERS")
+        for k in sorted(counters):
+            out.append(f"  {k:28s} {counters[k]}")
+
+    wall = sorted([iv for iv in intervals if not iv.reported], key=lambda i: i.t0)
+
+    # ---- headline DEAD TIME (operator-visible wait: from the named event to the last stage end) ----
+    if dead_time_after is not None and wall:
+        evt = [e.t for e in events if e.name == dead_time_after]
+        if evt:
+            dead = max(iv.t1 for iv in wall) - evt[0]
+            out.append("")
+            out.append("DEAD TIME  (headline #1 — operator-visible wait after the trigger)")
+            out.append(f"  from '{dead_time_after}' to end   {dead:.1f}s")
+
+    # ---- aggregate per-stage table (seconds; mirrors the FF AGGREGATE PER-STEP table) ----
+    by_step: Dict[str, List[float]] = defaultdict(list)
+    for iv in intervals:
+        by_step[iv.name].append(iv.t1 - iv.t0)            # seconds
+    total_wall = (max(i.t1 for i in wall) - min(i.t0 for i in wall)) if wall else 0.0
+    out.append("")
+    out.append(f"AGGREGATE PER-STAGE   (total wall {total_wall:.1f}s; durations in SECONDS)")
+    out.append(f"  {'stage':24s} {'n':>3s} {'total_s':>9s} {'mean_s':>8s} {'max_s':>8s}")
+    ordered = [s for s in _STATIC_STEP_ORDER if s in by_step] + \
+              [s for s in sorted(by_step) if s not in _STATIC_STEP_ORDER]
+    for step in ordered:
+        v = by_step[step]
+        tot = sum(v)
+        out.append(f"  {step:24s} {len(v):>3d} {tot:>9.2f} {tot/len(v):>8.2f} {max(v):>8.2f}")
+
+    # ---- schedule breakdown (mirrors the FF PER-FF-CYCLE BREAKDOWN: +offset from start, duration,
+    #      and [‖ overlapped: ...] marking stages that ran concurrently with this one) ----
+    if wall:
+        t0 = wall[0].t0
+        # collapse repeated per-frame stages (e.g. sweep.icp_per_frame x N) into one span row
+        spans: Dict[str, List[float]] = {}
+        for iv in wall:
+            s = spans.setdefault(iv.name, [iv.t0, iv.t1, 0])
+            s[0] = min(s[0], iv.t0); s[1] = max(s[1], iv.t1); s[2] += 1
+        rows = sorted(([n, a, b, cnt] for n, (a, b, cnt) in spans.items()), key=lambda r: r[1])
+        out.append("")
+        out.append("SCHEDULE BREAKDOWN  (stages in run order — STAGE: dur @ +offset from start;")
+        out.append("  [‖ name] = another stage that ran CONCURRENTLY inside this one's window)")
+        out.append("")
+        out.append(f"  ── static phase  (wall {total_wall:.1f}s) ──")
+        for name, a, b, cnt in rows:
+            off = a - t0
+            dur = b - a
+            tag = f" x{cnt}" if cnt > 1 else ""
+            # which OTHER stages overlap this one's [a,b] window (the 'hidden under' relationship)
+            ov = [n2 for n2, a2, b2, _ in rows if n2 != name and a2 < b and b2 > a]
+            ov_str = f"   [‖ {', '.join(ov)}]" if ov else ""
+            out.append(f"     {name:24s}{tag:>4s}  {dur:7.2f}s  @ +{off:5.1f}s{ov_str}")
+
+    # ---- gauges (seed points, gaussian count, train steps) ----
+    if gauges:
+        out.append("")
+        out.append("GAUGES (final value / n samples)")
+        for k in sorted(gauges):
+            v = gauges[k]
+            if v:
+                out.append(f"  {k:28s} {int(v[-1][1])}  (n={len(v)})")
+    out.append("=" * 78)
+    return "\n".join(out)

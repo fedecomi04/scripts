@@ -195,6 +195,17 @@ class GaussianSet:
     def _bump(self) -> None:
         self._version += 1
 
+    def enable_freelist(self) -> None:
+        """Flip static (exact-realloc) -> dynamic (free-list) IN PLACE, for the single-process
+        static->dynamic hand-off (no scene reload, keeps the warm models). Safe ONLY when there are
+        no dead rows yet (_count == _capacity), which is exactly the post-static state: the next insert
+        then begins over-allocating from here, identical to a fresh reload_from_state_dict + freelist."""
+        with self._lock:
+            assert self._count == self._capacity, \
+                f"enable_freelist requires packed rows (_count {self._count} == _capacity {self._capacity})"
+            self._freelist = True
+            self._assert_invariant()
+
     # ----- reads -----
     def snapshot(self) -> GaussianSnapshot:
         with self._lock:

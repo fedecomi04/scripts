@@ -3,7 +3,7 @@
 What it does, end-to-end:
 
 1. ``__init__``  — builds datamanager + model (reusing ``DynamicGSDataManager``
-   and ``DynamicGSModel`` as-is), then runs Phase 0a (SAM3 segmentation +
+   and ``DynamicGSModel`` as-is), then runs Phase 0a (FASTSAM segmentation +
    Fast-SAM3D 3D generation) and stashes the outputs on the instance. SAM3D
    subprocess pays its multi-minute cost here, before static training starts.
 

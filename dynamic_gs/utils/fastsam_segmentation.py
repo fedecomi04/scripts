@@ -328,7 +328,10 @@ class FastSamTextSegmenter:
               auto_threshold: bool = True,
               auto_min_ratio: float = 2.5,
               auto_mad_k: float = 3.0,
-              auto_margin_min: float = 0.04) -> List[Dict[str, Any]]:
+              auto_margin_min: float = 0.04,
+              promote_to_container: bool = True,
+              promote_contain_frac: float = 0.8,
+              promote_cos_margin: float = 0.03) -> List[Dict[str, Any]]:
         image = Image.open(image_path).convert("RGB")
         image_rgb = np.array(image)
         image_area = image.width * image.height
@@ -376,6 +379,39 @@ class FastSamTextSegmenter:
         else:  # legacy fixed-threshold path (auto_threshold=False)
             surv_score = {i: float(scores[i]) for i in surv}
             keep = [i for i in surv if surv_score[i] >= min_score]
+
+        # PROMOTE-TO-CONTAINER: split_components can carve an object into parts (e.g. a
+        # screwdriver -> metal shaft + handle), and CLIP often scores the small distinctive
+        # PART (the shaft) marginally higher than the whole, so the cliff gate keeps the PART
+        # and drops the fuller mask BEFORE the containment-dedup below can englobe it (measured:
+        # shaft cos 0.267 area 5112 KEPT vs full-screwdriver cos 0.256 area 42598 dropped, the
+        # shaft 100% inside the full mask). Fix: for each kept mask, if a LARGER SURVIVOR
+        # contains it (>= promote_contain_frac) within promote_cos_margin cosine, swap the kept
+        # PART for that fuller survivor. Runs on SURVIVORS (pre-cliff) so the fuller mask is
+        # still available. The dedup below then collapses any duplicates the promotion creates.
+        if promote_to_container and keep and surv:
+            promoted: List[int] = []
+            for i in keep:
+                mi = masks[i] > 0
+                ai = float(mi.sum())
+                best = i
+                best_area = ai
+                for j in surv:
+                    if j == i:
+                        continue
+                    aj = float(masks[j].sum())
+                    if aj <= best_area:
+                        continue                       # only promote to a LARGER mask
+                    inter = float(np.logical_and(mi, masks[j] > 0).sum())
+                    if inter / (ai + 1e-9) >= promote_contain_frac \
+                            and (cosines[i] - cosines[j]) <= promote_cos_margin:
+                        best, best_area = j, aj          # this larger survivor englobes i
+                if best != i and best not in promoted:
+                    surv_score.setdefault(best, surv_score.get(i, float(scores[best])))
+                    promoted.append(best)
+                elif best == i:
+                    promoted.append(i)
+            keep = list(dict.fromkeys(promoted))         # de-dup, preserve order
 
         candidates = []
         for i in keep:
