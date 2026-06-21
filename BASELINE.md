@@ -31,8 +31,9 @@ ns-train auto-discovers our methods via the `nerfstudio.method_configs` entry-po
 
 ## Running (OLD pipeline)
 
-> For the CURRENT pipeline use the `dynamic_gs2/` scripts (`live.sh` / `static.sh` / `resume_live.sh`,
-> see [`commands.md`](commands.md)). The scripts below drive the frozen `dynamic_gs/` baseline.
+> For the CURRENT pipeline use the `dynamic_gs2/` four mode scripts (`full_live.sh` / `full_recorded.sh` /
+> `warm_live.sh` / `warm_recorded.sh`, see [`commands.md`](commands.md)). The scripts below drive the
+> frozen `dynamic_gs/` baseline.
 
 Three top-level scripts cover the common flows. Defaults are chosen so most invocations are zero-argument.
 

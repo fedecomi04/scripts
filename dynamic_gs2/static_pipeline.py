@@ -7,13 +7,14 @@ module (static_seed / static_segment / static_sam3d / static_fuse) and a model h
 prewarm registry (model_loader); this file only SEQUENCES them and hands the GaussianSet the
 exported warm-cache. (rewrite_spec/static_phase.md §1/§4.)
 
-Two entry points:
-  run_static_from_recorded : the unattended-validatable path — a recorded static_scene/ already
-      on disk. Runs old static-gs (train+phase0a+phase0b) -> converts to dynamic_gs2
-      static_state.pt -> prewarms the dynamic models. Times the after-SAM3D stages.
-  run_static_live          : the full live schedule with the red-box UI (capture sweep -> trigger
-      -> segment -> SAM3D -> build seed -> write dataset -> old static-gs -> convert -> prewarm).
-      Needs the sim; OPERATOR-validated (the UI/SHM/capture pieces can't be unattended-tested).
+ONE source-agnostic entry point:
+  run_static(source_kind=...) : the deep stages (segment / SAM3D / seed / train / Phase-0b fuse)
+      are identical no matter where the frames come from; ONLY the front end differs.
+        live_bridge / ros1 : SWEEP the SHM stream into the red-box trigger UI + record static_scene/.
+        replay (recorded)  : NO UI, NO sweep — static_scene/ is already on disk; anchor = the last
+            keyframe (or trigger_frame). Prints phase boundaries instead of the viser checklist.
+      Returns the dynamic_gs2 static_state.pt path, OR (path, (sm,gset,lock), registry) when
+      return_scene=True (the single-process hand-off into the dynamic loop).
 
 DEAD-TIME headline is measured from the 'sam3d_done' event to the last stage end.
 """
@@ -31,21 +32,29 @@ from . import timing as _T
 from .frame import Frame, Intrinsics
 
 
-# ----------------------------------------------------------------- recorded path
-def _last_static_frame(data_dir, cfg):
-    """Build (Frame, Intrinsics) from the LAST static keyframe (the operator's final head-on view) — the frame
-    Phase-0a segments + SAM3D sees, exactly as the old phase0a used cached_train[-1]."""
+# ----------------------------------------------------------------- recorded path 
+def _anchor_from_disk(data_dir, cfg, trigger_frame=None):
+    """Build (Frame, Intrinsics) from a recorded static keyframe — the frame Phase-0a segments +
+    SAM3D sees. DEFAULT = the LAST keyframe (the operator's final head-on view), exactly as the old
+    phase0a used cached_train[-1]. trigger_frame=N instead picks the N-th keyframe (1-based, capture
+    order) — the recorded analogue of pressing the live trigger on a specific frame.
+
+    Frames are sorted by file_path STRING (NOT trailing integer) to match nerfstudio's dataparser.
+    The capture convention prefixes the pre-motion lead-in frames with 'aa_' SO THEY SORT FIRST,
+    leaving the last SWEEP keyframe (arm_*) as the anchor. A trailing-int sort breaks that
+    (aa_lead_00029 would sort after arm_00026) -> a near/oblique lead-in -> undersized fused object."""
     import json, cv2
     from .frame import Frame, Intrinsics
     st = Path(data_dir) / "static_scene"
     meta = json.loads((st / "transforms.json").read_text())
-    # Sort by file_path STRING (NOT trailing integer) to match nerfstudio's dataparser, which is what
-    # the old Phase-0a's cached_train[-1] used. The capture convention renames the pre-motion lead-in
-    # frames with an 'aa_' prefix SO THEY SORT FIRST, leaving the last SWEEP keyframe (arm_*) as the
-    # anchor. A trailing-int sort breaks that: aa_lead_00029 (29) wrongly sorts after arm_00026 (26),
-    # picking a near/oblique lead-in frame -> the object back-projects small -> undersized fused object.
-    fr = sorted(meta["frames"], key=lambda f: f["file_path"])[-1]
+    frames = sorted(meta["frames"], key=lambda f: f["file_path"])
+    if trigger_frame is None:
+        fr = frames[-1]
+    else:
+        fr = frames[max(0, min(len(frames) - 1, int(trigger_frame) - 1))]   # 1-based, clamped
     rgb = cv2.imread(str(st / fr["file_path"].lstrip("./")), cv2.IMREAD_COLOR)
+    if rgb is None:
+        raise FileNotFoundError(f"[static] anchor rgb not found/readable: {st / fr['file_path'].lstrip('./')}")
     dp = fr.get("depth_file_path") or fr["file_path"].replace("rgb", "depth").replace(".png", ".tiff")
     d = cv2.imread(str(st / dp.lstrip("./")), cv2.IMREAD_UNCHANGED)
     depth_m = (d.astype(np.float32) * 1e-3) if d is not None else np.zeros((meta["h"], meta["w"]), np.float32)
@@ -57,56 +66,6 @@ def _last_static_frame(data_dir, cfg):
     frame = Frame(seq=1, stamp_sec=0.0, rgb_bgr=rgb, depth_m=depth_m, mask_keep=mask,
                   c2w_4x4=np.asarray(fr["transform_matrix"], dtype=np.float64))
     return frame, intr
-
-
-def run_static_from_recorded(data_dir, cfg, device, *, prompt_text: str = "",
-                             prewarm_dynamic: bool = True) -> Path:
-    """Recorded/from-scratch static phase, FULLY NATIVE (no ns-train subprocess): the static_scene/
-    dataset is already on disk. Phase-0a (FastSAM segment + SAM3D on the last keyframe) -> native
-    train (static_train) + native Phase-0b (static_phase0b) + warm-cache (static_fuse) -> prewarm the
-    dynamic models. Returns the dynamic_gs2 static_state.pt path. Unattended-validated."""
-    from . import model_loader, static_fuse, static_segment, static_sam3d
-    tm = _T.new_ledger()
-    data_dir = Path(data_dir)
-    prompt = prompt_text or cfg.segmentation.prompt_text
-
-    reg = model_loader.build_registry(cfg, device,
-                                      want_anysplat=prewarm_dynamic, want_xfeat=prewarm_dynamic)
-
-    # Phase-0a — segment + SAM3D on the last static keyframe (the head-on view the masks belong to).
-    frame, intr = _last_static_frame(data_dir, cfg)
-    with tm.stage("trigger.snapshot_anchor"):
-        anchor = static_segment.snapshot_anchor(frame, intr, data_dir)
-    with tm.stage("trigger.fastsam_segment"):
-        objects = static_segment.segment(anchor, reg["fastsam"], prompt)
-    with tm.stage("trigger.write_seg_folder"):
-        static_segment.write_seg_folder(anchor, objects, prompt)
-    tm.event("objects_found", n=len(objects))
-    with tm.stage("trigger.sam3d_infer"):
-        sam3d = static_sam3d.generate(anchor, objects, reg["sam3d"])
-    tm.event("sam3d_done")          # dead-time origin: everything after this is operator-visible wait
-    reg["_sam_worker"].close()      # free FastSAM+SAM3D VRAM before the train (same as the live path)
-
-    # AnySplat spawn overlaps the native train (the §1 free slot), prewarm XFeat too (for go-live).
-    if prewarm_dynamic:
-        with tm.stage("after.anysplat_spawn"):
-            reg.get("anysplat") and reg["anysplat"].prewarm()
-        with tm.stage("sweep.dyn_models_prewarm"):
-            reg.get("xfeat") and reg["xfeat"].prewarm()
-
-    # Native train + Phase-0b + export (static_train + static_phase0b internals).
-    with tm.stage("after.splatfacto_train"):
-        out = static_fuse.train_fuse_and_export(
-            data_dir, cfg, device, anchor=anchor, sam3_objects=objects, sam3d_results=sam3d, tm=tm)
-    tm.event("static_state_written")
-
-    if prewarm_dynamic:
-        with tm.stage("end.wake_dynamic"):
-            reg.get("anysplat") and reg["anysplat"].wait_ready()
-            reg.get("xfeat") and reg["xfeat"].wait_ready()
-
-    _write_report(tm, data_dir, out)
-    return out
 
 
 # ----------------------------------------------------------------- deferred TSDF seed
@@ -344,125 +303,161 @@ class _RedBoxUI:
             pass
 
 
-def run_static_live(data_dir, cfg, device, *, prompt_text: str = "",
-                    source_kind: str = "live_bridge", box_px: int = 500,
-                    return_scene: bool = False):
-    """Full live static schedule (OPERATOR-validated — needs the sim).
+class _NullUI:
+    """No-op stand-in for the red-box UI on RECORDED runs — no viser server, no live feed, no
+    trigger button. The pipeline phase is conveyed by the [static] print lines instead (operator
+    request). Every _RedBoxUI method the shared back-end calls is a safe no-op here."""
+    def begin(self, *a, **k): pass
+    def done(self, *a, **k): pass
+    def drop_box(self): pass
+    def start_feed(self, *a, **k): pass
+    def show(self, *a, **k): pass
+    def fired(self) -> bool: return False
+    def close(self): pass
 
-    SWEEP: stream live frames into the red-box UI + record them to static_scene/ + ICP-live the
-      seed; prewarm FastSAM/SAM3D/XFeat. TRIGGER (button/Enter): snapshot anchor -> FastSAM
-      segment -> SAM3D infer. AFTER: finalize seed, then hand to the proven old static-gs on the
-      recorded dataset -> convert -> prewarm AnySplat under train. Returns the dynamic_gs2 .pt, OR
-      (path, (sm,gset,lock), registry) when return_scene=True (the single-process hand-off)."""
+
+def run_static(data_dir, cfg, device, *, prompt_text: str = "", source_kind: str = "live_bridge",
+               trigger_frame: Optional[int] = None, box_px: int = 500,
+               prewarm_dynamic: bool = True, ff_enabled: bool = True, return_scene: bool = False):
+    """The ONE static-phase orchestrator — source-agnostic. The deep stages (segment / SAM3D / seed /
+    train / Phase-0b fuse) are identical no matter where the frames come from; ONLY the front end differs:
+
+      live_bridge / ros1 : SWEEP the SHM stream into the red-box trigger UI + record static_scene/,
+          anchor = the frame on the operator's Trigger (button / Enter).
+      replay (recorded)  : NO UI, NO sweep — static_scene/ is already on disk; anchor = the LAST
+          keyframe (or trigger_frame), reusing the existing seed PLY. Prints phase boundaries.
+
+    Returns the dynamic_gs2 static_state.pt path, OR (path, (sm,gset,lock), registry) when
+    return_scene=True (the single-process hand-off into the dynamic loop)."""
     from . import model_loader, static_segment, static_sam3d, static_fuse
     from .adapters_source import open_source, ShmRing
     from .static_capture import StaticRecorder        # writes the recorded static_scene/ dataset
     tm = _T.new_ledger()
     data_dir = Path(data_dir)
     prompt = prompt_text or cfg.segmentation.prompt_text
+    is_live = source_kind in ("live_bridge", "ros1")
 
-    reg = model_loader.build_registry(cfg, device)
-    # Prewarms that fit the SWEEP VRAM budget kick off NOW (non-blocking bg threads), so their load
-    # overlaps the operator sweep instead of the trigger. Hidden here: FastSAM ~10 s + SAM3D ~48 s
-    # (both in the shared worker), XFeat ~2 s, gsplat-backward compile. AnySplat is NOT prewarmed here
-    # ON PURPOSE — its ~3.5 GB on top of SAM3D's 11.7 GB peak + Gazebo 2.6 OOMs a 16 GB card; it spawns
-    # AFTER the SAM worker is closed (post-SAM3D), overlapping the seed-build + train (the free slot).
-    # VRAM: FastSAM (0.85 GB) resident + SAM3D's ~11.7 GB LOAD-PEAK + Gazebo 2.6 OOMs a 16 GB card.
-    # So during the sweep load SAM3D ALONE (full headroom, the 40 s cost hidden under the sweep);
-    # FastSAM is loaded at the TRIGGER right before segment (only ~2.8 s, and it's needed there first
-    # anyway — segment runs before SAM3D infer). This guarantees FastSAM-ready-before-use AND gives
-    # SAM3D its full load headroom (the FastSAM-first-resident attempt OOM'd SAM3D's load, 2026-06-21).
+    # AnySplat is prewarmed for the dynamic loop's feedforward ONLY — gate it on ff_enabled so a --no-ff
+    # run never spawns its ~17 s / ~3.5 GB worker (which the FF-off dynamic loop would never adopt or
+    # free -> orphaned subprocess + leaked VRAM). XFeat stays warm regardless (tracking always needs it).
+    reg = model_loader.build_registry(cfg, device,
+                                      want_anysplat=(prewarm_dynamic and ff_enabled),
+                                      want_xfeat=prewarm_dynamic)
+    # Prewarms kick off NOW on bg threads (non-blocking): on a LIVE run their load (SAM3D ~40 s, XFeat
+    # ~2 s, gsplat-backward compile) overlaps the operator sweep; on a RECORDED run there is no sweep to
+    # hide under, so they simply load up-front while segment/SAM3D run. AnySplat is NOT prewarmed here
+    # (its ~3.5 GB on top of SAM3D's ~11.7 GB peak + Gazebo OOMs 16 GB) — it spawns after the SAM worker
+    # closes, overlapping the seed-build + train (the free slot). FastSAM loads lazily at segment().
     with tm.stage("sweep.sam3d_load"):
-        reg["sam3d"].prewarm()         # load SAM3D async (~40 s) — overlaps the sweep, no FastSAM contention
-    with tm.stage("sweep.dyn_models_prewarm"):
-        reg["xfeat"].prewarm()
+        reg["sam3d"].prewarm()
+    if prewarm_dynamic:
+        with tm.stage("sweep.dyn_models_prewarm"):
+            reg.get("xfeat") and reg["xfeat"].prewarm()
     with tm.stage("sweep.gsplat_warm"):
-        _warm_gsplat_backward(cfg, device)   # one throwaway grad step -> the gsplat CUDA backward compiles
-                                             # HERE (under the sweep), not on the first training step
+        _warm_gsplat_backward(cfg, device)
 
-    src = open_source(source_kind, data_dir=data_dir, shm_name=cfg.shm_name, attach=True)
-    ring = ShmRing(cfg.shm_name)
-    intr = ring.intrinsics()
-    ui = _RedBoxUI(cfg, box_px=box_px)
-    ui.start_feed(ring)                 # background thread keeps the LIVE feed flowing through EVERYTHING
-    ui.begin("capture")                 # checklist: capture is the first step (runs through the sweep)
-    recorder = StaticRecorder(data_dir, intr)
+    # ---- FRONT END: obtain the anchor Frame (+ intrinsics). live = sweep SHM; recorded = read disk ----
+    src = None
+    if is_live:
+        src = open_source(source_kind, data_dir=data_dir, shm_name=cfg.shm_name, attach=True)
+        ring = ShmRing(cfg.shm_name)
+        intr = ring.intrinsics()
+        ui = _RedBoxUI(cfg, box_px=box_px)
+        ui.start_feed(ring)             # background thread keeps the LIVE feed flowing through EVERYTHING
+        ui.begin("capture")
+        recorder = StaticRecorder(data_dir, intr)
+        # SWEEP: RECORD frames until the operator triggers. The GPU-TSDF seed is DEFERRED (built once
+        # after SAM3D frees): its ~8 GB VoxelBlockGrid can't coexist with SAM3D/FastSAM/publisher/Gazebo.
+        anchor_frame: Optional[Frame] = None
+        last_seq = -1
+        while not ui.fired():
+            fr = ring.peek_latest()
+            if fr is None or int(fr.seq) == last_seq:
+                time.sleep(0.005); continue
+            last_seq = int(fr.seq)
+            recorder.add(fr)
+            anchor_frame = fr
+        tm.event("triggered")
+        print(f"[static] sweep ended: recorder kept {recorder.num_kept} keyframes", flush=True)
+        if recorder.num_kept == 0:
+            print("[static] WARNING: 0 keyframes recorded — the seed build WILL fail. Check the live "
+                  "SHM feed (publisher producing frames with valid rgb/depth?).", flush=True)
+        recorder.finalize()             # writes static_scene/{rgb,depth,masks,transforms.json}
+        ui.drop_box()
+    else:
+        # RECORDED: static_scene/ is already on disk. Anchor = last keyframe (or trigger_frame). We read
+        # it off disk (file_path string-sort) rather than re-streaming through ReplaySource: ReplaySource
+        # orders by trailing integer, which would pick an 'aa_' lead-in frame as "last" instead of the
+        # final sweep keyframe -> undersized fused object (see _anchor_from_disk).
+        ui = _NullUI()
+        anchor_sel = "last keyframe" if trigger_frame is None else f"keyframe #{trigger_frame}"
+        print(f"[static] recorded source: static_scene/ on disk, anchor = {anchor_sel}, no UI", flush=True)
+        anchor_frame, intr = _anchor_from_disk(data_dir, cfg, trigger_frame)
 
-    # SWEEP: RECORD frames only until the operator triggers (the UI feed-thread shows them). The GPU-TSDF
-    # seed is DEFERRED (built once after SAM3D unloads, §2a/§2c): GPU-TSDF's VoxelBlockGrid is ~8 GB at
-    # 1200p and CANNOT coexist on the GPU with SAM3D / FastSAM / the publisher / Gazebo — running it live
-    # per-frame here OOMs (the exact failure DGS_LIVE_DEFER_TSDF=1 prevents). The seed build is ~1.5 s.
-    anchor_frame: Optional[Frame] = None
-    last_seq = -1
-    while not ui.fired():
-        fr = ring.peek_latest()
-        if fr is None or int(fr.seq) == last_seq:
-            time.sleep(0.005); continue
-        last_seq = int(fr.seq)
-        recorder.add(fr)
-        anchor_frame = fr
-    tm.event("triggered")
-    print(f"[static] sweep ended: recorder kept {recorder.num_kept} keyframes", flush=True)
-    if recorder.num_kept == 0:
-        print("[static] WARNING: 0 keyframes recorded — the seed build WILL fail. Check the live "
-              "SHM feed (publisher producing frames with valid rgb/depth?).", flush=True)
-    # 'capture' stays ONGOING (yellow) through segmentation + SAM3D and turns done only after SAM3D —
-    # capture isn't "finished" until the object the operator framed has been segmented + reconstructed.
-    ui.drop_box()                                            # box gone at trigger; capture step still yellow
-    ui.begin("segment", keep=("capture",))                  # keep 'capture' yellow through segment + SAM3D
-
-    # TRIGGER: freeze anchor, segment, SAM3D (the operator keeps moving — the live feed keeps flowing).
+    # ---- SHARED back end (identical for live + recorded): segment -> SAM3D -> seed -> train -> fuse ----
+    ui.begin("segment", keep=("capture",))
+    print("[static] segmentation: start", flush=True)
     with tm.stage("trigger.snapshot_anchor"):
         anchor = static_segment.snapshot_anchor(anchor_frame, intr, data_dir)
-    # Load FastSAM NOW (after SAM3D's load-peak is done; ~2.8 s) into the worker that already holds
-    # SAM3D resident — 7.3 + 0.85 + Gazebo fits 16 GB (only SAM3D's transient LOAD peak didn't).
     with tm.stage("trigger.fastsam_segment"):
-        reg["fastsam"].prewarm(); reg["fastsam"].wait_ready()
         objects = static_segment.segment(anchor, reg["fastsam"], prompt)
     with tm.stage("trigger.write_seg_folder"):
         static_segment.write_seg_folder(anchor, objects, prompt)
     tm.event("objects_found", n=len(objects))
+    print(f"[static] segmentation: done — {len(objects)} object(s)", flush=True)
     ui.done("segment")
-    ui.begin("generate", keep=("capture",))                 # keep 'capture' yellow alongside 'generate'
+    ui.begin("generate", keep=("capture",))
+
+    print("[static] object generation (SAM3D): start", flush=True)
     with tm.stage("trigger.sam3d_infer"):
         sam3d = static_sam3d.generate(anchor, objects, reg["sam3d"])
     tm.event("sam3d_done")             # dead-time origin
+    print("[static] object generation (SAM3D): done", flush=True)
     ui.done("generate")
-    ui.done("capture")                                       # capture finishes AFTER SAM3D (operator request)
+    ui.done("capture")                  # capture finishes AFTER SAM3D (live: the object is now reconstructed)
 
-    # AFTER SAM3D: free the shared SAM worker's VRAM (FastSAM + SAM3D ~8 GB) BEFORE the GPU-TSDF seed +
-    # splatfacto — they can't co-reside with the VoxelBlockGrid at 1200p. Closing the worker process
-    # 100%-frees its CUDA context (more reliable than unload_* which leaves cached allocator VRAM).
+    # Free the SAM worker (FastSAM + SAM3D VRAM) BEFORE the seed + train — they can't co-reside with the
+    # VoxelBlockGrid at 1200p; closing the worker process 100%-frees its CUDA context. Then spawn AnySplat
+    # into the freed slot (its ~17 s load overlaps the seed-build + train).
     with tm.stage("after.sam_worker_close"):
         reg["_sam_worker"].close()
+    if prewarm_dynamic:
+        with tm.stage("after.anysplat_spawn"):
+            reg.get("anysplat") and reg["anysplat"].prewarm()
 
-    # NOW spawn AnySplat (the GPU is free of SAM3D): its ~17 s load overlaps the seed-build + train
-    # below (the proven 'free slot'). Done HERE (not at sweep-start) because AnySplat's ~3.5 GB on top
-    # of SAM3D's 11.7 GB peak + Gazebo would OOM during the sweep.
-    with tm.stage("after.anysplat_spawn"):
-        reg["anysplat"].prewarm()
+    # Seed: build the TSDF init PLY if it isn't already on disk (a fresh live capture always builds it;
+    # a recorded dataset reuses the seed it was captured with).
+    ui.begin("train")
+    seed_ply = data_dir / "static_scene" / "depth_camera_init_points.ply"
+    if seed_ply.exists():
+        print(f"[static] reusing existing seed -> {seed_ply.name}", flush=True)
+    else:
+        print("[static] building TSDF seed", flush=True)
+        with tm.stage("after.tsdf_integrate"):
+            _build_seed_deferred(data_dir / "static_scene")
 
-    # finalize the recorded dataset, then build the seed in ONE GPU pass (the proven
-    # DGS_LIVE_DEFER_TSDF=1 path), then native train + Phase-0b.
-    recorder.finalize()                # writes static_scene/{rgb,depth,masks,transforms.json}
-    ui.begin("train")                  # 'Scene training' covers seed-build (below) + splatfacto train
-    with tm.stage("after.tsdf_integrate"):
-        _build_seed_deferred(data_dir / "static_scene")      # -> depth_camera_init_points.ply
+    print("[static] scene training: start", flush=True)
     with tm.stage("after.splatfacto_train"):
-        # on_fuse: the native fuse calls this between train + Phase-0b, so the checklist flips
-        # train->done / fuse->doing at the real boundary (train + fuse live inside one function).
+        # on_fuse fires at the train->Phase-0b boundary (both live inside train_fuse_and_export).
         def _on_fuse():
             ui.done("train"); ui.begin("fuse")
+            print("[static] fusion (Phase-0b): start", flush=True)
         out, sm, gset, lock = static_fuse.train_fuse_and_export(
             data_dir, cfg, device, anchor=anchor, sam3_objects=objects, sam3d_results=sam3d,
             tm=tm, return_scene=True, on_fuse=_on_fuse)
-    ui.done("fuse")
     tm.event("static_state_written")
+    print("[static] scene training + fusion: done", flush=True)
+    ui.done("fuse")
     ui.begin("realtime")
-    with tm.stage("end.wake_dynamic"):
-        reg["anysplat"].wait_ready(); reg["xfeat"].wait_ready()
 
-    src.close(); ui.close()
+    if prewarm_dynamic:
+        with tm.stage("end.wake_dynamic"):
+            reg.get("anysplat") and reg["anysplat"].wait_ready()
+            reg.get("xfeat") and reg["xfeat"].wait_ready()
+
+    if src is not None:
+        src.close()
+    ui.close()
     _write_report(tm, data_dir, out)
     if return_scene:
         return out, (sm, gset, lock), reg     # single-process hand-off: scene + warm model registry
@@ -485,25 +480,21 @@ def _write_report(tm, data_dir: Path, out_pt: Path) -> None:
 def _main():
     import argparse
     from . import config as _C
-    ap = argparse.ArgumentParser(description="dynamic_gs2 static-phase runner")
-    ap.add_argument("--mode", choices=["recorded", "live"], default="recorded",
-                    help="recorded = old static_scene/ on disk (unattended); live = sweep+red-box UI (needs sim)")
+    ap = argparse.ArgumentParser(description="dynamic_gs2 static-phase runner (source-agnostic)")
     ap.add_argument("--data", required=True, help="dataset dir")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--prompt", default="", help="object text prompt (else cfg/DGS_SAM3_PROMPT)")
-    ap.add_argument("--source", default="live_bridge", help="live source kind (live_bridge|ros1)")
+    ap.add_argument("--source", default="live_bridge",
+                    help="live_bridge|ros1 = sweep + red-box UI (needs sim); replay = recorded static_scene/ on disk")
+    ap.add_argument("--trigger-frame", type=int, default=None,
+                    help="replay: use the N-th static keyframe (1-based) as the SAM anchor instead of the last")
     ap.add_argument("--box-px", type=int, default=500, help="live: red-box side in px")
     ap.add_argument("--no-prewarm", dest="prewarm", action="store_false", default=True,
-                    help="DEFAULT prewarms AnySplat+XFeat DURING the static train (hidden under it) so "
-                         "go-live is instant = the fastest end-to-end path; --no-prewarm only to debug")
+                    help="skip the AnySplat+XFeat prewarm during the static phase (debug only)")
     args = ap.parse_args()
     cfg = _C.load_runtime_config()
-    if args.mode == "recorded":
-        run_static_from_recorded(args.data, cfg, args.device,
-                                 prompt_text=args.prompt, prewarm_dynamic=args.prewarm)
-    else:
-        run_static_live(args.data, cfg, args.device, prompt_text=args.prompt,
-                        source_kind=args.source, box_px=args.box_px)
+    run_static(args.data, cfg, args.device, prompt_text=args.prompt, source_kind=args.source,
+               trigger_frame=args.trigger_frame, box_px=args.box_px, prewarm_dynamic=args.prewarm)
 
 
 if __name__ == "__main__":

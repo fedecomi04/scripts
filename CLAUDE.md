@@ -42,7 +42,7 @@ Where to look:
 - Build report → [`dynamic_gs2/STATUS.md`](dynamic_gs2/STATUS.md) · LOC KPI → [`dynamic_gs2/LOC.md`](dynamic_gs2/LOC.md)
 - Module map the rewrite was generated against → [`rewrite_spec/00_OVERVIEW.md`](rewrite_spec/00_OVERVIEW.md)
 - Settled design calls → [`rewrite_spec/00_DECISIONS.md`](rewrite_spec/00_DECISIONS.md)
-- Launch commands → [`commands.md`](commands.md) (`dynamic_gs2/` `live.sh` / `static.sh` / `resume_live.sh`)
+- Launch commands → [`commands.md`](commands.md) — `dynamic_gs2/` has FOUR mode scripts (`full_live.sh` / `full_recorded.sh` / `warm_live.sh` / `warm_recorded.sh`); the core is source-agnostic (`--source {live_bridge,replay}`).
 
 **Architecture (current, `dynamic_gs2`) — WRAP not BE:**
 - [`gaussian_set.py`](dynamic_gs2/gaussian_set.py) is the SSOT: 6 gauss params + 4 identity buffers behind

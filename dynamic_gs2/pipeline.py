@@ -483,35 +483,39 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
 
 
 def run_full_live(data_dir, cfg, device, *, prompt_text: str = "", source_kind: str = "live_bridge",
-                  box_px: int = 300, ff_enabled: bool = True, max_seconds: Optional[float] = None) -> None:
-    """SINGLE-PROCESS whole pipeline: live static capture -> in-process hand-off -> live dynamic loop.
+                  box_px: int = 300, ff_enabled: bool = True, max_seconds: Optional[float] = None,
+                  trigger_frame: Optional[int] = None, transforms_name: str = "transforms.json") -> None:
+    """SINGLE-PROCESS whole pipeline: static phase -> in-process hand-off -> dynamic loop, for EITHER
+    a live source (source_kind='live_bridge', sweep + red-box UI) or a recorded dataset
+    (source_kind='replay', no UI; static reuses static_scene/ on disk, dynamic replays dynamic_scene/).
 
-    This is the point of warm-loading AnySplat/XFeat/LighterGlue during the static phase: the static
-    phase spawns + loads them (hidden under the sweep/train), then we carry the SAME warm handles AND
-    the in-memory scene straight into the dynamic loop — re-phasing the scene static->dynamic IN PLACE
-    (no reload) and reusing the already-warm AnySplat (no ~17s re-spawn). Two separate commands would
-    throw all that away (the warm worker dies with the static process)."""
+    The point of one process: AnySplat/XFeat/LighterGlue are warm-loaded during the static phase and
+    the in-memory scene is re-phased static->dynamic IN PLACE — no reload, no ~17 s AnySplat re-spawn.
+    Two separate commands would throw all that away (the warm worker dies with the static process)."""
     from . import static_pipeline
     data_dir = Path(data_dir)
-    # 1) live static capture (red-box sweep -> segment -> SAM3D -> train -> fuse), returning the
-    #    in-memory scene + the warm model registry.
-    _pt, (sm, gset, lock), reg = static_pipeline.run_static_live(
+    # 1) static phase (live sweep OR recorded reuse), returning the in-memory scene + warm registry.
+    _pt, (sm, gset, lock), reg = static_pipeline.run_static(
         data_dir, cfg, device, prompt_text=prompt_text, source_kind=source_kind,
-        box_px=box_px, return_scene=True)
+        box_px=box_px, trigger_frame=trigger_frame, ff_enabled=ff_enabled, return_scene=True)
     # 2) re-phase the scene static->dynamic IN PLACE (LR->0, means-grad hook, free-list + count-provider)
     #    so it matches build_loaded_scene(phase='dynamic') without a reload.
     sm.set_phase("dynamic")
     gset.enable_freelist()
     sm.set_count_provider(lambda: gset.count)
-    print(f"[pipeline] FULL-LIVE: re-phased scene to dynamic in place ({gset.num_points} gaussians); "
-          f"handing warm AnySplat/XFeat to the live loop", flush=True)
+    print(f"[pipeline] FULL: re-phased scene to dynamic in place ({gset.num_points} gaussians); "
+          f"handing warm AnySplat/XFeat to the dynamic loop", flush=True)
     # 3) extract the ALREADY-WARM handles from the registry (raw AnysplatHandle + XFeatTracker).
     warm_anysplat = reg["anysplat"].handle() if (ff_enabled and "anysplat" in reg) else None
     warm_tracker = reg["xfeat"].tracker() if "xfeat" in reg else None
-    # 4) live dynamic loop reusing the in-memory scene + warm models (no reload, no re-spawn).
+    # 4) dynamic loop reusing the in-memory scene + warm models (no reload, no re-spawn). For a recorded
+    #    run the dynamic source replays dynamic_scene/ through SHM — identical to the live path downstream.
+    src_opts = {}
+    if source_kind == "replay":
+        src_opts = dict(replay_mode="paced", transforms_name=transforms_name)
     run_live(data_dir, cfg, device, source_kind=source_kind, ff_enabled=ff_enabled,
              max_seconds=max_seconds, warm_scene=(sm, gset, lock),
-             warm_anysplat=warm_anysplat, warm_tracker=warm_tracker)
+             warm_anysplat=warm_anysplat, warm_tracker=warm_tracker, **src_opts)
 
 
 # --------------------------------------------------------------- CLI
@@ -526,6 +530,8 @@ def _main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--prompt", default="", help="full: object text prompt (else cfg/DGS_SAM3_PROMPT)")
     ap.add_argument("--box-px", type=int, default=300, help="full: red-box side in px")
+    ap.add_argument("--trigger-frame", type=int, default=None,
+                    help="full --source replay: use the N-th static keyframe (1-based) as the SAM anchor")
     ap.add_argument("--ff", action=argparse.BooleanOptionalAction, default=True,
                     help="feedforward (needs AnySplat worker); ON by default, --no-ff disables")
     ap.add_argument("--source", default="live_bridge", help="live source kind (live_bridge|ros1)")
@@ -549,7 +555,8 @@ def _main():
                                                         cull_replaced_enabled=bool(args.replaced_cull)))
     if args.mode == "full":
         run_full_live(args.data, cfg, args.device, prompt_text=args.prompt, source_kind=args.source,
-                      box_px=args.box_px, ff_enabled=args.ff, max_seconds=args.max_seconds)
+                      box_px=args.box_px, ff_enabled=args.ff, max_seconds=args.max_seconds,
+                      trigger_frame=args.trigger_frame, transforms_name=args.transforms)
     elif args.mode == "recorded":
         out = args.out_trace or str(Path(args.data) / "new_trace.jsonl")
         run_recorded_trace(args.data, cfg, args.device, out, ff_enabled=args.ff,

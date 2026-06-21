@@ -49,7 +49,7 @@ class _SharedSamWorker:
             try:
                 import os
                 # SAM3D's third_party/Fast-SAM3D/notebook/inference.py does
-                # `os.environ["CUDA_HOME"] = os.environ["CONDA_PREFIX"]` at import — but live.sh
+                # `os.environ["CUDA_HOME"] = os.environ["CONDA_PREFIX"]` at import — but the mode scripts
                 # launches via bare env-python so CONDA_PREFIX is unset -> KeyError in the worker.
                 # The worker runs in the sam3 env, so set CONDA_PREFIX to that env's prefix; the
                 # SamWorkerClient spawns with os.environ.copy(), so the worker inherits it. (Matches

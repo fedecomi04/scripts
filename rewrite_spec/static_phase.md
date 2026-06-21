@@ -2,8 +2,9 @@
 
 Status: **BUILT** (2026-06-20). The §4 module layout is implemented under `dynamic_gs2/`
 (`static_pipeline.py` orchestrator + `static_seed/segment/sam3d/capture/fuse.py` stages +
-`model_loader.py` prewarm registry + a static-phase report in `timing.py`). Entry:
-`dynamic_gs2/static.sh <data_dir> [prompt] [--live]` (or `-m dynamic_gs2.static_pipeline`).
+`model_loader.py` prewarm registry + a static-phase report in `timing.py`). Entry: the source-agnostic
+`static_pipeline.run_static(..., source_kind=)` — driven by the four mode scripts (`full_live.sh` /
+`full_recorded.sh` / `warm_live.sh` / `warm_recorded.sh`) or `-m dynamic_gs2.static_pipeline --source {live_bridge,replay}`.
 
 **SUPERSEDED by the NATIVE rewrite (2026-06-20, later same day).** The first cut wrapped the old
 `ns-train static-gs` as a subprocess + converted its `.pt`. That has been REPLACED by a fully

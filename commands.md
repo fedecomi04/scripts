@@ -20,26 +20,33 @@ Viser live view: **http://localhost:8081** (NOT :7007).
 
 ## 1. Run the pipeline (dynamic_gs2)
 
+**FOUR modes, nothing more.** The only axes are: full (run static) vs warm-start (load `static_state.pt`),
+and live (camera) vs recorded (replay through SHM). The core pipeline is source-agnostic — these scripts
+just pick `--source {live_bridge,replay}` and whether the static phase runs.
+
 ```bash
-# WHOLE pipeline, ONE command, ONE process (needs Gazebo/ROS + dVRK up):
-# live sweep (red-box UI) -> segment -> SAM3D -> seed -> native train -> Phase-0b fuse
-# -> re-phase static->dynamic IN PLACE -> live track (+ optional FF).
-dynamic_gs2/live.sh <data_dir> [prompt]
+# 1) FULL LIVE — whole pipeline in ONE process (needs Gazebo/ROS + dVRK up):
+#    live sweep (red-box UI) -> segment -> SAM3D -> seed -> train -> Phase-0b fuse
+#    -> re-phase static->dynamic IN PLACE -> live track (+ FF).
+dynamic_gs2/full_live.sh <data_dir> [prompt]
 
-# Static phase only: train + Phase-0a/0b fuse -> static_scene/static_state.pt + prewarm.
-dynamic_gs2/static.sh <data_dir> [prompt] [--live]
+# 2) FULL RECORDED — whole pipeline on a recorded dataset (no sim, no UI):
+#    static reuses static_scene/ on disk (anchor = last keyframe, or --trigger-frame N),
+#    dynamic replays dynamic_scene/ through SHM. Prints phase boundaries.
+dynamic_gs2/full_recorded.sh <data_dir> [prompt] [--trigger-frame N] [--no-ff]
 
-# Go LIVE on a pre-trained dataset (warm-load static_state.pt, track + optional FF):
-dynamic_gs2/resume_live.sh <data_dir> [--ff]
+# 3) WARM LIVE — skip static; warm-load static_state.pt + models, track on the LIVE camera:
+dynamic_gs2/warm_live.sh <data_dir> [--no-ff]
+
+# 4) WARM RECORDED — skip static; warm-load static_state.pt, replay dynamic_scene/ (no sim).
+#    The fast dev path to see the dynamic phase without retraining:
+dynamic_gs2/warm_recorded.sh <data_dir> [transforms_name] [--no-ff] [--fps N] [--loop]
 ```
 
-Validation / no-sim paths:
+Validation / dev tools (NOT pipeline entrypoints):
 ```bash
-# Visual: replay a recorded dataset through the new pipeline with the viser viewer up.
+# Visual: replay a recorded dataset through the pipeline with the viser viewer up.
 dynamic_gs2/view_dynamic.sh "<dataset>" transforms_313_trimmed.json   # --once / --ff
-
-# Replay-as-live: pace a recorded dataset through the LIVE loop (no operator).
-dynamic_gs2/replay_live.sh "<dataset>" [--ff]
 
 # Recorded A/B (unattended-validated, FF off): old-vs-new per-tick trace verdict.
 dynamic_gs2/replay_ab.sh "<dataset>" transforms_313_trimmed.json
