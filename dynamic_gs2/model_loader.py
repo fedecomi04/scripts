@@ -24,8 +24,29 @@ worker can't spawn/load, each handle FALLS BACK to the old subprocess path (neve
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from typing import List, Optional
+
+
+# ----------------------------------------------------------------- timing sink
+# Optional global TimingLedger so the bg PREWARM threads can record their actual model-LOAD wall
+# time (prewarm() is non-blocking -> a tm.stage() around the call only times the dispatch, not the
+# load). run_static calls set_timing_ledger(tm); each _go() records "load.<model>" via record_ms.
+_TM = None
+
+
+def set_timing_ledger(tm) -> None:
+    global _TM
+    _TM = tm
+
+
+def _record_load(name: str, seconds: float) -> None:
+    if _TM is not None:
+        try:
+            _TM.record_ms(f"load.{name}", seconds * 1000.0)
+        except Exception:
+            pass
 
 
 # ----------------------------------------------------------------- shared SAM worker
@@ -94,6 +115,7 @@ class FastSamHandle:
                 c = self._worker.client()
                 if c is not None:
                     s = c.load_fastsam()
+                    _record_load("fastsam", s)
                     print(f"[model_loader] FastSAM pre-loaded in worker ({s:.1f}s)", flush=True)
             except Exception as e:
                 print(f"[model_loader] FastSAM prewarm failed (will subprocess lazily): {e}", flush=True)
@@ -157,6 +179,7 @@ class Sam3dHandle:
                 c = self._worker.client()
                 if c is not None:
                     s = c.load_sam3d()
+                    _record_load("sam3d", s)
                     print(f"[model_loader] SAM3D pre-loaded in worker ({s:.1f}s)", flush=True)
             except Exception as e:
                 print(f"[model_loader] SAM3D prewarm failed (will subprocess lazily): {e}", flush=True)
@@ -218,6 +241,16 @@ class AnysplatPrewarmHandle:
 
     def prewarm(self) -> None:
         self._h.prewarm()                 # spawn+load+self-warm on a bg thread (non-blocking)
+        # Record the actual load wall-time (the subprocess load is opaque to us): a tiny watcher thread
+        # blocks on wait_ready and stamps load.anysplat when the worker reports ready.
+        t0 = time.time()
+        def _watch():
+            try:
+                self._h.wait_ready()
+                _record_load("anysplat", time.time() - t0)
+            except Exception:
+                pass
+        threading.Thread(target=_watch, name="anysplat-load-timer", daemon=True).start()
 
     def wait_ready(self) -> None:
         self._h.wait_ready()              # block until the worker has finished loading
@@ -250,7 +283,9 @@ class XFeatHandle:
             return
         def _go():
             try:
+                t0 = time.time()
                 self._build()
+                _record_load("xfeat", time.time() - t0)
             except Exception as e:
                 print(f"[model_loader] XFeat prewarm failed (will build lazily): {e}", flush=True)
         self._thread = threading.Thread(target=_go, name="xfeat-prewarm", daemon=True)

@@ -109,7 +109,7 @@ def train_fuse_and_export(data_dir, cfg, device, *, anchor, sam3_objects: List[d
     seed_xyz, seed_rgb = load_seed_ply(seed_ply_path(data_dir))
     lock = threading.RLock()
     sm = SceneModel(cfg, device, seed_xyz=seed_xyz, seed_rgb=seed_rgb, phase="static",
-                    num_downscales=1, resolution_schedule=100)   # half-res first 100, then full
+                    num_downscales=2, resolution_schedule=15)     # 1/4 first 15, 1/2 next 15, full @30
     sm.attach_render_lock(lock)
     gset = GaussianSet(sm, lock, freelist=False)                 # static = exact reallocating path
 

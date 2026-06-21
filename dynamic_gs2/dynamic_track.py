@@ -113,21 +113,29 @@ def _quat_mul(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
 
 
 def rotation_matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
+    """(3,3) rotation -> (4,) wxyz quaternion. Branch on the LARGEST of {trace, R00, R11, R22} so it is
+    numerically stable for ALL rotation angles (the trace-only method gives a degenerate sqrt for angles
+    >=120deg, trace <= 0). This is the single-matrix form of dynamic_ff_backends._rotmat_to_quat_wxyz —
+    same argmax-branch algorithm + same epsilons (sqrt clamp_min 1e-12, normalize clamp_min 1e-9) — so the
+    tracker's per-tick quaternion path and the FF batched path use one stable algorithm."""
     assert R.shape == (3, 3)
-    tr = R[0, 0] + R[1, 1] + R[2, 2]
-    if tr > 0:
-        s = torch.sqrt(tr + 1.0) * 2.0
+    r00, r11, r22 = R[0, 0], R[1, 1], R[2, 2]
+    tr = r00 + r11 + r22
+    cand = torch.stack([tr, r00, r11, r22])
+    branch = int(cand.argmax())
+    if branch == 0:                                  # trace branch
+        s = torch.sqrt((tr + 1.0).clamp_min(1e-12)) * 2.0
         q = torch.stack([0.25 * s, (R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s])
-    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-        s = torch.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+    elif branch == 1:                                # R00 branch
+        s = torch.sqrt((1.0 + r00 - r11 - r22).clamp_min(1e-12)) * 2.0
         q = torch.stack([(R[2, 1] - R[1, 2]) / s, 0.25 * s, (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s])
-    elif R[1, 1] > R[2, 2]:
-        s = torch.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+    elif branch == 2:                                # R11 branch
+        s = torch.sqrt((1.0 - r00 + r11 - r22).clamp_min(1e-12)) * 2.0
         q = torch.stack([(R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s, 0.25 * s, (R[1, 2] + R[2, 1]) / s])
-    else:
-        s = torch.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+    else:                                            # R22 branch
+        s = torch.sqrt((1.0 - r00 - r11 + r22).clamp_min(1e-12)) * 2.0
         q = torch.stack([(R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, 0.25 * s])
-    return _normalize_quats(q)
+    return q / q.norm().clamp_min(1e-9)
 
 
 class ReferenceObjectPose:
@@ -145,17 +153,24 @@ class ReferenceObjectPose:
         self._ref_means: Optional[torch.Tensor] = None
         self._ref_quats: Optional[torch.Tensor] = None
         self._ref_uid: Optional[torch.Tensor] = None      # uid of each ref row (same order as _ref_*)
+        # _ref_uid is fixed after capture(), so its argsort is too -> precompute once instead of every tick.
+        self._ref_order: Optional[torch.Tensor] = None        # argsort(_ref_uid)
+        self._ref_uid_sorted: Optional[torch.Tensor] = None   # _ref_uid[_ref_order]
 
     def capture(self, snapshot) -> int:
         ids = snapshot.buffers["object_instance_ids"][:, 0]
         mask = ids == self.d0_id
-        c = int(mask.sum().item())
+        ref_uid = snapshot.buffers["gauss_uid"][:, 0][mask].detach().clone()
+        c = ref_uid.shape[0]                                   # mask count without an .item() CUDA sync
         if c == 0:
             self._ref_means = self._ref_quats = self._ref_uid = None
+            self._ref_order = self._ref_uid_sorted = None
             return 0
         self._ref_means = snapshot.params["means"][mask].detach().clone()
         self._ref_quats = snapshot.params["quats"][mask].detach().clone()
-        self._ref_uid = snapshot.buffers["gauss_uid"][:, 0][mask].detach().clone()
+        self._ref_uid = ref_uid
+        self._ref_order = torch.argsort(self._ref_uid)        # invariant after capture -> hoist out of apply()
+        self._ref_uid_sorted = self._ref_uid[self._ref_order]
         return c
 
     def apply(self, rotation, translation, snapshot):
@@ -167,19 +182,20 @@ class ReferenceObjectPose:
             return None
         ids = snapshot.buffers["object_instance_ids"][:, 0]
         mask = ids == self.d0_id
-        c = int(mask.sum().item())
+        cur_uid = snapshot.buffers["gauss_uid"][:, 0][mask]      # uids in current mask order
+        c = cur_uid.shape[0]                                     # tensor-shape count -> no .item() CUDA sync
         if c != self._ref_means.shape[0]:
             return None
-        cur_uid = snapshot.buffers["gauss_uid"][:, 0][mask]      # uids in current mask order
         # reorder the reference rows so ref row r corresponds to the gaussian at current row r:
-        # gather[r] = index into _ref_* whose uid == cur_uid[r].
+        # gather[r] = index into _ref_* whose uid == cur_uid[r]. argsort(_ref_uid) is invariant after
+        # capture() so it is precomputed there; reuse it here. Same drift pattern as write_object_pose:
+        # searchsorted().clamp(max=N-1) then equality-check (no host-side pos.max() sync).
         dev = self._ref_means.device
-        ref_uid = self._ref_uid.to(cur_uid.device)
-        order = torch.argsort(ref_uid)                          # ref rows sorted by uid
-        pos = torch.searchsorted(ref_uid[order], cur_uid)       # where each cur uid sits in sorted ref
-        if int(pos.max()) >= ref_uid.shape[0] or not torch.equal(ref_uid[order][pos], cur_uid):
+        ref_uid_sorted = self._ref_uid_sorted.to(cur_uid.device)
+        pos = torch.searchsorted(ref_uid_sorted, cur_uid).clamp(max=ref_uid_sorted.shape[0] - 1)
+        if not torch.equal(ref_uid_sorted[pos], cur_uid):
             return None                                         # uid set drifted (shouldn't happen)
-        gather = order[pos].to(dev)                             # ref-row index for each current row
+        gather = self._ref_order.to(dev)[pos.to(dev)]           # ref-row index for each current row
         ref_means = self._ref_means[gather]
         ref_quats = self._ref_quats[gather]
         dt = self._ref_means.dtype

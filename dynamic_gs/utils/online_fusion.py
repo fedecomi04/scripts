@@ -47,6 +47,7 @@ API:
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -282,11 +283,19 @@ class _CpuOnlineFusion:
         depth_u16: np.ndarray,
         c2w_cv: np.ndarray,
         rgb_u8: Optional[np.ndarray] = None,
+        timer=None,
     ) -> np.ndarray:
+        # timer(stage, ms): optional callback so a caller (the live seed builder) can record the
+        # per-keyframe ICP vs TSDF split into its timing ledger. "icp" = src-cloud build + alignment,
+        # "tsdf" = the full-res integrate. None => no timing overhead.
+        _t0 = time.time()
         src = self._src_cloud(depth_u16, c2w_cv)
         if self.model is None:
             self.model = src
+            if timer is not None: timer("icp", (time.time() - _t0) * 1000.0)
+            _t0 = time.time()
             self._integrate(depth_u16, rgb_u8, c2w_cv)
+            if timer is not None: timer("tsdf", (time.time() - _t0) * 1000.0)
             self.idx += 1
             return c2w_cv
         T = np.eye(4)
@@ -297,12 +306,15 @@ class _CpuOnlineFusion:
             T = reg.transformation
         assert reg is not None
         refined = T @ c2w_cv if reg.fitness >= ICP_FITNESS_MIN else c2w_cv
+        if timer is not None: timer("icp", (time.time() - _t0) * 1000.0)
         if os.environ.get("DGS_FUSION_DEBUG") == "1":
             dpose = float(np.linalg.norm((refined - c2w_cv)[:3, 3]) * 1000.0)
             print(f"[fuse-cpu] idx={self.idx} fit={reg.fitness:.3f} "
                   f"rmse={reg.inlier_rmse*1000:.1f}mm dpose={dpose:.1f}mm "
                   f"{'FK-fallback' if reg.fitness < ICP_FITNESS_MIN else 'icp'}", flush=True)
+        _t0 = time.time()
         self._integrate(depth_u16, rgb_u8, refined)
+        if timer is not None: timer("tsdf", (time.time() - _t0) * 1000.0)
         src.transform(refined @ np.linalg.inv(c2w_cv))
         self._pend.append(src)
         self.idx += 1
@@ -536,6 +548,7 @@ class OnlineFusion:
         depth_u16: np.ndarray,
         c2w_opengl: np.ndarray,
         rgb_u8: Optional[np.ndarray] = None,
+        timer=None,
     ) -> np.ndarray:
         """Process one streamed frame.
 
@@ -551,6 +564,10 @@ class OnlineFusion:
             unchanged when ICP fitness < ``ICP_FITNESS_MIN``).
         """
         c2w_cv = self._cv_c2w(c2w_opengl)
+        # Only the CPU impl exposes the per-keyframe ICP/TSDF timer hook (the live seed builder runs
+        # CPU). Pass it through there; the GPU impl signature has no timer param.
+        if timer is not None and isinstance(self._impl, _CpuOnlineFusion):
+            return self._impl.add_frame(depth_u16, c2w_cv, rgb_u8, timer=timer)
         return self._impl.add_frame(depth_u16, c2w_cv, rgb_u8)  # type: ignore[attr-defined]
 
     def finalize(self) -> o3d.geometry.PointCloud:

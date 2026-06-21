@@ -2,8 +2,9 @@
 
 Replaces the old `ns-train static-gs` subprocess train. Drives the inner SplatfactoModel's
 grad render directly: build a nerfstudio Optimizers from the model's param groups (means LR=0,
-Invariant #1), step it under fp16 autocast, with the half-res-first-100 schedule (set via
-num_downscales=1 / resolution_schedule=100 on the SceneModel) and NoRefineStrategy (densify OFF,
+Invariant #1), step it under fp16 autocast, with a coarse-to-fine schedule (set via
+num_downscales=2 / resolution_schedule=15 on the SceneModel: 1/4 res for the first 15 steps, 1/2
+for the next 15, full from step 30) and NoRefineStrategy (densify OFF,
 set in SceneModel). Early-stop on the photometric-loss EMA, matching the old behavior.
 
 The built Optimizers IS assigned to model.optimizers so GaussianSet.rebind() survives the later
@@ -64,12 +65,18 @@ def train_static(scene_model, gset, cameras: List, batches: List[dict], *,
                  early_stop_loss: float = 0.02, early_stop_patience: int = 8,
                  early_stop_min_steps: int = 100, scale_clamp_max_m: float = 0.05,
                  scale_reset_value_m: float = 0.01, scale_clamp_every_n: int = 10,
+                 scale_clamp_start_step: int = 60,
                  tm=None, log_every_s: float = 2.0) -> int:
     """Fit Splatfacto for up to num_steps on the static keyframes. Returns the step it stopped at.
 
     cameras[i] = a nerfstudio Cameras(1); batches[i] = {"image","depth_image","mask"} (on device).
     Means stay locked by LR=0 (the ONLY means-lock in static — there is no grad hook). Densify is
-    off (NoRefineStrategy). fp16 autocast + GradScaler when mixed_precision."""
+    off (NoRefineStrategy). fp16 autocast + GradScaler when mixed_precision.
+
+    scale_clamp_start_step: don't run the mid-training scale clamp until this step — set ~30 past the
+    full-res step (multiscale 1/4->1/2->full hits full res at step 30, so 60) so the clamp never
+    fires during the coarse warmup (clamping a coarse-res fit leaves gaussians under-opacity -> the
+    end-of-train opacity purge culls them -> holes everywhere)."""
     dev = scene_model.device
     opt = _build_optimizers(scene_model, means_lr)
     scene_model.enforce_phase_lr()                      # re-assert means LR=0 on the now-built opt
@@ -97,7 +104,11 @@ def train_static(scene_model, gset, cameras: List, batches: List[dict], *,
         # scaler's per-optimizer state and silently skips real steps (measured: 17 dB vs 27 dB).
         opt.optimizer_scaler_step_all(scaler)
         scaler.update()
-        if scale_clamp_every_n > 0 and (step + 1) % scale_clamp_every_n == 0:
+        # Scale clamp only AFTER full res has been active ~30 steps (multiscale hits full res at step
+        # 30 -> clamp from 60). Clamping during the coarse 1/4->1/2 warmup shrinks gaussians against
+        # a low-res fit, leaving them under-opacity -> the end-of-train opacity purge culls them -> holes.
+        if (scale_clamp_every_n > 0 and step >= scale_clamp_start_step
+                and (step + 1) % scale_clamp_every_n == 0):
             _shrink_oversized_scales(scene_model, scale_clamp_max_m, scale_reset_value_m)
         lv = float(loss.detach())
         ema = lv if ema is None else 0.9 * ema + 0.1 * lv

@@ -317,6 +317,7 @@ class LiveBridgeSource:
             keyframe_translation_m=self._sub_kwargs.get("keyframe_translation_m", 0.02),
             keyframe_rotation_deg=self._sub_kwargs.get("keyframe_rotation_deg", 20.0),
             wipe_live_root=self._sub_kwargs.get("wipe_live_root", True),
+            max_hz=float(self._sub_kwargs.get("max_hz", 0.0)),   # 0 = full rate (default); >0 throttles
             new_layout=True)   # the ONLY live path: publisher writes the frame.py SHM directly
         # Read the publisher's one-line "ready" handshake (intrinsics + shm open confirmation).
         import time as _t

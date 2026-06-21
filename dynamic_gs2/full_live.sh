@@ -26,6 +26,11 @@ export CPATH="$ENV/targets/x86_64-linux/include${CPATH:+:$CPATH}"    # launch (e
 # Sim ZED-X depth-noise injection OFF for live: ~85 ms/frame in the publisher and it's a sim-only
 # realism model, irrelevant to live tracking. Set DGS_SIM_ZED_NOISE=1 before launch for a noise study.
 export DGS_SIM_ZED_NOISE="${DGS_SIM_ZED_NOISE:-0}"
+# Throttle the STATIC-SWEEP publisher to ~10 Hz: you sweep by hand + the recorder dedups keyframes at
+# 2cm/20deg, so 30 Hz of decode+mask-GL+SHM is wasted and its contention stretches the concurrent SAM3D
+# load. Applies to the static publisher ONLY — the dynamic loop spawns a SEPARATE publisher at FULL rate.
+# Set DGS_PUB_SWEEP_HZ=0 to disable (full 30 Hz everywhere, for a fast machine).
+export DGS_PUB_SWEEP_HZ="${DGS_PUB_SWEEP_HZ:-10}"
 
 # dVRK RT protection: reserve cores 0-3 for the dVRK 1kHz loop, cap math threadpools, pin the pipeline
 # to 4-23, lock the dVRK ONTO 0-3. Helpers self-skip when no dVRK/cpuset is present. DGS_NO_CPU_PIN=1 off.

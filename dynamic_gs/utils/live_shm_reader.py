@@ -166,6 +166,7 @@ def _spawn_publisher(
     keyframe_rotation_deg: float,
     wipe_live_root: bool,
     new_layout: bool = False,
+    max_hz: float = 0.0,
 ) -> subprocess.Popen:
     """Start the publisher in the ROS env. Returns the Popen handle.
 
@@ -227,6 +228,10 @@ def _spawn_publisher(
     env["PYTHONUNBUFFERED"] = "1"
     for _var in ("LD_LIBRARY_PATH", "CPATH", "LIBRARY_PATH", "CUDA_HOME"):
         env.pop(_var, None)
+    # Per-spawn output-rate cap (default 0 = OFF). Injected into THIS subprocess's env only, so the
+    # static-sweep publisher can be throttled without touching the dynamic publisher (separate spawn).
+    if max_hz and max_hz > 0:
+        env["DGS_PUB_MAX_HZ"] = str(max_hz)
 
     # Forward publisher stderr to a log file. Important: log lives in
     # /tmp so the publisher's --wipe-live-root doesn't blow it away

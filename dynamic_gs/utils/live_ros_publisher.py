@@ -585,6 +585,36 @@ class LivePublisher:
         self._mask_result_seq = -1         # which _mask_req_seq _mask_result was rendered for
         self._mask_thread_off = os.environ.get("DGS_PUB_MASK_THREAD") == "0"
 
+        # Optional output-rate cap (DGS_PUB_MAX_HZ, default 0 = OFF = unchanged full-rate behavior).
+        # Set by the spawner ONLY for the static-sweep publisher: the operator sweeps by hand and the
+        # recorder dedups keyframes at 2cm/20deg, so 30 Hz of decode + mask-GL + SHM is wasted and its
+        # GPU/CPU contention stretches the concurrent SAM3D load. Dropping at the callback skips the whole
+        # heavy worker path for throttled frames. The dynamic publisher is spawned WITHOUT it -> full rate.
+        try:
+            _max_hz = float(os.environ.get("DGS_PUB_MAX_HZ", "0"))
+        except ValueError:
+            _max_hz = 0.0
+        self._min_frame_dt = (1.0 / _max_hz) if _max_hz > 0 else 0.0
+        self._last_enqueue_t = 0.0
+        if self._min_frame_dt > 0:
+            # stderr (not stdout): stdout is consumed by the parent's ready-handshake reader, which
+            # discards non-JSON lines — so a stdout print here would vanish. stderr lands in the log.
+            print(f"[live] output rate capped to {_max_hz:.1f} Hz (DGS_PUB_MAX_HZ)",
+                  file=sys.stderr, flush=True)
+
+        # RGB-ONLY-after-trigger mode. The static pipeline touches <live_root>/.rgb_only once the
+        # operator triggers (sweep recorded, no more frames consumed except the UI's RGB feed). From
+        # then on we skip the GPU-heavy robot-mask GL render + the depth decode and write zeros for
+        # both, so the concurrent TSDF-seed build + Splatfacto train get the GPU back. RGB is still
+        # decoded + published so the viser feed stays live. Output is also capped to ~10 Hz in this
+        # mode. The sentinel lives in live_root, which is rmtree'd at every publisher spawn, so the
+        # SEPARATE dynamic publisher never inherits it -> dynamic always runs full mask+depth+rate.
+        self._rgb_only = False
+        self._rgb_only_sentinel = self.live_root / ".rgb_only"
+        self._rgb_only_min_dt = 1.0 / 10.0       # ~10 Hz once in rgb-only mode
+        self._rgb_only_last_check = 0.0
+        self._rgb_only_last_emit = 0.0
+
         # Disk recorder
         self._record_lock = threading.Lock()
         self._record_active = False
@@ -914,6 +944,14 @@ class LivePublisher:
         """
         import time as _t
 
+        # Output-rate cap (off by default): drop this frame BEFORE enqueue if it arrived within
+        # min_frame_dt of the last kept one — skips the entire decode + mask-GL + SHM worker path for it.
+        if self._min_frame_dt > 0.0:
+            _now = _t.time()
+            if _now - self._last_enqueue_t < self._min_frame_dt:
+                return
+            self._last_enqueue_t = _now
+
         # Enqueue. If the worker is falling behind, drop the OLDEST and
         # keep the newest — for tracking we always want the freshest
         # frame, not a stale backlog.
@@ -1100,6 +1138,24 @@ class LivePublisher:
             if _prof:
                 _t[k] = 1000.0 * (time.time() - t0)
         _s = time.time()
+        # Poll the rgb-only sentinel at most ~2x/s (a stat() per frame at 30 Hz is wasteful). Once the
+        # static pipeline touches <live_root>/.rgb_only at trigger we latch into rgb-only mode (never
+        # back out — the static publisher is torn down at static-end and the dynamic one is a fresh spawn).
+        if not self._rgb_only:
+            _nowc = time.time()
+            if _nowc - self._rgb_only_last_check >= 0.5:
+                self._rgb_only_last_check = _nowc
+                if self._rgb_only_sentinel.exists():
+                    self._rgb_only = True
+                    print("[live] rgb-only mode ON (trigger fired): mask+depth GL skipped, ~10 Hz",
+                          file=sys.stderr, flush=True)
+        # In rgb-only mode: cap to ~10 Hz and skip the GPU-heavy mask render + depth decode entirely.
+        if self._rgb_only:
+            _nowe = time.time()
+            if _nowe - self._rgb_only_last_emit < self._rgb_only_min_dt:
+                return
+            self._rgb_only_last_emit = _nowe
+
         try:
             c2w = self._interpolate_c2w(float(image_msg.header.stamp.to_sec()))
         except Exception as exc:
@@ -1108,6 +1164,35 @@ class LivePublisher:
         if c2w is None:
             return
         _lap("interp", _s)
+
+        if self._rgb_only:
+            # RGB-only: decode RGB for the UI feed, write zeros for depth+mask (the recorder is stopped
+            # and the UI reads only rgb_bgr). No mask GL render, no depth decode -> GPU freed for train.
+            rgb_bgr = self._decode_compressed_rgb(image_msg)
+            depth_m = np.zeros(rgb_bgr.shape[:2], dtype=np.float32)
+            mask_keep = np.full(rgb_bgr.shape[:2], 255, dtype=np.uint8)
+            with self._state_lock:
+                self._frame_seq += 1
+                seq = self._frame_seq
+                stamp = float(image_msg.header.stamp.to_sec())
+                self._latest = _StoredFrame(seq=seq, stamp_sec=stamp, rgb_bgr=rgb_bgr,
+                                            depth_m=depth_m, mask_keep=mask_keep, c2w_4x4=c2w)
+            if self._new_layout:
+                self._fc.write_frame(self.shm.buf, self._nl_layout, self._fc.Frame(
+                    seq=int(seq), stamp_sec=float(stamp), rgb_bgr=rgb_bgr, depth_m=depth_m,
+                    mask_keep=(mask_keep != 0), c2w_4x4=c2w))
+            else:
+                slot_idx = seq % NUM_SLOTS
+                slot_views_snapshot = self._slot_views
+                if not slot_views_snapshot:
+                    return
+                slot = slot_views_snapshot[slot_idx]
+                slot["seq"][0] = seq; slot["pose"][:] = c2w; slot["stamp"][0] = stamp
+                slot["rgb"][:] = rgb_bgr; slot["depth"][:] = depth_m; slot["mask"][:] = mask_keep
+                struct.pack_into("<Q", self.shm.buf, HDR_OFFSETS["latest_seq"], seq)
+            if not self._first_frame_event.is_set():
+                self._first_frame_event.set()
+            return
 
         # Submit the mask render to the dedicated mask thread FIRST: it needs only
         # the stamp + joint buffer (no rgb/depth), so it renders concurrently with

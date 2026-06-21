@@ -54,6 +54,13 @@ class DynamicLoop:
 
     def __init__(self, scene_model, gset, lock, tracker, ref_pose, d0_id, cfg, device,
                  ff_worker: Optional[FeedforwardWorker] = None, on_render=None):
+        # All 3 drivers funnel d0_id through here. pick_d0_instance_id returns -1 when no non-zero
+        # object_instance_id exists, in which case the tracker would silently never move anything -
+        # fail loud instead of running a no-op "tracking" loop.
+        if d0_id <= 0:
+            raise ValueError(
+                f"no tracked object: object_instance_ids are all zero (d0_id={d0_id}); "
+                "the scene has no fused object to track")
         self.sm = scene_model
         self.g = gset
         self.lock = lock
@@ -354,6 +361,8 @@ def run_view_recorded(data_dir, cfg, device, *, transforms_name: str = "transfor
                     last_n = n_now
                 bridge.update_camera_feed(ring_fr.rgb_bgr)
                 bridge.update_tracked_camera(ring_fr.c2w_4x4)
+                if row.get("ff_fired"):
+                    bridge.note_ff_tick()
                 bridge.request_render()
                 time.sleep(dt)
             if not loop_forever:
@@ -433,9 +442,9 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
         with lock:
             rgb, _, _ = sm.render(cam)
         return rgb
-    # follow_default=True: the live viewer opens following the live camera, so the rendered object
-    # overlays the camera-feed object (uncheck "Follow tracked frame" in the GUI to free-orbit).
-    bridge = ViserBridge(cfg.viser, device=device, follow_default=True)
+    # The viewer opens in "1 render" mode showing a single bird's-eye view; the GUI lets the
+    # operator switch view count / per-render source (Cam / Top / Left / Right / Manual) live.
+    bridge = ViserBridge(cfg.viser, device=device)
     bridge.attach(_render_fn)
 
     print(f"[pipeline] LIVE: d0_instance_id={d0_id}, scene={gset.num_points} gaussians, source={source_kind}")
@@ -462,9 +471,11 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
             if last_stamp is not None and fr.stamp_sec < last_stamp - 0.5:
                 loop.reset_for_loop()
             last_stamp = fr.stamp_sec
-            loop.step(fr)
+            row = loop.step(fr)
             bridge.update_camera_feed(fr.rgb_bgr)
             bridge.update_tracked_camera(fr.c2w_4x4)
+            if row.get("ff_fired"):
+                bridge.note_ff_tick()
             bridge.request_render()
     except KeyboardInterrupt:
         print("[pipeline] LIVE: interrupted by operator")

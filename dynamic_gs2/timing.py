@@ -322,13 +322,24 @@ _STATIC_STEP_ORDER = [
     "sweep.fastsam_load",           # FastSAM weights -> GPU (prewarm)
     "sweep.sam3d_load",             # SAM3D build (subprocess spawn + ctor)
     "sweep.dyn_models_prewarm",     # XFeat + LighterGlue (+AnySplat) -> load (prewarm)
+    # ACTUAL model-LOAD wall times (recorded by the bg prewarm threads via record_ms; these are the
+    # real load costs the prewarm dispatch hides — NOT the ~0s dispatch stages above).
+    "load.sam3d",                   # SAM3D weights load wall-time (in the shared worker)
+    "load.fastsam",                 # FastSAM weights load wall-time
+    "load.anysplat",               # AnySplat worker spawn+load wall-time (the handoff driver)
+    "load.xfeat",                   # XFeat+LighterGlue build wall-time
     # RED-BOX TRIGGER (object fills box; keep recording)
     "trigger.snapshot_anchor",      # freeze rgb+depth+pose+intr
     "trigger.fastsam_segment",      # FastSAM segment(anchor) -> mask
     "trigger.write_seg_folder",     # segmentation/ folder + overlay
     "trigger.sam3d_infer",          # SAM3D wake+infer(anchor) -> object PLY  (hidden under motion)
+    # INCREMENTAL CPU SEED (per-keyframe, fused on a bg thread DURING the sweep; means like the tracker)
+    "seed.icp_per_kf",              # per-keyframe ICP align (src-cloud + registration)  [mean/max/n]
+    "seed.tsdf_per_kf",             # per-keyframe full-res TSDF integrate              [mean/max/n]
+    "seed.drain_wait",              # finalize's wait for queued keyframes still fusing at trigger
+                                    # (~0 = worker kept up with the sweep; large = sweep outran fusion)
     # AFTER SAM3D (GPU free)
-    "after.tsdf_integrate",         # integrate-only at the live poses -> finalize -> seed PLY
+    "after.tsdf_integrate",         # seed finalize (extract+downsample) OR the GPU-subprocess fallback
     "after.splatfacto_load",        # build/instantiate the static train model
     "after.splatfacto_train",       # 500-step Splatfacto fit
     "after.anysplat_spawn",         # AnySplat worker spawn (overlaps train)
