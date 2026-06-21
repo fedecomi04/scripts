@@ -1,0 +1,13 @@
+# Generated/heavy artifacts — regenerable from the scripts, kept out of git.
+mask_out/
+__pycache__/
+*.glb
+*.obj
+*.ply
+*.mp4
+*.npy
+# Generated visualization PNGs (re-render from viz_elbow_frame.py / export_elbow_cam_marker.py)
+elbow_cam_marker_*.png
+elbow_cam_pose_*.png
+elbow_cam_pt_*.png
+viz_elbow_frame_*.png

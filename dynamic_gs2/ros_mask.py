@@ -40,6 +40,28 @@ WORLD_FRAME = "dynaarm_arm_tf/world"
 CAMERA_POSE_SAVE_FRAME = "dynaarm_arm_tf/camera_link_optical"
 MASK_RENDER_CAMERA_FRAME = "dynaarm_arm_tf/camera_pose_link"
 
+# Real-hardware camera mount. The real ZED Mini is bolted to the elbow link, NOT the sim's
+# end-effector/wrist mount. When DGS_REAL_HW_CAMERA is set, both the mask render and the saved
+# camera pose are derived from FK of this link times the measured fixed offset below, instead of
+# the sim camera frames. The offset is a true OPTICAL frame: camera +Z = viewing direction.
+REAL_HW_CAMERA = os.environ.get("DGS_REAL_HW_CAMERA", "0") != "0"
+REAL_HW_CAMERA_PARENT_LINK = "dynaarm_ELBOW"
+# Camera optical-center position in the ELBOW link frame (metres).
+REAL_HW_CAMERA_XYZ = np.array([0.05000, -0.16330, 0.03150], dtype=np.float32)
+# ELBOW_from_camera rotation: looks along ELBOW +X, image-up = ELBOW -Y (pure +90 deg pitch about Y).
+REAL_HW_CAMERA_ROT = np.array(
+    [
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+        [-1.0, 0.0, 0.0],
+    ],
+    dtype=np.float32,
+)
+# Real-rig WRIST_2 (gripper-rotation) reports a constant +45 deg offset vs the URDF zero. Verified by
+# overlaying the elbow mask on a real ZED frame: +45 deg matches the gripper, -45 does not. Applied only
+# on the real-HW path, to the joint value before FK, so it flows into BOTH the mask and the saved pose.
+REAL_HW_WRIST2_OFFSET_RAD = float(np.radians(45.0))
+
 URDF_PATH = Path(
     "/home/mrc-cuhk/dev/teleop/catkin_ws/src/active_camera_arm_control/"
     "active_camera_arm_examples/dynaarm_description/urdf/dynamic_gaussian_splat/"
@@ -489,6 +511,14 @@ class RobotMaskGenerator:
         return self._invert_rigid_transform(source_pose.astype(np.float32)) @ target_pose.astype(np.float32)
 
     def _sample_joint_positions(self, stamp: rospy.Time) -> dict[str, float]:
+        joints = self._sample_joint_positions_raw(stamp)
+        if REAL_HW_CAMERA and "WRIST_2" in joints:
+            # Apply the real-rig WRIST_2 constant offset once, at the joint boundary, so every FK
+            # consumer (mask render + saved camera pose) sees the corrected value.
+            joints["WRIST_2"] = joints["WRIST_2"] + REAL_HW_WRIST2_OFFSET_RAD
+        return joints
+
+    def _sample_joint_positions_raw(self, stamp: rospy.Time) -> dict[str, float]:
         if not self.joint_state_times_sec:
             raise RuntimeError("No Gazebo joint state samples were received")
 
@@ -545,6 +575,24 @@ class RobotMaskGenerator:
         default_pose = link_fk[default_link_name].astype(np.float32)
         return default_pose @ self._static_link_offset(MASK_RENDER_CAMERA_FRAME, resolved_camera_frame)
 
+    def _elbow_camera_pose_from_link_fk(self, link_fk: dict[str, np.ndarray]) -> np.ndarray:
+        # Real-HW camera pose: FK of the elbow link times the measured fixed offset. Returns a c2w in
+        # the ROS optical convention (+Z forward, +Y down), same as `camera_link_optical` would be.
+        parent = link_fk.get(REAL_HW_CAMERA_PARENT_LINK)
+        if parent is None:
+            raise RuntimeError(f"FK missing real-HW camera parent link '{REAL_HW_CAMERA_PARENT_LINK}'")
+        offset = np.eye(4, dtype=np.float32)
+        offset[:3, :3] = REAL_HW_CAMERA_ROT
+        offset[:3, 3] = REAL_HW_CAMERA_XYZ
+        return parent.astype(np.float32) @ offset
+
+    def elbow_camera_optical_pose(self, stamp: rospy.Time) -> np.ndarray:
+        # Public: the real-HW camera optical c2w at `stamp`, in the ROS optical frame. Callers that need
+        # an OpenGL/nerfstudio c2w should pass this through `rotate_camera_frame_only`.
+        joints = self._sample_joint_positions(stamp)
+        link_fk = self.robot.link_fk(cfg=joints, use_names=True)
+        return self._elbow_camera_pose_from_link_fk(link_fk)
+
     def _update_robot_poses(self, link_fk: dict[str, np.ndarray]) -> None:
         assert self.scene is not None
         for link_name, visual, node in self.robot_nodes:
@@ -557,7 +605,9 @@ class RobotMaskGenerator:
                 link_to_visual = visual.origin.astype(np.float32)
             self.scene.set_pose(node, pose=base_to_link.astype(np.float32) @ link_to_visual)
 
-    def _build_render_camera_pose(self, ros_pose: np.ndarray) -> np.ndarray:
+    def _build_render_camera_pose(self, ros_pose: np.ndarray, optical: bool = False) -> np.ndarray:
+        # pyrender's camera looks down -Z with +Y up. `optical_to_opengl` (diag(1,-1,-1)) converts a
+        # standard optical frame (+Z forward, +Y down) into that pyrender convention.
         optical_to_opengl = np.eye(4, dtype=np.float32)
         optical_to_opengl[:3, :3] = np.array(
             [
@@ -567,6 +617,14 @@ class RobotMaskGenerator:
             ],
             dtype=np.float32,
         )
+        # When the input pose is already a true optical frame (the real-HW elbow camera defines its
+        # +Z as the viewing direction), the standard optical->OpenGL flip is all that's needed.
+        if optical:
+            return ros_pose @ optical_to_opengl
+
+        # Sim path: `camera_pose_link` (MASK_RENDER_CAMERA_FRAME) is a body-style frame whose +X is the
+        # viewing direction and -Z is up, not an optical frame. These two extra 90-deg remaps rotate that
+        # body frame onto the optical convention before the optical->OpenGL flip is applied.
         rot_y_m90 = np.eye(4, dtype=np.float32)
         rot_y_m90[:3, :3] = np.array(
             [
@@ -626,15 +684,24 @@ class RobotMaskGenerator:
         _t0 = time.time() if sweep else 0.0   # timing only when the diagnostic sweep is on
         sampled_joint_positions = self._sample_joint_positions(stamp)
         link_fk = self.robot.link_fk(cfg=sampled_joint_positions, use_names=True)
-        camera_pose = self._camera_pose_from_link_fk(link_fk, camera_frame)
+        if REAL_HW_CAMERA:
+            # Real-HW: render from the elbow optical camera (+Z forward). The optical build-pose needs
+            # no body-frame remaps, and the render comes out upright (no vertical flip).
+            camera_pose = self._elbow_camera_pose_from_link_fk(link_fk)
+            render_pose = self._build_render_camera_pose(camera_pose, optical=True)
+        else:
+            camera_pose = self._camera_pose_from_link_fk(link_fk, camera_frame)
+            render_pose = self._build_render_camera_pose(camera_pose)
         self._update_robot_poses(link_fk)
-        self.scene.set_pose(self.camera_node, pose=self._build_render_camera_pose(camera_pose))
+        self.scene.set_pose(self.camera_node, pose=render_pose)
         _tr = time.time() if sweep else 0.0
         _, depth = self.renderer.render(self.scene)
         _gl = (time.time() - _tr) * 1000.0 if sweep else 0.0
 
         # 0 where the robot is rendered, 255 elsewhere (rendered at self._render_w x _render_h).
-        keep = cv2.flip((depth == 0).astype(np.uint8) * 255, 0)
+        robot_keep = (depth == 0).astype(np.uint8) * 255
+        # Sim body-frame render is upside-down (GL origin) and needs the flip; the optical render is upright.
+        keep = robot_keep if REAL_HW_CAMERA else cv2.flip(robot_keep, 0)
         if keep.shape[1] != self.intrinsics.width or keep.shape[0] != self.intrinsics.height:
             keep = cv2.resize(
                 keep,

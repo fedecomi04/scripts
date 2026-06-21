@@ -167,6 +167,7 @@ GAZEBO_JOINT_STATES_TOPIC = _REC.GAZEBO_JOINT_STATES_TOPIC
 GAZEBO_CAMERA_POSE_TOPIC = _REC.GAZEBO_CAMERA_POSE_TOPIC
 MASK_RENDER_CAMERA_FRAME = _REC.MASK_RENDER_CAMERA_FRAME
 CAMERA_POSE_SAVE_FRAME = _REC.CAMERA_POSE_SAVE_FRAME
+REAL_HW_CAMERA = _REC.REAL_HW_CAMERA
 INIT_CLOUD_NAME = _REC.INIT_CLOUD_NAME
 MAX_INIT_CLOUD_POINTS = _REC.MAX_INIT_CLOUD_POINTS
 TIME_EPS_SEC = _REC.TIME_EPS_SEC
@@ -857,6 +858,23 @@ class LivePublisher:
             self._gazebo_pose_matrices.insert(insert_at, pose_matrix)
 
     def _interpolate_c2w(self, stamp_sec: float):
+        if REAL_HW_CAMERA:
+            # Real-HW: no Gazebo pose topic. Derive the camera pose from FK of the elbow link (same
+            # transform that drives the mask), then convert the ROS optical c2w to OpenGL/nerfstudio.
+            if self._mask_gen is None:
+                self._mask_gen = RobotMaskGenerator(
+                    intrinsics=self.intrinsics,
+                    joint_state_times_sec=self._joint_state_times_sec,
+                    joint_state_positions=self._joint_state_positions,
+                )
+            try:
+                optical_c2w = self._mask_gen.elbow_camera_optical_pose(
+                    rospy.Time.from_sec(stamp_sec)
+                ).astype(np.float64)
+            except RuntimeError:
+                return None
+            return rotate_camera_frame_only(optical_c2w)
+
         times = self._gazebo_pose_times_sec
         mats = self._gazebo_pose_matrices
         if not times:

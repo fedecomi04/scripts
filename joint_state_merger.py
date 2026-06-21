@@ -1,21 +1,56 @@
 #!/usr/bin/env python3
 import rospy
 from sensor_msgs.msg import JointState
-from gazebo_msgs.srv import GetJointProperties
 
 class JointStateMerger:
     def __init__(self):
-        self.pub = rospy.Publisher("/joint_states_full", JointState, queue_size=10)
-        self.sub = rospy.Subscriber("/joint_states", JointState, self.cb, queue_size=10)
+        input_topic = rospy.get_param("~input_topic", "/joint_states")
+        output_topic = rospy.get_param("~output_topic", "joint_states_full")
 
-        rospy.wait_for_service("/gazebo/get_joint_properties")
-        self.get_joint = rospy.ServiceProxy("/gazebo/get_joint_properties", GetJointProperties)
+        self.pub = rospy.Publisher(output_topic, JointState, queue_size=10)
+        self.sub = rospy.Subscriber(input_topic, JointState, self.cb, queue_size=10)
 
-        self.candidates = rospy.get_param(
-            "~gripper_joint_candidates",
-            ["finger_joint", "dynaarm_arm::finger_joint", "Dynaarm_Arm::finger_joint"],
-        )
-        self.last_good_name = None
+        # Finger-joint SOURCE: "gazebo" reads it from the Gazebo physics service (sim, default);
+        # "topic" subscribes to a real gripper joint_states topic (real robot — the service is absent).
+        # Either way the value lands in self.last_finger_joint and cb() upserts it + the 5 mimics.
+        self.source = rospy.get_param("~gripper_source", "gazebo").lower()
+        self.last_finger_joint = 0.0
+
+        if self.source == "topic":
+            self.gripper_topic = rospy.get_param("~gripper_topic", "/arm_1/gripper/joint_states")
+            self.gripper_joint_name = rospy.get_param("~gripper_joint_name", "finger_joint")
+            self.gripper_sub = rospy.Subscriber(
+                self.gripper_topic, JointState, self._on_gripper_state, queue_size=10,
+            )
+            rospy.loginfo("[joint_state_merger] finger source=TOPIC %s (joint '%s')",
+                          self.gripper_topic, self.gripper_joint_name)
+        else:
+            from gazebo_msgs.srv import GetJointProperties
+            rospy.wait_for_service("/gazebo/get_joint_properties")
+            self.get_joint = rospy.ServiceProxy("/gazebo/get_joint_properties", GetJointProperties)
+            self.candidates = rospy.get_param(
+                "~gripper_joint_candidates",
+                ["finger_joint", "dynaarm_arm::finger_joint", "Dynaarm_Arm::finger_joint"],
+            )
+            self.finger_poll_hz = rospy.get_param("~finger_poll_hz", 75.0)
+            self.last_good_name = None
+            self.read_finger_joint_once()
+            rospy.Timer(rospy.Duration(1.0 / self.finger_poll_hz), self.poll_finger_joint)
+            rospy.loginfo("[joint_state_merger] finger source=GAZEBO (service @ %.0f Hz)",
+                          self.finger_poll_hz)
+
+    # -------- real-robot source: cache the finger angle from the gripper topic --------
+    def _on_gripper_state(self, msg):
+        if not msg.name or not msg.position:
+            return
+        try:
+            i = list(msg.name).index(self.gripper_joint_name)
+        except ValueError:
+            rospy.logwarn_throttle(
+                2.0, "[joint_state_merger] joint '%s' not in %s (names=%s)"
+                % (self.gripper_joint_name, self.gripper_topic, list(msg.name)))
+            return
+        self.last_finger_joint = float(msg.position[i])
 
     def read_finger_joint(self):
         names = [self.last_good_name] if self.last_good_name else []
@@ -30,6 +65,15 @@ class JointStateMerger:
             except Exception:
                 pass
         raise RuntimeError("Could not read finger_joint from Gazebo")
+
+    def read_finger_joint_once(self):
+        try:
+            self.last_finger_joint = self.read_finger_joint()
+        except Exception as e:
+            rospy.logwarn_throttle(2.0, str(e))
+
+    def poll_finger_joint(self, _event):
+        self.read_finger_joint_once()
 
     def upsert(self, msg, name, value):
         if name in msg.name:
@@ -55,11 +99,7 @@ class JointStateMerger:
         out.velocity = list(msg.velocity)
         out.effort = list(msg.effort)
 
-        try:
-            q = self.read_finger_joint()
-        except Exception as e:
-            rospy.logwarn_throttle(2.0, str(e))
-            return
+        q = self.last_finger_joint
 
         # Root joint used by the URDF
         self.upsert(out, "finger_joint", q)
