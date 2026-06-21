@@ -165,6 +165,7 @@ def _spawn_publisher(
     keyframe_translation_m: float,
     keyframe_rotation_deg: float,
     wipe_live_root: bool,
+    new_layout: bool = False,
 ) -> subprocess.Popen:
     """Start the publisher in the ROS env. Returns the Popen handle.
 
@@ -194,6 +195,8 @@ def _spawn_publisher(
     ]
     if wipe_live_root:
         inner_args.append("--wipe-live-root")
+    if new_layout:
+        inner_args.append("--new-layout")     # publisher writes the dynamic_gs2 frame.py SHM directly
     # Replay recording: if DGS_RECORD_REPLAY=<dir> is set, the publisher records
     # the full SHM frame stream + control events there for deterministic replay.
     _rec_dir = os.environ.get("DGS_RECORD_REPLAY")

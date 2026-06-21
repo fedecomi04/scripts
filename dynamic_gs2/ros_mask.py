@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
+# Live ROS mask + RGB/depth/pose helpers shared by the dynamic_gs2 publisher.
+#
+# This module is the LIVE half of the old `save_data_img_depth_mask_pose.py` recorder: the topic/path
+# constants, the small ROS<->numpy converters, and `RobotMaskGenerator` (the per-frame robot-exclusion
+# silhouette renderer). The standalone `CaptureSession` recorder + `main()` from the old file are NOT
+# carried over — dynamic_gs2 captures via `static_capture.StaticRecorder` + the live publisher's SHM
+# write, never this script's `main()`.
+#
+# The live publisher (`dynamic_gs/utils/live_ros_publisher.py`) importlib-loads this module by PATH and
+# pulls the symbols below; it runs in the minimal `dynamic_gs_ros` py3.8 env, so keep the imports to
+# what that env provides (ROS bindings + cv2/numpy/pyrender/trimesh/urdfpy).
 from __future__ import annotations
 
 from bisect import bisect_left
-import datetime
-import json
 import os
 from pathlib import Path
-import re
-import tempfile
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+import re
+import tempfile
 
 import cv2
-from message_filters import ApproximateTimeSynchronizer, Subscriber
 import numpy as np
 import pyrender
 import rospy
-from geometry_msgs.msg import PoseStamped
-from sensor_msgs.msg import CameraInfo, Image, JointState
-from tf.transformations import quaternion_from_matrix, quaternion_matrix, quaternion_slerp
+from sensor_msgs.msg import Image
+from tf.transformations import quaternion_matrix
 import trimesh
 from urdfpy import URDF
 
@@ -32,10 +40,6 @@ WORLD_FRAME = "dynaarm_arm_tf/world"
 CAMERA_POSE_SAVE_FRAME = "dynaarm_arm_tf/camera_link_optical"
 MASK_RENDER_CAMERA_FRAME = "dynaarm_arm_tf/camera_pose_link"
 
-DATASET_ROOT = Path(
-    "/home/mrc-cuhk/Documents/dynamic_gaussian_splat/data_teleoperation/"
-    "datasets/dynaarm_gs_depth_mask_01"
-)
 URDF_PATH = Path(
     "/home/mrc-cuhk/dev/teleop/catkin_ws/src/active_camera_arm_control/"
     "active_camera_arm_examples/dynaarm_description/urdf/dynamic_gaussian_splat/"
@@ -57,13 +61,6 @@ PACKAGE_MAP = {
     ),
 }
 
-SAVE_HZ = 30.0
-# Minimum stamp delta required to save a new frame. Using exactly 1/SAVE_HZ
-# decimates an exactly-SAVE_HZ source to half-rate because sub-ms rounding in
-# the stamp delta puts dt just under 1/30. The 10% slack admits the on-rate
-# stream while still skipping every other frame from a 2x source.
-SAVE_MIN_PERIOD_SEC = 0.9 / SAVE_HZ
-MAX_IMAGES = 600
 SYNC_QUEUE_SIZE = 20
 SYNC_SLOP_SEC = 0.1
 IMAGE_NAME_PREFIX = "arm"
@@ -74,7 +71,6 @@ BACKGROUND_COLOR_THRESHOLD = 10.0
 MASK_KEEP_ERODE_RADIUS_PX = 4
 MASK_MIN_KEEP_COMPONENT_AREA_PX = 64
 TIME_EPS_SEC = 1e-6
-MAX_GAZEBO_POSE_HISTORY_SEC = 30.0
 
 # ROS optical / OpenCV camera frame:
 #   +X right, +Y down, +Z forward
@@ -92,13 +88,6 @@ class CameraIntrinsics:
     fy: float
     cx: float
     cy: float
-
-
-@dataclass
-class SavedFrameRecord:
-    seq: int
-    stamp: rospy.Time
-    frame: dict
 
 
 def ros_image_to_bgr(msg: Image) -> np.ndarray:
@@ -163,16 +152,6 @@ def compose_transform_matrix(translation_xyz: np.ndarray, quaternion_xyzw: np.nd
 
 def normalize_frame_id(frame_id: str | None) -> str:
     return (frame_id or "").strip().lstrip("/")
-
-
-def resolve_relpath(base_dir: Path, rel_path: str) -> Path:
-    return (base_dir / rel_path).resolve()
-
-
-def write_json_atomic(path: Path, payload: dict) -> None:
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(tmp_path, path)
 
 
 def write_ascii_ply(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
@@ -268,14 +247,6 @@ def distribute_point_budget_evenly(capacities: list[int], total_budget: int) -> 
     return quotas
 
 
-def delete_if_exists(path: Path) -> None:
-    try:
-        if path.exists():
-            path.unlink()
-    except Exception as exc:
-        rospy.logwarn("Failed to delete %s: %s", path, exc)
-
-
 class RobotMaskGenerator:
     def __init__(
         self,
@@ -349,23 +320,58 @@ class RobotMaskGenerator:
         tmp.close()
         return tmp.name
 
-    def _ensure_renderer(self) -> None:
-        if self.renderer is not None:
+    def _ensure_renderer(self, scale: float | None = None) -> None:
+        if self.renderer is not None and scale is None:
             return
+        if scale is not None:
+            # Sweep mode rebuild: tear down the existing renderer so we rebuild at the new scale.
+            if self.renderer is not None:
+                try:
+                    self.renderer.delete()
+                except Exception:
+                    pass
+                self.renderer = None
+                self.scene = None
+                self.camera_node = None
+                self.robot_nodes = []
+
+        # Quarter-resolution render: pyrender is the publisher's single biggest per-frame cost
+        # (GL render ~53 ms @1920x1200, full mask ~66 ms). The robot-exclusion keep-mask is a coarse
+        # silhouette, so rendering small and NEAREST-upscaling the binary result back to full res is
+        # visually identical for the gripper cut-out. A live scale sweep (n=58/scale, 3 cycles) found
+        # mask render time is fill-bound DOWN TO ~480x300 and then hits a ~14-15 ms FLOOR (fixed cost:
+        # URDF FK + per-mesh pyrender pose updates + GL setup + the full-res upscale) — 0.25, 0.20, and
+        # 0.15 all measure ~14-17 ms, so going below 0.25 buys nothing but jaggier edges. 0.25 sits at
+        # the floor (median ~15 ms, inside the 20 ms budget) with a clean silhouette. The full output
+        # shape (intrinsics.width x height) is unchanged — both call sites get full res.
+        # DGS_MASK_RENDER_SCALE=1.0 restores full-res rendering.
+        if scale is not None:
+            self._render_scale = scale
+        else:
+            try:
+                self._render_scale = float(os.environ.get("DGS_MASK_RENDER_SCALE", "0.25"))
+            except ValueError:
+                self._render_scale = 0.25
+        self._render_scale = min(max(self._render_scale, 0.1), 1.0)
+        self._render_w = max(1, int(round(self.intrinsics.width * self._render_scale)))
+        self._render_h = max(1, int(round(self.intrinsics.height * self._render_scale)))
+        # Actual achieved scale per axis (integer rounding may differ slightly from the request).
+        sx = self._render_w / float(self.intrinsics.width)
+        sy = self._render_h / float(self.intrinsics.height)
 
         self.renderer = pyrender.OffscreenRenderer(
-            viewport_width=self.intrinsics.width,
-            viewport_height=self.intrinsics.height,
+            viewport_width=self._render_w,
+            viewport_height=self._render_h,
         )
         self.scene = pyrender.Scene(
             bg_color=np.array([0.0, 0.0, 0.0, 1.0]),
             ambient_light=np.array([0.8, 0.8, 0.8]),
         )
         camera = pyrender.IntrinsicsCamera(
-            fx=self.intrinsics.fx,
-            fy=self.intrinsics.fy,
-            cx=self.intrinsics.cx,
-            cy=self.intrinsics.cy,
+            fx=self.intrinsics.fx * sx,
+            fy=self.intrinsics.fy * sy,
+            cx=self.intrinsics.cx * sx,
+            cy=self.intrinsics.cy * sy,
             znear=0.001,
             zfar=100.0,
         )
@@ -582,20 +588,63 @@ class RobotMaskGenerator:
         return ros_pose @ optical_to_opengl @ rot_y_m90 @ rot_z_90
 
     def _render_robot_exclusion_mask(self, stamp: rospy.Time, camera_frame: str) -> np.ndarray:
-        self._ensure_renderer()
+        # Scale-sweep diagnostic: DGS_MASK_SCALE_SWEEP="0.5,0.35,0.25,0.2" cycles render scales,
+        # rebuilding the renderer every DGS_MASK_SWEEP_EVERY frames (default 40), so one live run
+        # measures mask render time vs resolution. Off unless the env is set.
+        if not hasattr(self, "_sweep_scales"):
+            raw = os.environ.get("DGS_MASK_SCALE_SWEEP", "").strip()
+            self._sweep_scales = [float(x) for x in raw.split(",") if x] if raw else []
+            self._sweep_every = int(os.environ.get("DGS_MASK_SWEEP_EVERY", "60"))
+            self._sweep_n = 0
+            self._sweep_idx = -1
+            self._sweep_t = []        # per-render ms for the current window
+            self._sweep_t_render = []  # GL render() only, isolates fill from FK/upscale overhead
+        sweep = bool(self._sweep_scales)
+        if sweep:
+            phase = self._sweep_n // self._sweep_every
+            idx = phase % len(self._sweep_scales)
+            if idx != self._sweep_idx:
+                # flush the window we just finished
+                if self._sweep_t:
+                    a = sorted(self._sweep_t[2:]); g = sorted(self._sweep_t_render[2:])  # drop 2 warmups
+                    if a:
+                        rospy.loginfo("[mask-sweep] scale=%.2f %dx%d  total med=%.1f p90=%.1f  "
+                                      "GLrender med=%.1f  n=%d",
+                                      self._render_scale, self._render_w, self._render_h,
+                                      a[len(a)//2], a[min(len(a)-1, int(len(a)*0.9))],
+                                      g[len(g)//2], len(a))
+                self._sweep_idx = idx
+                self._sweep_t = []; self._sweep_t_render = []
+                self._ensure_renderer(scale=self._sweep_scales[idx])
+            self._sweep_n += 1
+        else:
+            self._ensure_renderer()
         assert self.renderer is not None
         assert self.scene is not None
         assert self.camera_node is not None
 
+        _t0 = time.time() if sweep else 0.0   # timing only when the diagnostic sweep is on
         sampled_joint_positions = self._sample_joint_positions(stamp)
         link_fk = self.robot.link_fk(cfg=sampled_joint_positions, use_names=True)
         camera_pose = self._camera_pose_from_link_fk(link_fk, camera_frame)
         self._update_robot_poses(link_fk)
         self.scene.set_pose(self.camera_node, pose=self._build_render_camera_pose(camera_pose))
+        _tr = time.time() if sweep else 0.0
         _, depth = self.renderer.render(self.scene)
+        _gl = (time.time() - _tr) * 1000.0 if sweep else 0.0
 
-        # 0 where the robot is rendered, 255 elsewhere.
-        return cv2.flip((depth == 0).astype(np.uint8) * 255, 0)
+        # 0 where the robot is rendered, 255 elsewhere (rendered at self._render_w x _render_h).
+        keep = cv2.flip((depth == 0).astype(np.uint8) * 255, 0)
+        if keep.shape[1] != self.intrinsics.width or keep.shape[0] != self.intrinsics.height:
+            keep = cv2.resize(
+                keep,
+                (self.intrinsics.width, self.intrinsics.height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        if sweep:
+            self._sweep_t.append((time.time() - _t0) * 1000.0)
+            self._sweep_t_render.append(_gl)
+        return keep
 
     def _compute_background_keep_mask(self, rgb_path: Path) -> np.ndarray | None:
         rgb_bgr = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
@@ -687,430 +736,8 @@ class RobotMaskGenerator:
     def save_mask(self, stamp: rospy.Time, rgb_path: Path, mask_path: Path) -> None:
         robot_exclusion_mask = self._render_robot_exclusion_mask(stamp, MASK_RENDER_CAMERA_FRAME)
         # Background masking disabled: keep the full background and only exclude the robot.
-        # background_keep_mask = self._compute_background_keep_mask(rgb_path)
-        # if background_keep_mask is None:
-        #     keep_mask = robot_exclusion_mask
-        # else:
-        #     keep_mask = cv2.bitwise_and(robot_exclusion_mask, background_keep_mask)
         keep_mask = robot_exclusion_mask
         keep_mask = self._refine_keep_mask(keep_mask)
 
         if not cv2.imwrite(str(mask_path), keep_mask):
             raise RuntimeError(f"Failed to save mask to {mask_path}")
-
-
-class CaptureSession:
-    def __init__(self) -> None:
-        self.intrinsics = None
-        self.robot_model = None
-
-        self.run_dir = None
-        self.rgb_dir = None
-        self.depth_dir = None
-        self.masks_dir = None
-        self.transforms_path = None
-        self.ply_path = None
-
-        self.metadata = None
-        self.saved_records: list[SavedFrameRecord] = []
-
-        self.frame_index = 0
-        self.last_saved_stamp = None
-        self.warned_unexpected_image_frame = False
-
-        self.joint_state_times_sec: list[float] = []
-        self.joint_state_positions: list[dict[str, float]] = []
-        self.gazebo_pose_times_sec: list[float] = []
-        self.gazebo_pose_matrices: list[np.ndarray] = []
-
-    def initialize(self) -> None:
-        camera_info = rospy.wait_for_message(CAMERA_INFO_TOPIC, CameraInfo, timeout=5.0)
-        self.intrinsics = CameraIntrinsics(
-            width=int(camera_info.width),
-            height=int(camera_info.height),
-            fx=float(camera_info.K[0]),
-            fy=float(camera_info.K[4]),
-            cx=float(camera_info.K[2]),
-            cy=float(camera_info.K[5]),
-        )
-
-        self.run_dir = self._make_unique_run_dir()
-        self.rgb_dir = self.run_dir / "rgb"
-        self.depth_dir = self.run_dir / "depth"
-        self.masks_dir = self.run_dir / "masks"
-        self.transforms_path = self.run_dir / "transforms.json"
-        self.ply_path = self.run_dir / INIT_CLOUD_NAME
-
-        self.rgb_dir.mkdir(parents=True, exist_ok=False)
-        self.depth_dir.mkdir(parents=True, exist_ok=False)
-        self.masks_dir.mkdir(parents=True, exist_ok=False)
-
-        self.metadata = {
-            "fl_x": self.intrinsics.fx,
-            "fl_y": self.intrinsics.fy,
-            "cx": self.intrinsics.cx,
-            "cy": self.intrinsics.cy,
-            "w": self.intrinsics.width,
-            "h": self.intrinsics.height,
-            "frames": [],
-        }
-        self.robot_model = RobotMaskGenerator(
-            intrinsics=self.intrinsics,
-            joint_state_times_sec=self.joint_state_times_sec,
-            joint_state_positions=self.joint_state_positions,
-        )
-        self.write_transforms()
-        rospy.loginfo("Saving dataset to %s", self.run_dir)
-
-    def _make_unique_run_dir(self) -> Path:
-        DATASET_ROOT.mkdir(parents=True, exist_ok=True)
-        base_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        candidate = DATASET_ROOT / base_name
-        suffix = 1
-        while candidate.exists():
-            suffix += 1
-            candidate = DATASET_ROOT / f"{base_name}_{suffix:02d}"
-        return candidate
-
-    def joint_state_callback(self, msg: JointState) -> None:
-        stamp_sec = float(msg.header.stamp.to_sec())
-        if stamp_sec <= 0.0 or not msg.name or not msg.position:
-            return
-
-        positions = {
-            name: float(position)
-            for name, position in zip(msg.name, msg.position)
-        }
-        if not positions:
-            return
-
-        insert_at = bisect_left(self.joint_state_times_sec, stamp_sec)
-        if insert_at < len(self.joint_state_times_sec) and abs(self.joint_state_times_sec[insert_at] - stamp_sec) <= TIME_EPS_SEC:
-            self.joint_state_positions[insert_at] = positions
-        else:
-            self.joint_state_times_sec.insert(insert_at, stamp_sec)
-            self.joint_state_positions.insert(insert_at, positions)
-
-    def gazebo_pose_callback(self, msg: PoseStamped) -> None:
-        stamp_sec = float(msg.header.stamp.to_sec())
-        if stamp_sec <= 0.0:
-            return
-
-        pose_matrix = pose_msg_to_matrix(msg.pose).astype(np.float64)
-        insert_at = bisect_left(self.gazebo_pose_times_sec, stamp_sec)
-        if (
-            insert_at < len(self.gazebo_pose_times_sec)
-            and abs(self.gazebo_pose_times_sec[insert_at] - stamp_sec) <= TIME_EPS_SEC
-        ):
-            self.gazebo_pose_matrices[insert_at] = pose_matrix
-        else:
-            self.gazebo_pose_times_sec.insert(insert_at, stamp_sec)
-            self.gazebo_pose_matrices.insert(insert_at, pose_matrix)
-
-        newest_time_sec = self.gazebo_pose_times_sec[-1]
-        while (
-            len(self.gazebo_pose_times_sec) > 1
-            and newest_time_sec - self.gazebo_pose_times_sec[0] > MAX_GAZEBO_POSE_HISTORY_SEC
-        ):
-            self.gazebo_pose_times_sec.pop(0)
-            self.gazebo_pose_matrices.pop(0)
-
-    def write_transforms(self) -> None:
-        if self.metadata is None or self.transforms_path is None:
-            return
-        write_json_atomic(self.transforms_path, self.metadata)
-
-    def _warn_if_unexpected_image_frame(self, frame_id: str) -> None:
-        normalized = normalize_frame_id(frame_id)
-        if normalized == CAMERA_POSE_SAVE_FRAME or self.warned_unexpected_image_frame:
-            return
-        rospy.logwarn(
-            "Image header frame_id is '%s' but poses are saved from '%s'.",
-            normalized,
-            CAMERA_POSE_SAVE_FRAME,
-        )
-        self.warned_unexpected_image_frame = True
-
-    def _lookup_pose_matrix(self, stamp: rospy.Time) -> np.ndarray:
-        if self.robot_model is None:
-            raise RuntimeError("Gazebo pose model is not initialized")
-
-        if not self.gazebo_pose_times_sec:
-            raise RuntimeError("No Gazebo camera pose samples were received")
-
-        query_time_sec = float(stamp.to_sec())
-        insert_at = bisect_left(self.gazebo_pose_times_sec, query_time_sec)
-
-        if (
-            insert_at < len(self.gazebo_pose_times_sec)
-            and abs(self.gazebo_pose_times_sec[insert_at] - query_time_sec) <= TIME_EPS_SEC
-        ):
-            pose_matrix = self.gazebo_pose_matrices[insert_at]
-        elif (
-            insert_at > 0
-            and abs(self.gazebo_pose_times_sec[insert_at - 1] - query_time_sec) <= TIME_EPS_SEC
-        ):
-            pose_matrix = self.gazebo_pose_matrices[insert_at - 1]
-        else:
-            prev_idx = insert_at - 1 if insert_at > 0 else None
-            next_idx = insert_at if insert_at < len(self.gazebo_pose_times_sec) else None
-
-            if prev_idx is None and next_idx is None:
-                raise RuntimeError("No Gazebo camera pose samples are available")
-            if prev_idx is None:
-                pose_matrix = self.gazebo_pose_matrices[next_idx]
-            elif next_idx is None:
-                pose_matrix = self.gazebo_pose_matrices[prev_idx]
-            else:
-                prev_time_sec = self.gazebo_pose_times_sec[prev_idx]
-                next_time_sec = self.gazebo_pose_times_sec[next_idx]
-                alpha = (query_time_sec - prev_time_sec) / (next_time_sec - prev_time_sec)
-                prev_matrix = self.gazebo_pose_matrices[prev_idx]
-                next_matrix = self.gazebo_pose_matrices[next_idx]
-                prev_quat = quaternion_from_matrix(prev_matrix)
-                next_quat = quaternion_from_matrix(next_matrix)
-                interp_quat = quaternion_slerp(prev_quat, next_quat, alpha)
-                interp_xyz = prev_matrix[:3, 3] * (1.0 - alpha) + next_matrix[:3, 3] * alpha
-                pose_matrix = compose_transform_matrix(interp_xyz, interp_quat)
-
-        optical_offset = self.robot_model._static_link_offset(
-            MASK_RENDER_CAMERA_FRAME,
-            CAMERA_POSE_SAVE_FRAME,
-        ).astype(np.float64)
-        return rotate_camera_frame_only(pose_matrix @ optical_offset)
-
-    def image_callback(self, image_msg: Image, depth_msg: Image) -> None:
-        if self.metadata is None or self.rgb_dir is None or self.depth_dir is None:
-            return
-        if self.frame_index >= MAX_IMAGES:
-            return
-
-        if self.last_saved_stamp is not None:
-            dt = (image_msg.header.stamp - self.last_saved_stamp).to_sec()
-            if dt < SAVE_MIN_PERIOD_SEC:
-                return
-
-        self._warn_if_unexpected_image_frame(image_msg.header.frame_id)
-
-        try:
-            transform_matrix = self._lookup_pose_matrix(image_msg.header.stamp)
-        except Exception as exc:
-            rospy.logwarn_throttle(2.0, "Skipping frame because Gazebo camera pose is unavailable: %s", exc)
-            return
-
-        image_bgr = ros_image_to_bgr(image_msg)
-        depth_mm = ros_depth_to_uint16_mm(depth_msg)
-
-        seq = int(image_msg.header.seq)
-        file_stem = f"{IMAGE_NAME_PREFIX}_{seq:05d}"
-        rgb_name = f"{file_stem}.png"
-        depth_name = f"{file_stem}.tiff"
-
-        rgb_path = self.rgb_dir / rgb_name
-        depth_path = self.depth_dir / depth_name
-        if not cv2.imwrite(str(rgb_path), image_bgr):
-            raise RuntimeError(f"Failed to save RGB image to {rgb_path}")
-        if not cv2.imwrite(str(depth_path), depth_mm):
-            raise RuntimeError(f"Failed to save depth image to {depth_path}")
-
-        frame_entry = {
-            "file_path": f"./rgb/{rgb_name}",
-            "depth_file_path": f"./depth/{depth_name}",
-            "transform_matrix": transform_matrix.tolist(),
-        }
-        self.metadata["frames"].append(frame_entry)
-        self.saved_records.append(
-            SavedFrameRecord(
-                seq=seq,
-                stamp=image_msg.header.stamp,
-                frame=frame_entry,
-            )
-        )
-        self.write_transforms()
-
-        self.frame_index += 1
-        self.last_saved_stamp = image_msg.header.stamp
-        rospy.loginfo("Saved frame %d/%d", self.frame_index, MAX_IMAGES)
-
-        if self.frame_index >= MAX_IMAGES:
-            rospy.signal_shutdown(f"Saved {MAX_IMAGES} images")
-
-    def _path_from_frame_entry(self, frame: dict, key: str) -> Path:
-        assert self.run_dir is not None
-        return resolve_relpath(self.run_dir.resolve(), frame[key])
-
-    def _remove_failed_frame_files(self, frame: dict) -> None:
-        for key in ("file_path", "depth_file_path", "mask_path"):
-            rel = frame.get(key)
-            if not rel:
-                continue
-            delete_if_exists(self._path_from_frame_entry(frame, key))
-
-    def generate_masks(self) -> None:
-        if self.metadata is None or self.masks_dir is None or self.robot_model is None:
-            return
-        if not self.saved_records:
-            return
-
-        kept_records = []
-        kept_frames = []
-        removed_count = 0
-
-        for record in self.saved_records:
-            rgb_name = Path(record.frame["file_path"]).name
-            rgb_path = self._path_from_frame_entry(record.frame, "file_path")
-            mask_path = self.masks_dir / rgb_name
-
-            try:
-                self.robot_model.save_mask(record.stamp, rgb_path, mask_path)
-            except Exception as exc:
-                removed_count += 1
-                rospy.logwarn(
-                    "Dropping frame %s (seq %d) because mask generation failed: %s",
-                    rgb_name,
-                    record.seq,
-                    exc,
-                )
-                self._remove_failed_frame_files(record.frame)
-                continue
-
-            record.frame["mask_path"] = f"./masks/{rgb_name}"
-            kept_records.append(record)
-            kept_frames.append(record.frame)
-
-        self.saved_records = kept_records
-        self.metadata["frames"] = kept_frames
-        self.frame_index = len(kept_records)
-        self.write_transforms()
-
-        if removed_count > 0:
-            rospy.loginfo("Dropped %d frame(s) without valid masks", removed_count)
-
-    def write_init_cloud_from_saved_frames(self) -> None:
-        if self.metadata is None or self.run_dir is None or self.ply_path is None:
-            return
-        if not self.metadata["frames"]:
-            return
-
-        dataset_dir = self.run_dir.resolve()
-        rng = np.random.default_rng(0)
-        frame_infos = []
-        valid_counts = []
-
-        for frame in self.metadata["frames"]:
-            if "mask_path" not in frame:
-                continue
-
-            depth_path = resolve_relpath(dataset_dir, frame["depth_file_path"])
-            rgb_path = resolve_relpath(dataset_dir, frame["file_path"])
-            mask_path = resolve_relpath(dataset_dir, frame["mask_path"])
-
-            depth_mm = load_saved_depth_mm(depth_path)
-            valid_mask = load_saved_mask(mask_path, depth_mm.shape)
-            valid_count = int(np.count_nonzero(valid_mask & (depth_mm > 0.0)))
-            if valid_count == 0:
-                continue
-
-            frame_infos.append(
-                {
-                    "frame": frame,
-                    "depth_path": depth_path,
-                    "rgb_path": rgb_path,
-                    "mask_path": mask_path,
-                }
-            )
-            valid_counts.append(valid_count)
-
-        if not frame_infos:
-            raise RuntimeError("No valid depth points remained after applying masks across saved frames")
-
-        quotas = distribute_point_budget_evenly(valid_counts, MAX_INIT_CLOUD_POINTS)
-        all_xyz = []
-        all_rgb = []
-
-        for frame_info, n_sample in zip(frame_infos, quotas):
-            if n_sample <= 0:
-                continue
-
-            frame = frame_info["frame"]
-            depth_mm = load_saved_depth_mm(frame_info["depth_path"])
-            valid_mask = load_saved_mask(frame_info["mask_path"], depth_mm.shape)
-            rgb_bgr = load_saved_rgb(frame_info["rgb_path"], depth_mm.shape)
-
-            ys, xs = np.where(valid_mask & (depth_mm > 0.0))
-            if ys.size == 0:
-                continue
-            if n_sample < ys.size:
-                choice = rng.choice(ys.size, size=n_sample, replace=False)
-                ys = ys[choice]
-                xs = xs[choice]
-
-            depth_m = depth_mm[ys, xs] / 1000.0
-            x = (xs.astype(np.float32) - self.intrinsics.cx) * depth_m / self.intrinsics.fx
-            y = -(ys.astype(np.float32) - self.intrinsics.cy) * depth_m / self.intrinsics.fy
-            xyz_cam = np.stack([x, y, -depth_m], axis=1)
-            hom = np.concatenate(
-                [xyz_cam, np.ones((xyz_cam.shape[0], 1), dtype=np.float32)],
-                axis=1,
-            )
-            transform_matrix = np.asarray(frame["transform_matrix"], dtype=np.float32)
-            xyz_world = (transform_matrix @ hom.T).T[:, :3]
-            rgb = rgb_bgr[ys, xs][:, ::-1].astype(np.uint8)
-
-            all_xyz.append(xyz_world.astype(np.float32))
-            all_rgb.append(rgb)
-
-        if not all_xyz:
-            raise RuntimeError("No valid depth points remained after applying masks across saved frames")
-
-        xyz = np.concatenate(all_xyz, axis=0)
-        rgb = np.concatenate(all_rgb, axis=0)
-        write_ascii_ply(self.ply_path, xyz, rgb)
-        self.metadata["ply_file_path"] = INIT_CLOUD_NAME
-        self.write_transforms()
-
-    def cleanup(self) -> None:
-        if self.robot_model is not None:
-            self.robot_model.cleanup()
-            self.robot_model = None
-
-
-def main() -> None:
-    rospy.init_node("save_data_img_depth_mask_pose")
-    session = CaptureSession()
-
-    try:
-        session.initialize()
-
-        joint_state_sub = rospy.Subscriber(
-            GAZEBO_JOINT_STATES_TOPIC,
-            JointState,
-            session.joint_state_callback,
-            queue_size=200,
-        )
-        gazebo_pose_sub = rospy.Subscriber(
-            GAZEBO_CAMERA_POSE_TOPIC,
-            PoseStamped,
-            session.gazebo_pose_callback,
-            queue_size=200,
-        )
-        rgb_sub = Subscriber(IMAGE_TOPIC, Image)
-        depth_sub = Subscriber(DEPTH_TOPIC, Image)
-        sync = ApproximateTimeSynchronizer(
-            [rgb_sub, depth_sub],
-            queue_size=SYNC_QUEUE_SIZE,
-            slop=SYNC_SLOP_SEC,
-        )
-        sync.registerCallback(session.image_callback)
-
-        rospy.spin()
-
-        session.generate_masks()
-        session.write_init_cloud_from_saved_frames()
-        session.write_transforms()
-    finally:
-        session.cleanup()
-
-
-if __name__ == "__main__":
-    main()

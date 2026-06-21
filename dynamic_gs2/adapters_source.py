@@ -288,53 +288,59 @@ class Ros1Source:
             self._log_fd = None
 
 
-# --------------------------------------------------------------- live (bridge over proven publisher)
+# --------------------------------------------------------------- live (proven publisher, DIRECT new-layout)
 class LiveBridgeSource:
-    """RECOMMENDED live producer: reuses the proven old ROS publisher + reader
-    (dynamic_gs.utils.live_shm_reader.LiveShmSubscriber, which spawns the validated
-    py3.8 publisher) and FORWARDS each frame into the NEW SHM layout. Zero new
-    rospy/FK/mask/decode code — the entire live stack that already works in production
-    is reused; only the byte layout is bridged. Runs in the dynamic_gs env.
+    """RECOMMENDED live producer: spawns the proven py3.8 ROS publisher with --new-layout so it writes
+    THIS SHM segment (frame.py layout) DIRECTLY. The tracker's ShmRing reads it — NO forwarder thread,
+    NO LiveFrame copy, NO SHM-A->SHM-B copy (the old double-write is gone). All the proven
+    rospy/FK/mask/decode code is reused unchanged; only the publisher's SHM-write target changed.
 
     NOTE: requires a live Gazebo/ROS stack; validated by the OPERATOR (pipeline step 4).
     """
 
     def __init__(self, *, old_shm_name: str = "dgs_live_shm", live_root=None,
                  ready_timeout_s: float = 30.0, **sub_kwargs):
-        self.old_shm_name = old_shm_name
+        self.old_shm_name = old_shm_name                  # kept for API-compat; unused in the direct path
         self.live_root = live_root
         self.ready_timeout_s = ready_timeout_s
         self._sub_kwargs = sub_kwargs
-        self._sub = None
-        self._prod: Optional[ShmProducer] = None
+        self._proc = None
         self._intr: Optional[Intrinsics] = None
-        self._thread: Optional[threading.Thread] = None
-        self._stop = threading.Event()
 
     def attach(self, shm_name: str = DEFAULT_SHM_NAME) -> None:
-        from dynamic_gs.utils.live_shm_reader import LiveShmSubscriber
-        kw = dict(shm_name=self.old_shm_name, ready_timeout_s=self.ready_timeout_s, **self._sub_kwargs)
-        if self.live_root is not None:
-            kw["live_root"] = self.live_root
-        self._sub = LiveShmSubscriber(**kw)               # spawns the proven publisher
-        i = self._sub.intrinsics                           # @property on LiveShmSubscriber (NOT a method)
-        self._intr = Intrinsics(width=int(i.width), height=int(i.height),
-                                fx=float(i.fx), fy=float(i.fy), cx=float(i.cx), cy=float(i.cy))
-        self._prod = ShmProducer(self._intr, name=shm_name)   # NEW layout
-        self._thread = threading.Thread(target=self._forward, daemon=True)
-        self._thread.start()
-
-    def _forward(self) -> None:
-        last = -1
-        while not self._stop.is_set():
-            lf = self._sub.peek_latest()
-            if lf is None or int(lf.seq) == last:
-                self._stop.wait(0.002)
+        import json as _json
+        from dynamic_gs.utils.live_shm_reader import _spawn_publisher, LIVE_ROOT
+        live_root = self.live_root if self.live_root is not None else LIVE_ROOT
+        # Spawn the proven publisher writing the NEW layout straight into `shm_name` (what ShmRing reads).
+        self._proc = _spawn_publisher(
+            live_root=live_root, shm_name=shm_name,
+            keyframe_translation_m=self._sub_kwargs.get("keyframe_translation_m", 0.02),
+            keyframe_rotation_deg=self._sub_kwargs.get("keyframe_rotation_deg", 20.0),
+            wipe_live_root=self._sub_kwargs.get("wipe_live_root", True),
+            new_layout=True)   # the ONLY live path: publisher writes the frame.py SHM directly
+        # Read the publisher's one-line "ready" handshake (intrinsics + shm open confirmation).
+        import time as _t
+        deadline = _t.time() + self.ready_timeout_s
+        ready = None
+        while _t.time() < deadline:
+            line = self._proc.stdout.readline()
+            if not line:
+                if self._proc.poll() is not None:
+                    raise RuntimeError("live publisher exited during startup; see /tmp/dgs_live_publisher/")
                 continue
-            last = int(lf.seq)
-            self._prod.write(Frame(seq=int(lf.seq), stamp_sec=float(lf.stamp_sec),
-                                   rgb_bgr=lf.rgb_bgr, depth_m=lf.depth_m,
-                                   mask_keep=lf.mask_keep, c2w_4x4=lf.c2w_4x4))
+            try:
+                msg = _json.loads(line.decode().strip() if isinstance(line, bytes) else line.strip())
+            except Exception:
+                continue
+            if msg.get("event") == "ready":
+                ready = msg; break
+            if msg.get("event") == "init_error":
+                raise RuntimeError("live publisher init failed: %s" % msg.get("error"))
+        if ready is None:
+            raise RuntimeError("live publisher did not become ready in %.0fs" % self.ready_timeout_s)
+        self._intr = Intrinsics(width=int(ready["width"]), height=int(ready["height"]),
+                                fx=float(ready["fx"]), fy=float(ready["fy"]),
+                                cx=float(ready["cx"]), cy=float(ready["cy"]))
 
     def intrinsics(self) -> Intrinsics:
         if self._intr is None:
@@ -342,19 +348,23 @@ class LiveBridgeSource:
         return self._intr
 
     def next_frame(self) -> Optional[Frame]:
-        return None                                       # forwarder thread drives SHM
+        return None                                       # publisher writes SHM directly; read via ShmRing
 
     def close(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-        if self._sub is not None:
+        # _spawn_publisher does NOT start a new session, so the proc shares our process group —
+        # never killpg here (it would kill us). The cmd is `bash -c "... exec python ..."`, so exec
+        # replaced bash: SIGTERM to proc.pid hits the python publisher directly (its SIGTERM handler
+        # drops the rospy node + unlinks the SHM).
+        if self._proc is not None:
             try:
-                self._sub.close()
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
             except Exception:
                 pass
-        if self._prod is not None:
-            self._prod.close(unlink=True)
+            self._proc = None
 
 
 # --------------------------------------------------------------- factory

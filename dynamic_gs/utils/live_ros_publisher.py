@@ -128,20 +128,20 @@ from tf.transformations import quaternion_from_matrix, quaternion_slerp
 
 
 # ---------------------------------------------------------------------------
-# Recorder module loader (single source of truth for ROS topics, mask render
-# logic, intrinsics). Loaded via importlib because the recorder lives outside
-# any package.
+# ROS-mask module loader (single source of truth for ROS topics, mask render
+# logic, intrinsics). Loaded via importlib by PATH because the publisher runs
+# as a standalone script in the minimal dynamic_gs_ros env, not as a package.
 # ---------------------------------------------------------------------------
 
-_RECORDER_SCRIPT = Path(__file__).resolve().parents[2] / "save_data_img_depth_mask_pose.py"
+_RECORDER_SCRIPT = Path(__file__).resolve().parents[2] / "dynamic_gs2" / "ros_mask.py"
 
 
 def _load_recorder_module():
-    spec = importlib.util.spec_from_file_location("_dgs_live_recorder", _RECORDER_SCRIPT)
+    spec = importlib.util.spec_from_file_location("_dgs_ros_mask", _RECORDER_SCRIPT)
     if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load recorder module from {_RECORDER_SCRIPT}")
+        raise ImportError(f"cannot load ros_mask module from {_RECORDER_SCRIPT}")
     module = importlib.util.module_from_spec(spec)
-    sys.modules["_dgs_live_recorder"] = module
+    sys.modules["_dgs_ros_mask"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -456,7 +456,12 @@ class LivePublisher:
                     pass
 
     def __init__(self, live_root: Path, shm_name: str, keyframe_translation_m: float,
-                 keyframe_rotation_deg: float, record_replay_dir: Optional[str] = None):
+                 keyframe_rotation_deg: float, record_replay_dir: Optional[str] = None,
+                 new_layout: bool = False):
+        # new_layout=True: write the dynamic_gs2 frame.py SHM layout DIRECTLY (one write, read by the
+        # tracker with no bridge/forwarder/extra copies). Default False keeps the proven old layout +
+        # all old readers (live_shm_reader) byte-identical. LiveBridgeSource passes new_layout=True.
+        self._new_layout = bool(new_layout)
         if not rospy.core.is_initialized():
             rospy.init_node("dynamic_gs_live_pub", disable_signals=True, anonymous=True)
         # Replay-recording tap (off unless --record-replay): captures the full
@@ -563,6 +568,23 @@ class LivePublisher:
         self._worker_thread: Optional[threading.Thread] = None
         self._worker_shutdown = threading.Event()
 
+        # Dedicated mask thread. The robot-exclusion mask (URDF FK + pyrender, the
+        # single longest per-frame step) depends ONLY on the image timestamp + the
+        # joint-state buffer — NOT on rgb/depth — so it can render concurrently with
+        # the rgb/depth decode on the worker thread. pyrender's GL context is thread-
+        # bound, so the RobotMaskGenerator is built and used entirely on THIS one
+        # thread for its whole life. The worker submits a stamp (_mask_req), decodes
+        # rgb/depth meanwhile, then waits for _mask_done. Frame time drops from
+        # mask+decode to max(mask, decode). DGS_PUB_MASK_THREAD=0 forces inline.
+        self._mask_thread: Optional[threading.Thread] = None
+        self._mask_req_event = threading.Event()
+        self._mask_done_event = threading.Event()
+        self._mask_req_seq = 0             # monotone id the worker stamps each request with
+        self._mask_req_stamp = None        # rospy.Time submitted by the worker
+        self._mask_result = None           # np.ndarray keep-mask, or None on error
+        self._mask_result_seq = -1         # which _mask_req_seq _mask_result was rendered for
+        self._mask_thread_off = os.environ.get("DGS_PUB_MASK_THREAD") == "0"
+
         # Disk recorder
         self._record_lock = threading.Lock()
         self._record_active = False
@@ -588,8 +610,27 @@ class LivePublisher:
                           % (_ZED_NOISE._SIGMA0, _ZED_NOISE._K, _ZED_NOISE._HOLE_RATE))
 
         # Shared memory allocation. Sized once H/W are known.
-        slot_bytes, offsets = _slot_layout(self.intrinsics.height, self.intrinsics.width)
-        total = HEADER_BYTES + NUM_SLOTS * slot_bytes
+        if self._new_layout:
+            # Write the dynamic_gs2 frame.py layout DIRECTLY — the tracker reads this segment with no
+            # bridge/forwarder, no LiveFrame copy, no SHM-A->SHM-B copy (eliminates the old double-write).
+            import importlib.util as _ilu
+            import sys as _sys
+            # live_ros_publisher.py is scripts/dynamic_gs/utils/ -> parents[2] == scripts/ -> dynamic_gs2/
+            _fp = Path(__file__).resolve().parents[2] / "dynamic_gs2" / "frame.py"
+            _spec = _ilu.spec_from_file_location("_dgs2_frame", str(_fp))
+            self._fc = _ilu.module_from_spec(_spec)
+            _sys.modules["_dgs2_frame"] = self._fc       # py3.8 dataclass field-type resolution needs the
+            _spec.loader.exec_module(self._fc)           # module registered in sys.modules before exec
+
+            self._nl_intr = self._fc.Intrinsics(
+                width=self.intrinsics.width, height=self.intrinsics.height,
+                fx=self.intrinsics.fx, fy=self.intrinsics.fy,
+                cx=self.intrinsics.cx, cy=self.intrinsics.cy)
+            self._nl_layout = self._fc.compute_layout(self.intrinsics.height, self.intrinsics.width)
+            total = self._nl_layout.total_size
+        else:
+            slot_bytes, offsets = _slot_layout(self.intrinsics.height, self.intrinsics.width)
+            total = HEADER_BYTES + NUM_SLOTS * slot_bytes
         # Unlink any stale region with the same name (previous crash).
         try:
             existing = shared_memory.SharedMemory(name=shm_name)
@@ -602,19 +643,24 @@ class LivePublisher:
             pass
         self.shm = shared_memory.SharedMemory(name=shm_name, create=True, size=total)
         self.shm_name = shm_name
-        self.slot_bytes = slot_bytes
-        self.offsets = offsets
-        _write_header(
-            self.shm.buf,
-            self.intrinsics.height, self.intrinsics.width,
-            self.intrinsics.fx, self.intrinsics.fy, self.intrinsics.cx, self.intrinsics.cy,
-            slot_bytes, offsets,
-            latest_seq=0, ready=1, shutdown=0,
-        )
+        if self._new_layout:
+            self._fc.pack_header(self.shm.buf, self._nl_intr, self._nl_layout.num_slots)
+            self._fc.set_ready(self.shm.buf, True)
+        else:
+            self.slot_bytes = slot_bytes
+            self.offsets = offsets
+            _write_header(
+                self.shm.buf,
+                self.intrinsics.height, self.intrinsics.width,
+                self.intrinsics.fx, self.intrinsics.fy, self.intrinsics.cx, self.intrinsics.cy,
+                slot_bytes, offsets,
+                latest_seq=0, ready=1, shutdown=0,
+            )
 
-        # Pre-build slot numpy views (zero-copy into shm.buf).
+        # Pre-build slot numpy views (zero-copy into shm.buf). New-layout mode writes via the frame.py
+        # codec instead, so the old views aren't built (kept empty).
         self._slot_views = []
-        for i in range(NUM_SLOTS):
+        for i in (() if self._new_layout else range(NUM_SLOTS)):
             base = HEADER_BYTES + i * slot_bytes
             self._slot_views.append({
                 "pose": np.frombuffer(self.shm.buf, dtype=np.float64,
@@ -819,9 +865,25 @@ class LivePublisher:
         ).astype(np.float64)
         return rotate_camera_frame_only(base @ optical_offset)
 
-    @staticmethod
-    def _decode_compressed_rgb(msg: CompressedImage) -> np.ndarray:
-        """JPEG-decode a sensor_msgs/CompressedImage to BGR uint8 HxWx3."""
+    _turbojpeg = None          # lazily-probed TurboJPEG instance (None=unprobed, False=unavailable)
+
+    @classmethod
+    def _decode_compressed_rgb(cls, msg: CompressedImage) -> np.ndarray:
+        """JPEG-decode a sensor_msgs/CompressedImage to BGR uint8 HxWx3.
+
+        cv2.imdecode is single-threaded ~20 ms at 1200p (measured; thread count doesn't help one
+        decode). Use libjpeg-turbo (PyTurboJPEG) when installed — 2-4x faster — else fall back to cv2.
+        To get the speedup: `pip install PyTurboJPEG` into the dynamic_gs_ros env (libturbojpeg is a
+        system lib, usually already present). Probed once, then cached."""
+        if cls._turbojpeg is None:
+            try:
+                from turbojpeg import TurboJPEG, TJPF_BGR
+                cls._turbojpeg = (TurboJPEG(), TJPF_BGR)
+            except Exception:
+                cls._turbojpeg = False
+        if cls._turbojpeg:
+            tj, bgr = cls._turbojpeg
+            return tj.decode(bytes(msg.data), pixel_format=bgr)
         arr = np.frombuffer(msg.data, dtype=np.uint8)
         return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
@@ -873,23 +935,82 @@ class LivePublisher:
         after subscriptions are set up."""
         if self._worker_thread is not None:
             return
+        if not self._mask_thread_off:
+            self._mask_thread = threading.Thread(
+                target=self._mask_thread_loop, name="dgs-publisher-mask", daemon=True,
+            )
+            self._mask_thread.start()
         self._worker_thread = threading.Thread(
             target=self._worker_loop, name="dgs-publisher-worker", daemon=True,
         )
         self._worker_thread.start()
 
+    def _render_mask(self, stamp) -> Optional[np.ndarray]:
+        """Lazily build the RobotMaskGenerator and render one robot-exclusion mask
+        for `stamp`, or None on failure. Shared by the threaded loop and the inline
+        fallback so the construct+render+error-handling lives in ONE place. The GL
+        context is created on whatever thread first calls this (the mask thread when
+        threaded, the worker when inline) and must only ever be used from that thread."""
+        try:
+            if self._mask_gen is None:
+                self._mask_gen = RobotMaskGenerator(
+                    intrinsics=self.intrinsics,
+                    joint_state_times_sec=self._joint_state_times_sec,
+                    joint_state_positions=self._joint_state_positions,
+                )
+            return self._mask_gen._render_robot_exclusion_mask(stamp, MASK_RENDER_CAMERA_FRAME)
+        except Exception as exc:
+            rospy.logwarn_throttle(2.0, "[live] mask render failed: {}".format(exc))
+            return None
+
+    def _mask_thread_loop(self) -> None:
+        """Own the RobotMaskGenerator (and its thread-bound GL context) for the
+        whole publisher lifetime; render one mask per request submitted by the
+        worker. Built lazily on the FIRST request so joint-state samples exist.
+
+        Each result is tagged with the request's _mask_req_seq so the worker can
+        reject a mask rendered for an OLDER request — e.g. when a slow render
+        overran the worker's wait, the worker abandoned that frame and submitted a
+        new one; without the seq check the worker would consume the stale mask and
+        the rgb/depth stream would silently desync one frame behind forever."""
+        while not self._worker_shutdown.is_set():
+            if not self._mask_req_event.wait(timeout=0.1):
+                continue
+            self._mask_req_event.clear()
+            req_seq = self._mask_req_seq          # snapshot the id we're serving
+            stamp = self._mask_req_stamp
+            result = self._render_mask(stamp)
+            self._mask_result = result
+            self._mask_result_seq = req_seq       # tag BEFORE signalling done
+            self._mask_done_event.set()
+
     def _worker_loop(self) -> None:
         """Drain frame_queue and do cv_bridge + pose interp + mask render
         + shm write. Runs in its own thread so the rospy receive thread
-        is never blocked on heavy work."""
+        is never blocked on heavy work.
+
+        DGS_PUB_PROFILE=1 logs the worker's PRODUCTION rate + per-frame wall every ~2 s, so we can
+        tell whether the live tracker is frame-STARVED (worker < tracker Hz) vs the tick itself being
+        slow. The mask render is full-res pyrender of the robot URDF — the prime suspect for a slow
+        worker (recorded reads pre-baked masks from disk, so it pays none of this)."""
         import queue as _q
+        profile = os.environ.get("DGS_PUB_PROFILE") == "1"
+        _n, _t_acc, _t0 = 0, 0.0, time.time()
         while not self._worker_shutdown.is_set():
             try:
                 image_msg, depth_msg, _enq_t = self._frame_queue.get(timeout=0.1)
             except _q.Empty:
                 continue
             try:
+                _ts = time.time()
                 self._process_synced_pair(image_msg, depth_msg)
+                if profile:
+                    _n += 1; _t_acc += time.time() - _ts
+                    if time.time() - _t0 >= 2.0:
+                        hz = _n / (time.time() - _t0)
+                        rospy.loginfo("[pub-profile] worker %.1f Hz, %.1f ms/frame (n=%d, qsize=%d)"
+                                      % (hz, 1000.0 * _t_acc / max(_n, 1), _n, self._frame_queue.qsize()))
+                        _n, _t_acc, _t0 = 0, 0.0, time.time()
             except Exception as exc:
                 rospy.logwarn_throttle(2.0, "[live] worker exc: {}".format(exc))
 
@@ -971,6 +1092,14 @@ class LivePublisher:
 
     def _process_synced_pair(self, image_msg: CompressedImage, depth_msg: Image) -> None:
         """The original _on_synced body, now running on the worker thread."""
+        # DGS_PUB_PROFILE=1: per-stage wall (interp/rgb/depth/noise/mask/shm) so we see EXACTLY
+        # which step costs what — not just mask-vs-total. Near-zero overhead when off.
+        _prof = os.environ.get("DGS_PUB_PROFILE") == "1"
+        _t = {}
+        def _lap(k, t0):
+            if _prof:
+                _t[k] = 1000.0 * (time.time() - t0)
+        _s = time.time()
         try:
             c2w = self._interpolate_c2w(float(image_msg.header.stamp.to_sec()))
         except Exception as exc:
@@ -978,30 +1107,54 @@ class LivePublisher:
             return
         if c2w is None:
             return
+        _lap("interp", _s)
 
-        rgb_bgr = self._decode_compressed_rgb(image_msg)
-        depth_m = self._decode_raw_depth(depth_msg)
+        # Submit the mask render to the dedicated mask thread FIRST: it needs only
+        # the stamp + joint buffer (no rgb/depth), so it renders concurrently with
+        # the rgb/depth decode below. We collect its result just before the SHM write.
+        _s_mask = time.time()
+        use_mask_thread = (not self._mask_thread_off) and self._mask_thread is not None
+        if use_mask_thread:
+            self._mask_done_event.clear()
+            self._mask_req_seq += 1            # tag THIS request so we can reject a stale result
+            req_seq = self._mask_req_seq
+            self._mask_req_stamp = image_msg.header.stamp
+            self._mask_req_event.set()
+
+        _s = time.time(); rgb_bgr = self._decode_compressed_rgb(image_msg); _lap("rgb", _s)
+        _s = time.time(); depth_m = self._decode_raw_depth(depth_msg); _lap("depth", _s)
+        _s = time.time()
         if _ZED_NOISE.enabled():
             depth_m = _ZED_NOISE.apply_zed_depth_noise(depth_m, self._zed_noise_rng)
+        _lap("noise", _s)
 
         should_write = False
         if self._record_active:
             with self._record_lock:
                 should_write = self._record_keyframe_filter.accept(c2w[:3, :4])
 
-        if self._mask_gen is None:
-            self._mask_gen = RobotMaskGenerator(
-                intrinsics=self.intrinsics,
-                joint_state_times_sec=self._joint_state_times_sec,
-                joint_state_positions=self._joint_state_positions,
-            )
-        try:
-            mask_keep = self._mask_gen._render_robot_exclusion_mask(
-                image_msg.header.stamp, MASK_RENDER_CAMERA_FRAME
-            )
-        except Exception as exc:
-            rospy.logwarn_throttle(2.0, "[live] mask render failed: {}".format(exc))
-            return
+        if use_mask_thread:
+            # Wait for the overlapped render. mask= is now WALL since submit (so it
+            # reads ~0 when fully hidden behind decode; the render cost is still real).
+            if not self._mask_done_event.wait(timeout=1.0):
+                rospy.logwarn_throttle(2.0, "[live] mask thread timeout")
+                return
+            # Reject a result rendered for an EARLIER request: a slow render that
+            # overran a prior frame's wait sets _mask_done late; without this check
+            # we'd consume that older frame's mask here and desync the stream by one
+            # frame permanently. Drop this frame instead (the next one re-syncs).
+            if self._mask_result_seq != req_seq:
+                rospy.logwarn_throttle(2.0, "[live] mask result stale (seq mismatch) — drop frame")
+                return
+            mask_keep = self._mask_result
+            _lap("mask", _s_mask)
+            if mask_keep is None:
+                return
+        else:
+            mask_keep = self._render_mask(image_msg.header.stamp)
+            _lap("mask", _s_mask)
+            if mask_keep is None:
+                return
 
         with self._state_lock:
             self._frame_seq += 1
@@ -1012,19 +1165,39 @@ class LivePublisher:
                 rgb_bgr=rgb_bgr, depth_m=depth_m, mask_keep=mask_keep, c2w_4x4=c2w,
             )
 
-        slot_idx = seq % NUM_SLOTS
-        slot_views_snapshot = self._slot_views
-        if not slot_views_snapshot:
-            return
-        slot = slot_views_snapshot[slot_idx]
-        slot["seq"][0] = seq
-        slot["pose"][:] = c2w
-        slot["stamp"][0] = stamp
-        slot["rgb"][:] = rgb_bgr
-        slot["depth"][:] = depth_m
-        slot["mask"][:] = mask_keep
-        latest_off = HDR_OFFSETS["latest_seq"]
-        struct.pack_into("<Q", self.shm.buf, latest_off, seq)
+        _s = time.time()
+        if self._new_layout:
+            # Single direct write into the dynamic_gs2 frame.py segment (the tracker reads this — no
+            # bridge). write_frame copies each array into its SHM slot view via slice-assign, which
+            # accepts non-contiguous sources and casts dtype, so the old per-field np.ascontiguousarray
+            # wrappers here were a redundant SECOND full-frame copy (the measured shm-stage spikes).
+            # Pass the decoded arrays straight through. frame.py's Frame contract is mask {0,1} and the
+            # render returns {0,255}: `mask_keep != 0` is a cheap bool that slice-assign casts to uint8.
+            self._fc.write_frame(self.shm.buf, self._nl_layout, self._fc.Frame(
+                seq=int(seq), stamp_sec=float(stamp),
+                rgb_bgr=rgb_bgr,
+                depth_m=depth_m,
+                mask_keep=(mask_keep != 0),
+                c2w_4x4=c2w))
+        else:
+            slot_idx = seq % NUM_SLOTS
+            slot_views_snapshot = self._slot_views
+            if not slot_views_snapshot:
+                return
+            slot = slot_views_snapshot[slot_idx]
+            slot["seq"][0] = seq
+            slot["pose"][:] = c2w
+            slot["stamp"][0] = stamp
+            slot["rgb"][:] = rgb_bgr
+            slot["depth"][:] = depth_m
+            slot["mask"][:] = mask_keep
+            latest_off = HDR_OFFSETS["latest_seq"]
+            struct.pack_into("<Q", self.shm.buf, latest_off, seq)
+        _lap("shm", _s)
+        if _prof:
+            rospy.loginfo_throttle(2.0, "[pub-profile] stages ms: "
+                + " ".join("%s=%.1f" % (k, _t.get(k, 0.0))
+                           for k in ("interp", "rgb", "depth", "noise", "mask", "shm")))
 
         # Replay tap: enqueue the fresh decoded arrays (NOT the SHM views) for
         # the background writer. They're per-frame fresh, so refs are safe; the
@@ -1332,7 +1505,10 @@ class LivePublisher:
                 pass
         # Mark header.shutdown so any future reader sees we're done.
         try:
-            struct.pack_into("<I", self.shm.buf, HDR_OFFSETS["shutdown"], 1)
+            if self._new_layout:
+                self._fc.set_shutdown(self.shm.buf, True)   # new-layout shutdown flag (frame.py codec)
+            else:
+                struct.pack_into("<I", self.shm.buf, HDR_OFFSETS["shutdown"], 1)
         except Exception:
             pass
         # Stop accepting new ROS messages so callbacks don't pile up
@@ -1410,6 +1586,9 @@ def _main() -> int:
     parser.add_argument("--record-replay", type=str, default=None,
                         help="Directory to record the full SHM frame stream + control "
                              "events for deterministic replay (live_replay_publisher).")
+    parser.add_argument("--new-layout", action="store_true",
+                        help="Write the dynamic_gs2 frame.py SHM layout DIRECTLY (no bridge/forwarder). "
+                             "LiveBridgeSource passes this; old readers (live_shm_reader) need it OFF.")
     args = parser.parse_args()
 
     if args.wipe_live_root:
@@ -1422,12 +1601,14 @@ def _main() -> int:
             keyframe_translation_m=args.keyframe_translation_m,
             keyframe_rotation_deg=args.keyframe_rotation_deg,
             record_replay_dir=args.record_replay,
+            new_layout=args.new_layout,
         )
     except Exception as exc:
         _send_response({"event": "init_error", "error": "{}: {}".format(type(exc).__name__, exc)})
         return 1
 
-    # First "ready" message — reader uses this to know shm is open.
+    # First "ready" message — reader uses this to know shm is open. In new-layout mode the slot/header
+    # byte sizes are owned by frame.py (the reader uses frame.py to decode), so report 0 for them.
     _send_response({
         "event": "ready",
         "shm_name": args.shm_name,
@@ -1437,9 +1618,10 @@ def _main() -> int:
         "fy": pub.intrinsics.fy,
         "cx": pub.intrinsics.cx,
         "cy": pub.intrinsics.cy,
-        "num_slots": NUM_SLOTS,
-        "slot_bytes": pub.slot_bytes,
-        "header_bytes": HEADER_BYTES,
+        "num_slots": (pub._nl_layout.num_slots if args.new_layout else NUM_SLOTS),
+        "slot_bytes": (0 if args.new_layout else pub.slot_bytes),
+        "header_bytes": (0 if args.new_layout else HEADER_BYTES),
+        "new_layout": bool(args.new_layout),
     })
 
     def _atexit_shutdown():

@@ -65,9 +65,30 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 <!-- BEGIN: CLEANUP NOTES (working section, prepend new items here) -->
 <!-- ============================================================ -->
 
-# Dynamic-GS Cleanup
+# Dynamic-GS
 
-Working section for the in-progress cleanup of the dynamic-gs pipeline. All new cleanup-related notes go here, above the separator below. Older project documentation stays untouched after the separator.
+## CURRENT STATE — read this first
+
+The pipeline was rewritten. **`scripts/dynamic_gs2/` is the active, validated pipeline** (clean
+~3k-LOC rewrite, ~90% LOC cut from the old 28k). The old **`scripts/dynamic_gs/` package is the
+frozen ground-truth baseline** — its `ns-train` methods still run and the rewrite is verified
+*against* it, but new work goes through `dynamic_gs2/`.
+
+**Single source of truth for the live pipeline:** [`dynamic_gs2/STATUS_LIVE.md`](dynamic_gs2/STATUS_LIVE.md)
+(most recent reality). Also: [`dynamic_gs2/STATUS.md`](dynamic_gs2/STATUS.md) (overnight build report),
+[`dynamic_gs2/LOC.md`](dynamic_gs2/LOC.md) (the KPI), and the design blueprint in
+[`rewrite_spec/00_OVERVIEW.md`](rewrite_spec/00_OVERVIEW.md) (the module map the rewrite was generated
+against; `rewrite_spec/00_DECISIONS.md` = the settled calls). The pre-rewrite audit of the OLD package
+lives in [`code_audit/00_PURGE_PLAN.md`](code_audit/00_PURGE_PLAN.md) (historical — the rewrite was the
+chosen path over an in-place purge).
+
+The **Design Invariants** below are pipeline-agnostic: `dynamic_gs2` preserves all of them (it WRAPs
+the same nerfstudio `SplatfactoModel` and honors the same LR/background/viser rules). Where a note
+cites an old `dynamic_gs/` symbol, the equivalent lives under `dynamic_gs2/` (e.g. the `gaussian_set.py`
+SSOT owns the surgery the old `StaticGSModel`/`DynamicGSModel` did).
+
+Everything under **"Historical session notes"** is a dated record of the OLD-pipeline development that
+produced these invariants. Kept for the reasoning; not a current code map.
 
 ## Keeping this file accurate (MANDATORY)
 
@@ -77,10 +98,6 @@ This file is loaded as authoritative instructions every session — a stale clai
 2. **Reference code by symbol name, NOT line number.** Write `` [`dynamic_gs_config.py`](dynamic_gs/dynamic_gs_config.py) (`_ZERO_LR_OPTIMIZERS`) `` — never `:138` / `#L138`. Line numbers drift on any unrelated edit above them; symbol names only break when the symbol is actually renamed (and then rule 1 applies). The exception is the vendored-nerfstudio reference trace far below, which points into a pinned dependency.
 
 Dated session notes (`### … (YYYY-MM-DD)`) are historical records of *measurements taken at that date* — do NOT rewrite their numbers (that fabricates). If a dated note's conclusion was later reverted, prepend a `> **SUPERSEDED (date):**` banner stating current reality instead of editing the body.
-
-## Goal
-
-Do a whole cleanup of the dynamic-gs pipeline (model, pipeline, datamanager, config, utils). Open scope — entries below will refine what "cleanup" covers.
 
 ## Design Invariants (NON-NEGOTIABLE — DO NOT VIOLATE)
 
@@ -113,9 +130,60 @@ These are hard rules the pipeline depends on. If a change appears to require bre
    - **How enforced:** every method config in [`dynamic_gs_config.py`](dynamic_gs/dynamic_gs_config.py) sets `vis="tensorboard"` (NS viewer OFF; the tensorboard writer is suppressed by `_suppress_nerfstudio_output_writes` in [`dynamic_gs/__init__.py`](dynamic_gs/__init__.py)). `DynamicGSPipelineBaseConfig.enable_viser_direct: bool = True` is the default in [`dynamic_gs_pipeline_base.py`](dynamic_gs/dynamic_gs_pipeline_base.py), so viser-direct spins up automatically on port 8081 (configurable via `viser_direct_port`).
    - **History:** the Path-A client-side `GaussianSplatHandle` path (commits [`703cb9b`](https://github.com) / [`92b11a5`](https://github.com)) flashed on every property write (WebGL canvas remount; viser flags the handle "WIP" through 1.0.29) and crashed the browser on a version bump. **It was replaced by the server-side rasterize + push-image pattern, which is now canonical** ([`viser_direct.py`](dynamic_gs/utils/viser_direct.py); see [[project_viser_pushimg_baseline]]). The legacy handle API (`setup_handles` / `push_tracker_transform` / `add_ff_insert_chunk` / `refresh_static_handle` / `maybe_flush_ff_handle` / `flush_pending_ff`) is retained as **no-op stubs** for call-site compatibility.
 
-## Notes
+## Historical session notes (OLD `dynamic_gs/` pipeline development)
+
+> These are dated records of the OLD-pipeline work that produced the Design Invariants above.
+> Per the accuracy rules, their numbers are NOT rewritten. Current reality lives in
+> [`dynamic_gs2/STATUS_LIVE.md`](dynamic_gs2/STATUS_LIVE.md); the first note below is the bridge
+> from this history to the rewrite.
+
+### Live publisher perf: mask half-res + dedicated mask thread + shm-trim; mask code → `dynamic_gs2/ros_mask.py` (2026-06-21)
+
+Optimized the live ROS publisher worker ([`live_ros_publisher.py`](dynamic_gs/utils/live_ros_publisher.py)
+`_process_synced_pair`) from **~85 ms/frame (~11 Hz) → ~22 ms/frame (~21 Hz)** (operator accepted 21 Hz;
+the 20 ms hard target is NOT met — the mask render floors at ~14-15 ms). `DGS_PUB_PROFILE=1` logs per-stage
+`interp/rgb/depth/noise/mask/shm` ms + worker Hz to rosout.log.
+
+* **noise off for live** — `live.sh` sets `DGS_SIM_ZED_NOISE=0` (the sim ZED-noise model was ~85 ms/frame,
+  the single biggest cost; it's a sim-only realism model, irrelevant to live tracking). Master toggle is
+  still ON-by-default for recorded/seed paths (see the 2026-06-15 note).
+* **mask half-res render** — [`RobotMaskGenerator._ensure_renderer`](dynamic_gs2/ros_mask.py) renders the
+  robot-exclusion silhouette at `DGS_MASK_RENDER_SCALE` (default **0.25** = 480×300) and NEAREST-upscales
+  the binary keep-mask back to full res (output shape unchanged — both call sites get full res). A live scale
+  sweep (n=58/scale, 3 cycles, via `DGS_MASK_SCALE_SWEEP`) found mask is fill-bound DOWN TO ~480×300 then
+  hits a **~14-15 ms FLOOR** (fixed cost: URDF FK + per-mesh pyrender pose updates + GL + the full-res
+  upscale) — 0.25/0.20/0.15 all ~14-17 ms, so below 0.25 buys nothing but jaggier edges. Full-res was ~66 ms.
+* **dedicated mask thread** ([`_mask_thread_loop`](dynamic_gs/utils/live_ros_publisher.py)) — the mask
+  (FK+GL) has NO dependency on rgb/depth, so it renders concurrently with the rgb/depth decode; frame time →
+  max(mask, decode) not sum (A/B measured **−8 ms**, 32→24 ms). pyrender's GL context is thread-bound → the
+  RobotMaskGenerator GL renderer is created+used ONLY on the mask thread. `DGS_PUB_MASK_THREAD=0` forces inline.
+  **Stale-mask guard (required):** each request is tagged with `_mask_req_seq` and the result with
+  `_mask_result_seq`; the worker rejects+drops a frame whose result seq ≠ request seq. Without it, a render
+  that overran the worker's `_mask_done_event.wait(1.0)` (reachable on cold start) would let the worker consume
+  the PREVIOUS frame's mask, desyncing the stream one frame behind permanently. Fires ~once at cold start
+  (SAM3D-load GL stall) then 0 in steady state.
+* **shm-trim** — the new-layout SHM write passes decoded arrays straight to [`frame.py`](dynamic_gs2/frame.py)
+  `write_frame` (its `view[:]=src` slice-assign casts dtype + accepts non-contiguous), dropping the 3 redundant
+  `np.ascontiguousarray` + `(mask>0).astype` copies; mask passed as `(mask_keep != 0)` bool → frame.py's {0,1}
+  contract. shm-stage 24-32 ms spikes → ~5-8 ms.
+* **TurboJPEG** ([`_decode_compressed_rgb`](dynamic_gs/utils/live_ros_publisher.py)) — libjpeg-turbo
+  (PyTurboJPEG, TJPF_BGR) when installed (~2-4× vs cv2.imdecode's single-threaded ~20 ms @1200p), else cv2
+  fallback; probed once, cached.
+
+**Mask code moved:** the live half of the old `save_data_img_depth_mask_pose.py` (DELETED, ~1140 LOC) was
+extracted into **[`dynamic_gs2/ros_mask.py`](dynamic_gs2/ros_mask.py)** (~740 LOC: ROS topic/path constants +
+ROS↔numpy helpers + `CameraIntrinsics` + `RobotMaskGenerator`). The standalone `CaptureSession` + `main()`
+recorder were dropped (dynamic_gs2 captures via `static_capture.StaticRecorder` + the publisher's SHM write,
+never that `main()`). The publisher importlib-loads `ros_mask.py` BY PATH (`parents[2]/dynamic_gs2/ros_mask.py`,
+module `_dgs_ros_mask`); it runs in the py3.8 `dynamic_gs_ros` env. All 24 `_REC.*` symbols the publisher pulls
+are present. SHM image channel is BGR end-to-end (`Frame.rgb_bgr`, cv2 convention); consumers flip to RGB via a
+lazy `[..., ::-1]` view (~free) — kept BGR because changing it saves no time and touches ~6 consumers.
 
 ### dynamic_gs2 clean-architecture rewrite — built + validated (2026-06-18)
+
+> **UPDATE (2026-06-20):** the live run, FF-on, AND a fully-native static-from-scratch phase are now
+> all VALIDATED — see [`dynamic_gs2/STATUS_LIVE.md`](dynamic_gs2/STATUS_LIVE.md) (the "PENDING" items
+> in this note are done). `dynamic_gs2/live.sh` runs the whole pipeline in one process.
 
 The 28k-LOC vibe-coded pipeline was rewritten into [`scripts/dynamic_gs2/`](dynamic_gs2/) (the old `dynamic_gs/` stays the frozen baseline + the source of the heavy vendored utils the new modules WRAP). **START at [`dynamic_gs2/STATUS.md`](dynamic_gs2/STATUS.md).** KPI: **2,582 LOC vs 28,003 = 90.8% cut** (target <10k), 9/9 unit tests green. Decisions in [`rewrite_spec/00_DECISIONS.md`](rewrite_spec/00_DECISIONS.md); per-module specs in [`rewrite_spec/`](rewrite_spec/).
 
@@ -636,11 +704,18 @@ Called from `_tracker_tick_live` immediately after `_apply_cotracker_motion` ret
 
 ---
 
-## Project Overview
+## Project Overview — OLD `dynamic_gs/` package (FROZEN BASELINE)
+
+> Everything from here to the end of the file describes the **old `dynamic_gs/` package**, which is now
+> the **frozen ground-truth baseline**, NOT the active pipeline. It is still accurate for that package
+> (and much of `dynamic_gs2/` WRAPs these same vendored utils, so this map stays useful), but the live
+> flows, module layout, and launch scripts of the CURRENT pipeline are in
+> [`dynamic_gs2/STATUS_LIVE.md`](dynamic_gs2/STATUS_LIVE.md) + [`commands.md`](commands.md). Read this
+> section as reference for the baseline, not as the current architecture.
 
 **dynamic-gs** is a static + dynamic Gaussian Splatting system for robotic teleoperation, integrated with [Nerfstudio](https://github.com/nerfstudio-project/nerfstudio). The static phase fits a Splatfacto scene; the dynamic phase tracks objects via XFeat and (optionally) feedforward-decodes newly revealed surfaces. Designed for live RGB-D streams from a single arm-mounted camera.
 
-The codebase was rewritten 2026-05-30 → 2026-06-01. The historical monolith (`dynamic_gs_pipeline.py`, 5329 LOC) was deleted; capabilities are now split across three thin pipelines, the dynamic logic into a shared base.
+The codebase was rewritten 2026-05-30 → 2026-06-01. The historical monolith (`dynamic_gs_pipeline.py`, 5329 LOC) was deleted; capabilities are now split across three thin pipelines, the dynamic logic into a shared base. *(That refactor was itself later superseded by the full `dynamic_gs2/` rewrite — see CURRENT STATE at the top.)*
 
 ## Installation
 
@@ -659,7 +734,10 @@ ns-train auto-discovers our methods via the `nerfstudio.method_configs` entry-po
 | `dynamic_gs_ros` | 3.8 | none | n/a | Minimal ROS Noetic env for the live publisher subprocess. ROS bindings come from `/opt/ros/noetic/lib/python3/dist-packages` via `source /opt/ros/noetic/setup.bash`. The publisher spawn wrapper sets `PYTHONNOUSERSITE=1` — without it, user-local pyrender shadows the env's. |
 | `anysplat_dynamic_gs` | 3.12 | — | ✅ | AnySplat feedforward decoder env (persistent worker; see `utils/anysplat_decode.py`). |
 
-## Running
+## Running (OLD pipeline)
+
+> For the CURRENT pipeline use the `dynamic_gs2/` scripts (`live.sh` / `static.sh` / `resume_live.sh`,
+> see [`commands.md`](commands.md)). The scripts below drive the frozen `dynamic_gs/` baseline.
 
 Three top-level scripts cover the common flows. Defaults are chosen so most invocations are zero-argument.
 

@@ -25,6 +25,10 @@ export LD_LIBRARY_PATH="$ENV/lib:${LD_LIBRARY_PATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"  # shared-GPU defrag
 export CUDA_HOME="$ENV"                                              # gsplat JIT needs these on a bare-python
 export CPATH="$ENV/targets/x86_64-linux/include${CPATH:+:$CPATH}"    # launch (else cuda_runtime.h not found)
+# Sim ZED-X depth-noise injection OFF for live: profiled at ~85 ms/frame in the publisher worker
+# (the single biggest per-frame cost) — and it's a sim-only realism model, irrelevant to live tracking.
+# Set DGS_SIM_ZED_NOISE=1 before live.sh only for a noise-robustness study.
+export DGS_SIM_ZED_NOISE="${DGS_SIM_ZED_NOISE:-0}"
 
 # dVRK RT protection: reserve cores 0-3 for the dVRK 1kHz loop, cap math threadpools, pin the pipeline
 # to 4-23, lock the dVRK ONTO 0-3. Helpers self-skip when no dVRK/cpuset is present. DGS_NO_CPU_PIN=1 off.
