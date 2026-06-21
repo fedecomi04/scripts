@@ -1,919 +1,185 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-## 1. Think Before Coding
+Guidance for Claude Code in this repo. This file is **always-loaded current truth only** —
+no dated session notes, no frozen-baseline reference. Those live in:
 
-**Don't assume. Don't hide confusion. Surface tradeoffs.**
+- [`HISTORY.md`](HISTORY.md) — all dated `### … (YYYY-MM-DD)` session notes + superseded reasoning.
+- [`BASELINE.md`](BASELINE.md) — the frozen OLD `dynamic_gs/` package reference (arch map, splatfacto trace).
+- [`dynamic_gs2/STATUS_LIVE.md`](dynamic_gs2/STATUS_LIVE.md) — **the SSOT for the live pipeline** (most recent reality).
 
-Before implementing:
-- State your assumptions explicitly. If uncertain, ask.
-- If multiple interpretations exist, present them - don't pick silently.
-- If a simpler approach exists, say so. Push back when warranted.
-- If something is unclear, stop. Name what's confusing. Ask.
-
-## 2. Simplicity First
-
-**Minimum code that solves the problem. Nothing speculative.**
-
-- No features beyond what was asked.
-- No abstractions for single-use code.
-- No "flexibility" or "configurability" that wasn't requested.
-- No error handling for impossible scenarios.
-- If you write 200 lines and it could be 50, rewrite it.
-
-Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
-
-## 3. Surgical Changes
-
-**Touch only what you must. Clean up only your own mess.**
-
-When editing existing code:
-- Don't "improve" adjacent code, comments, or formatting.
-- Don't refactor things that aren't broken.
-- Match existing style, even if you'd do it differently.
-- If you notice unrelated dead code, mention it - don't delete it.
-
-When your changes create orphans:
-- Remove imports/variables/functions that YOUR changes made unused.
-- Don't remove pre-existing dead code unless asked.
-
-The test: Every changed line should trace directly to the user's request.
-
-## 4. Goal-Driven Execution
-
-**Define success criteria. Loop until verified.**
-
-Transform tasks into verifiable goals:
-- "Add validation" â "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" â "Write a test that reproduces it, then make it pass"
-- "Refactor X" â "Ensure tests pass before and after"
-
-For multi-step tasks, state a brief plan:
-```
-1. [Step] â verify: [check]
-2. [Step] â verify: [check]
-3. [Step] â verify: [check]
-```
-
-Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+If you find yourself adding a dated note or a war-story to *this* file, it belongs in HISTORY.md instead.
 
 ---
 
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+## 1. Behavioral guidelines
 
-<!-- ============================================================ -->
-<!-- BEGIN: CLEANUP NOTES (working section, prepend new items here) -->
-<!-- ============================================================ -->
+**Think before coding.** State assumptions explicitly; if uncertain, ask. If multiple interpretations
+exist, present them — don't pick silently. If a simpler approach exists, say so. If something is
+unclear, stop and name it.
 
-# Dynamic-GS
+**Simplicity first.** Minimum code that solves the problem. No speculative features, abstractions for
+single-use code, unrequested configurability, or error handling for impossible scenarios. If 200 lines
+could be 50, rewrite it.
 
-## CURRENT STATE — read this first
+**Surgical changes.** Touch only what you must. Don't refactor what isn't broken, don't "improve"
+adjacent code, match existing style. Remove orphans *your* change created; mention pre-existing dead
+code, don't delete it. Every changed line should trace to the request.
 
-The pipeline was rewritten. **`scripts/dynamic_gs2/` is the active, validated pipeline** (clean
-~3k-LOC rewrite, ~90% LOC cut from the old 28k). The old **`scripts/dynamic_gs/` package is the
-frozen ground-truth baseline** — its `ns-train` methods still run and the rewrite is verified
-*against* it, but new work goes through `dynamic_gs2/`.
-
-**Single source of truth for the live pipeline:** [`dynamic_gs2/STATUS_LIVE.md`](dynamic_gs2/STATUS_LIVE.md)
-(most recent reality). Also: [`dynamic_gs2/STATUS.md`](dynamic_gs2/STATUS.md) (overnight build report),
-[`dynamic_gs2/LOC.md`](dynamic_gs2/LOC.md) (the KPI), and the design blueprint in
-[`rewrite_spec/00_OVERVIEW.md`](rewrite_spec/00_OVERVIEW.md) (the module map the rewrite was generated
-against; `rewrite_spec/00_DECISIONS.md` = the settled calls). The pre-rewrite audit of the OLD package
-lives in [`code_audit/00_PURGE_PLAN.md`](code_audit/00_PURGE_PLAN.md) (historical — the rewrite was the
-chosen path over an in-place purge).
-
-The **Design Invariants** below are pipeline-agnostic: `dynamic_gs2` preserves all of them (it WRAPs
-the same nerfstudio `SplatfactoModel` and honors the same LR/background/viser rules). Where a note
-cites an old `dynamic_gs/` symbol, the equivalent lives under `dynamic_gs2/` (e.g. the `gaussian_set.py`
-SSOT owns the surgery the old `StaticGSModel`/`DynamicGSModel` did).
-
-Everything under **"Historical session notes"** is a dated record of the OLD-pipeline development that
-produced these invariants. Kept for the reasoning; not a current code map.
-
-## Keeping this file accurate (MANDATORY)
-
-This file is loaded as authoritative instructions every session — a stale claim actively misleads. Two rules:
-
-1. **If you change code that this file references, update this file in the SAME change.** That includes: config defaults / field values (`xfeat_top_k`, `STATIC_NUM_STEPS`, `segmentation_backend`, …), the lines that enforce a Design Invariant, default-flag states, and any symbol/file/module name mentioned here. The diff is not done until the doc matches the code.
-2. **Reference code by symbol name, NOT line number.** Write `` [`dynamic_gs_config.py`](dynamic_gs/dynamic_gs_config.py) (`_ZERO_LR_OPTIMIZERS`) `` — never `:138` / `#L138`. Line numbers drift on any unrelated edit above them; symbol names only break when the symbol is actually renamed (and then rule 1 applies). The exception is the vendored-nerfstudio reference trace far below, which points into a pinned dependency.
-
-Dated session notes (`### … (YYYY-MM-DD)`) are historical records of *measurements taken at that date* — do NOT rewrite their numbers (that fabricates). If a dated note's conclusion was later reverted, prepend a `> **SUPERSEDED (date):**` banner stating current reality instead of editing the body.
-
-## Design Invariants (NON-NEGOTIABLE — DO NOT VIOLATE)
-
-These are hard rules the pipeline depends on. If a change appears to require breaking one of them, **stop and flag it explicitly** — do not silently violate. Each rule has a stated reason so you can judge edge cases.
-
-1. **Static phase: `means` LR = 0.** Gaussian positions stay locked on the TSDF-fused seed (`depth_camera_init_points.ply`). Only `features_dc`, `features_rest`, `opacities`, `scales`, `quats` train. **Why:** the TSDF seed is geometrically correct (ICP-fused depth); allowing means to drift under photometric loss in 500 steps (`STATIC_NUM_STEPS=500`) produces visibly blurry / smeared output. Verified by: the `means` optimizer in [`dynamic_gs_config.py`](dynamic_gs/dynamic_gs_config.py) (`lr=0.0`). *History: was `1.6e-4` until 2026-06-02; the docstring claimed "effectively 0 because densification is off" but Adam moves means via `.grad` regardless of densification — that claim was wrong. Resolved by setting LR to 0.0 explicitly.*
-
-2. **Static phase: `camera_optimizer.mode = "off"`.** Camera poses are NOT optimized during static training. **Why:** `transforms.json` contains ICP-refined poses (see invariant #3), so the residual error is sub-mm — there is nothing for camera-opt to fix. Leaving it on at LR=1e-3 over 500 steps drifts cameras by visible amounts (degrees / cm), smearing the scene. Verified by: the static-gs `camera_optimizer` in [`dynamic_gs_config.py`](dynamic_gs/dynamic_gs_config.py) (`mode="off"`). *History: was `"SO3xR3"` until 2026-06-02; user explicitly observed cameras moving "by a LOT" in the viewer during run #2 and reported the prior fixed-means + fixed-poses runs converged "insanely good" in 500 epochs.*
-
-3. **`<data>/static_scene/transforms.json` contains ICP-refined poses, not raw URDF FK.** The raw URDF capture is preserved at `<data>/static_scene/transforms_urdf_backup.json`. **Why:** the TSDF seed PLY lives in the ICP-refined frame; if training cameras stay in the raw FK frame, there's a systematic 1–4 mm misalignment across the trajectory that camera-opt would have to undo (but per invariant #2, camera-opt is off). Tool: [`scripts/rewrite_transforms_with_icp.py`](rewrite_transforms_with_icp.py) (back up + ICP rewrite + new top-level `pose_source: "icp_refined_from_urdf_v1"` flag in transforms.json). Idempotent — re-runs detect the existing backup and refuse to overwrite it. **Drift on new_env (measured):** median 0.96 mm / 0.053°, max 3.94 mm / 0.41° over 68 frames. *Future: integrate this write-back directly into `ConcurrentFusionRunner.stop_and_finalize` so capture itself produces ICP-refined transforms.json (no post-pass needed).*
-
-4. **Dynamic phase: ALL gauss-param LRs = 0.** Only the XFeat tracker's rigid transform + feedforward decode insertions mutate the scene during dynamic phase. **Why:** the dynamic phase is a runtime, not a training loop. Per-step gradient descent on Gaussian params would fight against the tracker. Enforced by [`_ZERO_LR_OPTIMIZERS`](dynamic_gs/dynamic_gs_config.py) used by both `dynamic-gs` and `dynamic-gs-live`.
-
-5. **`outputs/` is suppressed across all runs.** Nerfstudio's default `outputs/<exp>/<method>/<timestamp>/` directory tree is not used. All artifacts live under `<data_dir>/`. **Why:** dataset dir is self-contained, portable, and survives output-tree cleanups. Enforced by three monkeypatches in [`dynamic_gs/__init__.py`](dynamic_gs/__init__.py) targeting `ExperimentConfig.save_config`, `Trainer.train`'s `dataparser_transforms.json` write, and `writer.setup_event_writer`'s tensorboard branch. Note: when `--vis viewer` is enabled, Nerfstudio's `ViewerState.__init__` still calls `mkdir(exist_ok=True)` on `outputs/<run>` — pre-create the parent before launching.
-
-6. **Background color = Gazebo sky `(0.86, 0.92, 1.0)`.** Used by both `StaticGSModel` and `DynamicGSModel` (and the viser viewer default). **Why:** the simulator renders against this sky; training/inference against any other background introduces a constant photometric bias the renderer would have to compensate for via opacity tweaks at silhouettes.
-
-7. **Persistent SAM3 + Fast-SAM3D worker is the canonical path for SAM3 / SAM3D during live capture.** [`SamWorkerClient`](dynamic_gs/utils/sam_worker.py) (spawn-once, load-on-demand, JSON-over-pipe). **Why:** measured 9.4 s/call savings on SAM3 cold-start + 22 s/call on SAM3D (when reused). The legacy per-call subprocess paths in [`sam3_segmentation.run_sam3_subprocess`](dynamic_gs/utils/sam3_segmentation.py) / [`sam3d.run_sam3d_multi_object_subprocess`](dynamic_gs/utils/sam3d.py) are still fallbacks but the live flow auto-spawns the worker at `fusion_runner.start()` time. Future: also wire into `fusion/phase0.py` (currently still uses the legacy per-call path for recorded datasets).
-
-8. **Per-object identity buffers are owned by specific pipeline phases:**
-   - `object_instance_ids` — written by Phase 0b fusion only.
-   - `inserted_flags` — written by Phase 0b (SAM3D inserts) and by `rgbd_decode.insert_inpaint_gaussians` (FF Mode B inserts).
-   - `sam3d_init_target_flags` — initialized to zeros, **never written at runtime**: the only value-writer is `DynamicGSModel.initialize_object_from_sam3d` ([`dynamic_gs_model.py`](dynamic_gs/dynamic_gs_model.py)), which has **no caller** (Phase 0b's `run_phase0b_fusion` never touches it). Placeholder buffer; all-zeros is the expected state.
-   - `object_flags` — written by the dynamic-gs pipeline's D0 selection on the first dynamic frame, **never by the static pipeline**. `object_flags=0` in `post_fusion_state.pt` is the correct/expected state.
-
-9. **Live visualization uses viser-direct, NEVER Nerfstudio's viewer.** Always connect to **`http://localhost:8081`** (the viser-direct port), never `:7007` (the NS viewer). Do NOT pass `--vis viewer` on the CLI.
-   > **CORRECTION (2026-06-17):** viser-direct is **server-side rasterize + push-image**, **NOT client-side WebGL**. The Path-A `GaussianSplatHandle` (client-side splatting) approach was **REMOVED** ([`viser_direct.py`](dynamic_gs/utils/viser_direct.py) header documents the new pattern). So the "client-side WebGL" framing in the bullets below is obsolete — the real reason to avoid the NS viewer is its render-state-machine *render path*, not server-vs-client rasterization (both rasterize server-side now).
-   - **Render path (the actual problem with the NS viewer):** every camera move triggers a server `get_outputs` render in BOTH. The NS viewer wraps it in a render-state-machine (low_move/low_static/high) with a render-interrupt (`IOChangeException`) that, under the shared FF lock, can **deadlock**. Viser-direct replaces that with one plain dedicated render thread that calls `model.get_outputs(camera)` and pushes the result (~25 ms/`get_outputs` at 512×512) — no state machine, no render-interrupt.
-   - **Concurrency hazards:** the NS render thread reads `gauss_params` while the FF bg thread is mid-`insert_inpaint_gaussians`. Even with the shared `_model_lock` + `attach_render_lock` hook plumbed into `DynamicGSModel.get_outputs_for_camera`, a post-training rasterization race can deadlock the render thread (observed 2026-06-02). Viser-direct avoids this with a single `model_lock` held by the pipeline around every tracker write + FF insert and by the render thread around each `get_outputs`, plus one **atomic** `client.scene.set_background_image(...)` full-frame push per render (no mid-rebuild scene state → no flash).
-   - **How enforced:** every method config in [`dynamic_gs_config.py`](dynamic_gs/dynamic_gs_config.py) sets `vis="tensorboard"` (NS viewer OFF; the tensorboard writer is suppressed by `_suppress_nerfstudio_output_writes` in [`dynamic_gs/__init__.py`](dynamic_gs/__init__.py)). `DynamicGSPipelineBaseConfig.enable_viser_direct: bool = True` is the default in [`dynamic_gs_pipeline_base.py`](dynamic_gs/dynamic_gs_pipeline_base.py), so viser-direct spins up automatically on port 8081 (configurable via `viser_direct_port`).
-   - **History:** the Path-A client-side `GaussianSplatHandle` path (commits [`703cb9b`](https://github.com) / [`92b11a5`](https://github.com)) flashed on every property write (WebGL canvas remount; viser flags the handle "WIP" through 1.0.29) and crashed the browser on a version bump. **It was replaced by the server-side rasterize + push-image pattern, which is now canonical** ([`viser_direct.py`](dynamic_gs/utils/viser_direct.py); see [[project_viser_pushimg_baseline]]). The legacy handle API (`setup_handles` / `push_tracker_transform` / `add_ff_insert_chunk` / `refresh_static_handle` / `maybe_flush_ff_handle` / `flush_pending_ff`) is retained as **no-op stubs** for call-site compatibility.
-
-## Historical session notes (OLD `dynamic_gs/` pipeline development)
-
-> These are dated records of the OLD-pipeline work that produced the Design Invariants above.
-> Per the accuracy rules, their numbers are NOT rewritten. Current reality lives in
-> [`dynamic_gs2/STATUS_LIVE.md`](dynamic_gs2/STATUS_LIVE.md); the first note below is the bridge
-> from this history to the rewrite.
-
-### Live publisher perf: mask half-res + dedicated mask thread + shm-trim; mask code → `dynamic_gs2/ros_mask.py` (2026-06-21)
-
-Optimized the live ROS publisher worker ([`live_ros_publisher.py`](dynamic_gs/utils/live_ros_publisher.py)
-`_process_synced_pair`) from **~85 ms/frame (~11 Hz) → ~22 ms/frame (~21 Hz)** (operator accepted 21 Hz;
-the 20 ms hard target is NOT met — the mask render floors at ~14-15 ms). `DGS_PUB_PROFILE=1` logs per-stage
-`interp/rgb/depth/noise/mask/shm` ms + worker Hz to rosout.log.
-
-* **noise off for live** — `live.sh` sets `DGS_SIM_ZED_NOISE=0` (the sim ZED-noise model was ~85 ms/frame,
-  the single biggest cost; it's a sim-only realism model, irrelevant to live tracking). Master toggle is
-  still ON-by-default for recorded/seed paths (see the 2026-06-15 note).
-* **mask half-res render** — [`RobotMaskGenerator._ensure_renderer`](dynamic_gs2/ros_mask.py) renders the
-  robot-exclusion silhouette at `DGS_MASK_RENDER_SCALE` (default **0.25** = 480×300) and NEAREST-upscales
-  the binary keep-mask back to full res (output shape unchanged — both call sites get full res). A live scale
-  sweep (n=58/scale, 3 cycles, via `DGS_MASK_SCALE_SWEEP`) found mask is fill-bound DOWN TO ~480×300 then
-  hits a **~14-15 ms FLOOR** (fixed cost: URDF FK + per-mesh pyrender pose updates + GL + the full-res
-  upscale) — 0.25/0.20/0.15 all ~14-17 ms, so below 0.25 buys nothing but jaggier edges. Full-res was ~66 ms.
-* **dedicated mask thread** ([`_mask_thread_loop`](dynamic_gs/utils/live_ros_publisher.py)) — the mask
-  (FK+GL) has NO dependency on rgb/depth, so it renders concurrently with the rgb/depth decode; frame time →
-  max(mask, decode) not sum (A/B measured **−8 ms**, 32→24 ms). pyrender's GL context is thread-bound → the
-  RobotMaskGenerator GL renderer is created+used ONLY on the mask thread. `DGS_PUB_MASK_THREAD=0` forces inline.
-  **Stale-mask guard (required):** each request is tagged with `_mask_req_seq` and the result with
-  `_mask_result_seq`; the worker rejects+drops a frame whose result seq ≠ request seq. Without it, a render
-  that overran the worker's `_mask_done_event.wait(1.0)` (reachable on cold start) would let the worker consume
-  the PREVIOUS frame's mask, desyncing the stream one frame behind permanently. Fires ~once at cold start
-  (SAM3D-load GL stall) then 0 in steady state.
-* **shm-trim** — the new-layout SHM write passes decoded arrays straight to [`frame.py`](dynamic_gs2/frame.py)
-  `write_frame` (its `view[:]=src` slice-assign casts dtype + accepts non-contiguous), dropping the 3 redundant
-  `np.ascontiguousarray` + `(mask>0).astype` copies; mask passed as `(mask_keep != 0)` bool → frame.py's {0,1}
-  contract. shm-stage 24-32 ms spikes → ~5-8 ms.
-* **TurboJPEG** ([`_decode_compressed_rgb`](dynamic_gs/utils/live_ros_publisher.py)) — libjpeg-turbo
-  (PyTurboJPEG, TJPF_BGR) when installed (~2-4× vs cv2.imdecode's single-threaded ~20 ms @1200p), else cv2
-  fallback; probed once, cached.
-
-**Mask code moved:** the live half of the old `save_data_img_depth_mask_pose.py` (DELETED, ~1140 LOC) was
-extracted into **[`dynamic_gs2/ros_mask.py`](dynamic_gs2/ros_mask.py)** (~740 LOC: ROS topic/path constants +
-ROS↔numpy helpers + `CameraIntrinsics` + `RobotMaskGenerator`). The standalone `CaptureSession` + `main()`
-recorder were dropped (dynamic_gs2 captures via `static_capture.StaticRecorder` + the publisher's SHM write,
-never that `main()`). The publisher importlib-loads `ros_mask.py` BY PATH (`parents[2]/dynamic_gs2/ros_mask.py`,
-module `_dgs_ros_mask`); it runs in the py3.8 `dynamic_gs_ros` env. All 24 `_REC.*` symbols the publisher pulls
-are present. SHM image channel is BGR end-to-end (`Frame.rgb_bgr`, cv2 convention); consumers flip to RGB via a
-lazy `[..., ::-1]` view (~free) — kept BGR because changing it saves no time and touches ~6 consumers.
-
-### dynamic_gs2 clean-architecture rewrite — built + validated (2026-06-18)
-
-> **UPDATE (2026-06-20):** the live run, FF-on, AND a fully-native static-from-scratch phase are now
-> all VALIDATED — see [`dynamic_gs2/STATUS_LIVE.md`](dynamic_gs2/STATUS_LIVE.md) (the "PENDING" items
-> in this note are done). `dynamic_gs2/live.sh` runs the whole pipeline in one process.
-
-The 28k-LOC vibe-coded pipeline was rewritten into [`scripts/dynamic_gs2/`](dynamic_gs2/) (the old `dynamic_gs/` stays the frozen baseline + the source of the heavy vendored utils the new modules WRAP). **START at [`dynamic_gs2/STATUS.md`](dynamic_gs2/STATUS.md).** KPI: **2,582 LOC vs 28,003 = 90.8% cut** (target <10k), 9/9 unit tests green. Decisions in [`rewrite_spec/00_DECISIONS.md`](rewrite_spec/00_DECISIONS.md); per-module specs in [`rewrite_spec/`](rewrite_spec/).
-
-* **WRAP not BE:** [`gaussian_set.py`](dynamic_gs2/gaussian_set.py) is the SSOT (6 params + 4 identity buffers behind ONE locked surgery API + immutable `snapshot()`); [`scene_model.py`](dynamic_gs2/scene_model.py) renders/trains those SAME tensor objects via a *wrapped* nerfstudio `SplatfactoModel` (`rebind()` after surgery, no copy). One SHM ingest path ([`frame.py`](dynamic_gs2/frame.py) + [`shm_channel.py`](dynamic_gs2/shm_channel.py) + [`adapters_source.py`](dynamic_gs2/adapters_source.py)) for recorded (`ReplaySource`) + live (`LiveBridgeSource`, which reuses the ENTIRE proven ROS publisher and forwards into the new SHM layout).
-* **VALIDATED (unattended, real data):** the new core loads the REAL 458k-gaussian `screwdriver recorded full` `static_state.pt` + renders @1200p; tracker A/B vs the old run's per-frame motion logs = **FUNCTIONAL EQUIVALENCE** (312/312 tracked, endpoint |t| old 460.7mm / new 459.5mm = 1.2mm over a 460mm path). NOT bit-identical (per-tick cum diff p50 1.5°/16mm = accumulated match-set variance that reconverges — a known tracker property). `gaussian_set` passed a 16-agent adversarial review (0 high/critical).
-* **FF "insert much less" P0 fix is IN + unit-tested:** [`dynamic_feedforward.py`](dynamic_gs2/dynamic_feedforward.py) bg thread reads ONLY the immutable `FeedforwardDispatch` (grep-asserted) + load-shed `enforce_ceiling`/`_purge_ff_inserts` (protect_mask never drops the tracked object).
-* **PENDING operator validation (code written, not unattended-safe):** the LIVE camera run ([`dynamic_gs2/resume_live.sh`](dynamic_gs2/resume_live.sh), needs the sim) and the FF-on full AnySplat decode A/B (`--ff`, needs the `anysplat_dynamic_gs` subprocess; CDN half validated). Static-phase-from-scratch is deferred — the new pipeline warm-loads the `.pt` the OLD static phase produces. Unattended-validated path: `dynamic_gs2/replay_ab.sh "<dataset>" transforms_313_trimmed.json`. See [[project_dynamic_gs2_rewrite]].
-
-### Real-ZED depth: NEURAL / conf 75 / texture 100 is the decode setting; doubled walls = DEPTH not POSE (2026-06-16)
-
-Settled the real-ZED `zed_scene` "doubled walls/ground" problem. **It's the DEPTH, not the poses** — proven, not assumed: stepping every frame's reprojected cloud through [`scripts/step_reproject_static.py`](scripts/step_reproject_static.py) (ESC/N=next, A=accumulate, P=pair-with-prev-in-red), consecutive frames overlap perfectly; and the seed-fusion's own ICP debug (`DGS_FUSION_DEBUG=1` in [`online_fusion.py`](dynamic_gs/utils/online_fusion.py)) shows ICP moves the VIO pose only ~10 mm/frame (mean), fitness 0.969, **0 FK-fallbacks** over 118 frames, with a ~5-6 mm inlier-RMSE FLOOR = the ZED stereo-depth floor. The trajectory is tiny (65 cm path, loops back to 3.8 cm) so there's no room for VIO drift. **KLT was considered and rejected** — it's a 2D tracker, not a pose estimator; ZED's stereo-inertial VIO already beats a hand-rolled KLT-VO, and the poses are already ICP-refined. There is NO loop-closure / pose-graph / global BA anywhere (seed = greedy frame-to-model ICP); if pose drift ever DID dominate on a longer trajectory, the fix would be a pose-graph, not KLT.
-
-**The fix is at SVO-decode time on the Jetson** (PC has no ZED SDK; see [[project_zed_real_camera_workflow]]). [`zed_svo_to_dataset.py`](zed_svo_to_dataset.py) gained `--confidence` / `--texture-confidence` flags + a depth-coverage-% report (these did NOT exist before this session). **Defaults are now `--depth-mode NEURAL --confidence 75 --texture-confidence 100`.** Knob semantics (range 1..100, **LOWER = reject MORE = FEWER points**, 100 = reject nothing — confirmed against Stereolabs docs):
-* **`confidence` SATURATES on NEURAL** — 65 / 75 / 90 all give ≈69% coverage on zed_scene. 75 chosen.
-* **`texture_confidence` is a CLIFF** — 100→68.9%, 99→50.4%, 95→18.1%, 90→9.5% coverage. MUST stay 100 on NEURAL (NEURAL *infers* textureless depth; lowering this deletes good inference). The original aggressive `tex=90` was the bug that collapsed the first decode to 9.5%.
-* **QUALITY is unusable for the seed** — even at 75/100 (58% coverage) the walls are ALL BENT. Plain stereo can't reconstruct textureless surfaces at any confidence; only NEURAL's inference can. (Operator-confirmed by eye in the viewer.)
-* Result at NEURAL/75/100: **68.9% coverage, walls/ground clean + single-surfaced**, only minor bend on large low-texture door panels (NEURAL inferring — acceptable).
-
-**NEURAL live fps (MEASURED on the live camera + this Orin):** HD1200 (1920×1200) **46.1 fps** (req 60, 21.7 ms/frame), SVGA 58.7, HD1080 30. So **NEURAL at full 1200p clears the 20-30 fps live target with headroom — no need to drop resolution.** ⚠️ An earlier SVO test gave a MISLEADING 17.6 fps because `svo_real_time_mode=False` measures raw serial decode (no capture/compute overlap, 56.8 ms); on the LIVE camera grab+depth PIPELINE → 46 fps. Always measure live fps on the camera, not fast-decode SVO. ZED X (GMSL2) rejects HD720 ("INVALID RESOLUTION"); valid res: SVGA/HD1080/HD1200/HD2K/VGA. SDK 4.1.2 has NO `NEURAL_LIGHT` (a 5.0 feature) — not needed. Full sweep + datasets: `data_teleoperation/datasets/ZED/zed_scene_DEPTHMODE_COMPARISON.md`.
-
-### Depth filter: median+bilateral on ALL depth (2026-06-16)
-
-> **PARTIALLY SUPERSEDED (2026-06-17) — the *where* drifted; the filter + defaults are unchanged.** Current code (verified): **RECORDED** filters at the batch source ([`_tracker_tick`](dynamic_gs/dynamic_gs_pipeline_recorded.py), so tracker + FF both consume cleaned depth) — matches the body. **LIVE does NOT filter at the batch source**: it filters at the **FF site on the FF bg thread**, gated by `_filter_depth_at_ff=True` ([`dynamic_gs_pipeline_live.py`](dynamic_gs/dynamic_gs_pipeline_live.py); the FF-site call is in [`dynamic_gs_pipeline_base.py`](dynamic_gs/dynamic_gs_pipeline_base.py) `_anysplat_bg_run`), so the **live tracker runs on RAW depth** (its critical path pays nothing) and only the FF inserts get cleaned depth. The **static TSDF seed is NOT pre-filtered** — there is no `filter_depth` call in [`online_fusion.py`](dynamic_gs/utils/online_fusion.py) or [`fusion_runner.py`](dynamic_gs/utils/fusion_runner.py) (the body's "static seed filters per-frame" is stale); TSDF multi-view averaging + voxel quantization make pre-filtering redundant for the seed (see [[project_depth_prefilter_redundant_for_tsdf_seed]]).
-
-[`dynamic_gs/utils/depth_filter.py`](dynamic_gs/utils/depth_filter.py) — `filter_depth` (CPU cv2, ~60 ms @1200p) and `filter_depth_torch` (GPU torch, ~16 ms: median 7.4 + bilateral 8.6). **median(5×5) + weight-corrected bilateral (sigmaColor=0.01 m)**, hole-safe (invalid==0 pixels held out — never bled into valid neighbours, never invented where the sensor returned none). Kills stereo **flying-pixels** at depth discontinuities (a silhouette pixel whose depth jumped to the background back-projects to an AnySplat gaussian floating off-surface — operator-observed on the banana live run) + smooths surface jitter. **ON by default**; `DGS_DEPTH_FILTER=0` disables; `DGS_DEPTH_MEDIAN_KSIZE` / `DGS_DEPTH_BILATERAL_SIGMA_COLOR_M` / … env-overridable. `filter_depth_torch(median=, bilateral=)` allows a per-stage split (unused — all callers run the full filter).
-
-* **Applied to ALL depth** (user decision): the **dynamic** tracker + FF filter ONCE at the batch source ([`_batch_from_live_frame`](dynamic_gs/dynamic_gs_pipeline_live.py) live / `_tracker_tick` recorded), so BOTH the tracker `batch["depth_image"]` AND feedforward `model._get_gt_depth(batch)` consume the cleaned depth (NO re-filter at the FF site — would double-apply). The **static seed** filters per-frame in [`online_fusion.fuse_recorded_dataset`](dynamic_gs/utils/online_fusion.py) (the recorded + GPU-subprocess seed path) and [`fusion_runner`](dynamic_gs/utils/fusion_runner.py) `add_frame` (concurrent-capture path), metres domain, before the mask-zeroing.
-* **Why ship full + NOT a fast kernel:** A/B'd raw / median / bilateral / both on a static banana reproj ([`scripts/compare_depth_filters.py`](scripts/compare_depth_filters.py)) and a real ZED frame ([`scripts/compare_depth_filters_zed.py`](scripts/compare_depth_filters_zed.py)). median+bilateral is marginally best, but the **median / bilateral / both difference is imperceptible on textured surfaces** → the cost of a custom sorting-network/Triton kernel buys nothing visible. Measured dead-ends: kornia GPU median is SLOWER (12.4 ms), a mean-based sub-ms outlier reject caught only 1% of fliers (mean is dragged toward the fly cluster at edges; median is robust, mean isn't). Table-plane RMS barely moves (it's dominated by the ~4–5 mm physical stereo-depth FLOOR, which filtering correctly does NOT remove — that floor is the real ZED's, see the cloud-smear notes). **The real real-ZED limitation is TEXTURELESS surfaces** (stereo can't match → bad/missing depth, unfixable by post-filter); that is a separate capture-side problem (ZED `confidence_threshold` / `texture_confidence` / depth-mode), noted for a later session. Optimization path IF filter cost ever binds: Sugy SIGGRAPH-2025 (GPU median sorting-network, ≤5×) + Liu *Computing* 2025 (OpenCL bilateral, vectorized weights).
-
-### GPU TSDF seed doubling — `trunc_voxel_multiplier` mismatch (FIXED 2026-06-16)
-
-**Symptom:** every **GPU-built** static seed (the default since 2026-06-01) had objects' **far edges DOUBLED** in the raw `depth_camera_init_points.ply` — a faint repeated/ghost surface on the edge grazing away from the camera. Never noticed because **splatfacto training masks it** (the seed inits Gaussians at the doubled edge, but opacity/scale/color training against the RGB loss fades the spurious ones — even with means LR=0), so it only surfaced on raw-seed inspection.
-
-**Root cause (proven by isolation, NOT theory):** in [`_GpuOnlineFusion._integrate`](dynamic_gs/utils/online_fusion.py) the `voxel_grid.integrate(...)` call **omitted `trunc_voxel_multiplier`**, so Open3D used its **default 8.0** → truncation = `8×voxel` = **16 mm @ 2 mm voxel / 24 mm @ 3 mm**. The CPU [`_CpuOnlineFusion`](dynamic_gs/utils/online_fusion.py) `ScalableTSDFVolume` uses a **FIXED `TSDF_TRUNC_M=0.008` (8 mm)**. The GPU's 2–3× larger truncation smears the SDF along the ray and carves a spurious 2nd zero-crossing at grazing/far edges → doubling. **Isolation chain (2026-06-16):** old March seed (CPU-era) = clean; current code on the SAME clean depth → GPU **doubles**, CPU **clean** (rules out depth noise + the depth-cap; it's the GPU path). Per-frame debug (`DGS_FUSION_DEBUG=1`, gated logging in both `add_frame`s) showed GPU **ICP fitness ~1.0, pose corrections ~0.2 mm, 0 FK-fallbacks** → poses are correct, so it's the **integration**, not registration.
-
-**Fix:** pass `trunc_voxel_multiplier = TSDF_TRUNC_M / TSDF_VOXEL_M` to the GPU `integrate` so GPU truncation always equals the CPU's 8 mm at any voxel. Verified: GPU re-fuse with the fix on the old clean depth → doubling **gone**, matches CPU. **Consequence:** every dataset's seed built GPU before this carries the doubling (and its `static_state.pt` was trained on the doubled seed — visually fine due to masking, but the seed is wrong); rebuild seeds if a clean raw cloud is needed. The CPU path was always correct (`DGS_FUSION_DEVICE=cpu`).
-
-### capture-only seed fusion now mirrors live (contained GPU subprocess @ 3mm) (2026-06-15)
-
-`capture_only.py` was the ONLY flow that crashed on 1200p capture: `[fusion] frame N failed: … illegal memory access` then `MemoryCache::Free … should have been recorded` → `Aborted (core dumped)`, intermittently (clean→some-frames→crash across runs). Root cause: it started the **in-process per-frame concurrent `ConcurrentFusionRunner`** (GPU `_GpuOnlineFusion` VoxelBlockGrid) at **2 mm**, which at 1920×1200 OOMs the hashmap (even with ~12 GB free) → CUDA illegal access → the teardown-abort killed the WHOLE capture. Live never hit this because it does something different: `live_session` defaults `DGS_LIVE_DEFER_TSDF=1` → **never starts the concurrent worker**, and builds the seed via the GPU TSDF batch in a **SUBPROCESS** at **`DGS_TSDF_VOXEL_M=0.003` (3 mm)** (`live_session.py` ~L1118: `subprocess.run([... -m dynamic_gs.utils.online_fusion, static_dir])`). The subprocess CONTAINS the teardown-abort (kills only the subprocess, not the session) and 3 mm fits 16 GB; 2 mm doesn't. **Fix:** [`capture_only.py`](scripts/capture_only.py) now removes the in-process concurrent worker and builds the seed at STATIC end exactly like live — GPU `online_fusion` subprocess at 3 mm, CPU `build_tsdf_seed` fallback. NOTE the near/far split (`adaptive_downsample`: near<1m at integrate density, far>1m→`FAR_VOXEL_M=0.01`) is a POST-fusion OUTPUT downsample — it does NOT reduce the (uniform) TSDF integrate voxel, so it can't fix the OOM; only the integrate `TSDF_VOXEL_M` (→3 mm) does. Open3D's VoxelBlockGrid is single-resolution (no per-distance integrate voxel).
-
-### NEXT-SESSION CHECKLIST (queued 2026-06-15)
-
-User's tomorrow list (details in the dated notes below):
-1. **Unlock max depth** — raise `DGS_TSDF_DEPTH_MAX_M` past 3.0 and verify no GPU OOM (pair with a coarser `DGS_TSDF_VOXEL_M`; watch `nvidia-smi`). The 3 m cap is an OOM guard, not a sensor limit — see the depth-cap note + [`online_fusion.py`](dynamic_gs/utils/online_fusion.py).
-2. **ICP real A/B** — settle ICP's sign with an actual `DGS_FF_ICP=0` vs `=1` comparison; currently ON by default on an eyeball call only.
-3. **Gaussian hygiene** — [DONE] per-insert UNIFORM-SHRINK oversized / cull tiny FF gaussians (`feedforward_anysplat_max_scale_m=0.05`; env `DGS_FF_MAX_SCALE_M`/`DGS_FF_MIN_SCALE_M`). [DONE] one-shot static opacity purge (`static_phase_opacity_purge_threshold=0.05`). [DONE] during-training static scale RESET (`scale_clamp_max_m=0.05` trigger → `scale_reset_value_m=0.01`, every `scale_clamp_every_n=10`). [DONE] 2 m depth cap (seed `DEPTH_MAX_M=2.0` + `scene_depth_max_m` training mask). [TODO] periodic DYNAMIC-phase purge of cumulative FF inserts ([[static-phase-opacity-purge-todo]]); CDN/FF depth-exclude (C+D); never drop `object_flags==1`.
-4. **Test all objects** — run the full pipeline across every object (banana / screwdriver / duck / …) to confirm the 2026-06-15 fixes (coverage-gate holes, ICP-off-or-on, keep-all-blobs, fractional block-validity, min-area 76) generalize, not just the banana scene.
-
-### Sim-to-real ZED-X depth-noise model on sim depth (2026-06-15, IMPLEMENTED; ON by default since 2026-06-16)
-
-The Gazebo `libgazebo_ros_openni_kinect.so` depth sensor returns the GPU z-buffer **noise-free** (its URDF `<noise>` block applies to RGB only, not depth) — so sim depth is perfect, the sim-to-real gap. [`dynamic_gs/utils/zed_depth_noise.py`](dynamic_gs/utils/zed_depth_noise.py) corrupts clean sim depth into ZED-X-realistic per-pixel jitter, **calibrated to our ACTUAL ZED-X**, not a generic paper:
-
-* **Axial noise** (stereo physics `σ_z ∝ z²`): per-pixel zero-mean Gaussian, `σ_z(z) = σ0 + k·z²` metres. **Current default (2026-06-16) is an UPPER-BOUND fit** — deliberately tuned to the NOISIEST real capture so the sim trains the pipeline against worst-case sensor noise (robustness). Measured the same flat-window roughness metric on three real HD1200 NEURAL captures: `ZED/scene_dataset` runs ~2–3× noisier than `ZED/zed_validate*` (scene_dataset mean 0.50 mm @0.4 m → 1.25 @1.0 → 2.49 @2.4; its **p90** 0.84 @0.4 → 2.20 @1.0 → 3.66 @2.4). LSQ z² fit to the `scene_dataset` **p90** → **`σ0=1.47 mm`** (a FLAT term so noise is visible even at near range) **`k=0.500 mm/m²`** (`DGS_SIM_ZED_SIGMA0_M=0.00147`, `DGS_SIM_ZED_K_M=0.000500`). So σ ≈ **1.5 mm @0.3 m, 2.0 mm @1.0 m, 3.0 mm @1.75 m** — visibly grainy at tabletop range. *History: the first real fit (2026-06-15) was the `zed_validate2` MEAN → `σ0≈0, k=0.477` — the typical-case low end, near-invisible <1.5 m; switched 2026-06-16 to the p90 upper bound.*
-* **Random holes** ~1% (`DGS_SIM_ZED_HOLE_RATE`). **Range gate** [0.05, 3.0] m (`DGS_SIM_ZED_Z_MIN/Z_MAX`): the min matches `DEPTH_MIN_M`, but the max is **3.0 m vs the fusion's `DEPTH_MAX_M` = 2.0 m** ([`online_fusion.py`](dynamic_gs/utils/online_fusion.py)) — the noise model gates wider than the TSDF cap, so the 2–3 m band gets noisy depth that fusion then discards; set `DGS_SIM_ZED_Z_MAX=2.0` to align.
-* **NOT modeled** (deliberate): edge/discontinuity flying-pixels (the real sensor IS rough there, but flat-surface jitter is sub-mm as measured).
-* **VALIDATED end-to-end (2026-06-15):** with this measured-σ model ON, a fresh live capture+train+go-live runs correctly — Phase-0b NDP registration places the SAM3D mesh right and AnySplat FF inserts cleanly. The earlier 3/4-objects registration failures + AnySplat blobs were caused by the WRONG (Ortiz exponential) model's ~40× over-noise corrupting the back-projected target cloud, NOT a pipeline defect and NOT the segmentation-frame-index theory (the recorded `static0_rgb.png` was confirmed pixel-exact to `cached_train[-1]` for all 4 objects). Diagnostic: [`scripts/reproject_static_frames.py`](scripts/reproject_static_frames.py) writes per-frame colored back-projection PLYs to `<static>/reproj_check/` to eyeball depth jitter.
-
-> **HISTORY (2026-06-15):** the FIRST cut used the Ortiz et al. 2018 exponential `f(Z)=a·exp(b·Z)` per-resolution (hd1080 a=0.0106/b=0.2215). **That was WRONG**: `f(Z)` is the paper's whole-frame RMS *error* (bias + calibration + edge effects averaged over a checkerboard), NOT clean-surface per-pixel jitter. Sampled per-pixel it injected ~12 mm σ @0.5 m → ~5 cm visible spread, ~40× noisier than the real camera. Replaced after measuring the real sensor (above). The `DGS_SIM_ZED_RES`/`_A`/`_B` knobs are GONE.
-
-**Inject point:** [`live_ros_publisher.py`](dynamic_gs/utils/live_ros_publisher.py) `_process_synced_pair`, right after `_decode_raw_depth` returns float32 metres and BEFORE the SHM write + disk write — so both the live SHM stream and recorded TIFFs get the noisy depth. Loaded via importlib (the publisher runs as a standalone script in `dynamic_gs_ros`, not as a package); module uses only numpy+os so it's safe in that minimal env. **Master toggle: ON by default (2026-06-16) — `DGS_SIM_ZED_NOISE=0` disables (clean sim depth); `enabled()` returns `os.environ.get("DGS_SIM_ZED_NOISE","1") != "0"`.** Knobs env-overridable: `DGS_SIM_ZED_K_M`, `DGS_SIM_ZED_SIGMA0_M`, `DGS_SIM_ZED_HOLE_RATE`, `DGS_SIM_ZED_Z_MIN/Z_MAX`. **NOTE:** the current upper-bound model (`σ0=1.47 mm`) is **visibly grainy at tabletop range** (unlike the prior sub-mm mean-fit) — by design, for robustness. **Re-noising an existing recorded dataset:** [`scripts/renoise_static_depth.py`](scripts/renoise_static_depth.py) raises already-baked static depth to the current model (`σ_add=√(σ_new²−σ_old²)` per pixel, variances add), backs up originals to `static_scene/_orig_depth_backup/`, and rebuilds the TSDF seed (CPU). Datasets recorded before 2026-06-16 carry the old mean-fit/no-noise depth; re-noise or re-record for the upper-bound model.
-
-### Static scene 2 m depth cap (seed + training mask) + during-training scale reset (2026-06-15)
-
-Major static-side change: limit the static reconstruction to near depth + bound Gaussian scale, motivated by the real ZED (depth error ~5 cm avg beyond ~2 m) and to cut Gaussian count.
-
-* **Depth cap (single value, applied at two sites):**
-  * **Seed** — [`online_fusion.py`](dynamic_gs/utils/online_fusion.py) `DEPTH_MAX_M` default 3.0→**2.0** (env `DGS_TSDF_DEPTH_MAX_M`). Only depth in (0.05, 2.0] m is TSDF-integrated → seed PLY bounded at 2 m → with densification off, the static reconstruction geometry is bounded. On zed_scene: seed 2.10M→1.65M pts (−21.5%), depth p99 3.29→2.09 m. (1200p ZED OOMs the GPU VoxelBlockGrid → rebuild the seed with `DGS_FUSION_DEVICE=cpu`.)
-  * **Training loss mask** — [`StaticGSModel.get_loss_dict`](dynamic_gs/static_gs_model.py) override (`scene_depth_max_m=2.0`) ANDs a depth-keep `(0.05, 2.0] m` into `batch["mask"]` (was gripper-only), so the photometric loss never fits color to far / no-return pixels (no seed Gaussians there anyway). Depth is in every batch via `DynamicGSDataManager.get_metadata`. Keep this EQUAL to `DEPTH_MAX_M`. 0 disables.
-  * **NOT yet done (separate pass):** the CDN / FF dynamic-side depth exclude (`change_mask.py live_depth_max_m` is still 3.0; FF reproject/ICP read raw sensor depth with no ceiling). That's the "C+D" half of the cutoff.
-
-* **During-training scale RESET (hysteresis), [`StaticGSModel._shrink_oversized_scales_cb`](dynamic_gs/static_gs_model.py):** the sparse far band near the cap leaves a few Gaussians with huge Splatfacto-init/trained scales (measured up to 1.45 m) that smear the background; densification is OFF so Splatfacto's own scale prune never runs. A training callback every `scale_clamp_every_n` (=**10**) steps resets oversized splats — largest axis > `scale_clamp_max_m` (trigger, **0.05 m**) → UNIFORMLY divide all axes so the largest becomes `scale_reset_value_m` (reset target, **0.01 m**), shape preserved (NOT per-axis clamp, NOT cull). **Mid-training, NOT at the end** — end-shrinking a converged scene leaves big HOLES (the scene leaned on the big splats for coverage); mid-training lets the optimizer re-cover between resets. Reset BELOW the trigger (0.01 vs 0.05) avoids pinning at the boundary + immediately re-tripping. Compute is negligible (sub-ms/call). Measured maxes on zed_scene by cadence: end-clamp→holes; every-100→313 mm tail; every-30→75 mm; every-10 + reset-0.01 is the current setting. Tighter cadence trades smaller max for hole-risk in the sparse far band (no densification to refill).
-
-* **Static opacity purge** (one-shot, end of static, before Phase 0b) — [`static_gs_pipeline.py`](dynamic_gs/static_gs_pipeline.py) `static_phase_opacity_purge_threshold=0.05`: deletes scene Gaussians with `sigmoid(opacity)<0.05` via `delete_gaussian_indices`. Measured 34–40% drop on zed_scene. Official 3DGS prunes at 0.005 continuously during densification; 0.05 is the aggressive one-shot end value. Runs before the object is fused (object_flags all 0) so nothing tracked is touched.
-
-* **Viewer for a static ckpt in Nerfstudio** — new [`scripts/view_static_ckpt_nerfstudio.py`](scripts/view_static_ckpt_nerfstudio.py): loads a `static_state.pt`'s `gauss_params` into a vanilla Splatfacto model + launches the NS viewer (server-side gsplat = real splats) at :7007. Run with `TORCH_COMPILE_DISABLE=1` — splatfacto's `@torch.compile`'d `get_viewmat` otherwise wraps NS's render-interrupt `IOChangeException` as a fatal `InternalTorchDynamoError` on camera moves; the script also sets `torch._dynamo.config.suppress_errors=True` as a backstop. Safe to use the NS viewer for a STATIC ckpt (none of invariant #9's live-pipeline concurrency hazards).
-
-### FF-insert scale hygiene: uniform-shrink oversized + cull tiny (2026-06-15, IMPLEMENTED)
-
-**User-reported failure mode:** a single FF (AnySplat) insert with a huge scale — typically a far/background Gaussian — sometimes *destroyed the scene* (one giant blob smears the render). There was NO scale cap on inserts: [`reproject_anysplat_to_scene`](dynamic_gs/utils/anysplat_decode.py) built world log-scales as `log_scales + log(s_per_gauss)` then enlarged them again by `scale_multiplier` (2.0) and returned them unbounded — a large predicted scale × per-gauss `s` × 2.0 = an arbitrarily large Gaussian (worst far, where it subtends more world-space).
-
-**Implemented (insert-batch filter):** `reproject_anysplat_to_scene` takes `max_scale_m` / `min_scale_m` (metres) and, right before the voxel-dedup block (where all parallel arrays align so it covers every crop window): **uniformly shrinks** oversized gaussians (largest axis > `max_scale_m` → all three axes ÷ the SAME factor so the largest becomes `max_scale_m`, preserving the splat's SHAPE — NOT a per-axis clamp, which flattens it; NOT a cull) and **drops** gaussians whose LARGEST axis < `min_scale_m` (sub-mm specks = count bloat). Mirrors the static-phase shrink. NOTE the scales are first ×`scale_multiplier` (=2.0) at ~L759, so the ×2 inflates and the 0.05 cap catches the overshoot. Config on [`DynamicGSPipelineBaseConfig`](dynamic_gs/dynamic_gs_pipeline_base.py): `feedforward_anysplat_max_scale_m=0.05` (5 cm), `feedforward_anysplat_min_scale_m=0.0` (tiny-cull off). Env-overridable for live A/B: `DGS_FF_MAX_SCALE_M` / `DGS_FF_MIN_SCALE_M`. Validated: huge 0.5 m → 0.05 (aspect preserved); 1 cm → untouched; tiny → culled when min set. *History: the first cut was a per-axis `np.minimum` clamp; changed to uniform divide (2026-06-15, user request) so anisotropic inserts aren't flattened.*
-
-**Static-phase opacity purge — IMPLEMENTED (2026-06-15).** `StaticGSPipeline._finalize_static_training` now runs a one-shot purge BEFORE Phase 0b: deletes scene Gaussians with `sigmoid(opacity) < static_phase_opacity_purge_threshold` (default **0.05**; 0 disables) via [`StaticGSModel.delete_gaussian_indices`](dynamic_gs/static_gs_model.py) (subsets all 6 gauss_params + all 4 identity buffers + refreshes optimizers), then logs the drop count. Runs before the SAM3D object is fused (object_flags all 0 here) so nothing tracked is at risk, and before the cache save so the dynamic phase inherits the leaner scene. Official 3DGS prunes at sigmoid-opacity **0.005** continuously during densification; 0.05 is the more aggressive one-shot end-of-training value (measured −26% here, no visible change).
-
-**Still TODO (rest of checklist item 3):** periodic DYNAMIC-phase purge of cumulative FF inserts (`inserted_flags==1`, below opacity/scale floors, every N FF calls) to cap growth (459k→1.29M on real-1200p) — see [[static-phase-opacity-purge-todo]]. Never drop `object_flags==1`. The insert-batch filter caps NEW inserts; the static purge cleans the seed scene; neither caps cumulative dynamic growth.
-
-### Per-tick CDN kept only the largest blob + block-validity halo too aggressive (2026-06-15)
-
-Two CDN-correctness fixes after the coverage-gate + ICP work, both user-spotted on the `2026-06-15_020656` `_ff_debug` dump.
-
-* **(1) Per-tick CDN now keeps ALL change components, not just the largest.** `_compute_tick_cdn` → [`_compute_change_mask`](dynamic_gs/dynamic_gs_pipeline_base.py) called `compute_change_mask` with the default `keep_largest_only=True`, so `build_change_mask`'s cleanup kept only the single biggest connected component. But the FF is built to fill EVERY revealed region (`select_top_n_components_filtered(cdn_clean, n=256)` downstream), so a separate change region in the same frame was silently dropped → "change not detected" (confirmed: frame 119 raw mask = exactly 1 component, 450k px). Fix: `_compute_tick_cdn` now passes `keep_largest_only=False`. ALSO lowered `OFFICIAL_FILTER_MIN_AREA` 760→**76** in [`active_mask.py`](dynamic_gs/utils/active_mask.py) (used by `_apply_cleanup_recipe`): this min-component-area filter runs at the POOLED grid resolution (ds≈10 at 1920×1200, so 1 pooled px ≈ ds² full-res px), so the old 760 removed any change smaller than ~76k full-res px (~275² region); 76 lets ~7.6k-full-res-px revealed surfaces survive. Both usages of the constant are the same cleanup path, so they move together.
-* **(2) Downsample block-validity is now FRACTIONAL, not strict.** The MS-SSIM downsample path in [`compute_change_mask`](dynamic_gs/change_detection/change_mask.py) marked a pooled block invalid if ANY of its source pixels were excluded (object/gripper) via `max_pool(1-valid)`. At ds≈10 px that carved a ~downsample-px dead halo around the tracked object where change couldn't be detected (the user: "too aggressive… not the whole block if a single pixel touches the object"). The block colour is ALREADY the masked mean of only the valid pixels, so a mostly-valid block is uncontaminated. Fix: keep a block when `avg_pool(valid) >= block_valid_min_frac` (new `ChangeMaskConfig` field, default **0.5**; **1.0 reproduces the old strict rule**). Gripper-leak is still prevented because the kept block's colour excludes the gripper pixels (masked mean). Removed the now-orphaned `_max_pool` helper. Both fields (`block_valid_min_frac`, and the `live_depth_*` from the coverage-gate fix) are `ChangeMaskConfig` defaults, NOT wired to model config. Validated end-to-end (deterministic depth-mode): #1 True→1 blob / False→2 blobs; #2 lenient keeps more boundary change than strict.
-
-### CDN coverage-gate dropped fillable holes (the static scene's missing geometry) (2026-06-15)
-
-**Symptom (user, on `2026-06-15_020656` live `_ff_debug`):** the change mask misses obvious change — e.g. the table strip BELOW a lifted banana renders as background sky (the static scene has NO Gaussians there) while the live sensor clearly sees table, yet the CDN never flags it. Measured on `call_0006_frame_000069`: **521 569 px (22.6% of the frame) are "holes"** (rendered ≈ background `(0.86,0.92,1.0)` but live shows a real surface); of those **424 805 are under neither the object nor gripper mask**, and only **0.8%** are flagged → **420 734 px of valid, genuinely-changed pixels were dropped.**
-
-**Root cause:** the scene-coverage gate in [`compute_change_mask`](dynamic_gs/change_detection/change_mask.py) AND'd every low-alpha pixel (`rendered_alpha < scene_coverage_threshold`, 0.5) OUT of `valid_mask`, so the CDN could never flag it. A hole = no Gaussians = alpha≈0 = gated out — exactly the pixels feedforward exists to fill. The gate was added for a real reason (camera looking PAST the scene into the void → rendered depth falls back to `depth.max()` → CDN fires on the whole void → spurious "change" bands above the object), but it couldn't tell a **fillable hole** (live sensor sees a near surface) from the **genuine void** (live sensor sees sky/nothing) and dropped both.
-
-**Fix:** gate on the LIVE sensor too. Keep a low-coverage pixel when live depth is a valid near surface (`live_depth_min_m..live_depth_max_m` = 0.05..3.0 m, matching `DEPTH_MIN_M`/`DEPTH_MAX_M` in [`online_fusion.py`](dynamic_gs/utils/online_fusion.py)); the true void (live depth 0 / sky / beyond range) still drops. `coverage_keep = (cov > cov_thr) | live_valid`. `gt_depth` was already passed into `compute_change_mask`; the two new bounds are `ChangeMaskConfig` defaults (NOT wired to model config — one-line change if tuning is needed). Live depth is uint16 mm on disk, invalid=0 (~4% sky), table ≤ ~2.6 m. **Validated** end-to-end through `compute_change_mask` on a synthetic covered+hole+void scene: old gate flags 0% of the hole, new gate flags 100% while the void stays 0%. **Consequence (honest):** flagging the holes means FF now tries to fill ~22% of this view, and AnySplat fills render soft → feeds the add/cull churn (below). The holes are ultimately a **static-reconstruction coverage** problem (table under the grasped object was occluded at capture → never seen; broader holes = thin sweep / aggressive seed downsample) — the gate fix lets FF *fill* them; it doesn't make them not exist.
-
-### AnySplat CDN churn diagnosed: soft re-render re-flags the static background (2026-06-15)
-
-On the same `_ff_debug` dump, the OTHER failure mode (over-fire): the cleaned change mask grows from ~120k px (call 10, lower-left) to engulf the whole table (~550k px, call 25+), then freezes at **Jaccard 1.00 with the previous call** for the rest of the run (frames 509→729) at ~0% net cull — the SAME ~24% of the frame re-decoded every call, never tracking the object. Mean RGB diff inside that region is only 22.6 (vs 66.3 outside, which is the gripper/sky the masks exclude): the static table renders soft, accumulated AnySplat inserts render softer (visible pale smears in `_4_rendered`), MS-SSIM (coarse-heavy) reads the soft background as change → insert → still soft → re-flag. Self-reinforcing: each insert expands the mismatch until the whole table saturates. Diagnostic montages written to `<data>/dynamic_scene/_ff_debug/_analysis/` (`churn_montage.png`, `diff_call60.png`, `frame69_*.png`) by ad-hoc scripts (not committed).
-
-**Root cause of the loop found (2026-06-15, same session): FF ICP places inserts in a DIFFERENT frame than the CDN judges them in.** The AnySplat FF runs ICP ([`icp_refine_scene_c2w`](dynamic_gs/utils/anysplat_decode.py)) to align the live sensor cloud to the static SCENE Gaussian cloud → `scene_c2w_refined = T·raw`, and [`reproject_anysplat_to_scene`](dynamic_gs/utils/anysplat_decode.py) places inserts via that refined pose. But the CDN renders + scores from the **RAW** live pose (`_render_from_camera` on `_latest_tracker_frame["camera"]`, [`_scene_c2w_for_frame`](dynamic_gs/dynamic_gs_pipeline_live.py)). A non-identity `T` then re-projects each insert through `raw⁻¹·T·raw` when the CDN re-renders it — the **rotation part scales with depth**, so far/background inserts drift mm→cm, the CDN re-flags them, FF re-inserts → the loop. Confirmed by the user's symptom ("misaligned by mm/cm for the furthest background points"). ICP **is** running (timing: `FF.3a.icp_refine n=34 avg=216.5ms` on `2026-06-15_020656`), on the FF **bg thread** ([`_anysplat_bg_run`](dynamic_gs/dynamic_gs_pipeline_base.py) inside `_feedforward_threaded`), so it does NOT block the tracker tick (shares the GPU but doesn't serialize). **Toggle:** `DGS_FF_ICP=0` (env, live A/B no relaunch) forces ICP off → `scene_c2w_refined = raw` → inserts land where the live camera sees the surface = the CDN's frame.
-
-> **UPDATE (2026-06-15, later same day):** after the coverage-gate + keep-all-blobs + fractional-block-validity + min-area fixes landed, the operator re-evaluated and found **ICP-ON looks BETTER** (it pulls inserts onto the existing scene so they seam less), so it is **kept ON by default** (`feedforward_anysplat_icp_refine=True`). This was an **eyeball call, NOT a rigorous A/B** — the theoretical depth-scaled divergence above is real but its net cost vs the seam-reduction benefit was never measured. `DGS_FF_ICP=0` remains available to disable. So the "ICP causes the loop" framing above is the *mechanism*, not a settled verdict — the loop was tamed mostly by the OTHER fixes; ICP's sign is unconfirmed.
-
-### Registration-target border cleanup (near-surface filter) + live FF-debug toggle (2026-06-15)
-
-Two follow-ups after the frame-consistency fix (the major offset is gone; these are second-order).
-
-* **(A) Mask-border table leakage → local near-surface filter (geometry-derived tolerance).** The object mask silhouette overshoots onto the table, and at the edge the depth sensor sees PAST the object to far surfaces; both bled into the back-projected registration target and biased the centroid/bbox the NDP/CPD init keys on. [`backproject_mask_to_world`](dynamic_gs/fusion/phase0.py) drops masked pixels that sit FARTHER than the local-window MINIMUM masked depth by more than a genuine object surface could account for. **No hardcoded distance:** the per-pixel tolerance is derived as `(half_window_px · z / fx · tan(max_object_slope_deg))` — i.e. the most a surface tilted up to `max_object_slope_deg` (default **70°**, the only knob; the "steepest object surface to preserve") can recede across the half-window at that pixel's depth. Auto-scales with window (`near_surface_window_frac=0.012` of the short side), depth, and intrinsics. `>=90°` disables. Object interior == local min (kept); thin/smooth parts kept; a flat object coplanar with the table has no step so nothing is dropped there (benign — same plane, no centroid bias). Asymmetric (too-far only), complements the symmetric MAD scrub. Diagnostic: [`scripts/diag_near_surface.py`](scripts/diag_near_surface.py). **Why this approach (generality is the point):** it is purely LOCAL — each pixel is compared only to the object's own nearby near-surface — so it makes NO assumption about a flat support and works whether the object sits on a table, on an uneven/non-flat surface, or is held in the gripper. **Known limitation (honest, accepted):** a ROUNDED object's own sides curve away steeply at the silhouette, so they are indistinguishable from immediate-silhouette background at similar depth — tightening the angle clips the object (measured: 45°→drops 53–82% = mostly object; 60°→18–31%; 70°→7–16%; ~75–78° ≈ the prior 15 mm). So it reliably removes far see-through + clearly-behind background but NOT the last ~cm silhouette band; the registration centroid/bbox are already 5–95-percentile-robust so that residual is minor. **Rejected support-plane removal** (fit a table plane, keep points above it): cleaner on the last band BUT assumes a planar support — does NOT generalize to non-flat surfaces / in-gripper objects, so explicitly NOT used (user decision 2026-06-15). **Also rejected:** unrestricted depth-discontinuity (removes the object's OWN edges); fixed-px erosion (kills thin objects); blind RANSAC plane-removal on the masked target (dominant plane is often the object itself).
-
-* **(B) AnySplat CDN churn (add/remove same region) — under investigation.** Symptom: feedforward keeps removing+adding the same scene regions; insertion itself is good. Leading hypothesis (from code map, NOT yet confirmed on live frames): inserted Gaussians render soft/blurry vs the sharp live frame → MS-SSIM in `_compute_tick_cdn` re-flags the SAME region as change every FF tick → oscillation; the in-front cull keeps inserts at the right depth but wrong texture, so the re-render still mismatches. To diagnose: the per-FF-call debug dump (`_save_ff_debug_images` → `<data>/dynamic_scene/_ff_debug/`, ordered `call_NNNN_frame_MMMMMM_K_NAME.png`, K=1..7: gripper/object/real/rendered/rerendered_after_cull/raw_mask/clean_mask) is now toggleable on a LIVE run via **`DGS_FF_DEBUG=1`** in [`resume_live.sh`](scripts/resume_live.sh) / [`bootstrap_live.sh`](scripts/bootstrap_live.sh) (was hardcoded `--pipeline.save-debug-images=False`). Candidate fixes to evaluate once frames are in hand: oscillation guard (skip FF if current clean CDN has high Jaccard overlap with the previous tick's), `change_mask_rgb_threshold` 0.07→0.10, `feedforward_anysplat_scale_multiplier` 2.0→1.5, or widening `feedforward_cull_in_front_depth_tol_m`.
-
-### SAM3D insert offset root cause: live anchor ≠ phase-0 reference frame (2026-06-15)
-
-**Symptom:** the SAM3D-fused object lands ~2–3 cm off the real object ("offset to the right"), consistently, on every object (banana/screwdriver/duck), in the LIVE capture → `static-gs` flow. NDP shape correct, intrinsics/poses/conventions all correct.
-
-**Root cause (proven on `2026-06-14_231201`):** the live `SAM3` retry loop segments a freshly-captured **anchor** `LiveFrame` (the head-on view when the operator presses Enter), and SAM3D + the mask are built on it — but **the anchor was never written as a recorded keyframe**. `ns-train static-gs` Phase-0 then operates on `cached_train[-1]` = the last *recorded sweep* keyframe (`arm_00039`, a different pose ~6.9 cm away), **overwrites `static0_rgb.png` with it** ([`phase0.py`](dynamic_gs/fusion/phase0.py) `run_phase0a`), and `sam3_reuse_cached` **reuses the anchor's mask** against that frame's depth+camera. A correct mask on the wrong frame's geometry → the mask back-projects onto the **table** → the registration target is ~half table → the centroid-seeded NDP fit drags the object off. Verified: `static0_rgb.png` ≡ `arm_00039.png` (Δ=0), anchor depth 6.9 cm from the nearest dataset frame and not in the dataset; overlaying the anchor mask on the **anchor** depth hugs the object, on `arm_00039` depth it sits on the table. **The mask never "shifts" — it's a correct mask applied to the wrong frame.** NOT intrinsics/resolution/NDP/cull (all ruled out by measurement). Diagnostics: [`scripts/diag_target_contamination.py`](scripts/diag_target_contamination.py), [`diag_anchor_vs_dataset.py`](scripts/diag_anchor_vs_dataset.py), [`diag_validate_fix.py`](scripts/diag_validate_fix.py).
-
-**Canonical fix (2026-06-15, supersedes relying on "the last frame"):** [`live_session._write_anchor_ref`](dynamic_gs/utils/live_session.py) writes the EXACT frame SAM3/SAM3D used — `<data>/static_scene/anchor_ref/{rgb.png (gripper-blacked, as segmented), mask_NN.png, depth.tiff (uint16 mm), intrinsics.json, c2w.json, overlay.png}` — once, at segmentation time. Phase-0 reads its reference frame from there: [`phase0.load_anchor_reference`](dynamic_gs/fusion/phase0.py) builds a `Cameras` from `c2w.json`+`intrinsics.json` and `run_phase0b_fusion` uses that camera + `anchor_ref` depth + image for the mask back-projection (and `run_phase0a` uses `anchor_ref/rgb.png` for segmentation/overlay instead of overwriting `static0_rgb`). So the correct mask is back-projected through the frame it belongs to, with NO dependence on which dataset frame is "last." Falls back to `cached_train[-1]` only when `anchor_ref/` is absent (recorded / capture-only datasets — there phase-0a segments `cached_train[-1]` directly, already consistent). `anchor_ref/overlay.png` is the one image guaranteed to show the mask on its own frame. Round-trip validated (write → load → Cameras).
-
-**Fix #1 (kept, complementary):** [`live_session._append_anchor_as_static_keyframe`](dynamic_gs/utils/live_session.py) also writes the segmented anchor (rgb/depth/mask/pose) as the **final** static keyframe right after `sub.stop_recording()` and before the seed build. The nerfstudio dataparser argsorts `file_path`, and the 5-digit pad keeps numeric==lexical, so `arm_00040` > `arm_00039` lands as `cached_train[-1]` → mask, depth, camera, pose and the back-projection target are all the same frame (the best head-on view, which is what Phase-0 wants), and the TSDF seed gets that view too. Byte-matches the recorder ([`live_ros_publisher._write_frame_to_disk`](dynamic_gs/utils/live_ros_publisher.py): cv2 BGR rgb, `clip(depth_m*1000,0,65535).astype(uint16)` mm depth, uint8 keep-mask, raw OpenGL `c2w_4x4`, atomic tmp+`os.replace`). `transforms.json` is rebuilt per recording (`start_recording` resets `frames=[]`), so re-runs don't accumulate duplicate anchors. Validated offline (helper unit test + anchor-mask/anchor-depth overlay alignment); confirm on a fresh end-to-end run that the inserted object overlaps the real object.
-
-### Capture timing report — three granular rows added (2026-06-14)
-
-`timing_report_capture.txt` (rendered by [`timing_ledger`](dynamic_gs/utils/timing_ledger.py) `render()` from rows recorded in [`live_session.py`](dynamic_gs/utils/live_session.py)) gained two new rows, and a third was confirmed already present elsewhere. All three answer "why is the static phase slow?" with REAL measurements (no estimates):
-
-* **`capture` / "operator sweep (N keyframes)" [infer]** — wall the operator spent sweeping, from `_t_capture_start` (just after `start_recording`) to `_t_capture_end` (the single Enter that breaks the SAM3 loop, stamped right before `sub.stop_recording()`). `N` = `sub.num_recorded_frames()` in the name. This is operator-controlled, so it's expected to dominate — the row makes that explicit.
-* **`pointcloud_fusion` / "TSDF per-frame add_frame (mean; p90=… max=… n=… fail=…)" [fusion]** — per-frame ICP+TSDF cost. New accessor [`ConcurrentFusionRunner.per_frame_add_stats`](dynamic_gs/utils/fusion_runner.py) surfaces the worker's `timings_ms`/`fail_count` (the same numbers it already PRINTS in `stop_and_finalize`). Recorded in `_finalize_safe` after `stop_and_finalize()`. **Deferred-vs-concurrent:** in the DEFAULT `DGS_LIVE_DEFER_TSDF=1` path the concurrent worker never runs (seed = single batch GPU pass, which has its own "TSDF batch seed (GPU)" row), so `per_frame_add_stats()` returns `None` → **no row emitted** (no fake number). The per-frame row appears ONLY when `DGS_LIVE_DEFER_TSDF=0` (concurrent fusion actually ran). The mean fills the timed slot; p90/max/n/fail ride in the name string (ledger has no extra-fields slot).
-* **Static training duration** — ALREADY recorded; no change. [`static_gs_pipeline.py`](dynamic_gs/static_gs_pipeline.py) `_finalize_static_training` records `static_training` / "Splatfacto" / "train" from `_train_start_t` (first `BEFORE_TRAIN_ITERATION`) to `AFTER_TRAIN`. It lands in the SEPARATE `timing_report_static.txt` (stage-2 `ns-train static-gs` `reset()`s the ledger for its own report).
-
-### From-scratch end-to-end timing section (command → first tracked frame) (2026-06-14)
-
-The dynamic `timing_report.txt` now carries a top section, **"STATIC SEQUENCE FROM SCRATCH — command entered → first dynamic frame tracked"**, shown ONLY for a from-scratch `bootstrap_live.sh` run (not resume / bare `ns-train` / recorded). It lists the per-stage walls (capture+seg+SAM3D+TSDF / ICP seed refine / static-train+Phase-0b / go-live→first-frame) plus the single full wall-clock.
-
-* **Why a sidecar (not the ledger):** the from-scratch sequence spans three processes (`live_session` capture → `ns-train static-gs` → `ns-train dynamic-gs-live`), and each `reset()`s [`timing_ledger`](dynamic_gs/utils/timing_ledger.py) in its own `__init__`, so the JSONL can't span the whole thing. Instead [`bootstrap_live.sh`](scripts/bootstrap_live.sh) (`dgs_stamp_seq`) writes real `date +%s.%N` boundary stamps to `<data_dir>/.static_sequence_t0` (`t0_command` / `t1_capture_start` / `t2_capture_end` / `t3_fit_start` / `t4_golive_start`). These are measured wall deltas (include inter-process overhead), not estimates.
-* **Emit + consume-once:** `DynamicGSPipelineBase._capture_static_sequence_total` (called from both subclasses' `_on_tracker_frame` when `is_first`, i.e. the first genuinely-tracked D0 frame — in live, after D0 stops deferring) reads the sidecar, computes the breakdown via `_render_static_sequence_section`, stashes it on `self._static_sequence_section`, then **deletes the sidecar**. `_write_timing_report` prints the stash if present. Deleting on consume means a later `resume_live.sh` on the same dir (which never stamps the sidecar) correctly SKIPS the section.
-
-### The pose KF is rate-sensitive (wall-clock dt) — DON'T change the tracker tick rate (2026-06-13)
-
-> **SUPERSEDED (2026-06-13, later same day):** the **pose KF is now DISABLED by default** (`xfeat_pose_filter_enabled=False`) — on the real-1200p jerky pickup the constant-velocity KF lagged/overshot at every setting; raw RANSAC pose + the `xfeat_static_hold` median (now window 15 / 18 mm / 6°) was the best of 5 live A/B configs. So the wall-clock-dt rate-sensitivity below no longer gates tracker tuning. The KF, if re-enabled, is also **rate-invariant** now (`xfeat_pose_filter_fixed_fps=9.0` feeds a fixed dt). AND the CDN no longer "renders every tick": the **whole feedforward (CDN render included) runs OFF the tracker thread** (`_dispatch_feedforward_async`/`_feedforward_threaded`), FF cadence is every **10** ticks, `xfeat_top_k=1024`. Net tracker: 7.6→10.8 Hz. The body below is the historical reasoning that led to the KF-off decision.
-
-The pose Kalman filter uses **wall-clock dt** (`tracker_common.PoseKalmanFilter.filter` → `dt = timestamp - self._last_time`, fed `time.time()` in [`xfeat_motion.py`](dynamic_gs/utils/xfeat_motion.py)), and its process-noise is tuned at the **per-tick-CDN cadence (~9 Hz)**. Any change to the tracker tick rate silently detunes it.
-
-**Tried + REVERTED:** gating the per-tick CDN render to FF-ticks-only (CDN is FF-only, so it looked like a free ~2× speedup) doubled+varied the tick rate → wall-clock dt changed → **KF detuned → oscillation / terrible tracking**. `DGS_KF_SYNTHETIC_FPS=20` (fixed-dt) did NOT save it — dt=0.05 vs the tuned ~0.11 just over-smoothed the other way. **Reverted: the CDN renders EVERY tick again** ([`dynamic_gs_pipeline_recorded.py`](dynamic_gs/dynamic_gs_pipeline_recorded.py) / [`_live`](dynamic_gs/dynamic_gs_pipeline_live.py) `_tracker_tick`), keeping the KF at its tuned ~9 Hz cadence; no env var, no retune. The tracker core (`xfeat_motion`/`tracker_common`/the KF math) was never changed through any of this. **To actually speed the tracker you must FIRST make the KF rate-invariant** (e.g. enable + tune `DGS_KF_SYNTHETIC_FPS` at the target rate, retuning `accel_sigma`/`alpha_sigma`/meas sigmas there) — only then gate the CDN. The `_recurring_ff_due`/`_oneshot_ff_due` predicates + `_ff_due_this_tick` plumbing remain (harmless; the CDN is just unconditional now).
-
-**Decide-FF-once invariant:** the FF-fire gate is evaluated EXACTLY ONCE per tick and stored in `self._ff_due_this_tick` (set where the tick decides `need_cdn`); `_on_tracker_frame` reuses the flag. Re-evaluating `_recurring_ff_due` in the hook raced the min-gap clock → fired FF on a CDN-skipped tick → `cdn.shape` on `None` crash that killed the tracker thread (fixed `5ee9d2b`; a defensive `cdn is None → skip` guard sits in the `_run_feedforward` dispatcher as backstop). Predict with `_tracker_tick_count + 1` in the tick (the hook runs post-increment).
-
-### AnySplat reprojection was square-only — broke at 1920×1200 (2026-06-13)
-
-**Symptom:** at 1200p the FF produced a "ghost" second copy of static objects offset sideways (e.g. a second droid next to the real one), comet-tail smears, the gripper appearing in the scene, and runaway insert accumulation (scene ballooned 459k→1.6M gaussians as misplaced inserts re-triggered CDN every tick). At 800×800 the SAME code worked perfectly.
-
-**Root cause:** AnySplat's [`process_image`](third_party/AnySplat/src/utils/image.py) does **aspect-preserving resize (shorter side → 448) + CENTER-CROP to 448×448** — for 1920×1200 it resizes to 716×448 then crops 134 px off each side (AnySplat only sees the centre horizontal slice). But [`reproject_anysplat_to_scene`](dynamic_gs/utils/anysplat_decode.py) assumed a full-frame **anisotropic squash**: it scaled scene intrinsics by `W_any/scene_w` (= 448/1920) for x and resized sensor depth with a plain `cv2.resize(..., (448,448))`. Those two agree **only when the scene is square** (the 800×800 era: resize→448, no crop, `448/800` correct on both axes). At 1920×1200 the x-scale was wrong (used /1920 instead of /1200) **and** the centre-crop offset (−134 px) was missing → every insert mapped sideways = ghosts; the component (CDN/gripper) mask was indexed at the wrong pixels too → gripper leaked in.
-
-**Fix:** `reproject_anysplat_to_scene` now **inverts the resize+center-crop**. It maps each AnySplat pred-crop pixel `(u,v)` back to the true scene pixel via `crop_scale = 448/min(W,H)`, `crop_left/top = (new−448)//2`, then samples **full-resolution** sensor depth at `(u_scene,v_scene)`, indexes the component mask at **scene** resolution, and back-projects through the **full** scene intrinsics. Algebraically identical to the old path at 800×800 (crop_scale=448/800, crop_left=0). Recorded-1200p result vs the broken run: per-call inserts 20k–66k → 200–1.8k, scene 1.6M → ~497k, ghost/comet-tail/gripper gone (frames 131/137). **No code regression caused this — the reproject was always square-only; the ZED-X move to 1920×1200 exposed the latent assumption.** The hardcoded `H_any,W_any = 448,448` in [`_anysplat_bg_run`](dynamic_gs/dynamic_gs_pipeline_base.py) is CORRECT (AnySplat does output a 448 crop) — the bug was the coordinate math around it, not the 448.
-
-**Follow-up — adaptive crop (same session):** AnySplat's fixed center-crop only sees the centre slice, so change near the image edges was never fed to it. [`_anysplat_crop_windows`](dynamic_gs/dynamic_gs_pipeline_base.py) now picks the square crop to **ENCOMPASS the change mask** (`size = max(bbox_w,bbox_h) + 2·50 px` at the change's natural scale — NOT forced to 448; AnySplat up/down-samples internally) centred on the change, clamped to image bounds. When the change bbox is **wider than the image short side** (one square can't cover it) it returns **two** horizontally-tiled windows (capped at 2); otherwise one (don't run AnySplat twice when unneeded). `_anysplat_bg_run` decodes per window (ICP runs ONCE, before the loop), each filtered by the FULL change mask + union-deduped so overlaps don't double-insert; `reproject_anysplat_to_scene(scene_crop=(left,top,size))` maps the 448 pixels back through the chosen window (any size). Recorded-1200p: `windows=1` normally, `windows=2` fired on wide multi-component frames, scene plateaued ~663k (vs 497k center-crop — the extra is legit edge/wide-change coverage the center-crop skipped), no runaway.
-
-**Follow-up — ordered `_ff_debug` dump + object-mask %-scale (same session):**
-* The per-FF-call dump now writes a fixed numbered sequence so files sort/view in raw→clean pipeline order: `<stem>_1_gripper_mask`, `_2_object_mask`, `_3_real`, `_4_rendered` (PRE-cull render = what the RAW CDN scored against), `_5_rerendered_after_cull` (POST-cull render = what the CLEAN CDN scored against), `_6_raw_mask`, `_7_clean_mask`. Compare 4↔5 for the cull's effect and 6↔7 for the resulting mask change. **Caveat:** `_4_rendered` is captured at FF-dispatch (a few ticks AFTER the tick that produced `_6_raw_mask`, since the FF runs on a bg thread while the main loop keeps ticking + moving the tracked object), so 4↔6 is *approximate*, not a pixel-exact pair — to make it exact you'd stash the tick render in the `TrackerFrame` and thread it through (not done; the render delta is imperceptible by eye so it wasn't worth the plumbing). Diagnostic finding via this dump: the big raw→clean removal that's "neither object nor gripper" is the `_feedforward_cull_then_reclean_cdn` **re-render** (raw = tick CDN, clean = a fresh `_compute_tick_cdn` on the later/post-cull scene), NOT the object-footprint subtract (measured: object-subtract explained only ~122 of ~123k removed px on one frame).
-* **Object-mask %-scale** (`feedforward_object_mask_scale: float = 1.02`): `_feedforward_clean_cdn` now enlarges the subtracted object footprint by +2% about its OWN centroid (`_scale_mask_about_centroid`, cv2 warpAffine) before the existing `feedforward_object_mask_dilate_px` dilation. Scales with object size (unlike fixed-px), so it swallows the thin rendered-vs-live **misplacement ring** that otherwise gets flagged as change → the FF would insert a flat copy of the object onto the tracked 3D object. 1.0 disables.
-
-### Real-1200p end-to-end + tracker/CDN/insert overhaul (2026-06-12 → 13)
-
-One day of fixes, each measured on the recorded screwdriver scene (800×800 `recording_15fps_2026-06-11_115107`, then the REAL 1920×1200 `replay_20260612_203321`). Commits `4402133..d1f6e7e`. Final validation on the real-1200p episode: **312/312 ticks, 0 tracking failures, peak 22.7 cm / 33°, end 20.6 cm (object stays on the plate), tail jiggle 0.7 mm / 0.2°/tick**.
-
-* **Tracker** (see also the updated KF note below): per-tick object-mask match filter re-enabled (`xfeat_object_mask_filter`, stops background-pinning once the object is grasped); subsequent anchors unified to the D0 process (full-image keypoints POST-filtered — the old pre-masked re-extract corrupted descriptors; failures 87→22); scale-ratio anchor gate ([`SCALE_GATE_RATIO`](dynamic_gs/utils/xfeat_motion.py) 1.3× on cam↔centroid distance, `DGS_XFEAT_SCALE_SELECT=1` enables scale-aware selection); **static-hold** (`xfeat_static_hold*`: trend-gated median; current code window **15** ticks, gates **18 mm / 6°** — tightened from 10 / 12 mm / 4° when the KF was disabled 2026-06-13) kills stationary shake.
-* **CDN**: MS-SSIM pyramid weights now COARSE-heavy `(0.15,0.30,0.55)` (`_rgb_msssim_score pyramid_weights`) — the full-res band read the soft-render-vs-sharp-live mismatch as change everywhere (static false inserts 14 939→934 gauss / 20 calls). `_apply_cleanup_recipe` cleanup-empty now returns EMPTY (the old raw-mask fallback fed noise specks to the FF every quiet tick → compounding insert loop, 47→849/call at 1200p). **`change_mask_downsample_target_side=140` (2026-06-13, raised from 100)** — the CDN runs MS-SSIM on a finer grid (single scalar `ds = sqrt(H·W)/target_side` applied equally to BOTH axes, so the pooled grid keeps native aspect — NOT a forced square; at 1920×1200 target 140 → ds≈10 → 192×120 grid). Finer = catches smaller change regions; validated on `replay_20260612_203321` (no-component frames 24→8, 43/52 FF calls inserted, 0 tracking failures, no static over-fire). Lower back toward 100 if static FPs reappear. **[SUPERSEDED 2026-06-13, later same day: raised again 140→150; current code default is `change_mask_downsample_target_side=150` — the 140 measurements above are the historical intermediate.]**
-* **FF inserts**: AnySplat voxel dedup OFF (both `feedforward_anysplat_voxel_dedup_m` and `_far_m` = 0 — code runs dedup if EITHER >0) + `feedforward_anysplat_scale_multiplier=2.0` (dense+2× = smooth; thinned+2× = blurry+CDN churn; dense+1× = gritty, tuned by eye). Open item: motion-phase insert volume at 1200p is still large (the validation run grew 459 k→1.29 M gauss; no OOM, but heavy).
-* **Static-render blur was UNDERTRAINING, not seed density** (user confirmed the TSDF seed is correct → NoRefineStrategy/no-densification is right). The early-stop loss EMA flattens long before the render is sharp at 1200p: it fired at step 107 while render PSNR keeps climbing (same 459k seed: step107=24.0 dB, step500=26.3, step1000=27.3). Fixed by lowering `STATIC_EARLY_STOP_LOSS` 0.09→0.02 ([`static_gs_pipeline.py`](dynamic_gs/static_gs_pipeline.py)) so the scene trains ~the full 500-step budget. (`replay_20260612_203321` static_state.pt is the 1000-step build, 27.3 dB.) The min-view ~14 dB floor is a sweep coverage gap, not steps.
-* **VRAM at 1200p (16 GB card)**: datamanager inner config now `cache_images="cpu"` (a ~300-frame 1200p episode is ~11 GB of rgb+depth+mask on GPU); [`fusion/phase0.py`](dynamic_gs/fusion/phase0.py) post-segmentation restore no longer force-moves caches to CUDA (was the measured 11.33 GB OOM).
-* **FastSAM auto-threshold** ([`select_kept_indices`](dynamic_gs/utils/fastsam_segmentation.py)): replaced the hardcoded `min_score=0.2` with largest log-ratio-gap ("how many") + raw-cosine presence gate ("whether any"); masks are now **connected-component-split before CLIP scoring** (a single FastSAM mask spanning two objects — screwdriver+Android — was the instance-contamination root cause). `margin_min=0.04` (0.05 rejected the real screwdriver at margin 0.042 when the gripper blackout hides the handle — the capture flow always ends hovering over the object).
-  * **Promote-to-container** (`FastSamTextSegmenter.infer`, `promote_to_container=True`, 2026-06-20): the component-split fights the "keep the fullest mask" intent — CLIP often scores a small distinctive PART (a screwdriver's metal shaft) marginally above the WHOLE, so the cliff gate keeps the part and drops the fuller mask BEFORE the containment-dedup can englobe it. Measured on the screwdriver anchor: shaft cos 0.267 / area 5112 KEPT vs full-screwdriver cos 0.256 / area 42598 dropped (shaft 100% inside the full mask, lost by 0.011 cosine). Fix: after the cliff gate, for each kept mask, if a LARGER SURVIVOR contains it (≥`promote_contain_frac`=0.8) within `promote_cos_margin`=0.03 cosine, swap the part for that fuller survivor — runs on the SURVIVORS (pre-cliff) so the fuller mask is still available; the dedup then collapses duplicates. Guard is conjunctive (contains AND larger AND cosine-margin) so it never grabs a non-overlapping bigger blob. Result: full screwdriver (shaft+handle) kept. Default-on; the subprocess inherits the `infer` defaults (no CLI plumbing).
-* **Real-1200p dataset** `replay_20260612_203321`: static = 57 keyframes (27 replay-sweep + 30 pose-deduped from the manual recording's pre-motion lead-in, renamed `aa_*` so the segmentation anchor stays the last SWEEP frame — frames sort by file_path and the anchor is the last frame); dynamic = manual teleop pickup, 643 frames recorded via `capture_only.py --no-fusion` (RTF ~1 with nothing else on GPU), trimmed to start at frame 330 (`transforms_full_backup.json` = untrimmed, `transforms_313_trimmed.json` = the active cut). Replay-harness gotchas: full-stack replay tanks RTF (GPU contention — capture with recorder only); the publisher needs `/dynaarm_arm/joint_states_full` (the merger needs the CONTROLLERS launch: load `controllers/joint_state_controller` + start via `switch_controller` if the spawner races params).
-
-### Segmentation: FastSAM replaces SAM3 as default + SAM3D gaussian-only VRAM trim (2026-06-11)
-
-Replaced SAM3 with **FastSAM + CLIP** as the default text-prompted segmenter (`segmentation_backend: Literal["sam3","fastsam"] = "fastsam"` on BOTH `StaticGSModelConfig` and `DynamicGSModelConfig`, kept in sync). Goal: shrink the segmentation footprint so SAM3D can load earlier/co-reside, cutting time-to-teleop-ready.
-
-* **Why FastSAM:** measured resident **854 MiB** (peak 1930) vs SAM3's **3772** (peak 4522) — ~4.4× lighter; load **2.4 s** warm (vs SAM3 8.4 s); infer ~1 s. [`utils/fastsam_segmentation.py`](dynamic_gs/utils/fastsam_segmentation.py) `FastSamTextSegmenter`: FastSAM-x (class-agnostic masks) + CLIP `ViT-B-32-quickgelu`/openai scoring, keeping ALL candidates (not top-1) so SAM3's area/border/dedup/max_objects filters + the byte-identical output contract (`{mask_path,score,bbox,mask_area,object_index}` + raw NPZ) apply unchanged. Use the `-quickgelu` CLIP variant for OpenAI weights or match quality silently degrades.
-* **Quality gate** ([`scripts/compare_sam3_fastsam.py`](scripts/compare_sam3_fastsam.py)): screwdriver on recording_15fps, gripper-blacked last frame → top-1 IoU **0.79** (near-identical bbox; FastSAM mask ~25 % looser, the whole IoU gap). PASS (≥0.75). Looser mask → SAM3D gets a bigger region → more fused gaussians (54 559 vs SAM3's 11 780 on this scene); tighten via `fastsam_conf` if it grabs background.
-* **Worker:** FastSAM lives in the same `sam3_dynamic_gs` `SamWorkerClient` as SAM3/SAM3D (`load_fastsam`/`unload_fastsam`/`fastsam_infer`/`fastsam_infer_raw`). All `load_*`/`*_infer` responses now carry `gpu_resident_mb`/`gpu_peak_mb` (permanent instrumentation). Subprocess fallback + CLI: `run_fastsam_subprocess`. Phase0a + live_session branch on the backend; `sam3_reuse_cached` is now backend-aware (a SAM3 cache won't be served to a FastSAM run). Deps: `ultralytics` + `open-clip-torch` installed `--no-deps` into the sam3 env (torch untouched).
-* **SAM3D gaussian-only trim** ([`apply_sam3d_gaussian_trim`](dynamic_gs/utils/sam3d.py), on by default; `DGS_SAM3D_NO_TRIM=1` disables): fp16 the two diffusion generators + both DINOv2 condition embedders (SAFE — forward already runs under `autocast(float16)`, so fp32 weights were cast per-op anyway) + move never-invoked modules (`slat_decoder_mesh`, `ss_encoder`, `slat_decoder_gs_4`) to CPU. Measured **resident 11698 → 7273 MiB (−4.4 GB)**, peak 12536 → 11707, gs 58944 → 58912, chamfer 4.66 mm on a ~1 m object (and it's NDP-registered onto real depth in Phase 0b anyway). 7.3 GB resident lets SAM3D LOAD during live capture alongside Gazebo (~2.6) + TSDF integrate (~3); 11.7 peak co-resides with splatfacto (~1.1).
-* **Measured VRAM table (RTX 5070 Ti, 15842 MiB; supersedes the stale eyeballed comments in [`sam_worker.py`](dynamic_gs/utils/sam_worker.py)):** SAM3 3.8/4.5 · SAM3D 12.0/13.0 (trimmed 7.3/11.7) · FastSAM 0.85/1.9 · splatfacto step **1.1** (NOT 5–8). Tools: [`scripts/measure_vram.py`](scripts/measure_vram.py), [`scripts/sam3d_trim_probe.py`](scripts/sam3d_trim_probe.py).
-* **Orchestration:** eager-AnySplat now also fires in recorded `static-gs` (`__init__`, gated `DGS_EAGER_ANYSPLAT`) → loads during training, adopted by dynamic-gs-live. **SAM3D‖splatfacto concurrent is deliberately NOT enabled** — trimmed peak 11.7 + training 2.5 + Gazebo 2.6 = 16.8 > 15.8 (OOM when sim is up). Safe realized parallelism: FastSAM‖TSDF-integrate during capture + AnySplat‖splatfacto. Also fixed: SAM3D subprocess now pins `CONDA_PREFIX` itself (was crashing when ns-train launched via bare env python).
-
-### Dynamic-phase tracker freeze root cause: cudnn.benchmark autotune (2026-06-11)
-
-The per-tick object freeze (~0.5 s hitches, multi-second worst case) was **`torch.backends.cudnn.benchmark = True`** — set globally by `nerfstudio/scripts/train.py:71` — combined with the XFeat crop (`_crop_for_xfeat`) presenting a **new conv input shape almost every tick**. Benchmark mode runs an exhaustive cudnn conv-algorithm autotune per new shape (100s of ms to seconds).
-
-* **Fix:** `DynamicGSPipelineBase.__init__` unconditionally sets `torch.backends.cudnn.benchmark = False` for the dynamic phase. Static training (fixed 800×800 shapes) keeps nerfstudio's default. gsplat (custom CUDA) and LighterGlue (cublas matmul) are unaffected by the flag.
-* **Measured (new_env, 192 frames, viser on + connected client, FF rgbd):** `DN.3c_xfeat_extract` avg 754.4 ms / max 5711.7 ms → **avg 14.3 ms / max 29.7 ms** (53×); `DN.3_estimate_total` 763.4 → 22.2 ms — back at the documented 17–30 Hz sweet spot.
-* **Ruled out by measurement first** (don't re-suspect these): viser server-side rendering (viser-OFF run was *slower*, 685 ms avg) and GPU queue backlog (new `DN.3c0_gpu_queue_wait` sync-split key measured 0.1 ms avg — queue was empty; the extract call itself was slow).
-* New permanent timing keys: `DN.3c0_gpu_queue_wait` (sync before extract — splits queue-wait from compute) and `DN.2_cdn_render` (per-tick CDN render wall; `DGS_DIAG_SYNC=1` makes it sync inside the timer for true GPU cost).
-
-### Interactive object picker + preseg id-order fix (2026-06-11)
-
-Operator now picks the tracked object in viser instead of the anchor heuristic, and can switch objects mid-run.
-
-* **Picker** (`interactive_object_selection: bool = False` on `DynamicGSPipelineBaseConfig`): at D0 a viser GUI folder shows the SAM3 input image with every object's mask colored + numbered ([`utils/object_picker.py`](dynamic_gs/utils/object_picker.py) auto-detects preseg vs SAM3D artifacts), an **`add_dropdown`** of object ids (NOT `add_button_group` — button groups are momentary, their `.value` doesn't persist the click) and a **Done** button. The tick **blocks** (`_wait_for_selection`, 0.25 s Event slices) until Done or `object_selection_timeout_s` — deliberately, so the trainer's step counter doesn't race to `max_num_iterations` while the panel is open (a recorded run otherwise burns all 5000 steps in ~6 s and the panel vanishes). The viser render thread is independent, so the browser stays live during the block. A persistent **"Change object"** button (+ bare-Enter on stdin in live mode) sets `_reselect_requested`; the tick reopens the picker; old object freezes at its last pose. Selection funnels through the shared `_reseed_tracked_object(new_id, camera, batch)` on the base (reset surface + object_flags + `capture_reference_object_pose` + XFeat re-seed) — also used by both subclasses' `_bootstrap_d0`. Headless/timeout fallback: `d0_force_instance_id` (promoted to the base config) → per-subclass heuristic.
-* **Invariant the picker relies on: SAM3 mask number i ⇔ `object_instance_ids == i+1`, in BOTH init paths.** SAM3D path already did this (`phase0.py` `instance_id = obj_idx + 1`). The preseg path **violated it** (the AMG coverage-merge compacted ids via `sorted(groups)` + positional `enumerate`, silently renumbering whenever a SAM3 mask had no AMG coverage — on new_env this merged the two androids into one id). Fixed in [`preseg_seed.py`](dynamic_gs/utils/preseg_seed.py): `_assign_and_merge` returns `(sam3_index, mask)` pairs and `_propagate` seeds SAM2-video `obj_id = sam3_index + 1`. Additionally a SAM3 mask with **no** AMG coverage now falls back to the raw SAM3 mask instead of being dropped (the AMG step is stochastic; a run lost 2 of 9 objects before this). **Datasets labeled before 2026-06-11 carry stale ids — re-run `static-gs-preseg` (`--pipeline.reuse-sidecar-if-present False`) before trusting picker ids.** new_env regenerated + verified (9 ids, androids 8/9 separate, projection purity 99–100 %).
-* Teardown noise: `RuntimeError: cannot schedule new futures after shutdown` at "Training Finished" is viser's own inbound-websocket handler racing interpreter exit when a browser tab is still open — cosmetic. Our outbound pushes are guarded (`ViserDirectScene.is_closing` + guards in `request_render` / `_render_once` / `_viser_direct_register_ff_insert`). Note `feedforward_video_out` is currently declared but **no writer is implemented** — no mp4 is produced by the dynamic pipelines.
-
-### Anchor keyframe gate: relative camera↔object orientation (2026-06-11)
-
-The XFeat multi-anchor pool now captures a new keyframe (fresh object features) when the object's orientation **as seen from the camera** moves >`ROTATION_GATE_DEG` (22.5°) from every existing anchor — **not** the object's absolute world rotation as before. Relative orientation = `R_rel = R_cam_world^T @ R_object_world` ([`_relative_object_rotation`](dynamic_gs/utils/xfeat_motion.py)); the gate ([`_min_anchor_relative_distance_deg`](dynamic_gs/utils/xfeat_motion.py)) and anchor selection ([`_select_nearest_anchor_by_rotation`](dynamic_gs/utils/xfeat_motion.py)) both compare relative-to-relative.
-
-* **Why:** XFeat/LighterGlue match on *appearance from a viewpoint*. The old absolute-object gate never fired when the **camera** moved while the object was still (or both moved together), so no fresh features were captured even though the view changed → match degradation / tracking loss. The relative gate fires on object-only, camera-only, or combined motion.
-* Each `_Anchor` now stores `camera_rotation` (`camera_to_world[:3,:3]` at capture); the c2w was already passed to `_build_anchor` (used only for back-projection) — now retained. The output pose contract is **unchanged**: `_cumulative_*` (object D0→current world pose), the Kabsch composition, the Kalman filter, and the returned `MotionEstimate` are untouched — this is purely an internal keyframing-policy change.
-* **Verified:** unit cases — object +30°/cam still → 30°; **cam +30°/object still → 30°** (was ~0° before, the bug); both +30° together → 0° (no spurious anchor). Recorded + live runs grow the pool via `[xfeat-anchor] … rel-view rot from nearest = …` as the arm camera orbits a static object; extract steady ~13–15 ms.
-
-### Viser tracker-view features (2026-06-11)
-
-Two additive controls in viser-direct (`ViserDirectScene`, shared by recorded + live; a **"Tracker view"** GUI folder), pushed each tick from the base via `_push_viser_camera_feed(camera, batch)`:
-
-* **Live camera-feed thumbnail** ("Show camera feed", on by default): `gui.add_image` side-panel showing the current tracked frame's RGB (`batch["image"]`), refreshed in place each render (~ms JPEG encode, render-side only when a client is connected).
-* **Follow-tracked-frame toggle** ("Follow tracked frame", off by default): snaps the viewer camera to the tracked frame's c2w each render so the splat view matches the feed. MUST use the same `R_viser = R_nerf @ _FLIP_YZ` nerfstudio→viser conversion as `_apply_initial_camera` — omitting the flip misaligns every frame except the initial one (the bug that surfaced + was fixed on first use).
-
-### Tracker pose Kalman filter (2026-06-10)
-
-*Validated 2026-06-11: user confirmed tracking looks clearly better with the filter ON (less stationary jiggle) than the raw-pose run (`xfeat_pose_filter_enabled False`); ON stays the default.*
-
-
-Output-side SE(3) constant-velocity error-state Kalman filter on the XFeat/RANSAC pose, targeting stationary-object jiggle (root cause per the 2026-05-26 notes: per-tick match-set variance → different Kabsch subsets).
-
-* [`tracker_common.PoseKalmanFilter`](dynamic_gs/utils/tracker_common.py) — 12-state ESKF (pos, vel, rot-err, ang-vel), `cv2.Rodrigues` exp/log, ~31 µs/call.
-* **Filters ONLY the `MotionEstimate.rotation/translation` returned to the pipeline.** The tracker's internal `_cumulative_*` pose (anchor selection, anchor creation, next-tick prediction) stays raw — smoothing lag can never destabilize tracking. Failure ticks hold the last filtered pose (cosmetic; pipeline only applies on `success`).
-* **The pose KF is DISABLED by default (2026-06-13, `xfeat_pose_filter_enabled=False`).** After extensive live A/B on the real-1200p jerky pickup, the constant-velocity KF could NOT achieve zero-lag smoothing at any setting: low process noise lagged; high process noise overshot (velocity-state swing = jitter AND lag at the stop); the 20mm/10° meas sigma that crushes stationary jiggle also distrusts the correct moving measurements → lag. KF-OFF (raw RANSAC pose) was measured the best of 5 configs by the user. **The stationary-jiggle job is now handled by the `xfeat_static_hold` median alone** (engages only when the object is genuinely fixed → zero motion lag by construction). Static-hold tightened with the KF off: **window 10→15, trans gate 12→18 mm, rot 4→6°**. Live A/B env knobs (no relaunch): `DGS_HOLD_WINDOW` / `DGS_HOLD_TRANS_MM` / `DGS_HOLD_ROT_DEG`, and for the KF if re-enabled `DGS_KF_ACCEL_SIGMA` / `DGS_KF_ALPHA_SIGMA` / `DGS_KF_MEAS_TRANS_MM` / `DGS_KF_MEAS_ROT_DEG`.
-* If the KF is re-enabled (smoother-motion scene): it is now **rate-invariant** (`xfeat_pose_filter_fixed_fps=9.0` feeds a FIXED dt so the tracker tick rate can't detune it — `Q ~ accel_sigma²·dt⁴`, so wall-clock dt let a faster tracker collapse Q and over-smooth). The old wall-clock-dt knobs/measurements: `accel_sigma=0.02`, `alpha_sigma=0.1`, meas **20 mm / 10°** (U-curve on the static tail: 20/10 → 0.8/0.9 mm best; 40/20 WORSE). Snap gate env-tunable via `DGS_KF_SNAP_TRANS_M`/`DGS_KF_SNAP_ROT_DEG`.
-* **Per-tick CDN render is now FF-gated** (rendered only on ticks where feedforward will consume it, not every tick) — a tracker speedup that's safe because the KF is off / rate-invariant. The decide-FF-once-per-tick invariant (`_ff_due_this_tick`) + the `cdn is None → return` guard still hold.
-* **Synthetic bench** (3 mm / 0.5° measurement noise, 20 Hz): stationary jitter 5.22→2.48 mm, 0.844→0.406° (~2.1×); smooth motion (0.2 m/s, 30°/s) tracks at 2.27 mm mean (better than raw — velocity state models it); worst-case instantaneous 5 cm step settles to <5 mm in 4 ticks (~200 ms). Lower `accel_sigma` = more smoothing + slower step response.
-* **Innovation gate (snap-reset):** per-tick pose jumps > 5 cm or > 10° (filter ctor defaults `snap_trans_m` / `snap_rot_rad`) cannot come from continuous motion — they are reacquisitions (object left the view and came back moved) or anchor-pool discontinuities. The filter snaps to the measurement and restarts the velocity estimate instead of smoothing through (which would overshoot — the step kicks the velocity state). Tracking-loss gaps are also safe by construction: failure ticks never call `filter()`, so no velocity extrapolation during the gap, and the reacquire `dt` is clamped to 50 ms.
-* **Reacquire bench** (after 5 s gap): unmoved → noise floor in 1 tick; moved 2 cm/3° (below gate) → ~4 ticks; moved 30 cm/45° (gate fires) → noise floor in 1 tick. The actual reacquisition risk is UPSTREAM, not the KF: if the object rotated far from every stored anchor viewpoint while unseen, LighterGlue has no appearance match and tracking stays lost (new anchors are only created on success).
-* Not yet validated on a live run — if jiggle persists at default settings, drop `accel_sigma` to 0.02 / `alpha_sigma` to 0.1 (~2.5×, 7-tick settle) before suspecting a different root cause (e.g. anchor-switch pose jumps, which the KF spreads over a few ticks rather than removes — an 8 mm jump takes ~6 ticks to converge).
-
-### Phase 0b registration: NDP non-rigid + post-fusion cull (2026-06-10)
-
-Replaced the rigid-only CPD/TEASER++ similarity fit as the **default** Phase-0b SAM3D registration with **NDP (Neural Deformation Pyramid)** non-rigid registration. CPD and TEASER++ are **not removed** — both remain selectable fallbacks via config.
-
-* **Why:** the SAM3D model is a complete-but-approximate object; the masked-depth back-projection is a partial-but-metrically-accurate scan of the same object. A single rigid+scale fit can't conform the approximate model to the real geometry. NDP non-rigidly deforms the complete cloud onto the accurate partial scan.
-* **Backend switch:** `sam3d_registration_backend: Literal["ndp", "cpd", "teaser"] = "ndp"` in BOTH [`StaticGSModelConfig`](dynamic_gs/static_gs_model.py) and [`DynamicGSModelConfig`](dynamic_gs/dynamic_gs_model.py) (kept byte-for-byte in sync). The `"ndp"` branch in [`register_and_fuse_sam3d_object`](dynamic_gs/utils/sam3d_fusion.py) reuses the existing rigid init (SAM3D-rotation + bbox-scale + centroid translate) as NDP's initialization, then non-rigidly deforms onto the target; `aligned_points`/`kept_points` become the warped cloud (NDP is non-linear → `similarity_transform` stays identity, `canonical_to_world_4x4` carries only the rigid-init approximation — fine since FoundationPose is no longer wired in).
-* **Vendored NDP:** [`dynamic_gs/utils/ndp/`](dynamic_gs/utils/ndp/) (`nets.py` + `rigid_body.py`, pure-torch, **no pytorch3d**) + the wrapper [`dynamic_gs/utils/ndp_register.py`](dynamic_gs/utils/ndp_register.py) (`deform_source_to_target`). Runs in-process on GPU in the main `dynamic_gs` env. No checkpoint (no-learned optimization): model construct ≈ **3.8 ms**, solve ≈ **2.0 s/object** (hierarchical Sim3, 9 levels, 500 iters/level, 6000-pt subsample, full-cloud warp). Config defaults mirror `DeformationPyramid/shape_transfer.py`. The no-learned NDP hyperparameters (m=9, Sim3 motion, w_reg=0) were tuned by eye on the banana and screwdriver scenes to land on these values.
-* **Post-fusion cull (two stages, in [`run_phase0b_fusion`](dynamic_gs/fusion/phase0.py)):** the inserted SAM3D points are culled against the trusted real surface so the accurate scan owns the visible side and SAM3D only fills the occluded back:
-  1. **Proximity de-dup** (existing, tuned, ON by default): cull points within `tau = max(spacing(E)·1.3, 3 mm)` of the existing visible-surface Gaussians. NOTE: 3D-distance based → on **thin** parts it also removes the occluded back (the back sits within `tau` of the front). Known tradeoff.
-  2. **In-front (occlusion) cull** (NEW, band = 0): [`cull_points_in_front`](dynamic_gs/fusion/phase0.py) drops any inserted point closer to the camera than the back-projected real front surface (depth-buffer test, inverse of `backproject_mask_to_world`, 2 px dilation). Keeps everything at-or-behind the front, including thin-part backs.
-* **Prototype + tuning bench:** [`scripts/experiments/nonrigid_bench/`](experiments/nonrigid_bench/) — standalone NDP-vs-(SPARE/SyNoRiM) benchmark on a single SAM3 → SAM3D → back-project pair, with `02_run_ndp.py` (the reference deform+cull driver) and `view_results.py`. Cull knobs there: `NRB_CULL_PROXIMITY` (default on), `NRB_CULL_BAND_M` (default 0), `NRB_CULL_STRENGTH`/`NRB_CULL_TAU_FLOOR_M`.
-* **Verified:** NDP branch through `register_and_fuse_sam3d_object` (65 888 kept pts, 2.0 s) + `cull_points_in_front` with a real `Cameras` (removed in-front pts). Full `ns-train static-gs` end-to-end run not yet re-run on this change.
-
-### Static-phase init seed: online ICP+TSDF fusion (2026-06-01)
-
-> **SUPERSEDED (2026-06-12, constants only):** the dated voxel/downsample numbers below drifted. Current code ([`online_fusion.py`](dynamic_gs/utils/online_fusion.py)): `TSDF_VOXEL_M = 0.002` (**2 mm**, not 1.5 mm; env-overridable via `DGS_TSDF_VOXEL_M`), `FAR_VOXEL_M = 0.01` (**1 cm**, not 5 mm). The fusion ingests depth ONLY in the band `DEPTH_MIN_M` = 0.05 m (hardcoded) to `DEPTH_MAX_M` = **2.0 m by default, env-overridable via `DGS_TSDF_DEPTH_MAX_M`** (was 3.0 / hardcoded until 2026-06-15) — applied at the integration validity mask and `depth_trunc`. Depth outside that band is excluded from integration entirely (not clamped → no surface there, not retained noise). The measurements in the body (point counts, ms, speedups) are historical and unchanged.
-
-Replaced the naive per-frame back-projection + post-pass refine with **one streaming pass** that runs concurrent with capture.
-
-* New shared utility: [`dynamic_gs/utils/online_fusion.py`](dynamic_gs/utils/online_fusion.py) — `OnlineFusion` class wrapping Open3D `ScalableTSDFVolume` + point-to-plane ICP. Verbatim port of `experiments/icp_fusion_mvp/online_fusion.py`.
-* Concurrent runner: [`dynamic_gs/utils/fusion_runner.py`](dynamic_gs/utils/fusion_runner.py) — `ConcurrentFusionRunner` polls `static_scene/transforms.json` on a watcher thread, enqueues each newly-written keyframe to a worker thread that calls `add_frame`. On Enter: drain queue + `finalize()` → `depth_camera_init_points.ply`. Wired into both `capture_only.py` and `live_session.py`.
-* **GPU port**: Open3D 0.19 tensor pipelines on this sm_120 GPU work. **Measured** 38.8× total speedup vs CPU (CPU 630 ms/frame → GPU 16 ms/frame at 800×800, 2.5 mm voxel, 30-frame avg). The previous note that "Open3D GPU TSDF is broken on this sm_120 GPU" is outdated and removed. The bench script lives in [`scripts/bench_gpu_fusion.py`](scripts/bench_gpu_fusion.py).
-* **GPU now the default (2026-06-01)**: `OnlineFusion` was split into `_CpuOnlineFusion` (legacy `ScalableTSDFVolume` + `registration_icp`) and `_GpuOnlineFusion` (`o3d.t.pipelines.slam.Model` VoxelBlockGrid + `multi_scale_icp` on CUDA). The public `OnlineFusion(...)` constructor auto-selects GPU when `o3d.core.cuda.is_available()`; set `DGS_FUSION_DEVICE=cpu` to force the fallback. Measured on validate_run_1 (71 frames, 800×800, full pipeline including `finalize` + `adaptive_downsample` + PLY write): **CPU 73.9 s → GPU 7.7 s (9.6× total)**; per-frame `add_frame` 17.6 ms mean (24 ms p90). Initial block count lowered to 8 k (was 40 k in the bench) to avoid OOM when other GPU workloads share the device.
-* **TSDF voxel**: was 2.5 mm CPU. New default **1.5 mm GPU** ([`online_fusion.py`](dynamic_gs/utils/online_fusion.py) `TSDF_VOXEL_M = 0.0015`). 1.0 mm OOMs at 16 GB GPU (Open3D hashmap rehash overhead, not actual block memory). 1.5 mm → 10.1 M points on validate_run_1, 5 ms integrate.
-* **Profiler** [`scripts/profile_fusion.py`](scripts/profile_fusion.py): per-substep breakdown on CPU; integrate dominated (320 ms / 51 %), ICP only 127 ms / 20 %. Drove the GPU decision.
-
-### Static-phase seed downsampling: near/far split (2026-06-01)
-
-Output of the TSDF fusion is too uniformly dense for the Splatfacto seed. Tried per-point feature scoring; abandoned. Final strategy is simple binary near/far split.
-
-* **Tried + dropped**: percentile-rank feature score (curv + color gradient), with multiple variants — depth-multiplicative penalty, depth-linear-floor penalty, depth-as-effective-threshold-multiplier. All abandoned. Reason: feature scoring on TSDF surfaces couldn't separate real edges from grazing-wall noise; curvature (`λ₀/Σλ`) is unstable at grazing angles because the smallest eigenvalue of the local cov spikes from depth noise on slanted thin-band TSDF surfaces. Raising the curv threshold killed real subtle edges before killing the wall ellipses. Color-gradient turned out to be a small fraction (~5 %) of the signal because TSDF integration smooths small color deltas.
-* **Shipped (initial form)**: [`scripts/adaptive_downsample.py`](scripts/adaptive_downsample.py). Keep all points within **1.0 m of the last camera pose** at native 1.5 mm density. Voxel-downsample the rest to **5 mm**. On validate_run_1: 10.15 M → 1.14 M (8.9× reduction, near zone = 3.4 % of points).
-* **Auto-wired (2026-06-01)**: the same logic now lives in [`dynamic_gs/utils/online_fusion.py`](dynamic_gs/utils/online_fusion.py) as `adaptive_downsample(pc, last_cam_xyz, ...)`, invoked between `OnlineFusion.finalize()` and the PLY write in BOTH:
-  * [`ConcurrentFusionRunner.stop_and_finalize`](dynamic_gs/utils/fusion_runner.py) — used by `capture_only.py` + `live_session.py` (last camera pose read from the freshly-written `transforms.json`).
-  * [`fuse_recorded_dataset`](dynamic_gs/utils/online_fusion.py) — used by the recorded-data post-pass.
-* Hyperparameters as module constants `NEAR_RADIUS_M = 1.0`, `FAR_VOXEL_M = 0.005` in `online_fusion.py`. Standalone script kept as-is for ad-hoc runs against existing PLYs. Re-verified end-to-end on validate_run_1: 13.77 M → 1.50 M (9.1× reduction).
-* **GPU port (2026-06-01)**: `adaptive_downsample` now uses `o3d.t.geometry.PointCloud` on CUDA when available; auto-falls back to CPU. Measured **7.1× speedup** on validate_run_1 (CPU 4437 ms → GPU 624 ms, 13.77 M-point cloud). Gotcha: Open3D 0.19's CUDA reduction kernel rejects `Tensor.sum(dim=1)` on large Float32 tensors ("Unsupported data type"); workaround is manual `sq[:,0]+sq[:,1]+sq[:,2]` elementwise add (lowers to safe ops). Result point counts differ ~6 % between CPU and GPU paths due to different voxel tie-breaking — both correctly enforce the 5 mm grid.
-* Reference camera pose is the **last** frame's `transform_matrix` (the operator's final viewpoint), not the first.
-* Feature-analysis tooling kept for future work: [`scripts/analyze_feature_score.py`](scripts/analyze_feature_score.py) (rank + absolute-threshold modes with cached `.npy` sidecars). Not on any code path.
-
-### Capture-only recorder + bootstrap rewrites (2026-05-31 → 2026-06-01)
-
-* New: [`scripts/capture_only.sh`](scripts/capture_only.sh) / [`scripts/capture_only.py`](scripts/capture_only.py) — record-only flow, no SAM3 / SAM3D / training. Static phase = publisher dedup recorder + concurrent fusion. Dynamic phase = reader-side 30 fps SHM polling, no dedup. Two Enter presses (switch phase / stop). Default dir = timestamped subdir under `data_teleoperation/datasets/`.
-* [`bootstrap_live.sh`](scripts/bootstrap_live.sh) capture flow rewritten: prompt via CLI (no second interactive ask), record-from-launch with on-screen "press Enter when centered", SAM3-zero-mask retry loop instead of crash.
-* Static keyframe dedup default lowered to **2 cm + 20° OR-rule** in `live_shm_reader.py` (was 1 cm; raised again because 1 cm produced too many near-duplicates on slow sweeps).
-* `outputs/` wiped + suppressed: [`dynamic_gs/__init__.py`](dynamic_gs/__init__.py) monkeypatches three nerfstudio write-sites (`ExperimentConfig.save_config`, `Trainer.train`'s `dataparser_transforms.json` write, `writer.setup_event_writer` tensorboard branch). All artifacts now live under the dataset dir.
-
-### Tracker purge — XFeat only (2026-05-26)
-
-The 5-tracker dispatch (cotracker / tapir / tapnext / klt / xfeat) is gone. XFeat is now the only supported tracker. Surviving runtime files:
-
-- `dynamic_gs/utils/xfeat_motion.py` — the tracker
-- `dynamic_gs/utils/tracker_common.py` — shared `MotionEstimate` dataclass + Kabsch/RANSAC helpers (extracted from the old `cotracker_motion.py` because XFeat depended on those static methods)
-- **Deleted** (commit `5de7fab`, 2026-05-31): `cotracker_motion.py`, `tapir_motion.py`, `tapnext_motion.py`, `klt_motion.py`, `live_ros_subscriber.py` (formerly under `dynamic_gs/utils/_purged/`). No longer in the repo — recover from `5de7fab^` if needed.
-- `dynamic_gs/utils/sam2.py` — deleted entirely.
-
-Pipeline + model config changes:
-- Model: 50+ legacy fields removed (`cotracker_*`, `tapir_*`, `tapnext_*`, `klt_*`, `dynamic_tracker` Literal). Only `xfeat_*` fields remain.
-- Pipeline: `_TRACKER_LABELS`, `tracker_kind`/`dynamic_tracker` reads, and the 5-branch `_initialize_motion_estimator` dispatch all collapsed to single XFeat constructor.
-- `utils/__init__.py` keeps `CoTrackerMotionEstimate` as an alias for `tracker_common.MotionEstimate` (a couple of debug-viz call sites import the old name).
-- `enable_cotracker_rigid_motion: bool = True` kept as the master tracker switch despite the legacy name (config-compat).
-
-To revive a purged tracker: recover its source from commit `5de7fab^`, port its `CoTrackerMotionEstimator._foo` static-method calls to `tracker_common.foo`, place the file in `dynamic_gs/utils/`, and re-add the dispatch branch in `_initialize_motion_estimator`.
-
-### Per-tick object mask removal — XFeat (2026-05-26)
-
-> **SUPERSEDED (2026-06-12):** the per-tick object mask was later RE-ADDED, and full-frame extraction was dropped. Current code:
-> - `xfeat_object_mask_filter: bool = True` (in [`dynamic_gs_model.py`](dynamic_gs/dynamic_gs_model.py), default ON) renders the tracked instance's mask each tick and uses it as a **post-match** filter — matches landing outside the object's predicted footprint are dropped before RANSAC. Without it the pose pins to static background once the object is grasped + lifted ("stops moving"). Set to `False` to restore the gripper-keep-only behavior described below.
-> - Extraction no longer runs on the full natural frame: `xfeat_crop_to_object_bbox=True` (in [`dynamic_gs_model.py`](dynamic_gs/dynamic_gs_model.py)) crops rgb+depth+camera to the object's projected bbox padded by `xfeat_crop_padding_px=150` (raised from 60 on 2026-06-12 — the 60 px box clipped the CNN receptive field of boundary keypoints, destabilizing descriptors; 300 was tried then abandoned, the crop ballooned to ~730×680).
-> The 2026-05-26 measurements below are historical (top_k was 300 then; now 3000).
-
-`render_object_mask + erode + dilate + pre-mask` was firing every tick for XFeat (~4 ms/tick) and produced **zero measurable quality benefit**. Removed entirely; XFeat now extracts on the full natural frame and uses **only `gripper_keep`** for post-match filtering.
-
-Net effect at 800×800, `xfeat_top_k=300`:
-- `DN.3j_object_mask_render`: 4ms → 0ms
-- `DN.3_tracker_motion`: 34 → 21 ms (-38%)
-- Effective rate: 12 Hz → 17.7 Hz
-- Inliers under motion: 100-160 with min ~19-30 (well above `min_track_points=12`)
-
-Anchor pool quality holds — new anchors filter on `gripper_keep` only (instead of `gripper_keep ∩ object_mask`), but LighterGlue's attention rejects background pairs and RANSAC catches anything that slips through. KLT path (deleted with the other legacy trackers) **did** need the mask structurally because it sampled FAST keypoints from inside it.
-
-### XFeat config sweet spots — known shake / RANSAC failure modes (2026-05-26)
-
-> **UPDATE (2026-06-13):** `xfeat_top_k` default is now **1024** (in [`dynamic_gs_model.py`](dynamic_gs/dynamic_gs_model.py)) — was 3000 (2026-06-12), 300 originally. Lowered for tracker Hz: measured extract 31.5→26 ms, 12.5→13.8 Hz (FF off), 0 failures. 1024 is 3× the ~300 shake floor; DO NOT drop below ~512. The 300-era reasoning below still holds against going *too low* (match-set variance → shake). `xfeat_lighterglue_depth_confidence=-1.0` and `xfeat_ransac_iterations=32` are unchanged and current.
-
-These three settings together produced a stable tracker (17-30 Hz, inliers/correspondences ≈ 1.0). Deviations caused regressions that took hours to diagnose:
-
-- **`xfeat_top_k=300`** — DO NOT drop below 200. At `top_k=100` the post-depth-filter survivor set varies tick-to-tick → different ~30-50 point Kabsch subsets → visible object shake on stationary scenes. The "tick_total went UP" symptom (28→31ms) is a secondary clue — fewer keypoints didn't even help speed because XFeat extract is image-bound, not K-bound.
-- **`xfeat_lighterglue_depth_confidence=-1.0`** — DISABLED. Enabling early-exit (e.g. 0.95) picks a different transformer layer each tick → different match set → noisy Kabsch → shake. Same root cause as the `top_k=100` shake: match-set variance.
-- **`xfeat_ransac_iterations=32`** — was 128, no quality loss at 32 with `~64-100` candidate correspondences. Saved ~4ms.
-
-Inlier diagnostic now in `[tracker-rate]`: `inliers=X/Y avg (min Z, n=N/F)`. Watch `min` — if it consistently drops below 15 under fast motion, the mask removal would need to be revisited for anchor creation.
-
-### train_lock disable was a mistake — DO NOT redo (2026-05-26)
-
-Attempted to disable Nerfstudio's `train_lock` in `NoSaveTrainer.setup` to let renders and tracker ticks run concurrently. Worked in isolation (`LIVE.between_tick_gap` 27 → 2 ms) but caused **GPU contention** between the splat renderer and XFeat/LighterGlue kernels:
-
-| | Baseline (lock on) | Lock off + render every tick | Lock off + render every 3rd tick |
-|---|---|---|---|
-| outside-tick | 27 ms | 2 ms | 4 ms |
-| tracker_motion | 28 ms | 77 ms | 25 ms |
-| effective rate | 17 Hz | 10 Hz | 30 Hz |
-
-Net throughput unchanged at every-tick-render — the lock was hiding render cost behind serialization, not wasting cycles. Only worked at N=3 throttle but visual rate dropped to ~10 Hz and the user perceived it as "not updating." Reverted everything. The achievable lock-disable win requires bypassing server-side rendering entirely (supervisor's "push transforms directly to Viser via `GaussianSplatHandle.position`/`.wxyz`" — browser does WebGL splat) — that's a 1-2 day rewrite not yet attempted.
-
-Files to NOT re-touch unless attempting the full Viser-direct rewrite:
-- `NoSaveTrainer.setup` — currently clean (no override of `train_lock` or `_update_viewer_state`)
-- Pipeline `live_render_kick_every_n_ticks` config exists with default N=1 (inert) for future experiments
-
-### Killing ns-train safely — `kill <bash_pid>` is wrong (2026-05-26)
-
-`nohup ns-train ... > log 2>&1 &` returns the **bash wrapper PID**, not the Python process. `kill $BASHPID` kills only the wrapper; the Python process keeps running, holding GPU memory and CUDA streams. Three of these zombies stacked up during this session and caused a 2× tracker slowdown ([tracker-rate] dropped from ~18 Hz to ~10 Hz) before I noticed.
-
-Correct sequence:
-```bash
-PYPID=$(ps -ef | grep "ns-train.*dynamic-gs" | grep -v grep | awk '{print $2}')
-kill -9 $PYPID
-pkill -9 -f "live_ros_publisher"
-# Then ALWAYS verify:
-nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
-```
-
-If `nvidia-smi` shows any leftover python pids holding VRAM, kill those by PID directly. Any unexplained tracker slowdown should immediately trigger a zombie check.
-
-### Live mode timing-gap decomposition (2026-05-26)
-
-Added per-step instrumentation to localise `LIVE.between_tick_gap`:
-
-- `GAP.trainer_outer_loop` — wall-clock between `train_iteration` return and next entry. Captures Nerfstudio's `AFTER_TRAIN_ITERATION` callbacks, writer scalars, `_update_viewer_state`, eval check, `write_out_storage`. Typically **~24-27 ms** in live tracking-only mode and is the dominant chunk.
-- `GAP.pipeline_prelude` — `train_iteration` entry → `_tracker_tick_live` start (= `_sync_phase` + pipeline dispatch). Typically <0.1 ms.
-- `GAP.pipeline_postlude` — `_tracker_tick_live` exit → `get_train_loss_dict` return (= zero-loss dummy + timing-summary check). Typically <0.2 ms.
-
-If `between_tick_gap` is large, ~100 % of it lives in `GAP.trainer_outer_loop`. The pipeline-side contributes essentially zero overhead in tracking-only mode. To shrink the gap further would require overriding `Trainer.train()` (the whole outer loop) — not just `train_iteration`.
-
-### Live tracker 30 Hz fix (2026-05-26)
-
-Root cause: gazebo RTF=0.32 (sim ran at 32 % real-time) → camera produced ~10 wall-clock fps; `rostopic hz` reported "30 Hz" using sim time and misled the diagnosis for hours.
-
-Sim-side fixes (the ones that solved it):
-- Replaced triangle-mesh `<collision>` with cylinder/box primitives on 6 world objects (coke_can, banana, fidget_spinner, side_plate, wooden_box, bolt); originals kept as XML comments.
-- Dropped ODE `<iters>` 500 → 50 in [empty_world.world](../../dev/teleop/catkin_ws/src/active_camera_arm_control/active_camera_arm_gazebo/worlds/dynamic_gaussian_splat/empty_world.world).
-- Capped pose-plugin `<updateRate>` 0.0 → 250 Hz in both dynaarm URDFs (was firing every 1000 Hz world tick).
-
-Publisher-side improvements kept as permanent wins even though they did NOT fix the root cause:
-- RGB `/compressed` (JPEG) + depth `/compressedDepth` (PNG-16UC1) transports, with auto-launched C++ `image_transport republish` for depth and a decoder that skips the 12-byte ConfigHeader.
-- Worker-thread architecture in [live_ros_publisher.py](dynamic_gs/utils/live_ros_publisher.py): `_on_synced` just enqueues into `queue.Queue(maxsize=4)` with drop-oldest; `_worker_loop` drains and does cv_bridge + pose interp + mask render + shm write.
-- 50 Hz throttle (`_POSE_JOINT_MIN_DT_SEC = 0.02`) on pose/joint callbacks (we only need bracketing samples per ~33 ms image stamp).
-
-Diagnostic dead-ends — removed; do not re-add:
-- E-core CPU pinning (`taskset -c 20-23`) — made the publisher slower because E-cores are slower per clock than P-cores.
-- `DGS_PUB_NO_POSE_JOINT` / `DGS_PUB_SKIP_POSE_JOINT` env vars — tested the wrong hypothesis (pose/joint GIL contention was never the cause).
-- `_count_rgb_cb` / `_count_depth_cb` + `_maybe_log_rates` — measured per-topic inbound Hz; answer was always "10 Hz" so the cap was upstream of rospy.
-- `rospy.AnyMsg` + manual `struct.unpack` bypass — pointless once wall-vs-sim clock measurement revealed RTF was the real issue.
-
-Confirmation tool: [/tmp/test_wall_rate.py](file:///tmp/test_wall_rate.py) subscribes to `/clock`, `/image_raw`, `/image_raw/compressed` via `rospy.AnyMsg` and computes rate from `time.time()`; `/clock` wall-rate ÷ physics target gives true RTF. RTF < 1.0 ⇒ no rospy tuning can help.
-
-### Splatfacto per-iteration sequence (with code references)
-
-Reference trace of what Nerfstudio + Splatfacto actually do per training step. Useful as the baseline to compare the dynamic-gs custom phase/optim logic against.
-
-- Outer loop sets `self.step = step` — [trainer.py:247](../nerfstudio/nerfstudio/engine/trainer.py#L247)
-- Fire `BEFORE_TRAIN_ITERATION` callbacks — [trainer.py:260-263](../nerfstudio/nerfstudio/engine/trainer.py#L260-L263)
-- `step_cb` stashes step, optimizers, schedulers onto the model — [splatfacto.py:407-410](../nerfstudio/nerfstudio/models/splatfacto.py#L407-L410)
-- Call `train_iteration(step)` — [trainer.py:266](../nerfstudio/nerfstudio/engine/trainer.py#L266)
-- Zero gradients on this step's active param groups — [trainer.py:497](../nerfstudio/nerfstudio/engine/trainer.py#L497)
-- `pipeline.get_train_loss_dict(step)` called — [trainer.py:502](../nerfstudio/nerfstudio/engine/trainer.py#L502)
-- Pipeline calls `model.get_outputs(camera)` — [splatfacto.py:485](../nerfstudio/nerfstudio/models/splatfacto.py#L485)
-  - Apply learned camera-pose correction — [splatfacto.py:501](../nerfstudio/nerfstudio/models/splatfacto.py#L501)
-  - Build view matrix + intrinsics K — [splatfacto.py:534-535](../nerfstudio/nerfstudio/models/splatfacto.py#L534-L535)
-  - Call `gsplat.rasterization(...)` → `render, alpha, self.info` — [splatfacto.py:555-575](../nerfstudio/nerfstudio/models/splatfacto.py#L555-L575)
-  - `strategy.step_pre_backward(...)` (registers `means2d` to retain its gradient) — [splatfacto.py:577-579](../nerfstudio/nerfstudio/models/splatfacto.py#L577-L579)
-  - Composite rendered RGB with background — [splatfacto.py:583](../nerfstudio/nerfstudio/models/splatfacto.py#L583)
-- Pipeline calls `model.get_loss_dict(outputs, batch)` — [splatfacto.py:652](../nerfstudio/nerfstudio/models/splatfacto.py#L652)
-  - Composite GT image with background — [splatfacto.py:660](../nerfstudio/nerfstudio/models/splatfacto.py#L660)
-  - Compute L1 = `mean(|gt − pred|)` — [splatfacto.py:673](../nerfstudio/nerfstudio/models/splatfacto.py#L673)
-  - Compute `1 − SSIM(gt, pred)` — [splatfacto.py:674](../nerfstudio/nerfstudio/models/splatfacto.py#L674)
-  - Combine: `(1 − ssim_lambda)·L1 + ssim_lambda·(1 − SSIM)` — [splatfacto.py:689](../nerfstudio/nerfstudio/models/splatfacto.py#L689)
-- Sum loss_dict into scalar `loss` — [trainer.py:503](../nerfstudio/nerfstudio/engine/trainer.py#L503)
-- `grad_scaler.scale(loss).backward()` fills `.grad` on every param tensor and on `info["means2d"]` — [trainer.py:504](../nerfstudio/nerfstudio/engine/trainer.py#L504)
-- `optimizer_scaler_step_some` → Adam step on each active param group — [trainer.py:510](../nerfstudio/nerfstudio/engine/trainer.py#L510)
-- `scheduler_step_all` → schedulers decay LRs for next step — [trainer.py:527](../nerfstudio/nerfstudio/engine/trainer.py#L527)
-- `train_iteration` returns to outer loop
-- Fire `AFTER_TRAIN_ITERATION` callbacks — [trainer.py:269-272](../nerfstudio/nerfstudio/engine/trainer.py#L269-L272)
-- `step_post_backward` dispatcher runs — [splatfacto.py:365](../nerfstudio/nerfstudio/models/splatfacto.py#L365)
-- Delegates to `strategy.step_post_backward(...)` — [splatfacto.py:367-374](../nerfstudio/nerfstudio/models/splatfacto.py#L367-L374)
-  - If outside refinement window or wrong step → return early
-  - Else read `info["means2d"].grad`, decide clone/split/prune, mutate `gauss_params` + each Adam's `m`,`v` state in lockstep
-  - Every `reset_alpha_every × refine_every` steps: reset all opacities low
-- Loop to next step
-
-### Splatfacto `get_outputs(camera)` — the render function
-
-Pure forward render: given one camera, returns the rendered image (plus depth/alpha). Does **not** compute loss, does **not** call backward, does **not** modify Gaussians.
-
-1. **Apply pose correction** — `camera_optimizer.apply_to_camera(camera)` adds the learned 6D offset to the dataset c2w (training only, if camera-opt is on) — [splatfacto.py:501](../nerfstudio/nerfstudio/models/splatfacto.py#L501).
-2. **Pick which Gaussians to render** — all of them, unless a `crop_box` is set (viewer feature) — [splatfacto.py:506-528](../nerfstudio/nerfstudio/models/splatfacto.py#L506-L528).
-3. **Build camera matrices** — `viewmat` from corrected c2w, intrinsics `K` — [splatfacto.py:534-535](../nerfstudio/nerfstudio/models/splatfacto.py#L534-L535).
-4. **Pick render mode** — `"RGB+ED"` if depth is needed this step, else `"RGB"` — [splatfacto.py:544-547](../nerfstudio/nerfstudio/models/splatfacto.py#L544-L547).
-5. **Active SH degree** — `min(step // sh_degree_interval, max_sh_degree)` — coarse-to-fine color schedule — [splatfacto.py:549-553](../nerfstudio/nerfstudio/models/splatfacto.py#L549-L553).
-6. **Call `gsplat.rasterization(...)`** — the differentiable splatting kernel; inputs the 7 param tensors + camera matrices; returns `render`, `alpha`, `self.info` — [splatfacto.py:555-575](../nerfstudio/nerfstudio/models/splatfacto.py#L555-L575).
-7. **`strategy.step_pre_backward(...)`** — registers `means2d` so its gradient is retained through backward (needed by densification) — [splatfacto.py:577-579](../nerfstudio/nerfstudio/models/splatfacto.py#L577-L579).
-8. **Composite with background** — `rgb = render + (1 − alpha) · background`, clamp [0,1] — [splatfacto.py:582-584](../nerfstudio/nerfstudio/models/splatfacto.py#L582-L584).
-9. **Apply bilateral grid** — only if enabled and training; per-image color correction — [splatfacto.py:587-589](../nerfstudio/nerfstudio/models/splatfacto.py#L587-L589).
-10. **Extract depth** — mask out empty regions (alpha = 0) — [splatfacto.py:591-595](../nerfstudio/nerfstudio/models/splatfacto.py#L591-L595).
-11. **Return** `{"rgb", "depth", "accumulation" (= alpha), "background"}` — [splatfacto.py:600-604](../nerfstudio/nerfstudio/models/splatfacto.py#L600-L604).
-
-**`alpha`** is per-pixel accumulated opacity in `[0, 1]`: `alpha = 1 − Π(1 − αᵢ)` over all Gaussians touching that pixel. Used to composite the background and to mask depth.
-
-### Splatfacto `get_loss_dict(outputs, batch, metrics_dict)` — the loss function
-
-Takes the rendered output and GT batch, returns a dict of scalar losses that the trainer sums and backprops.
-
-1. **Composite GT with background** — same background as the render, so they're compared on equal footing — [splatfacto.py:660](../nerfstudio/nerfstudio/models/splatfacto.py#L660).
-2. **Apply mask if present** — if `batch["mask"]` exists, multiply both GT and pred so masked pixels contribute zero — [splatfacto.py:665-671](../nerfstudio/nerfstudio/models/splatfacto.py#L665-L671).
-3. **L1 loss** — `mean(|gt − pred|)` — [splatfacto.py:673](../nerfstudio/nerfstudio/models/splatfacto.py#L673).
-4. **SSIM loss** — `1 − SSIM(gt, pred)`; windowed structural similarity — [splatfacto.py:674](../nerfstudio/nerfstudio/models/splatfacto.py#L674).
-5. **Combine** — `main_loss = (1 − ssim_lambda)·L1 + ssim_lambda·(1 − SSIM)`, default `ssim_lambda = 0.2` — [splatfacto.py:689](../nerfstudio/nerfstudio/models/splatfacto.py#L689).
-6. **Scale regularization** (optional, only if `use_scale_regularization=True`, every 10 steps) — penalizes Gaussians with large max/min scale ratio (PhysGaussian) — [splatfacto.py:675-686](../nerfstudio/nerfstudio/models/splatfacto.py#L675-L686).
-7. **MCMC regularizers** (only if `strategy="mcmc"`) — L1 on opacity and exp(scale) — [splatfacto.py:693-702](../nerfstudio/nerfstudio/models/splatfacto.py#L693-L702).
-8. **Camera optimizer loss** (training only) — regularization on learned pose offsets — [splatfacto.py:704-706](../nerfstudio/nerfstudio/models/splatfacto.py#L704-L706).
-
-Returns: `{"main_loss", "scale_reg", possibly "mcmc_opacity_reg", "mcmc_scale_reg", "camera_opt_*"}`.
-
-### Splatfacto optional features (opt-in via config)
-
-| Feature | Flag | Default | What it does |
-|---|---|---|---|
-| **Bilateral grid** | `use_bilateral_grid` | `False` | Per-image learnable color correction (exposure/WB drift) |
-| **Camera-pose optimization** | `camera_optimizer.mode` | `"off"` | Learnable 6D pose offset per training image (`"SO3xR3"` or `"SE3"`) |
-| **Antialiased rasterization** | `rasterize_mode` | `"classic"` | `"antialiased"` adjusts opacity to keep splats consistent across resolutions; reduces aliasing |
-| **Scale regularization** | `use_scale_regularization` | `False` | Penalizes spiky/elongated Gaussians (max/min scale ratio > `max_gauss_ratio`); from PhysGaussian |
-| **Absolute-gradient densification** | `use_absgrad` | `True` | Uses absolute screen-space grad instead of signed; densifies more aggressively |
-| **MCMC strategy** | `strategy` | `"default"` | `"mcmc"` swaps clone/split/prune for Langevin-dynamics sampling; adds opacity + scale L1 regs |
-| **Random init** | `random_init` | `False` | Init Gaussians in a random cube instead of SfM points |
-| **Output depth during training** | `output_depth_during_training` | `False` | Render depth every train step (slower, enables depth losses) |
-| **Color-corrected metrics** | `color_corrected_metrics` | `False` | Histogram match before PSNR/SSIM — fair comparison under color drift |
-| **Background color** | `background_color` | `"random"` | `"random"` / `"black"` / `"white"`; randomization prevents memorizing a fixed bg |
-| **Max Gaussian cap** | `max_gs_num` | `1_000_000` | Hard cap; densification stops past this |
-| **SH degree schedule** | `sh_degree` + `sh_degree_interval` | `3`, every `1000` steps | Activates one extra SH band per interval — coarse-to-fine on color |
-| **Resolution schedule** | `num_downscales` + `resolution_schedule` | `2`, every `3000` steps | Start at 1/4 res, double up to full — coarse-to-fine on image res |
-
-In dynamic-gs, `camera_optimizer.mode="SO3xR3"` is overridden on in `DynamicGSModelConfig`.
-
-### Live-mode viewer refresh fix (2026-05-25)
-
-> **PRE-REWRITE (2026-06-12 note):** this describes code in the since-deleted monolith `dynamic_gs_pipeline.py` (5329 LOC, removed in the 2026-05-30→06-01 rewrite). `_tracker_tick_live` and `_apply_cotracker_motion` no longer exist; the logic moved into the split `dynamic_gs_pipeline_{base,live,recorded}.py`. Kept for the design reasoning, not as a current code map.
-
-**Problem.** In live tracking-only mode the tracker mutated object Gaussian means at ~8 Hz, but the viser viewer only repainted them at ~0.5–2 Hz (camera-move was smooth, object motion was not). Two throttles on the render path were the cause:
-
-1. **`viewer.update_scene(step)`'s step-count gate** at [viewer.py:520](../nerfstudio/nerfstudio/viewer/viewer.py#L520) — fires a `"step"` render action only every `render_freq = train_util * vis_time / (train_time - train_util * train_time)` train iterations. With `train_time` very small (tracker-tick-only step), `render_freq` blows up to ~70+ iters/render → ~3–4 actions/sec.
-2. **`RenderStateMachine.action()` filter** at [render_state_machine.py:99](../nerfstudio/nerfstudio/viewer/render_state_machine.py#L99) — ignores `"step"` when `self.state == "low_move"`. Viser camera `on_update` events (fired by the browser even on passive interaction) keep the state in `low_move`. So even the few `"step"` actions that did fire were dropped → state never promoted to `"high"` → `_calculate_image_res` returned the `vis_rays_per_sec / target_fps` fallback (~60 px) instead of `max_res`.
-
-**Why `"rerender"` is the wrong action.** The state transitions in [render_state_machine.py:73-78](../nerfstudio/nerfstudio/viewer/render_state_machine.py#L73-L78):
-- `low_static + step → high` (promotes)
-- `high + rerender → low_static` (DEMOTES — `"rerender"` means "restart at low res then re-promote", not "scene changed material")
-
-**Fix.** Don't go through `action()` at all. Directly push a high-res render on every fresh tracker tick:
-
-```python
-# dynamic_gs/dynamic_gs_pipeline.py — _force_viewer_rerender helper
-sm.state = "low_static"                              # force out of low_move
-sm.next_action = RenderAction("step", camera_state)   # queue high-res step
-sm.render_trigger.set()                               # wake render thread
-```
-
-Called from `_tracker_tick_live` immediately after `_apply_cotracker_motion` returns. Zero modifications to nerfstudio core code — the back-reference to the trainer (and thus `trainer.viewer_state.render_statemachines`) is acquired via `training_callback_attributes.trainer` in `get_training_callbacks`. *(All three symbols were in the deleted monolith — see the banner above.)*
-
-**Net effect.** Visual rate becomes whatever `_render_img` itself can do (limited by render cost + `train_lock` contention), instead of being throttled to 0.5–2 Hz. `outside-tick` in the `[tracker-rate]` line grows correspondingly — that's real render work now, not dedup-spinning.
-
-**What this means for the rewrite.** The viewer / trainer / tracker integration is currently three independent throttles fighting each other (`update_scene`'s step gate, `action()`'s state filter, `train_lock`). In a clean rewrite, consider:
-- A direct "scene mutated" signal from the tracker to the render thread that bypasses the state machine entirely (single threading.Event per client).
-- Either eliminate `train_lock` in tracking-only mode (the trainer doesn't mutate during a tracker tick) or use RWLock so renders can run concurrently with read-only tracker ticks.
-- The render state machine's `low_move/low_static/high` heuristic is designed for interactive NeRF training. For live tracking it's mostly noise — a fixed `high` state with `max_res` would be simpler and equally correct.
-
-<!-- ============================================================ -->
-<!-- END: CLEANUP NOTES — existing project documentation below     -->
-<!-- ============================================================ -->
+**Goal-driven execution.** Turn tasks into verifiable goals ("fix the bug" → "write a test that
+reproduces it, then make it pass"). For multi-step work, state a brief plan with a verify-check per step.
 
 ---
 
-## Project Overview — OLD `dynamic_gs/` package (FROZEN BASELINE)
+## 2. CURRENT STATE — read this first
 
-> Everything from here to the end of the file describes the **old `dynamic_gs/` package**, which is now
-> the **frozen ground-truth baseline**, NOT the active pipeline. It is still accurate for that package
-> (and much of `dynamic_gs2/` WRAPs these same vendored utils, so this map stays useful), but the live
-> flows, module layout, and launch scripts of the CURRENT pipeline are in
-> [`dynamic_gs2/STATUS_LIVE.md`](dynamic_gs2/STATUS_LIVE.md) + [`commands.md`](commands.md). Read this
-> section as reference for the baseline, not as the current architecture.
+**`scripts/dynamic_gs2/` is the active, validated pipeline** (clean ~3k-LOC rewrite, ~90% LOC cut from
+the old 28k). The old **`scripts/dynamic_gs/` package is the frozen ground-truth baseline** — its
+`ns-train` methods still run and the rewrite is verified *against* it, but new work goes through
+`dynamic_gs2/`.
 
-**dynamic-gs** is a static + dynamic Gaussian Splatting system for robotic teleoperation, integrated with [Nerfstudio](https://github.com/nerfstudio-project/nerfstudio). The static phase fits a Splatfacto scene; the dynamic phase tracks objects via XFeat and (optionally) feedforward-decodes newly revealed surfaces. Designed for live RGB-D streams from a single arm-mounted camera.
+Where to look:
+- Live pipeline reality → [`dynamic_gs2/STATUS_LIVE.md`](dynamic_gs2/STATUS_LIVE.md)
+- Build report → [`dynamic_gs2/STATUS.md`](dynamic_gs2/STATUS.md) · LOC KPI → [`dynamic_gs2/LOC.md`](dynamic_gs2/LOC.md)
+- Module map the rewrite was generated against → [`rewrite_spec/00_OVERVIEW.md`](rewrite_spec/00_OVERVIEW.md)
+- Settled design calls → [`rewrite_spec/00_DECISIONS.md`](rewrite_spec/00_DECISIONS.md)
+- Launch commands → [`commands.md`](commands.md) (`dynamic_gs2/` `live.sh` / `static.sh` / `resume_live.sh`)
 
-The codebase was rewritten 2026-05-30 → 2026-06-01. The historical monolith (`dynamic_gs_pipeline.py`, 5329 LOC) was deleted; capabilities are now split across three thin pipelines, the dynamic logic into a shared base. *(That refactor was itself later superseded by the full `dynamic_gs2/` rewrite — see CURRENT STATE at the top.)*
+**Architecture (current, `dynamic_gs2`) — WRAP not BE:**
+- [`gaussian_set.py`](dynamic_gs2/gaussian_set.py) is the SSOT: 6 gauss params + 4 identity buffers behind
+  one locked surgery API + immutable `snapshot()`.
+- [`scene_model.py`](dynamic_gs2/scene_model.py) renders/trains those same tensor objects via a *wrapped*
+  nerfstudio `SplatfactoModel` (`rebind()` after surgery, no copy).
+- One SHM ingest path ([`frame.py`](dynamic_gs2/frame.py) + [`shm_channel.py`](dynamic_gs2/shm_channel.py)
+  + [`adapters_source.py`](dynamic_gs2/adapters_source.py)) for recorded (`ReplaySource`) and live
+  (`LiveBridgeSource`, which reuses the proven ROS publisher into the new SHM layout).
+- Live mask render → [`dynamic_gs2/ros_mask.py`](dynamic_gs2/ros_mask.py) (`RobotMaskGenerator`).
+- FF dispatch → [`dynamic_feedforward.py`](dynamic_gs2/dynamic_feedforward.py) (bg thread reads only the
+  immutable `FeedforwardDispatch`).
 
-## Installation
+> The full module list + current launch flows live in STATUS_LIVE.md — keep that authoritative, not this summary.
 
-```bash
-pip install -e .   # from scripts/
-```
+---
 
-ns-train auto-discovers our methods via the `nerfstudio.method_configs` entry-point in `pyproject.toml`. Method names registered: `static-gs`, `static-gs-preseg`, `dynamic-gs`, `dynamic-gs-live`.
+## 3. Keeping this file accurate (MANDATORY)
 
-## Conda Environments
+This file is loaded as authoritative instructions every session — a stale claim actively misleads.
 
-| Env | Python | torch | sm_120 native | Role |
-|---|---|---|---|---|
-| `dynamic_gs` | 3.12 | 2.11+cu128 | ✅ | Main env: hosts all four ns-train methods, XFeat tracker, Open3D 0.19 (TSDF on GPU), nerfstudio, gsplat. |
-| `sam3_dynamic_gs` | 3.12 | 2.11+cu128 | ✅ | SAM3 + Fast-SAM3D subprocess env. Invoked via `conda run -n sam3_dynamic_gs python ...` from `utils/sam3d.py` and `utils/sam3_segmentation.py`. |
-| `dynamic_gs_ros` | 3.8 | none | n/a | Minimal ROS Noetic env for the live publisher subprocess. ROS bindings come from `/opt/ros/noetic/lib/python3/dist-packages` via `source /opt/ros/noetic/setup.bash`. The publisher spawn wrapper sets `PYTHONNOUSERSITE=1` — without it, user-local pyrender shadows the env's. |
-| `anysplat_dynamic_gs` | 3.12 | — | ✅ | AnySplat feedforward decoder env (persistent worker; see `utils/anysplat_decode.py`). |
+1. **If you change code this file references, update this file in the SAME change.** Config defaults/values,
+   the lines enforcing an Invariant, default-flag states, any symbol/file/module name mentioned here. The
+   diff is not done until the doc matches the code.
+2. **Reference code by symbol name, NOT line number.** Write `` [`config.py`](path) (`_ZERO_LR_OPTIMIZERS`) ``,
+   never `:138`. Line numbers drift on any unrelated edit; symbol names only break on an actual rename (and
+   then rule 1 applies). Exception: the pinned vendored-nerfstudio trace in BASELINE.md.
+3. **Never rewrite a dated note's numbers** (that fabricates). Dated notes record measurements *at that date*.
+   If a conclusion was later reverted, prepend a `> **SUPERSEDED (date):**` banner in HISTORY.md — don't edit
+   the body. **Banners stack in HISTORY.md, never here:** this file states only current reality, so a fact
+   that flips gets *replaced* here and the old version + banner moves to HISTORY.md.
 
-## Running (OLD pipeline)
+---
 
-> For the CURRENT pipeline use the `dynamic_gs2/` scripts (`live.sh` / `static.sh` / `resume_live.sh`,
-> see [`commands.md`](commands.md)). The scripts below drive the frozen `dynamic_gs/` baseline.
+## 4. Design Invariants (NON-NEGOTIABLE — DO NOT VIOLATE)
 
-Three top-level scripts cover the common flows. Defaults are chosen so most invocations are zero-argument.
+Hard rules the pipeline depends on. If a change appears to require breaking one, **stop and flag it
+explicitly** — do not silently violate. Each has a stated reason so you can judge edge cases.
 
-```bash
-# Capture-only: record a fresh static + dynamic dataset, no training
-scripts/capture_only.sh
-# default: data → datasets/<YYYY-MM-DD_HHMMSS>/, 2cm/20° dedup static, 30 fps dynamic
+> Symbol refs below may still point at the frozen `dynamic_gs/` baseline. The invariants themselves are
+> pipeline-agnostic — `dynamic_gs2` preserves all of them (it wraps the same `SplatfactoModel`). **TODO:**
+> confirm/replace each `Verified:` pointer with its `dynamic_gs2` equivalent (the `gaussian_set.py` SSOT
+> owns the surgery the old `StaticGSModel`/`DynamicGSModel` did). Don't guess the gs2 symbol — verify it.
 
-# Full pipeline: capture + train static + go live
-scripts/bootstrap_live.sh <data_dir> [sam3_prompt]
+1. **Static phase: `means` LR = 0.** Positions stay locked on the TSDF-fused seed
+   (`depth_camera_init_points.ply`); only `features_dc/_rest`, `opacities`, `scales`, `quats` train.
+   **Why:** the seed is geometrically correct (ICP-fused depth); means drifting under photometric loss
+   smears the output. Adam moves means via `.grad` regardless of densification, so this must be an
+   explicit `lr=0.0`, not "effectively 0". *History: HISTORY.md (was 1.6e-4 until 2026-06-02).*
 
-# Resume on a pre-trained dataset (skip capture + static training)
-scripts/resume_live.sh <data_dir>
-# requires <data_dir>/static_scene/post_fusion_state.pt
-```
+2. **Static phase: `camera_optimizer.mode = "off"`.** Poses are NOT optimized during static training.
+   **Why:** `transforms.json` holds ICP-refined poses (invariant #3), residual is sub-mm — nothing to fix.
+   Leaving it on drifts cameras by visible amounts and smears the scene. *History: HISTORY.md (was
+   `"SO3xR3"` until 2026-06-02).*
 
-Direct method invocations also work:
-```bash
-ns-train static-gs        --data <data_dir> --pipeline.model.sam3_prompt_text "..."
-ns-train static-gs-preseg --data <data_dir> --pipeline.text-prompts "..."   # per-Gaussian SAM IDs, no SAM3D/CPD
-ns-train dynamic-gs       --data <data_dir>   # recorded dataset
-ns-train dynamic-gs-live  --data <data_dir>   # live SHM stream
-```
+3. **`<data>/static_scene/transforms.json` holds ICP-refined poses, not raw URDF FK.** Raw capture
+   preserved at `transforms_urdf_backup.json`. **Why:** the seed PLY lives in the ICP-refined frame;
+   raw-FK training cameras leave a systematic 1–4 mm misalignment camera-opt can't undo (it's off, #2).
+   Tool: [`scripts/rewrite_transforms_with_icp.py`](rewrite_transforms_with_icp.py) — idempotent, refuses
+   to overwrite an existing backup. Measured drift: median 0.96 mm / 0.053°, max 3.94 mm / 0.41° over 68 frames.
 
-`outputs/` is intentionally empty across runs — see [`dynamic_gs/__init__.py`](dynamic_gs/__init__.py) for the three monkeypatches that suppress nerfstudio's `config.yml` / `dataparser_transforms.json` / tensorboard writes. All artifacts live under the dataset dir.
+4. **Dynamic phase: ALL gauss-param LRs = 0.** The dynamic phase is a runtime, not a training loop — only
+   the tracker's rigid transform + feedforward inserts mutate the scene. Per-step gradient descent would
+   fight the tracker. **Verified:** `_ZERO_LR_OPTIMIZERS` in the config (used by `dynamic-gs` + `dynamic-gs-live`).
 
-## High-Level Architecture
+5. **`outputs/` is suppressed across all runs.** Nerfstudio's `outputs/<exp>/…` tree is unused; all
+   artifacts live under `<data_dir>/`. **Why:** the dataset dir is self-contained and portable.
+   **Verified:** three monkeypatches in [`dynamic_gs/__init__.py`](dynamic_gs/__init__.py)
+   (`ExperimentConfig.save_config`, the `dataparser_transforms.json` write, the tensorboard branch).
+   Note: `--vis viewer` still `mkdir`s `outputs/<run>` — pre-create the parent if ever enabled.
 
-### Pipelines (4 modules)
+6. **Background color = Gazebo sky `(0.86, 0.92, 1.0)`.** Used by the model render + viser default.
+   **Why:** the sim renders against this sky; any other background injects a constant photometric bias
+   the renderer would compensate for via opacity tweaks at silhouettes.
 
-```
-DynamicGSPipelineBase            (dynamic_gs_pipeline_base.py)
-├─ RecordedDynamicGSPipeline    (dynamic_gs_pipeline_recorded.py)
-└─ LiveDynamicGSPipeline        (dynamic_gs_pipeline_live.py)
+7. **Persistent SAM3 + Fast-SAM3D worker is the canonical SAM3/SAM3D path during live capture.**
+   `SamWorkerClient` (spawn-once, load-on-demand, JSON-over-pipe). **Why:** measured 9.4 s/call (SAM3
+   cold-start) + 22 s/call (SAM3D reuse) savings. The per-call subprocess paths remain fallbacks; the
+   live flow auto-spawns the worker at `fusion_runner.start()`.
 
-StaticGSPipeline                 (static_gs_pipeline.py)
-```
+8. **Per-object identity buffers are owned by specific phases:**
+   - `object_instance_ids` — written by Phase 0b fusion only (1..K).
+   - `inserted_flags` — written by Phase 0b (SAM3D inserts) + `rgbd_decode.insert_inpaint_gaussians` (FF Mode B).
+   - `sam3d_init_target_flags` — initialized to zeros, **never written at runtime**. The only value-writer
+     (`DynamicGSModel.initialize_object_from_sam3d`) has no caller. All-zeros is the expected state.
+   - `object_flags` — written by D0 selection on the first dynamic frame, **never by the static pipeline**.
+     `object_flags=0` in `post_fusion_state.pt` is correct/expected.
 
-* **`StaticGSPipeline`** — fits Splatfacto on the static dataset, then runs Phase 0a (SAM3 + Fast-SAM3D, in `fusion/phase0.py`) and Phase 0b (NDP non-rigid registration by default — CPD/TEASER++ still selectable — + insertion + post-fusion cull). Writes the warm-cache snapshot `<data>/static_scene/post_fusion_state.pt`.
-* **`DynamicGSPipelineBase`** — shared dynamic-phase logic: XFeat tracker tick, feedforward dispatcher (`rgbd_decode` or `anysplat_decode`), viser-direct push, persistent per-object identity buffers.
-* **`RecordedDynamicGSPipeline`** — feeds the base from a recorded `dynamic_scene/`.
-* **`LiveDynamicGSPipeline`** — feeds the base from a `LiveShmSubscriber` polling the ROS publisher's shared memory.
+9. **Live visualization uses viser-direct, NEVER Nerfstudio's viewer.** Connect to
+   **`http://localhost:8081`**, never `:7007`. Do NOT pass `--vis viewer`.
+   - **Mechanism:** viser-direct is **server-side rasterize + push-image** (one dedicated render thread
+     calls `model.get_outputs(camera)`, ~25 ms at 512×512, and pushes the result via an atomic
+     `client.scene.set_background_image(...)`; a single `model_lock` guards every tracker write + FF insert
+     + render). *(The old client-side `GaussianSplatHandle` "Path A" was removed; its API is no-op stubs.)*
+   - **Why avoid the NS viewer:** its render-state-machine render path wraps `get_outputs` in a
+     render-interrupt (`IOChangeException`) that, under the shared FF lock, can **deadlock** (observed
+     2026-06-02). viser-direct has no state machine and no render-interrupt.
+   - **Enforced:** every method config sets `vis="tensorboard"` (NS viewer off; tensorboard writes
+     suppressed by `_suppress_nerfstudio_output_writes`). `enable_viser_direct=True` is the default, so
+     viser-direct spins up on port 8081 (`viser_direct_port`).
+   - *History (Path-A removal, the deadlock, the flash-on-write bug): HISTORY.md.*
 
-### Models (2 modules)
+---
 
-* **`StaticGSModel`** (`static_gs_model.py`) — straight subclass of `SplatfactoModel` + the four persistent buffers (`object_flags`, `object_instance_ids`, `sam3d_init_target_flags`, `inserted_flags`). Uses `NoRefineStrategy` so densification is OFF during static training. Means LR is zeroed so seed positions stay fixed.
-* **`DynamicGSModel`** (`dynamic_gs_model.py`) — superset used by recorded + live dynamic pipelines. Adds `render_object_mask`, the rigid-transform helpers, ESAM lazy load, a `means`-gradient zeroing hook (enforces invariant #4), and the dynamic-phase config knobs. *(The scene-optimization machinery — `enable_scene_optimization`, `scene_opt_*`, `scene_opt_active_mask` — was purged in `06d2c47`; the dynamic phase does no per-step gradient descent.)*
-
-### Data + persistence
-
-* **Datamanager**: [`DynamicGSDataManager`](dynamic_gs/dynamic_gs_datamanager.py) wraps two `FullImageDatamanager`s (`static_scene/`, `dynamic_scene/`). Live mode pulls frames from SHM via [`LiveShmSubscriber`](dynamic_gs/utils/live_shm_reader.py).
-* **Persistence**: [`dynamic_gs/persistence/`](dynamic_gs/persistence/) — `save_post_fusion_state` writes `gauss_params.*` + all persistent buffers; `load_post_fusion_state` warm-restarts the dynamic pipelines from a static-gs snapshot.
-* **Fusion phase 0**: [`dynamic_gs/fusion/phase0.py`](dynamic_gs/fusion/phase0.py) — `run_phase0a_sam3_and_sam3d` + `run_phase0b_fusion`.
-
-### Static-phase seed pipeline (2026-06-01)
-
-The PLY at `<data>/static_scene/depth_camera_init_points.ply` is what Splatfacto inits Gaussians from. Today:
-
-1. **During capture**, [`utils/fusion_runner.py`](dynamic_gs/utils/fusion_runner.py) runs an `OnlineFusion` worker thread that watches `transforms.json` and integrates each new keyframe (`add_frame`). GPU TSDF + ICP at 2 mm voxel (`TSDF_VOXEL_M=0.002`), only depth in the 0.05–3.0 m band (`DEPTH_MIN_M`/`DEPTH_MAX_M`, hardcoded), ~16 ms/frame at 800×800.
-2. **On capture stop**, `stop_and_finalize()` drains the queue, calls `finalize()`, and writes the PLY (~0.6 s).
-3. **Optional adaptive downsample**: [`scripts/adaptive_downsample.py`](scripts/adaptive_downsample.py) keeps the <1 m near-zone at full density, voxel-downsamples the rest to 5 mm. Not yet auto-wired into the bootstrap flow; run manually if seed size matters.
-
-### Utility modules ([`dynamic_gs/utils/`](dynamic_gs/utils/))
-
-| Module | Role |
-|---|---|
-| `online_fusion.py` | `OnlineFusion` class: TSDF + ICP per frame, GPU. Drives the init seed. |
-| `fusion_runner.py` | `ConcurrentFusionRunner` — watcher + worker for streaming fusion. |
-| `rgbd_fusion_init.py` | Legacy offline post-pass refinement; only used as a fallback. |
-| `xfeat_motion.py` | The XFeat-only dynamic tracker (5-tracker dispatch purged 2026-05-26). |
-| `tracker_common.py` | Kabsch + RANSAC helpers + `MotionEstimate` dataclass shared by the tracker. |
-| `live_ros_publisher.py` | The ROS publisher run inside `dynamic_gs_ros` (subprocess). Owns the SHM. |
-| `live_shm_reader.py` | Reader-side wrapper: spawns the publisher, polls SHM, gives `peek_latest()`. |
-| `live_session.py` | The bootstrap-time interactive capture flow (SAM3 retry loop, SAM3D, fusion). |
-| `keyframe_filter.py` | ORB-SLAM-style greedy 2 cm/20° pose dedup; shared between recorded + live. |
-| `sam3_segmentation.py`, `sam3d.py`, `sam3d_fusion.py` | SAM3 + Fast-SAM3D subprocess wrappers + Phase-0b registration & fusion (NDP default; CPD/TEASER++ fallbacks). |
-| `ndp_register.py`, `ndp/` | Vendored NDP non-rigid deformation (`deform_source_to_target`) — the default Phase-0b backend. Pure-torch, no pytorch3d, in-process GPU. |
-| `esam.py` | ESAM interactive object-mask query (D0 bootstrap). |
-| ~~`optim_pool.py`~~ | **REMOVED** — dynamic-phase per-step optimization was dropped (the dynamic phase is a pure tracker+FF runtime; see invariant #4). File no longer exists; `OptimPool`/`optim_pool_*` are dead references. |
-| `active_mask.py` | `build_change_mask`, `select_top_n_components_filtered`, projection helpers. |
-| `viser_direct.py` | Standalone viser server pushed by the tracker; bypasses ns-viewer state machine. |
-| `rgbd_decode.py` | Feedforward Mode A/B: direct RGB-D back-projection into frozen Gaussians. |
-| `anysplat_decode.py` | Feedforward via the AnySplat persistent subprocess. |
-| `depth_loss.py`, `rigid_regularization.py`, `no_refine_strategy.py` | Smaller pieces used by the model. |
-
-The legacy trackers (cotracker / tapir / tapnext / klt) and the old live-subscriber were **deleted** (commit `5de7fab`, 2026-05-31) — recover from git history if ever needed.
-
-### Three-phase training (overview)
-
-**Phase 0 (Static)** — `static-gs`. Splatfacto fit on the SfM/TSDF seed for `static_num_steps` (default 500, `STATIC_NUM_STEPS` in `dynamic_gs_config.py`). Densification OFF, means LR = 0, camera-pose optimizer = `off` (NOT `SO3xR3` — see invariant #2). At end: Phase 0a SAM3 + Fast-SAM3D, then Phase 0b NDP non-rigid registration (default; CPD/TEASER++ selectable) + insertion + post-fusion cull (proximity de-dup + in-front occlusion). Writes `post_fusion_state.pt`.
-
-**Phase 1 (Dynamic)** — `dynamic-gs` / `dynamic-gs-live`. Warm-load from `.pt`. Per tracker tick: XFeat motion estimation → `apply_rigid_object_transform_from_reference` → viser-direct push. Optionally feedforward-decode CDN regions (rgbd or anysplat) into the scene.
-
-The legacy "Phase 0 split" (object insertion AFTER static training) is preserved by `static-gs`'s `_finalize_static_training` AFTER_TRAIN callback. The dynamic pipelines load the post-fusion snapshot directly and skip retraining.
-
-### Per-object identity buffers
-
-| Buffer | Type | Set by | Purpose |
-|---|---|---|---|
-| `object_instance_ids` | long (N,1) | Phase 0b fusion | Multi-object identity, 1..K |
-| `object_flags` | float (N,1) | D0 selection | Active dynamic object (0/1) |
-| `sam3d_init_target_flags` | float (N,1) | nobody (writer uncalled) | Placeholder — intended to mark SAM3D-inserted Gaussians; never written at runtime (see Invariant #8) |
-| `inserted_flags` | float (N,1) | rgbd_decode | Feedforward Mode B inserts |
-
-`object_instance_ids` only carries IDs for Fast-SAM3D-inserted Gaussians today. Future #1 (top of roadmap) will give every TSDF-seeded Gaussian a real ID via per-frame SAM2 propagation.
-
-### Optimizer groups + LRs
-
-Standard Splatfacto 7 groups: `means`, `features_dc`, `features_rest`, `opacities`, `scales`, `quats`, `camera_opt`.
-
-* Static phase (`static-gs`): all groups active, but `means` LR = **0.0** (explicit, in [`dynamic_gs_config.py`](dynamic_gs/dynamic_gs_config.py)) to lock seed positions — Adam moves means via `.grad` regardless of densification, so the old 1.6e-4 did NOT stay put (see Invariant #1).
-* Dynamic phase (`dynamic-gs` + `dynamic-gs-live`): all LRs zeroed (`_ZERO_LR_OPTIMIZERS` in `dynamic_gs_config.py`). The trainer's optimizer step is a no-op; mutations come from `apply_rigid_object_transform_from_reference` and feedforward inserts.
-
-## Data Format
+## 5. Data format + conventions (stable)
 
 ```
 <data_dir>/
-├── static_scene/
-│   ├── rgb/                          (BGR PNG)
-│   ├── depth/                        (uint16 mm TIFF)
-│   ├── masks/                        (uint8 robot-exclusion mask)
-│   ├── transforms.json               (Nerfstudio-formatted)
-│   ├── depth_camera_init_points.ply  (TSDF-fused seed)
-│   └── post_fusion_state.pt          (warm-cache after static-gs)
-├── dynamic_scene/
-│   ├── rgb/  depth/  masks/  transforms.json
-│   ├── initialization_debug/         (SAM3 anchor + debug images)
-│   └── initialization_artifacts/     (per-object SAM3D PLY + pose JSON)
+├── static_scene/   rgb/(BGR PNG) depth/(uint16 mm TIFF) masks/(uint8) transforms.json
+│                   depth_camera_init_points.ply (TSDF seed)  post_fusion_state.pt (warm cache)
+├── dynamic_scene/  rgb/ depth/ masks/ transforms.json  initialization_{debug,artifacts}/
 └── timing_report*.txt
 ```
 
-Dataparser settings: `orientation_method="none"`, `center_method="none"`, `auto_scale_poses=False` — poses are kept in metric units, not recentered.
+- Dataparser: `orientation_method="none"`, `center_method="none"`, `auto_scale_poses=False` — metric, not recentered.
+- Camera poses are OpenGL c2w; converted to OpenCV internally via `diag(1, -1, -1, 1)`.
+- Depth is uint16 mm on disk (`depth_unit_scale_factor=1e-3`); publisher emits float32 m at the SHM boundary.
 
-## ROS Data Collection
+## 6. Conda environments
 
-The live publisher subprocess is auto-spawned by `LiveShmSubscriber`. It runs the URDF FK + frame sync + atomic frame writes; the reader-side process never imports rospy.
+| Env | Python | Role |
+|---|---|---|
+| `dynamic_gs` | 3.12 | Main: ns-train methods, tracker, Open3D 0.19 (GPU TSDF), nerfstudio, gsplat. |
+| `sam3_dynamic_gs` | 3.12 | SAM3 + Fast-SAM3D (+ FastSAM/CLIP) worker subprocess. |
+| `dynamic_gs_ros` | 3.8 | Minimal ROS Noetic env for the live publisher subprocess. |
+| `anysplat_dynamic_gs` | 3.12 | AnySplat feedforward decoder (persistent worker). |
 
-Required: `dynaarm_with_gripper_for_gazebo_only_no_wrist_collision.urdf` must load the `libactive_camera_arm_link_pose_publisher.so` Gazebo plugin (publishes the camera pose to `/dynaarm_arm/dynaarm_arm/camera1/gazebo_pose`). See the historic 2026-05-04 version in `~/.config/Code/User/History/-45f4ea38/KHwu.urdf` for the canonical content.
+## 7. Open roadmap
 
-**Camera-pose plugin (`StampedLinkPosePublisher`) — what it actually publishes + the reset-survival fix (2026-06-14):** the plugin source is `active_camera_arm_control/active_camera_arm_gazebo/src/StampedLinkPosePublisher.cpp` (in the teleop catkin_ws, NOT this repo). Corrections to earlier notes here: it publishes the pose of **`dynaarm_WRIST_2_base`** (relative to `dynaarm_base`), **not** `camera_pose_link` (that link exists but is unused by this plugin); `updateRate=250.0` is set in the URDF `<plugin>` block, not the `.cpp`. **Failure mode + fix:** the plugin throttles by `world->SimTime()` and cached `last_publish_time_`. Until 2026-06-14 it had **no `Reset()` override**, so a `reset_world`/`reset_simulation` (or any `/clock` reset) rewound SimTime to ~0 while `last_publish_time_` kept its large value → the throttle delta went negative → it skipped publishing **every tick forever** (plugin stays loaded, world keeps stepping, but `gazebo_pose` goes permanently silent → the live publisher hangs waiting for the pose topic; the preflight `dgs_check_sim_alive` catches this). Fixed (teleop repo `federico/dynamic-gaussian-splat`, commit `d905560`) by adding a `Reset()` override + a backwards-SimTime guard in `OnUpdate`, so it re-arms on reset and keeps publishing across world resets. **The rebuilt `.so` only loads on a fresh model spawn / Gazebo restart** — a `reset_world` on an already-running pre-fix sim won't pick it up. If `gazebo_pose` is ever silent while the sim is otherwise healthy (joint_states flowing, RTF≈1, physics not paused), this is the first thing to check.
+1. Per-Gaussian SAM IDs — every Gaussian gets a real instance ID at the source, not just SAM3D inserts.
+2. Auto-pick by gripper TCP (closest-point to gripper, not centroid-to-camera).
+3. Multi-object Fast-SAM3D (`prompt_text` → `list[str]`, distinct instance IDs).
+4. Multi-object switching tracker (track whichever instance is moving).
+- Gaussian hygiene purge: drop sub-0.05-opacity + super-small-scale Gaussians, one-shot at static end
+  AND periodically in the dynamic phase to cap FF accumulation; never drop `object_flags==1`.
 
-`urdf/dynamic_gaussian_splat/` and `worlds/dynamic_gaussian_splat/` symlinks are required under the catkin workspace — the publisher expects them at those paths.
+## 8. Timing
 
-## Third-Party Dependencies (`third_party/`)
-
-* **`sam-3d-objects/`** — SAM3D model for single-view 3D object reconstruction. Multi-object path via `utils/sam3d.run_sam3d_multi_object`.
-* **SAM3** ([facebookresearch/sam3](https://github.com/facebookresearch/sam3)) — text-prompted segmentation. Invoked via `conda run -n sam3_dynamic_gs python`.
-* **ESAM** — interactive segmentation, D0 bootstrap.
-* **AnySplat** — feedforward decoder, persistent subprocess in `anysplat_dynamic_gs`.
-* **NDP (Neural Deformation Pyramid)** — vendored in `utils/ndp/` (`nets.py` + `rigid_body.py`); the default non-rigid Phase-0b backend via `utils/ndp_register.py`. Upstream: github.com/rabbityl/DeformationPyramid (no-learned path, no checkpoint).
-* **PROBREG / Open3D** — `utils/sam3d_fusion.py` CPD fallback; TEASER++ the rigid alternative (both still selectable, no longer the default).
-* **XFeat / LighterGlue** — vendored under `dynamic_gs/utils/xfeat_motion.py`'s dependencies.
-* **FoundationPose** — `third_party/FoundationPose/` kept on disk but no longer wired into the runtime (XFeat purge 2026-05-26).
-
-## Background + Camera Conventions
-
-* Camera poses are OpenGL c2w in `transforms.json`. `OnlineFusion` and FoundationPose helpers convert to OpenCV internally via `diag(1, -1, -1, 1)`.
-* Depth is uint16 millimetres on disk (`depth_unit_scale_factor = 1e-3` in the dataparser). The publisher converts to float32 metres at the SHM boundary.
-* Simulator background: Gazebo sky color `(0.86, 0.92, 1.0)` is set as the model's render background — not the dataparser `mask_color`. Defined in `StaticGSModel.populate_modules()` and `DynamicGSModel.populate_modules()` and as the viewer default in `nerfstudio/viewer/control_panel.py`.
-
-## Open Roadmap
-
-(Detailed in [`memory/project_multi_object_roadmap.md`](../../../home/mrc-cuhk/.claude/projects/-home-mrc-cuhk-Documents-dynamic-gaussian-splat-scripts/memory/project_multi_object_roadmap.md))
-
-1. **Per-Gaussian SAM IDs** — port from `experiments/icp_fusion_mvp/`. Every Gaussian gets a real instance ID at the source, not just Fast-SAM3D inserts.
-2. **Auto-pick by gripper TCP** — D0 picker uses closest-point to gripper, not 3D centroid to camera.
-3. **Multi-object Fast-SAM3D** — `sam3_prompt_text` becomes a `list[str]`; multi-mask insertion with distinct instance IDs.
-4. **Multi-object switching tracker** — track whichever instance is currently moving; swap on detected motion change.
-
-Also pending: **Gaussian hygiene purge** — drop sub-0.05-opacity AND super-small-scale Gaussians, one-shot at end of static phase (~26 % reduction, no visible change) AND periodically during the dynamic phase to cap FF-insert accumulation (459k→1.29M on real-1200p); never drop `object_flags==1`. Complements the oversized-insert clamp TODO above (one combined `min_scale < s < max_scale` + opacity filter on every insert batch). See [[static-phase-opacity-purge-todo]]. Also: Phase 0b CPD vs TEASER++ comparison.
-
-## Timing Reference
-
-Per-substep numbers live in `<data_dir>/timing_report.txt` after each run. Don't trust any number quoted here without verifying against a recent report — historical estimates have been wildly off (see memory entry [`feedback_no_timing_guesses.md`](../../../home/mrc-cuhk/.claude/projects/-home-mrc-cuhk-Documents-dynamic-gaussian-splat-scripts/memory/feedback_no_timing_guesses.md)).
-
-Most recent measurements (validate_run_1, 800×800, 71 frames, 2026-06-01):
-* Online fusion (GPU): mean 16 ms/frame, p90 21 ms — see `scripts/bench_gpu_fusion.py`.
-* Static training (Splatfacto, 1000 steps, no densify): under 20 s.
-* XFeat tick: 17–30 Hz steady, ~21 ms/tick at `xfeat_top_k=300`.
+Per-substep numbers live in `<data_dir>/timing_report.txt` after each run. **Don't quote a timing number
+from memory** — historical estimates have been wildly off. Verify against a recent report.
