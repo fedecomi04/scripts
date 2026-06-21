@@ -11,39 +11,68 @@ Env pythons (for the diagnostic scripts below):
 
 Viser live view: **http://localhost:8081** (NOT :7007).
 
+> **Current pipeline = `dynamic_gs2/`** (the clean rewrite, built + validated). The old
+> `dynamic_gs/` package is the frozen ground-truth baseline — its `ns-train` methods still
+> run but new work goes through `dynamic_gs2/`. Single source of truth for live status:
+> [`dynamic_gs2/STATUS_LIVE.md`](dynamic_gs2/STATUS_LIVE.md).
+
 ---
 
-## 1. Run the pipeline
+## 1. Run the pipeline (dynamic_gs2)
 
 ```bash
-# Capture only (record static+dynamic dataset, no training).
-# Default data dir = datasets/<timestamp>/
-scripts/capture_only.sh [data_dir]
+# WHOLE pipeline, ONE command, ONE process (needs Gazebo/ROS + dVRK up):
+# live sweep (red-box UI) -> segment -> SAM3D -> seed -> native train -> Phase-0b fuse
+# -> re-phase static->dynamic IN PLACE -> live track (+ optional FF).
+dynamic_gs2/live.sh <data_dir> [prompt]
 
-# Full: capture -> train static -> go live. Prompt = bare noun ("banana", no "the").
-scripts/bootstrap_live.sh <data_dir> "<prompt>"
+# Static phase only: train + Phase-0a/0b fuse -> static_scene/static_state.pt + prewarm.
+dynamic_gs2/static.sh <data_dir> [prompt] [--live]
 
-# Resume an already-trained scene (skips capture + training; needs
-# <data_dir>/static_scene/static_state.pt).
-scripts/resume_live.sh <data_dir>
+# Go LIVE on a pre-trained dataset (warm-load static_state.pt, track + optional FF):
+dynamic_gs2/resume_live.sh <data_dir> [--ff]
 ```
 
-Direct method calls (the scripts wrap these):
+Validation / no-sim paths:
 ```bash
+# Visual: replay a recorded dataset through the new pipeline with the viser viewer up.
+dynamic_gs2/view_dynamic.sh "<dataset>" transforms_313_trimmed.json   # --once / --ff
+
+# Replay-as-live: pace a recorded dataset through the LIVE loop (no operator).
+dynamic_gs2/replay_live.sh "<dataset>" [--ff]
+
+# Recorded A/B (unattended-validated, FF off): old-vs-new per-tick trace verdict.
+dynamic_gs2/replay_ab.sh "<dataset>" transforms_313_trimmed.json
+
+# Side-by-side [live | new-render] mp4 of the tracking:
+python -m dynamic_gs2.visualize "<dataset>" --transforms transforms_313_trimmed.json
+#   -> <dataset>/dynamic_gs2_viz.mp4
+```
+
+`<data_dir>` lives under `data_teleoperation/datasets/`.
+
+---
+
+## 2. Old pipeline (`dynamic_gs/` — frozen baseline)
+
+Still runnable; kept as the ground-truth reference the rewrite is verified against.
+```bash
+scripts/capture_only.sh   [data_dir]              # record static+dynamic, no training
+scripts/bootstrap_live.sh <data_dir> "<prompt>"   # capture -> train static -> go live
+scripts/resume_live.sh    <data_dir>              # resume a trained scene
+
+# Direct ns-train method calls (the scripts wrap these):
 ns-train static-gs        --data <data_dir> --pipeline.model.sam3_prompt_text "<prompt>"
-ns-train static-gs-preseg --data <data_dir> --pipeline.text-prompts "<prompt>"
+ns-train static-gs-preseg --data <data_dir> --pipeline.text-prompts "<prompt>"   # per-Gaussian IDs
 ns-train dynamic-gs       --data <data_dir>   # recorded dynamic dataset
 ns-train dynamic-gs-live  --data <data_dir>   # live SHM stream
 ```
 
-`<data_dir>` lives under `data_teleoperation/datasets/`. A bare name (e.g.
-`my_scene`) is resolved there automatically by capture_only.sh.
-
 ---
 
-## 2. Save the feedforward (CDN) debug frames
+## 3. Save the feedforward (CDN) debug frames
 
-Prefix any live launch with `DGS_FF_DEBUG=1`:
+Prefix any old-pipeline live launch with `DGS_FF_DEBUG=1`:
 ```bash
 DGS_FF_DEBUG=1 scripts/resume_live.sh   <data_dir>
 DGS_FF_DEBUG=1 scripts/bootstrap_live.sh <data_dir> "<prompt>"
@@ -59,14 +88,13 @@ on the FF thread → slower tracker). `_4`↔`_5` = cull effect; `_6`↔`_7` = m
 
 ---
 
-## 3. Inspect the SAM3D insert / registration (the current work)
+## 4. Inspect the SAM3D insert / registration
 
 Canonical anchor (the exact frame SAM3D used) after a **live** run:
 `<data_dir>/static_scene/anchor_ref/` — `overlay.png` is the guaranteed-correct
 mask-on-image; `rgb.png / mask_NN.png / depth.tiff / intrinsics.json / c2w.json`
 are what phase-0 reads. If `overlay.png` looks right but the fused object is off,
 the bug is downstream of the mask (registration/cull), not the mask itself.
-
 
 Run with the main env python; PLYs land in the dataset's
 `dynamic_scene/initialization_debug/` (open in SuperSplat / any PLY viewer):
@@ -99,7 +127,7 @@ Re-run FastSAM on a saved frame (sam3 env), e.g. to check a mask:
 
 ---
 
-## 4. Stop / GPU / safety
+## 5. Stop / GPU / safety
 
 ```bash
 # Stop a running ns-train (kill the PYTHON pid, NOT the bash wrapper):
@@ -116,18 +144,18 @@ nvidia-smi                      # full GPU status
 
 ---
 
-## 5. Useful env vars
+## 6. Useful env vars
 
 | var | effect |
 |---|---|
-| `DGS_FF_DEBUG=1` | save FF/CDN debug frames on a live run (section 2) |
+| `DGS_FF_DEBUG=1` | save FF/CDN debug frames on a live run (section 3) |
 | `DGS_FF_ICP=0` | disable AnySplat FF ICP refine (inserts placed via raw live pose). Default is ON (looks better — less seam with the static scene; not rigorously A/B'd). `=1` forces on. Runs off the tracker thread either way. |
-| `DGS_FF_MAX_SCALE_M=0.03` | clamp each FF-inserted gaussian's per-axis world scale (m). Default 0.05 (5 cm). Stops one oversized insert from smearing the scene; lower = tighter. 0 disables. |
+| `DGS_FF_MAX_SCALE_M=0.03` | clamp each FF-inserted gaussian's per-axis world scale (m). Stops one oversized insert from smearing the scene; lower = tighter. 0 disables. (dynamic_gs2 default 0.02; old dynamic_gs/ 0.05.) |
 | `DGS_FF_MIN_SCALE_M=0.0005` | drop FF-inserted gaussians whose largest axis < this (m) — culls sub-mm specks. Default 0.0 (off). |
 | `DGS_NO_CPU_PIN=1` | skip the dVRK CPU isolation |
 | `DGS_LIVE_DEFER_TSDF=0` | use the concurrent TSDF fuser instead of the deferred batch seed |
 | `DGS_FUSION_DEVICE=cpu` | force CPU TSDF (default auto-GPU) |
-| `DGS_TSDF_DEPTH_MAX_M=6.0` | raise the 3 m TSDF integration cap (default 3.0). **OOM risk** — raise `DGS_TSDF_VOXEL_M` too and watch `nvidia-smi`. |
+| `DGS_TSDF_DEPTH_MAX_M=6.0` | raise the 2 m TSDF integration cap (default 2.0). **OOM risk** — raise `DGS_TSDF_VOXEL_M` too and watch `nvidia-smi`. |
 | `DGS_TSDF_VOXEL_M=0.004` | coarser TSDF voxel (default 0.002 = 2 mm); needed if you raise the depth cap on a 16 GB GPU. |
 | `DGS_EAGER_ANYSPLAT=1` | preload AnySplat during capture/training (set by bootstrap) |
 

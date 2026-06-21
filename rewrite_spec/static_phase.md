@@ -37,7 +37,7 @@ NATIVE in-process static phase (operator request: "implement a fully new version
 
 The new dynamic_gs2 modules own ORCHESTRATION / timing / red-box UI / SHM capture / segmentation
 folder / prewarm AND now the train + Phase-0b fusion natively; only the pure register/cull/backproject/
-NDP/SAM3D math is WRAPPED. Timing → `timing_report_static_dgs2.txt`.
+NDP/SAM3D math is WRAPPED. Timing → `timing_report_static.txt`.
 
 This spec defines the dynamic_gs2-style static phase: a single SHM-fed black box, parallel to
 the existing dynamic_gs2 dynamic phase, replacing the old two-process (`live_session` +

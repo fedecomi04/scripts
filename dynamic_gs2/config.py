@@ -315,6 +315,10 @@ def load_runtime_config() -> RuntimeConfig:
         morph_open_px=_envi("DGS_CDN_OPEN_PX", ChangeMaskConfig.morph_open_px),
     )
     feedforward = FeedforwardConfig(
+        # FF (AnySplat decode) fires every N tracker ticks. AnySplat decode is the heaviest GPU step
+        # (~0.5s/cycle: crop_ipc ~320ms + worker_forward ~160ms), so it starves the viewer render —
+        # raise N to fire it LESS (20 ≈ half the rate of the old 10). DGS_FF_CADENCE tunes it live.
+        cadence_ticks=_envi("DGS_FF_CADENCE", 20),
         icp_refine=_envb("DGS_FF_ICP", True),
         icp_stride=_envi("DGS_FF_ICP_STRIDE", FeedforwardConfig.icp_stride),
         max_scale_m=_envf("DGS_FF_MAX_SCALE_M", FeedforwardConfig.max_scale_m),

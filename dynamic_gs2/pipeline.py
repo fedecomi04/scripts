@@ -477,13 +477,13 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
         static_persist.save_warm_cache(gset, data_dir, cfg, filename="post_dynamic_state.pt")
         print(f"[pipeline] LIVE: saved post_dynamic_state.pt ({gset.num_points} gaussians)")
         if ff_enabled:                                       # FF timing report (always-on; written once at end)
-            report_path = Path(data_dir) / "timing_report_ff.txt"
+            report_path = Path(data_dir) / "timing_report_dynamic.txt"
             _timing.get_ledger().write(report_path)
             print(f"[pipeline] LIVE: wrote FF timing report -> {report_path}")
 
 
 def run_full_live(data_dir, cfg, device, *, prompt_text: str = "", source_kind: str = "live_bridge",
-                  box_px: int = 350, ff_enabled: bool = True, max_seconds: Optional[float] = None) -> None:
+                  box_px: int = 300, ff_enabled: bool = True, max_seconds: Optional[float] = None) -> None:
     """SINGLE-PROCESS whole pipeline: live static capture -> in-process hand-off -> live dynamic loop.
 
     This is the point of warm-loading AnySplat/XFeat/LighterGlue during the static phase: the static
@@ -525,7 +525,7 @@ def _main():
     ap.add_argument("--data", required=True, help="dataset dir (with static_scene/static_state.pt)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--prompt", default="", help="full: object text prompt (else cfg/DGS_SAM3_PROMPT)")
-    ap.add_argument("--box-px", type=int, default=350, help="full: red-box side in px")
+    ap.add_argument("--box-px", type=int, default=300, help="full: red-box side in px")
     ap.add_argument("--ff", action=argparse.BooleanOptionalAction, default=True,
                     help="feedforward (needs AnySplat worker); ON by default, --no-ff disables")
     ap.add_argument("--source", default="live_bridge", help="live source kind (live_bridge|ros1)")

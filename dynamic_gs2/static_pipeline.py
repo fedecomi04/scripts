@@ -201,7 +201,7 @@ class _RedBoxUI:
     scene training / fusion / realtime): grey=not started, yellow=ongoing, green=done+elapsed.
     The orchestrator drives it via begin(key)/done(key); the current step's label is the feed banner."""
 
-    def __init__(self, cfg, box_px: int = 350):
+    def __init__(self, cfg, box_px: int = 300):
         self._box = int(box_px)
         self._fired = threading.Event()
         self._server = None
@@ -367,10 +367,13 @@ def run_static_live(data_dir, cfg, device, *, prompt_text: str = "",
     # (both in the shared worker), XFeat ~2 s, gsplat-backward compile. AnySplat is NOT prewarmed here
     # ON PURPOSE — its ~3.5 GB on top of SAM3D's 11.7 GB peak + Gazebo 2.6 OOMs a 16 GB card; it spawns
     # AFTER the SAM worker is closed (post-SAM3D), overlapping the seed-build + train (the free slot).
-    with tm.stage("sweep.fastsam_load"):
-        reg["fastsam"].prewarm()       # loads into the shared SAM worker (warm segment at trigger)
+    # VRAM: FastSAM (0.85 GB) resident + SAM3D's ~11.7 GB LOAD-PEAK + Gazebo 2.6 OOMs a 16 GB card.
+    # So during the sweep load SAM3D ALONE (full headroom, the 40 s cost hidden under the sweep);
+    # FastSAM is loaded at the TRIGGER right before segment (only ~2.8 s, and it's needed there first
+    # anyway — segment runs before SAM3D infer). This guarantees FastSAM-ready-before-use AND gives
+    # SAM3D its full load headroom (the FastSAM-first-resident attempt OOM'd SAM3D's load, 2026-06-21).
     with tm.stage("sweep.sam3d_load"):
-        reg["sam3d"].prewarm()         # loads into the SAME worker (warm ~10 s infer at trigger)
+        reg["sam3d"].prewarm()         # load SAM3D async (~40 s) — overlaps the sweep, no FastSAM contention
     with tm.stage("sweep.dyn_models_prewarm"):
         reg["xfeat"].prewarm()
     with tm.stage("sweep.gsplat_warm"):
@@ -411,7 +414,10 @@ def run_static_live(data_dir, cfg, device, *, prompt_text: str = "",
     # TRIGGER: freeze anchor, segment, SAM3D (the operator keeps moving — the live feed keeps flowing).
     with tm.stage("trigger.snapshot_anchor"):
         anchor = static_segment.snapshot_anchor(anchor_frame, intr, data_dir)
+    # Load FastSAM NOW (after SAM3D's load-peak is done; ~2.8 s) into the worker that already holds
+    # SAM3D resident — 7.3 + 0.85 + Gazebo fits 16 GB (only SAM3D's transient LOAD peak didn't).
     with tm.stage("trigger.fastsam_segment"):
+        reg["fastsam"].prewarm(); reg["fastsam"].wait_ready()
         objects = static_segment.segment(anchor, reg["fastsam"], prompt)
     with tm.stage("trigger.write_seg_folder"):
         static_segment.write_seg_folder(anchor, objects, prompt)
@@ -467,7 +473,7 @@ def run_static_live(data_dir, cfg, device, *, prompt_text: str = "",
 def _write_report(tm, data_dir: Path, out_pt: Path) -> None:
     """Render the static-phase timing report (schedule order + overlap timeline + dead time)."""
     try:
-        path = Path(data_dir) / "timing_report_static_dgs2.txt"
+        path = Path(data_dir) / "timing_report_static.txt"
         tm.write_static(path, dead_time_after="sam3d_done")
         print(f"[static] timing report -> {path}", flush=True)
         print(f"[static] dynamic_gs2 warm-cache -> {out_pt}", flush=True)
