@@ -358,4 +358,18 @@ def run_phase0b_native(scene_model, gset, lock, *, anchor, sam3_objects: List[di
         Path(artifact_dir).mkdir(parents=True, exist_ok=True)
         (Path(artifact_dir) / "phase0_manifest.json").write_text(
             json.dumps(manifest, indent=2, default=str) + "\n")
+
+    # Fail fast with a clear retry message if NO object ended up tagged (object_instance_ids all-zero).
+    # Each object can drop silently above (SAM3D returned {}, PLY load failed, <3 depth-backproject
+    # target points). Without this, the pipeline trains + hands off and only crashes ~30 s later in the
+    # tracker with the opaque "no tracked object" error. The <3-points case is usually sparse/holed
+    # depth on a thin or textureless object — retry with a bigger, more textured object.
+    total_tagged = int((gset.snapshot().buffers["object_instance_ids"].squeeze(-1) > 0).sum())
+    if total_tagged == 0:
+        raise RuntimeError(
+            f"Phase-0b fused 0 object Gaussians from {len(sam3d_results)} segmented object(s) — nothing "
+            "to track. The object was found by segmentation but dropped during fusion (see the "
+            "'[phase0b] obj N: ...' lines above: SAM3D failure, PLY load fail, or '<3 target points' "
+            "from sparse/holed depth on a thin/textureless object). RETRY with a bigger, more textured "
+            "object and make sure the depth over it is clean.")
     return manifest

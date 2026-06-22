@@ -32,6 +32,23 @@ export DGS_SIM_ZED_NOISE="${DGS_SIM_ZED_NOISE:-0}"
 # Set DGS_PUB_SWEEP_HZ=0 to disable (full 30 Hz everywhere, for a fast machine).
 export DGS_PUB_SWEEP_HZ="${DGS_PUB_SWEEP_HZ:-10}"
 
+# Real-HW ROS networking: the camera publisher runs on the Jetson (a DIFFERENT machine), so the PC's
+# master + nodes must advertise the PC's REAL IP, not localhost. Otherwise the Jetson is told the
+# subscriber is at "localhost", connects to its OWN localhost, and frames silently FREEZE (rqt + SHM
+# stop updating). roscore must ALSO be started with these set. DGS_PC_IP overrides the PC IP on the
+# Jetson link. Only on the real-HW path — sim stays on localhost.
+if [ "${DGS_REAL_HW_CAMERA:-0}" != "0" ]; then
+  DGS_PC_IP="${DGS_PC_IP:-192.168.55.100}"
+  export ROS_IP="${ROS_IP:-$DGS_PC_IP}"
+  export ROS_MASTER_URI="${ROS_MASTER_URI:-http://$DGS_PC_IP:11311}"
+  echo "[full_live] real-HW ROS net: ROS_MASTER_URI=$ROS_MASTER_URI ROS_IP=$ROS_IP "
+  echo "           (roscore MUST be started with the SAME ROS_IP/ROS_MASTER_URI, else frames freeze)"
+  # Cap the DYNAMIC publisher's PC-side processing rate (it otherwise runs full-rate, which spikes USB/CPU
+  # contention at the static->dynamic switch and starves the marginal ZED<->Jetson USB link -> grab
+  # FAILURE + tearing). Match it to the Jetson fps (~10). DGS_PUB_MAX_HZ=0 restores full rate.
+  export DGS_PUB_MAX_HZ="${DGS_PUB_MAX_HZ:-10}"
+fi
+
 # dVRK RT protection: reserve cores 0-3 for the dVRK 1kHz loop, cap math threadpools, pin the pipeline
 # to 4-23, lock the dVRK ONTO 0-3. Helpers self-skip when no dVRK/cpuset is present. DGS_NO_CPU_PIN=1 off.
 source "$SCRIPTS_DIR/scripts/_ros_cleanup.sh"

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -25,22 +26,41 @@ class StaticRecorder:
     transforms.json. One recorder per live static run."""
 
     def __init__(self, data_dir, intr: Intrinsics, *,
-                 trans_thresh_m: float = 0.02, rot_thresh_deg: float = 20.0):
+                 trans_thresh_m: float = 0.02, rot_thresh_deg: float = 20.0,
+                 interval_s: float = 0.0):
         self._root = Path(data_dir) / "static_scene"
         for sub in ("rgb", "depth", "masks"):
             (self._root / sub).mkdir(parents=True, exist_ok=True)
         self._intr = intr
         self._tt = float(trans_thresh_m)
         self._rt = float(np.deg2rad(rot_thresh_deg))
+        # interval_s > 0 -> time-based capture (every N s), for a FIXED camera that doesn't sweep
+        # (real-HW elbow mount). Defaults to 1.0 under DGS_REAL_HW_CAMERA, else 0 (motion dedup).
+        if interval_s <= 0.0:
+            _default = 1.0 if os.environ.get("DGS_REAL_HW_CAMERA", "0") != "0" else 0.0
+            try:
+                interval_s = float(os.environ.get("DGS_STATIC_INTERVAL_S", _default))
+            except ValueError:
+                interval_s = _default
+        self._interval_s = float(interval_s)
+        self._last_accept_t: float | None = None
         self._kept_R: List[np.ndarray] = []
         self._kept_t: List[np.ndarray] = []
         self._frames_meta: List[dict] = []
         self._n = 0
 
     def _is_keyframe(self, c2w: np.ndarray) -> bool:
-        """ORB-SLAM gate: accept frame 0; later frames only if no kept frame is within BOTH
-        the translation AND rotation thresholds (i.e. far enough in T or R from all kept)."""
+        """Accept gate. Time mode (interval_s>0): accept frame 0, then one every interval_s seconds
+        regardless of camera motion (fixed camera). Motion mode (default): ORB-SLAM gate — accept
+        frame 0; later frames only if no kept frame is within BOTH the translation AND rotation
+        thresholds (i.e. far enough in T or R from all kept)."""
         R, t = c2w[:3, :3], c2w[:3, 3]
+        if self._interval_s > 0.0:
+            now = time.time()
+            if self._last_accept_t is not None and (now - self._last_accept_t) < self._interval_s:
+                return False
+            self._last_accept_t = now
+            return True
         if not self._kept_R:
             return True
         for Rk, tk in zip(self._kept_R, self._kept_t):

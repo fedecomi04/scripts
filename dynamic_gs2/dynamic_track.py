@@ -157,6 +157,13 @@ class ReferenceObjectPose:
         self._ref_order: Optional[torch.Tensor] = None        # argsort(_ref_uid)
         self._ref_uid_sorted: Optional[torch.Tensor] = None   # _ref_uid[_ref_order]
 
+    def reference_centroid(self):
+        """Mean of the captured D0 reference means -> the object's single-point hypothesis (a (3,) numpy
+        array), or None if nothing is captured yet. Used by the pose log to record where the object is."""
+        if self._ref_means is None:
+            return None
+        return self._ref_means.mean(0).detach().cpu().numpy()
+
     def capture(self, snapshot) -> int:
         ids = snapshot.buffers["object_instance_ids"][:, 0]
         mask = ids == self.d0_id

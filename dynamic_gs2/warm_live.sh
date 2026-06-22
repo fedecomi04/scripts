@@ -25,6 +25,17 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export CUDA_HOME="$ENV"                                              # gsplat JIT needs these on a bare-python
 export CPATH="$ENV/targets/x86_64-linux/include${CPATH:+:$CPATH}"    # launch (else cuda_runtime.h not found)
 
+# Real-HW ROS networking (see full_live.sh): the Jetson publisher is on another machine, so the PC must
+# advertise its REAL IP, not localhost, or frames silently freeze. roscore must use the SAME values.
+if [ "${DGS_REAL_HW_CAMERA:-0}" != "0" ]; then
+  DGS_PC_IP="${DGS_PC_IP:-192.168.55.100}"
+  export ROS_IP="${ROS_IP:-$DGS_PC_IP}"
+  export ROS_MASTER_URI="${ROS_MASTER_URI:-http://$DGS_PC_IP:11311}"
+  echo "[warm_live] real-HW ROS net: ROS_MASTER_URI=$ROS_MASTER_URI ROS_IP=$ROS_IP "
+  # Cap dynamic publisher PC-side rate to ease USB/CPU contention (see full_live.sh). =0 for full rate.
+  export DGS_PUB_MAX_HZ="${DGS_PUB_MAX_HZ:-10}"
+fi
+
 # dVRK RT protection: reserve cores 0-3 for the dVRK 1kHz loop, cap math threadpools, pin the pipeline
 # to 4-23, lock the dVRK ONTO 0-3. Helpers self-skip when no dVRK/cpuset is present. DGS_NO_CPU_PIN=1 off.
 source "$SCRIPTS_DIR/scripts/_ros_cleanup.sh"

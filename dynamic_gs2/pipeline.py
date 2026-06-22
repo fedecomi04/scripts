@@ -74,6 +74,11 @@ class DynamicLoop:
         self._tick = 0
         self._seeded = False
         self._filter_depth = bool(getattr(getattr(cfg, "depth", None), "filter_enabled", True))
+        # Object-pose log (set by the driver, like tracker_intr): one JSONL per run with the tracked
+        # object's per-tick rigid pose. None disables it. Opened lazily on the first successful seed.
+        self.pose_log_path = None
+        self._pose_log = None
+        self._pose_seg = -1
 
     def _object_mask(self, camera) -> torch.Tensor:
         # Build the instance mask and render it under ONE lock hold: a fresh snapshot taken inside
@@ -82,6 +87,46 @@ class DynamicLoop:
         with self.lock:
             inst = (self.g.snapshot().buffers["object_instance_ids"][:, 0] == self.d0_id)
             return self.sm.render_object_mask(camera, inst)
+
+    # ----- object-pose log (per-tick rigid pose of the tracked object; non-blocking append) -----
+    # The tracker's (R,t) is the D0->current rigid transform in world frame, i.e. the object's pose
+    # relative to the anchor (= D0 reference). We define that anchor as the world origin, so the raw
+    # per-tick (R,t) IS the object's absolute pose. The object is a single point hypothesis (its D0
+    # centroid), NOT every gaussian. One JSONL file per run: an `anchor` record per seed segment
+    # (carrying the centroid), then a `pose` record per tick. Replay loops / re-seeds emit a new
+    # anchor segment, so a changed anchor is written down. Writes are tiny; flushed every 30 ticks.
+    def _pose_log_anchor(self, frame) -> None:
+        if self._pose_log is None:
+            self._pose_log = open(self.pose_log_path, "w")
+        self._pose_seg += 1
+        c = self.ref.reference_centroid()
+        rec = {"type": "anchor", "segment": self._pose_seg, "tick": self._tick,
+               "t_sec": float(frame.stamp_sec), "d0_instance_id": int(self.d0_id),
+               "centroid_world": (c.reshape(3).tolist() if c is not None else None),
+               "note": "anchor = world origin; per-tick R (row-major 3x3) + t are the D0->current "
+                       "rigid pose of the object in world frame"}
+        self._pose_log.write(json.dumps(rec) + "\n")
+        self._pose_log.flush()
+
+    def _pose_log_tick(self, frame, est) -> None:
+        if self._pose_log is None:
+            return
+        rec = {"type": "pose", "tick": self._tick, "t_sec": float(frame.stamp_sec),
+               "ok": bool(est.success),
+               "R": np.asarray(est.rotation, float).reshape(9).tolist(),
+               "t": np.asarray(est.translation, float).reshape(3).tolist()}
+        self._pose_log.write(json.dumps(rec) + "\n")
+        if self._tick % 30 == 0:
+            self._pose_log.flush()
+
+    def close_pose_log(self) -> None:
+        if self._pose_log is not None:
+            try:
+                self._pose_log.flush()
+                self._pose_log.close()
+            except Exception:
+                pass
+            self._pose_log = None
 
     def reset_for_loop(self) -> None:
         """Replay wrapped to frame 0: restore the dynamic state so each pass is identical.
@@ -191,6 +236,8 @@ class DynamicLoop:
             self.ref.capture(snap)
             kept = self.tracker.seed(inp)
             self._seeded = self.tracker.ready
+            if self._seeded and self.pose_log_path is not None:
+                self._pose_log_anchor(frame)     # new segment: anchor (= world origin) + object centroid
             # Dump the SEED-frame live+rendered pair too: tick 0 is the decisive frame for the
             # "object inserted in wrong place" check — if the rendered object overlays the live object
             # here (no motion yet), the placement is correct in world (any apparent offset is the
@@ -212,6 +259,8 @@ class DynamicLoop:
             if out is not None:
                 ms, qs, uids = out                       # uids: stable gauss_uid per subset row (NOT a mask)
                 self.g.write_object_pose(ms, qs, uids)   # resolves uid->live row under the lock (FF-race-safe)
+        if self.pose_log_path is not None:
+            self._pose_log_tick(frame, est)              # record the object's per-tick rigid pose
 
         if os.environ.get("DGS_TRACK_CMP") == "1":       # opt-in debug: per-tick live + rendered dump
             self._save_track_cmp(frame, cam)
@@ -264,6 +313,7 @@ def run_recorded_trace(data_dir, cfg, device, out_trace: str, *, ff_enabled: boo
 
     loop = DynamicLoop(sm, gset, lock, tracker, ref, d0_id, cfg, device, ff_worker=ff)
     loop.tracker_intr = intr
+    loop.pose_log_path = data_dir / "object_track_poses.jsonl"
 
     n = 0
     t0 = time.time()
@@ -282,6 +332,7 @@ def run_recorded_trace(data_dir, cfg, device, out_trace: str, *, ff_enabled: boo
         if ff is not None:
             ff.close()
     finally:
+        loop.close_pose_log()
         out.close()
         ring.close()
         src.close()
@@ -327,6 +378,7 @@ def run_view_recorded(data_dir, cfg, device, *, transforms_name: str = "transfor
                                set_hidden_fn=sm.set_hidden_indices)   # Option A: defer cull
     loop = DynamicLoop(sm, gset, lock, tracker, ref, d0_id, cfg, device, ff_worker=ff)
     loop.tracker_intr = intr
+    loop.pose_log_path = data_dir / "object_track_poses.jsonl"
 
     def render_fn(cam):
         with lock:
@@ -374,6 +426,7 @@ def run_view_recorded(data_dir, cfg, device, *, transforms_name: str = "transfor
     except KeyboardInterrupt:
         print("[pipeline] VIEW: stopped")
     finally:
+        loop.close_pose_log()
         if ff is not None:
             ff.close()
         bridge.close()
@@ -436,6 +489,7 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
     loop = DynamicLoop(sm, gset, lock, tracker, ref, d0_id, cfg, device, ff_worker=ff)
     loop.tracker_intr = ring.intrinsics()
     loop._cmp_dir = Path(data_dir) / "dynamic_scene" / "_track_debug"   # DGS_TRACK_CMP per-tick debug dump
+    loop.pose_log_path = Path(data_dir) / "object_track_poses.jsonl"
 
     from .dynamic_viz import ViserBridge
     def _render_fn(cam):
@@ -480,6 +534,7 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
     except KeyboardInterrupt:
         print("[pipeline] LIVE: interrupted by operator")
     finally:
+        loop.close_pose_log()
         if ff is not None:
             ff.close()
         bridge.close()

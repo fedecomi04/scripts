@@ -1,99 +1,66 @@
-# Hardware test — one-shot runbook (ZED Mini on the elbow)
+# Hardware test — commands
 
-Real camera = ZED Mini on `dynaarm_ELBOW`. Camera **frames + saved pose** come from URDF FK on the
-PC (NOT from Gazebo), gated by `DGS_REAL_HW_CAMERA=1`. The Jetson publishes ONLY the camera topics.
+Runnable from any folder (absolute paths). Jetson SSH + ZED camera + deps verified working.
 
-## The one switch that changes everything
 ```bash
+# every shell
+export ROS_MASTER_URI=http://192.168.55.100:11311   # PC master (direct single master)
+
+# 1. robot bringup (your side, NimbRo) -> needs /dynaarm_arm/joint_states_full alive (gripper_source=topic)
+
+# 2. Jetson ZED -> ROS camera topics (deploys + runs the node on the Jetson)
+/home/mrc-cuhk/Documents/dynamic_gaussian_splat/scripts/real_hw/run_zed_publisher.sh
+
+# 3. check topics
+rostopic hz   /dynaarm_arm/dynaarm_arm/camera1/image_raw
+rostopic echo -n1 /dynaarm_arm/dynaarm_arm/camera1/camera_info | grep -E "width|height|K:"
+rostopic echo -n1 /dynaarm_arm/joint_states_full | head -3
+
+# 4a. RECORD dataset (static + dynamic, no training) — Enter ends STATIC, Enter ends DYNAMIC
 export DGS_REAL_HW_CAMERA=1
-```
-With it set, the PC pipeline:
-- renders the robot-exclusion MASK from the elbow optical camera (FK of dynaarm_ELBOW × measured offset),
-- writes the saved camera POSE (transforms.json) from that SAME FK, converted to OpenGL c2w,
-- does NOT read `/dynaarm_arm/.../camera1/gazebo_pose` at all (see "rigid link" note below).
+export DGS_POSE_TOPIC=/dynaarm_arm/joint_states_full   # skip the dead gazebo_pose preflight
+/home/mrc-cuhk/Documents/dynamic_gaussian_splat/scripts/scripts/capture_only.sh real_dynaarm_recording
 
-Unset (default) = sim behaviour, byte-for-byte.
-
----
-
-## STEP 1 — robot bringup (arm + joints + TF), NO sim camera needed
-The arm/joint_states_full + TF must be up (same as sim, the arm is unchanged). Real robot driver
-replaces Gazebo. You still need:
-- `/dynaarm_arm/joint_states_full`   (from joint_state_merger — set gripper_source=topic for the real gripper)
-- ROS master reachable at `ROS_MASTER_URI`
-
-joint_state_merger for the REAL gripper (finger angle from a topic, not the Gazebo service):
-```bash
-rosrun <pkg> joint_state_merger.py _gripper_source:=topic \
-    _gripper_topic:=/arm_1/gripper/joint_states _gripper_joint_name:=finger_joint
-```
-
-## STEP 2 — Jetson: ZED Mini → ROS camera topics (run from the PC)
-```bash
-cd /home/mrc-cuhk/Documents/dynamic_gaussian_splat/scripts
-# point at the robot master if not localhost:
-export ROS_MASTER_URI=http://<PC-or-robot-master>:11311
-./real_hw/run_zed_publisher.sh
-```
-Publishes (MUST match the PC subscriber — verified identical):
-- `/dynaarm_arm/dynaarm_arm/camera1/image_raw(/compressed)`  RGB
-- `/dynaarm_arm/dynaarm_arm/camera1/depth/image_raw`         32FC1 metres
-- `/dynaarm_arm/dynaarm_arm/camera1/camera_info`             K from the SDK (NEVER sim values)
-
-Note: the Jetson docstring still says "pose comes from gazebo_pose" — that line is now STALE for the
-elbow build. With DGS_REAL_HW_CAMERA=1 the pose is FK on the PC; nothing needs to publish gazebo_pose.
-
-## STEP 3 — sanity-check topics BEFORE launching the pipeline
-```bash
-rostopic hz   /dynaarm_arm/dynaarm_arm/camera1/image_raw      # ZED RGB alive
-rostopic echo -n1 /dynaarm_arm/dynaarm_arm/camera1/camera_info | grep -E "width|height|K:"   # REAL K, real res
-rostopic echo -n1 /dynaarm_arm/joint_states_full | head -3    # joints alive
-# camera_info width/height + cx must be the ZED's, NOT 1920x1200 cx=960.5 (that's the sim fallback bug).
-```
-
-## STEP 4 — launch the pipeline (PC)
-```bash
-cd /home/mrc-cuhk/Documents/dynamic_gaussian_splat/scripts
+# 4b. OR run the live pipeline
 export DGS_REAL_HW_CAMERA=1
-# FULL (capture static -> dynamic), live:
-dynamic_gs2/full_live.sh "../data_teleoperation/datasets/$(date +%Y-%m-%d_%H%M%S)" "<prompt>"
-# OR WARM (skip static, reuse static_state.pt):
-# dynamic_gs2/full_live.sh writes static_state.pt; later:
-# DGS_REAL_HW_CAMERA=1 dynamic_gs2/warm_live.sh "<data_dir>"
-```
-Viser live view: http://localhost:8081  (NOT :7007).
+/home/mrc-cuhk/Documents/dynamic_gaussian_splat/scripts/dynamic_gs2/full_live.sh \
+    "/home/mrc-cuhk/Documents/dynamic_gaussian_splat/data_teleoperation/datasets/$(date +%Y-%m-%d_%H%M%S)" "screwdriver"
+# warm (reuse static_state.pt):
+# DGS_REAL_HW_CAMERA=1 /home/mrc-cuhk/Documents/dynamic_gaussian_splat/scripts/dynamic_gs2/warm_live.sh "<data_dir>"
 
----
-
-## The "rigid link stuff" in the URDF — what it is, and is it useless now?
-In the gazebo URDF there is a Gazebo plugin:
-```xml
-<plugin filename="libactive_camera_arm_link_pose_publisher.so" name="camera_pose_link_publisher">
-  <linkName>dynaarm_WRIST_2_base</linkName>
-  <referenceLinkName>dynaarm_base</referenceLinkName>
-  <linkPoseOffset>0.1 0 0.0 0 -1.39626 -3.14159</linkPoseOffset>
-  <topicName>/dynaarm_arm/dynaarm_arm/camera1/gazebo_pose</topicName>
-</plugin>
-```
-This is the "rigid link" pose publisher: a GAZEBO-ONLY plugin that took WRIST_2_base, applied the
-fixed camera offset, and published the camera pose on `gazebo_pose` at 250 Hz. The old real-HW plan
-reused that topic for the pose.
-
-- On hardware there is NO Gazebo, so this plugin does not run — it produced the sim pose only.
-- With DGS_REAL_HW_CAMERA=1 the PC computes the pose by FK itself (`elbow_camera_optical_pose`), so
-  `gazebo_pose` is NOT consumed. The plugin is therefore **useless for the hardware test** (it was the
-  sim's way of doing the same FK the PC now does directly). It is NOT useless for SIM — leave it in the
-  URDF; sim still uses it when DGS_REAL_HW_CAMERA is unset.
-- The offset it bakes (`0.1 0 0.0 0 -1.39626 -3.14159` off WRIST_2_base) is the OLD wrist mount, NOT the
-  elbow mount. Do not copy it for the elbow camera — the elbow values live in ros_mask.py
-  (REAL_HW_CAMERA_XYZ / REAL_HW_CAMERA_ROT).
-```
+# viser: http://localhost:8081
 ```
 
-## Verified wiring (2026-06-21)
-- Topic names identical in zed_mini_publisher.py and dynamic_gs2/ros_mask.py (image/depth/camera_info).
-- Under DGS_REAL_HW_CAMERA=1: mask + saved pose both from FK(dynaarm_ELBOW)×offset; gazebo_pose unused.
-- Saved pose convention: ROS optical → OpenGL c2w via rotate_camera_frame_only (diag(1,-1,-1)).
-- Production render path runs EXIT 0; mask upright; example saved cam world pos for a test config.
-- NOT yet validated against a live ZED frame (no real capture run yet) — orientation rpy unconfirmed
-  on real data; refine with eye-in-hand hand-eye calib if the camera image disagrees with the mask.
+## Cabling / physical rig (matters for mask + reliability)
+- The ZED USB cable is NOT in the URDF, so cables drooping into the camera view are NOT masked out and
+  leak into the scene. FIX physically: tape the cables flush along the arm links running BACK toward the
+  base (camera looks along ELBOW +X — keep cables on the -X/back side, out of the frustum).
+- Leave a small SERVICE LOOP at the camera mount (slack clamped to the link) so arm rotation flexes the
+  loop, not the connector. This also prevents the mid-motion USB disconnects.
+- ZED video needs a real USB 3.0 port: `lsusb -t` must show the camera (2b03 Video/uvcvideo) at 5000M
+  under the 10000M root, NOT 12M/480M. A marginal USB3 link causes "CAMERA NOT DETECTED" on open AND can
+  deliver torn left/right-stereo-in-one-frame artifacts. The 12M HID leg (2b03 IMU) is normal.
+- NEVER unplug the camera while the publisher is streaming — it wedges the ZED firmware (needs power
+  cycle / reboot to recover). Stop the publisher first, then unplug.
+
+## Jetson clock sync (IMPORTANT — else the dynamic camera pose FREEZES)
+The ZED camera (Jetson) and the robot joints publish on different machine clocks. A big skew makes the
+dynamic-phase camera pose freeze (render stays still, FF inserts misaligned). The pipeline now:
+- re-stamps camera+joints with the PC clock on receipt (robust to skew),
+- runs a LAUNCH-TIME skew check: if camera<->joint stamps differ > 20 ms it warns and asks
+  `[s]top or default to [l]atest-joints pose?`. Headless: set `DGS_CLOCK_SKEW=stop|latest`.
+
+Permanent fix (Jetson chrony -> PC; re-do if Jetson is reflashed / chrony reset):
+```bash
+# PC: serve NTP to the Jetson subnet
+echo "allow 192.168.55.0/24" | sudo tee -a /etc/chrony/chrony.conf
+echo "local stratum 10"      | sudo tee -a /etc/chrony/chrony.conf
+sudo systemctl restart chrony
+# Jetson: add the PC as a source (ADDITIVE) + step now
+ssh -t shengzhiwang@192.168.55.1 '
+  echo "server 192.168.55.100 iburst minpoll 1 maxpoll 2" | sudo tee -a /etc/chrony/chrony.conf
+  sudo systemctl restart chrony && sudo chronyc -a makestep'
+# verify: ssh ...jetson "chronyc tracking"  -> Leap=Normal, "synchronized: yes", Ref=192-168-55-100
+```
+One-shot fallback (non-permanent, resets on reboot):
+`ssh -t shengzhiwang@192.168.55.1 "sudo date -u -s @$(date -u +%s.%N)"`

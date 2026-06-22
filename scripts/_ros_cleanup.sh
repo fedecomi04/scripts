@@ -183,7 +183,10 @@ dgs_ros_cleanup() {
 # aren't running -- a state no process cleanup can fix (it's sim-side).
 # Returns 0 if a pose message arrives within the window; else prints a
 # "Restart Gazebo" message and returns 1 so the caller aborts.
-DGS_POSE_TOPIC="/dynaarm_arm/dynaarm_arm/camera1/gazebo_pose"
+# Default = the sim gazebo_pose plugin. On real hardware that topic does not exist (the camera pose
+# comes from FK); export DGS_POSE_TOPIC=/dynaarm_arm/joint_states_full so the preflight checks a
+# topic that IS live instead of false-aborting.
+DGS_POSE_TOPIC="${DGS_POSE_TOPIC:-/dynaarm_arm/dynaarm_arm/camera1/gazebo_pose}"
 # Per-attempt timeout (s) and number of attempts. The pose plugin can publish
 # at a LOW effective wall-clock rate (sim-time + host load), so a single short
 # wait false-negatives on a healthy sim (observed 2026-06-14: a message took

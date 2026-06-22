@@ -91,6 +91,13 @@ INIT_CLOUD_NAME = "depth_camera_init_points.ply"
 MAX_INIT_CLOUD_POINTS = 600000
 BACKGROUND_COLOR_THRESHOLD = 10.0
 MASK_KEEP_ERODE_RADIUS_PX = 4
+# Extra full-res grow of the robot-exclusion mask (px), applied in _render_robot_exclusion_mask so it
+# affects BOTH the live and recording paths. Default 10 px on the real-HW elbow mount (the rendered
+# silhouette under-covers slightly), 0 in sim. Override with DGS_MASK_ROBOT_GROW_PX.
+try:
+    MASK_ROBOT_GROW_PX = int(os.environ.get("DGS_MASK_ROBOT_GROW_PX", "16" if REAL_HW_CAMERA else "0"))
+except ValueError:
+    MASK_ROBOT_GROW_PX = 16 if REAL_HW_CAMERA else 0
 MASK_MIN_KEEP_COMPONENT_AREA_PX = 64
 TIME_EPS_SEC = 1e-6
 
@@ -559,6 +566,16 @@ class RobotMaskGenerator:
         sample_idx = prev_idx if prev_idx is not None else next_idx
         if sample_idx is None:
             raise RuntimeError("No Gazebo joint state samples are available")
+        # The query landed OUTSIDE the joint buffer window -> we return a boundary (oldest/newest) sample.
+        # If every frame hits this, the camera pose FREEZES (the 2026 clock-skew bug). With receipt-time
+        # re-stamping this should not happen; warn loudly (throttled) with the skew so a future drift /
+        # clock reset is visible instead of a silent freeze.
+        edge = self.joint_state_times_sec[sample_idx]
+        skew = query_time_sec - edge
+        rospy.logwarn_throttle(
+            2.0, "[mask] joint query %.3f outside buffer [%.3f..%.3f] (skew %.3fs) -> boundary sample; "
+            "camera pose may be FROZEN. Check camera<->robot clock sync.",
+            query_time_sec, self.joint_state_times_sec[0], self.joint_state_times_sec[-1], skew)
         sample = self.joint_state_positions[sample_idx]
         return {name: value for name, value in sample.items() if name in self.actuated_joint_names}
 
@@ -586,9 +603,18 @@ class RobotMaskGenerator:
         offset[:3, 3] = REAL_HW_CAMERA_XYZ
         return parent.astype(np.float32) @ offset
 
+    # When True, elbow_camera_optical_pose ignores the passed stamp and uses the NEWEST joints. This is
+    # the launch-time "default to latest pose" fallback the operator can pick when the camera<->joint
+    # clocks are skewed beyond the threshold (so the camera-stamp bisect would freeze the pose).
+    use_latest_joints: bool = False
+
     def elbow_camera_optical_pose(self, stamp: rospy.Time) -> np.ndarray:
         # Public: the real-HW camera optical c2w at `stamp`, in the ROS optical frame. Callers that need
-        # an OpenGL/nerfstudio c2w should pass this through `rotate_camera_frame_only`.
+        # an OpenGL/nerfstudio c2w should pass this through `rotate_camera_frame_only`. Normally requires
+        # the Jetson (camera) clock to be synced to the robot/PC clock so `stamp` lands inside the joint
+        # buffer; if use_latest_joints is set (clock-skew fallback), the newest joints are used instead.
+        if self.use_latest_joints and self.joint_state_times_sec:
+            stamp = rospy.Time.from_sec(self.joint_state_times_sec[-1])
         joints = self._sample_joint_positions(stamp)
         link_fk = self.robot.link_fk(cfg=joints, use_names=True)
         return self._elbow_camera_pose_from_link_fk(link_fk)
@@ -708,6 +734,39 @@ class RobotMaskGenerator:
                 (self.intrinsics.width, self.intrinsics.height),
                 interpolation=cv2.INTER_NEAREST,
             )
+        # Grow the robot-exclusion (black) region by GROW px at full res, for both the live and recording
+        # paths (the live path skips _refine_keep_mask). keep is white=keep/black=robot.
+        #
+        # OUTER-ONLY grow: a plain erode(keep) dilates the robot in ALL directions, which fills the
+        # gripper's concave jaw gap and HIDES the object held there. Instead grow only into the OUTER
+        # background (keep pixels reachable from the image border), never into ENCLOSED keep regions (the
+        # jaw gap is white but surrounded by robot -> NOT border-reachable -> protected). Result: the
+        # outer silhouette grows, concavities stay open.
+        if MASK_ROBOT_GROW_PX > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                          (MASK_ROBOT_GROW_PX * 2 + 1, MASK_ROBOT_GROW_PX * 2 + 1))
+            grown = cv2.erode(keep, k, iterations=1)            # robot dilated everywhere (incl. inward)
+            ate = (keep > 0) & (grown == 0)                     # keep pixels the grow turned into robot
+            # Which keep pixels are OUTER background (border-reachable)? Flood-fill keep from the border.
+            kb = (keep > 0).astype(np.uint8)
+            ff = kb.copy()
+            ffmask = np.zeros((kb.shape[0] + 2, kb.shape[1] + 2), np.uint8)
+            # seed the flood from every border keep pixel
+            for x in range(kb.shape[1]):
+                if kb[0, x]:
+                    cv2.floodFill(ff, ffmask, (x, 0), 2)
+                if kb[kb.shape[0] - 1, x]:
+                    cv2.floodFill(ff, ffmask, (x, kb.shape[0] - 1), 2)
+            for y in range(kb.shape[0]):
+                if kb[y, 0]:
+                    cv2.floodFill(ff, ffmask, (0, y), 2)
+                if kb[y, kb.shape[1] - 1]:
+                    cv2.floodFill(ff, ffmask, (kb.shape[1] - 1, y), 2)
+            outer_bg = (ff == 2)                                # border-reachable keep = outer background
+            # Only let the grow eat OUTER background; restore any enclosed (interior) keep it consumed.
+            keep = grown.copy()
+            restore = ate & (~outer_bg)
+            keep[restore] = 255
         if sweep:
             self._sweep_t.append((time.time() - _t0) * 1000.0)
             self._sweep_t_render.append(_gl)

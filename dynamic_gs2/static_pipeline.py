@@ -271,8 +271,21 @@ class _RedBoxUI:
             l, t = (W - s) // 2, (H - s) // 2
             cv2.rectangle(img, (l, t), (l + s, t + s), (0, 0, 255), 3)
         rgb = np.ascontiguousarray(img[..., ::-1])      # BGR -> RGB for viser
+        # Frame-size change guard. When the camera resolution changes mid-session (e.g. ZED 720p->1080p),
+        # a browser tab opened at the old size keeps a canvas of the old W/H; a new-size frame pushed into
+        # it renders at the OLD stride -> the image wraps horizontally and looks like two half-frames side
+        # by side ("right part on the left, left part on the right"). Log it so the cause is obvious, and
+        # push a 1x1 reset first so the browser re-creates the background at the new size.
+        last = getattr(self, "_last_push_hw", None)
+        if last is not None and last != (H, W):
+            print(f"[static] viser feed size changed {last} -> {(H, W)}; resetting background "
+                  "(hard-refresh the tab if the image looks split)", flush=True)
+        self._last_push_hw = (H, W)
         try:
             for _cid, client in self._server.get_clients().items():
+                if last is not None and last != (H, W):
+                    client.scene.set_background_image(
+                        np.zeros((1, 1, 3), dtype=np.uint8), format="jpeg")
                 client.scene.set_background_image(rgb, format="jpeg")
         except Exception:
             pass
@@ -427,8 +440,17 @@ def run_static(data_dir, cfg, device, *, prompt_text: str = "", source_kind: str
         static_segment.write_seg_folder(anchor, objects, prompt)
     tm.event("objects_found", n=len(objects))
     print(f"[static] segmentation: done — {len(objects)} object(s)", flush=True)
-    if objects:                          # valid segmentation -> unload FastSAM (~0.85 GB) from the shared
-        reg["fastsam"].release()         # worker NOW, so it isn't held idle through the ~10 s SAM3D infer
+    if not objects:
+        # Fail fast with a clear retry message. Without this the pipeline runs SAM3D + fusion + train
+        # on an empty object set, leaving object_instance_ids all-zero, and only crashes ~30 s later in
+        # the tracker with the opaque "no tracked object" error. Stop here and tell the operator to retry.
+        reg["fastsam"].release()
+        raise RuntimeError(
+            f"segmentation found 0 objects for prompt '{prompt}'. RETRY: re-run and make sure the object "
+            "is clearly in the camera view (fills the red box) at trigger time, and the prompt is a short "
+            "noun matching it (e.g. 'screwdriver'). Nothing was fused, so there is no object to track.")
+    reg["fastsam"].release()             # valid segmentation -> unload FastSAM (~0.85 GB) from the shared
+                                         # worker NOW, so it isn't held idle through the ~10 s SAM3D infer
     ui.done("segment")
     ui.begin("generate", keep=("capture",))
 

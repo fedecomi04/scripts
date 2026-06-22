@@ -39,3 +39,9 @@ experiments/
 # over GitHub's 100 MB limit). Fetch from upstream, don't commit.
 weights/
 RenderOption_*.json
+
+# Transient probe/run logs + a large scratch frame dump (45 MB) — regenerated,
+# not version-controlled.
+_probe_*.log
+rewrite_spec/_resume_*.log
+real_hw/frame_dump/

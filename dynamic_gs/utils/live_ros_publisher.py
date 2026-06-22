@@ -338,13 +338,24 @@ HDR_OFFSETS = _compute_header_field_offsets()
 
 
 class _KeyframeFilter:
-    """ORB-SLAM-style greedy keyframe filter. NumPy only; no torch."""
+    """ORB-SLAM-style greedy keyframe filter. NumPy only; no torch.
 
-    def __init__(self, translation_thresh_m: float, rotation_thresh_deg: float):
+    Two modes:
+      * motion dedup (default): accept a frame only when the camera has moved past the
+        translation/rotation thresholds vs every kept frame. Right for a hand-swept camera.
+      * time interval (interval_s > 0): accept a frame every interval_s seconds regardless of
+        camera motion. Right for a camera FIXED to the arm (e.g. real-HW elbow mount) where the
+        static scene is captured without sweeping — motion dedup would keep only the first frame.
+    """
+
+    def __init__(self, translation_thresh_m: float, rotation_thresh_deg: float,
+                 interval_s: float = 0.0):
         self.t_thresh = float(translation_thresh_m)
         self.r_thresh_rad = float(np.deg2rad(rotation_thresh_deg))
+        self.interval_s = float(interval_s)
         self._kept_R = []  # type: List[np.ndarray]
         self._kept_t = []  # type: List[np.ndarray]
+        self._last_accept_t = None  # type: Optional[float]
 
     @property
     def num_kept(self) -> int:
@@ -353,6 +364,7 @@ class _KeyframeFilter:
     def reset(self) -> None:
         self._kept_R.clear()
         self._kept_t.clear()
+        self._last_accept_t = None
 
     def accept(self, c2w_3x4) -> bool:
         c2w = np.asarray(c2w_3x4, dtype=np.float64)
@@ -360,6 +372,17 @@ class _KeyframeFilter:
             raise ValueError("expected (3,4) c2w, got {}".format(c2w.shape))
         R_i = c2w[:, :3]
         t_i = c2w[:, 3]
+
+        # Time-interval mode: fixed camera, accept on a wall-clock cadence (1st frame always kept).
+        if self.interval_s > 0.0:
+            now = time.time()
+            if self._last_accept_t is not None and (now - self._last_accept_t) < self.interval_s:
+                return False
+            self._last_accept_t = now
+            self._kept_R.append(R_i)
+            self._kept_t.append(t_i)
+            return True
+
         if not self._kept_R:
             self._kept_R.append(R_i)
             self._kept_t.append(t_i)
@@ -628,9 +651,19 @@ class LivePublisher:
         # when stop_recording returns; the fusion watcher then misses that frame.
         self._inflight_writes = 0
         self._inflight_cv = threading.Condition(self._record_lock)
+        # Static keyframe acceptance. With the camera FIXED to the arm (real-HW elbow mount) there is
+        # no sweep, so motion dedup keeps only the first frame. DGS_STATIC_INTERVAL_S switches to
+        # time-based capture (every N s); defaults to 1.0 s when DGS_REAL_HW_CAMERA is set, else 0
+        # (motion dedup unchanged for the sim hand-sweep).
+        _default_interval = 1.0 if REAL_HW_CAMERA else 0.0
+        try:
+            _static_interval_s = float(os.environ.get("DGS_STATIC_INTERVAL_S", _default_interval))
+        except ValueError:
+            _static_interval_s = _default_interval
         self._record_keyframe_filter = _KeyframeFilter(
             translation_thresh_m=keyframe_translation_m,
             rotation_thresh_deg=keyframe_rotation_deg,
+            interval_s=_static_interval_s,
         )
 
         # Sim-to-real ZED-X depth-error model (ON by default; DGS_SIM_ZED_NOISE=0 disables).
@@ -822,7 +855,15 @@ class LivePublisher:
     _POSE_JOINT_MIN_DT_SEC = 0.02
 
     def _on_joint_state(self, msg: JointState) -> None:
-        stamp_sec = float(msg.header.stamp.to_sec())
+        # Robust real-HW time base: re-stamp on RECEIPT with the PC clock. The camera (Jetson) and the
+        # robot publish on different machine clocks; matching them by their own stamps freezes the FK
+        # pose when the clocks disagree (observed: Jetson stuck in 2023). Re-stamping BOTH the joints
+        # (here) and the camera frames (_on_synced) with rospy.Time.now() puts them on ONE clock, so the
+        # joint<->camera bisect is correct regardless of cross-machine clock skew or NTP state.
+        if REAL_HW_CAMERA:
+            stamp_sec = float(rospy.Time.now().to_sec())
+        else:
+            stamp_sec = float(msg.header.stamp.to_sec())
         if stamp_sec <= 0.0 or not msg.name or not msg.position:
             return
         if (self._joint_state_times_sec and
@@ -962,6 +1003,14 @@ class LivePublisher:
         """
         import time as _t
 
+        # Robust real-HW time base (see _on_joint_state): re-stamp the camera frames on RECEIPT with the
+        # PC clock, so the camera stamp shares ONE clock with the re-stamped joints. One Time.now() for
+        # both image+depth keeps RGB/depth paired. Every downstream user reads image_msg.header.stamp.
+        if REAL_HW_CAMERA:
+            _pc_now = rospy.Time.now()
+            image_msg.header.stamp = _pc_now
+            depth_msg.header.stamp = _pc_now
+
         # Output-rate cap (off by default): drop this frame BEFORE enqueue if it arrived within
         # min_frame_dt of the last kept one — skips the entire decode + mask-GL + SHM worker path for it.
         if self._min_frame_dt > 0.0:
@@ -986,11 +1035,60 @@ class LivePublisher:
             except Exception:
                 pass
 
+    def _check_camera_joint_clock_skew(self, threshold_s: float = 0.020) -> None:
+        """Real-HW launch check: compare the RAW camera vs joint stream stamps. They are stamped on
+        different machines (Jetson camera vs robot joints); a large skew means the camera-stamp->joint
+        bisect would FREEZE the FK pose in the dynamic phase. Receipt-re-stamping makes the pipeline
+        robust regardless, but a skew still signals a misconfigured clock, so warn + let the operator
+        STOP or default to the latest-joints pose. >threshold_s (default 20 ms) triggers the prompt."""
+        if not REAL_HW_CAMERA:
+            return
+        try:
+            cam = rospy.wait_for_message(IMAGE_TOPIC + "/compressed", CompressedImage, timeout=5.0)
+            jnt = rospy.wait_for_message(GAZEBO_JOINT_STATES_TOPIC, JointState, timeout=5.0)
+        except rospy.ROSException:
+            rospy.logwarn("[live] clock-skew check: couldn't sample camera+joint stamps (timeout); skipping")
+            return
+        skew = abs(cam.header.stamp.to_sec() - jnt.header.stamp.to_sec())
+        rospy.loginfo("[live] camera<->joint raw clock skew = %.1f ms", skew * 1000.0)
+        if skew <= threshold_s:
+            return
+        msg = ("[live] CLOCK SKEW %.0f ms > %.0f ms between camera (Jetson) and joints (robot). "
+               "The camera-stamp pose lookup may FREEZE in the dynamic phase. Sync the Jetson clock "
+               "(NTP -> PC) to fix it properly." % (skew * 1000.0, threshold_s * 1000.0))
+        rospy.logwarn(msg)
+        # Ask the operator (only if interactive). DGS_CLOCK_SKEW=stop|latest forces the answer headless.
+        forced = os.environ.get("DGS_CLOCK_SKEW", "").strip().lower()
+        if forced in ("stop", "latest"):
+            choice = forced
+        elif sys.stdin is not None and sys.stdin.isatty():
+            print(msg, file=sys.stderr, flush=True)
+            ans = input("  [s]top, or default to [l]atest-joints pose? (s/l): ").strip().lower()
+            choice = "stop" if ans.startswith("s") else "latest"
+        else:
+            rospy.logwarn("[live] non-interactive; defaulting to LATEST-joints pose. "
+                          "Set DGS_CLOCK_SKEW=stop to abort instead.")
+            choice = "latest"
+        if choice == "stop":
+            raise RuntimeError("aborted: camera<->joint clock skew %.0f ms (sync the Jetson clock)"
+                               % (skew * 1000.0))
+        # latest: build the mask gen now (if needed) and flip it into latest-joints mode.
+        if self._mask_gen is None:
+            self._mask_gen = RobotMaskGenerator(
+                intrinsics=self.intrinsics,
+                joint_state_times_sec=self._joint_state_times_sec,
+                joint_state_positions=self._joint_state_positions,
+            )
+        self._mask_gen.use_latest_joints = True
+        rospy.logwarn("[live] using LATEST-joints pose (clock-skew fallback). The pose tracks the "
+                      "freshest arm state instead of matching the camera stamp.")
+
     def start_worker(self) -> None:
         """Spawn the worker thread that drains _frame_queue. Call once
         after subscriptions are set up."""
         if self._worker_thread is not None:
             return
+        self._check_camera_joint_clock_skew()
         if not self._mask_thread_off:
             self._mask_thread = threading.Thread(
                 target=self._mask_thread_loop, name="dgs-publisher-mask", daemon=True,
