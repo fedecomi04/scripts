@@ -56,6 +56,12 @@ class TrackerConfig:
     ransac_iterations: int = 68          # tuned: stabler inlier consensus, fewer flick-backs
     ransac_inlier_threshold: float = 0.004   # m; tuned: stricter inliers (cleaner pose) ↓ = stricter
     lighterglue_depth_confidence: float = -1.0
+    # LighterGlue match-acceptance confidence gate. UNTESTED-in-pipeline lowered value: the estimator
+    # default 0.1 was measured to over-reject correct matches on a small/rotated object (<=4 matches
+    # where MNN+RANSAC recovered 89 valid inliers @1.9mm); 0.02 recovered them in the offline
+    # tracking-viz. Lowering it here is expected to raise inlier counts (and may reduce the pose
+    # shaking) — NEEDS a live/replay run to confirm the RANSAC pose. ↓ = more (looser) matches.
+    lighterglue_min_conf: float = 0.02
     crop_to_object_bbox: bool = True
     crop_padding_px: int = 150
     object_mask_filter: bool = True
@@ -292,6 +298,7 @@ def load_runtime_config() -> RuntimeConfig:
         top_k=_envi("DGS_XFEAT_TOP_K", 1024),
         ransac_iterations=_envi("DGS_XFEAT_RANSAC_ITERS", 68),   # ↑ = stabler inlier consensus, less jitter
         ransac_inlier_threshold=_envf("DGS_XFEAT_RANSAC_INLIER_M", 0.004),  # ↓ = stricter inliers
+        lighterglue_min_conf=_envf("DGS_XFEAT_LG_MIN_CONF", 0.02),  # ↓ = looser LighterGlue matches
         scale_select=_envb("DGS_XFEAT_SCALE_SELECT", False),
         static_hold_window=_envi("DGS_HOLD_WINDOW", 15),
         static_hold_trans_mm=_envf("DGS_HOLD_TRANS_MM", 25.0),

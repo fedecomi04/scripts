@@ -59,6 +59,7 @@ class XFeatTracker:
             anchor_rotation_gate_deg=tracker_cfg.rotation_gate_deg,
             anchor_scale_gate=tracker_cfg.scale_gate_ratio,
             lighterglue_depth_confidence=tracker_cfg.lighterglue_depth_confidence,
+            lighterglue_min_conf=tracker_cfg.lighterglue_min_conf,
             pose_filter_enabled=pose_filter_cfg.enabled,
             pose_filter_accel_sigma=pose_filter_cfg.accel_sigma,
             pose_filter_alpha_sigma=pose_filter_cfg.alpha_sigma,
