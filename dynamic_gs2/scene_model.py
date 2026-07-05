@@ -17,15 +17,28 @@ import torch.nn as nn
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig
 
-# Try to disable densification (static phase mutates count surgically, not via
-# Splatfacto's clone/split/prune). NoRefineStrategy lives in the old package; we
-# re-import it if present, else fall back to a no-op post-backward.
-try:
-    from dynamic_gs.utils.no_refine_strategy import NoRefineStrategy  # type: ignore
-    _HAVE_NOREFINE = True
-except Exception:                                                      # pragma: no cover
-    NoRefineStrategy = None
-    _HAVE_NOREFINE = False
+# Disable densification (static phase mutates count surgically, not via
+# Splatfacto's clone/split/prune). No-op replacement for gsplat refinement
+# strategies (inlined verbatim from the old dynamic_gs.utils.no_refine_strategy).
+class NoRefineStrategy:
+    """No-op replacement for gsplat refinement strategies."""
+
+    absgrad = False
+
+    def initialize_state(self, **kwargs):
+        del kwargs
+        return {}
+
+    def step_pre_backward(self, *args, **kwargs):
+        del args, kwargs
+        return None
+
+    def step_post_backward(self, *args, **kwargs):
+        del args, kwargs
+        return None
+
+
+_HAVE_NOREFINE = True
 
 _GAZEBO_SKY = (0.86, 0.92, 1.0)          # Invariant #6
 _PARAM_NAMES = ("means", "features_dc", "features_rest", "scales", "quats", "opacities")

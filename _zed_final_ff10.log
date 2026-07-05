@@ -1,0 +1,63 @@
+[warm_recorded] warm-start dynamic, replaying transforms.json on /home/mrc-cuhk/Documents/dynamic_gaussian_splat/data_teleoperation/datasets/zed_final --ff --fps 10 --loop
+/home/mrc-cuhk/miniconda3/envs/dynamic_gs/lib/python3.12/site-packages/kornia/feature/lightglue.py:44: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+[static_persist] WARNING config fingerprint drift: cache=68f7076491360bd8 current=9baba91aa3b4c371 — loading anyway (geometry intact; tuning knobs differ).
+loading weights from: /home/mrc-cuhk/Documents/dynamic_gaussian_splat/scripts/third_party/xfeat/weights/xfeat.pt
+Loaded LightGlue model
+[xfeat] LighterGlue matcher enabled (weights: /home/mrc-cuhk/Documents/dynamic_gaussian_splat/scripts/third_party/xfeat/weights/xfeat-lighterglue.pt, depth_conf=-1.0)
+[xfeat-hold] static-hold: window=15 trans=25.0mm rot=10.0deg
+[ff-decode] AnySplat worker pre-warmed (ready for first decode)
+╭──────────────── viser ────────────────╮
+│             ╷                         │
+│   HTTP      │ http://localhost:8081   │
+│   Websocket │ ws://localhost:8081     │
+│             ╵                         │
+╰───────────────────────────────────────╯
+[viser] viewer at http://localhost:8081  (orbit to inspect the tracked scene)
+[pipeline] LIVE: d0_instance_id=1, scene=570702 gaussians, source=replay
+[xfeat-anchor] pool size: 2 (added; nearest rot=19.0deg scale=1.31x dist=0.39m, 212 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=24.1deg scale=1.05x dist=0.49m, 150 keypoints)
+[xfeat-anchor] pool size: 4 (added; nearest rot=3.1deg scale=1.05x dist=0.37m, 228 keypoints)
+[xfeat-anchor] pool size: 2 (added; nearest rot=19.2deg scale=1.31x dist=0.39m, 213 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=24.7deg scale=1.05x dist=0.49m, 151 keypoints)
+[xfeat-anchor] pool size: 4 (added; nearest rot=3.8deg scale=1.06x dist=0.37m, 263 keypoints)
+[ff-decode] insert scale cap active: clamping splats over max_scale_m=0.02 (first hit: 6 over, biggest 2.2cm). Silenced hereafter.
+[xfeat-anchor] pool size: 2 (added; nearest rot=19.2deg scale=1.31x dist=0.39m, 213 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=24.7deg scale=1.05x dist=0.49m, 151 keypoints)
+[xfeat-anchor] pool size: 4 (added; nearest rot=4.2deg scale=1.07x dist=0.37m, 267 keypoints)
+[xfeat-anchor] pool size: 2 (added; nearest rot=19.2deg scale=1.31x dist=0.39m, 213 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=24.7deg scale=1.05x dist=0.49m, 149 keypoints)
+[xfeat-anchor] pool size: 4 (added; nearest rot=3.1deg scale=1.05x dist=0.37m, 250 keypoints)
+[xfeat-anchor] pool size: 2 (added; nearest rot=19.2deg scale=1.31x dist=0.39m, 213 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=24.7deg scale=1.05x dist=0.49m, 151 keypoints)
+[xfeat-anchor] pool size: 4 (added; nearest rot=3.8deg scale=1.06x dist=0.37m, 263 keypoints)
+[xfeat-anchor] pool size: 2 (added; nearest rot=22.9deg scale=1.05x dist=0.49m, 140 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=24.6deg scale=1.01x dist=0.48m, 168 keypoints)
+[xfeat-anchor] pool size: 4 (added; nearest rot=9.6deg scale=1.30x dist=0.37m, 309 keypoints)
+[xfeat-anchor] pool size: 2 (added; nearest rot=19.2deg scale=1.31x dist=0.39m, 213 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=25.3deg scale=1.05x dist=0.49m, 131 keypoints)
+[xfeat-anchor] pool size: 2 (added; nearest rot=19.2deg scale=1.31x dist=0.39m, 213 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=24.7deg scale=1.05x dist=0.49m, 151 keypoints)
+[xfeat-anchor] pool size: 4 (added; nearest rot=3.8deg scale=1.06x dist=0.37m, 290 keypoints)
+[xfeat-anchor] pool size: 2 (added; nearest rot=22.9deg scale=1.05x dist=0.49m, 140 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=24.2deg scale=1.01x dist=0.48m, 167 keypoints)
+[xfeat-anchor] pool size: 4 (added; nearest rot=12.2deg scale=1.31x dist=0.37m, 311 keypoints)
+[xfeat-anchor] pool size: 2 (added; nearest rot=22.9deg scale=1.05x dist=0.49m, 140 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=25.1deg scale=1.02x dist=0.48m, 146 keypoints)
+[xfeat-anchor] pool size: 4 (added; nearest rot=13.8deg scale=1.33x dist=0.36m, 227 keypoints)
+[xfeat-anchor] pool size: 2 (added; nearest rot=18.1deg scale=1.31x dist=0.39m, 225 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=22.5deg scale=1.06x dist=0.49m, 152 keypoints)
+[xfeat-anchor] pool size: 4 (added; nearest rot=6.4deg scale=1.06x dist=0.37m, 271 keypoints)
+[xfeat-anchor] pool size: 2 (added; nearest rot=19.2deg scale=1.31x dist=0.39m, 213 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=25.3deg scale=1.05x dist=0.49m, 131 keypoints)
+[xfeat-anchor] pool size: 2 (added; nearest rot=22.9deg scale=1.05x dist=0.49m, 140 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=24.1deg scale=1.02x dist=0.50m, 156 keypoints)
+(viser) Connection opened (0, 1 total), 14 persistent messages
+[xfeat-anchor] pool size: 4 (added; nearest rot=12.4deg scale=1.31x dist=0.37m, 236 keypoints)
+[xfeat-anchor] pool size: 2 (added; nearest rot=19.4deg scale=1.34x dist=0.39m, 177 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=23.7deg scale=1.06x dist=0.49m, 150 keypoints)
+[xfeat-anchor] pool size: 4 (added; nearest rot=4.6deg scale=1.04x dist=0.37m, 260 keypoints)
+[xfeat-anchor] pool size: 2 (added; nearest rot=19.2deg scale=1.31x dist=0.39m, 210 keypoints)
+[xfeat-anchor] pool size: 3 (added; nearest rot=24.5deg scale=1.05x dist=0.49m, 149 keypoints)
+[xfeat-anchor] pool size: 4 (added; nearest rot=3.0deg scale=1.05x dist=0.37m, 224 keypoints)
+(viser) Connection closed (0, 0 total)

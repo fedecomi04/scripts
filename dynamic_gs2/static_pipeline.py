@@ -10,7 +10,7 @@ exported warm-cache. (rewrite_spec/static_phase.md §1/§4.)
 ONE source-agnostic entry point:
   run_static(source_kind=...) : the deep stages (segment / SAM3D / seed / train / Phase-0b fuse)
       are identical no matter where the frames come from; ONLY the front end differs.
-        live_bridge / ros1 : SWEEP the SHM stream into the red-box trigger UI + record static_scene/.
+        live_bridge        : SWEEP the SHM stream into the red-box trigger UI + record static_scene/.
         replay (recorded)  : NO UI, NO sweep — static_scene/ is already on disk; anchor = the last
             keyframe (or trigger_frame). Prints phase boundaries instead of the viser checklist.
       Returns the dynamic_gs2 static_state.pt path, OR (path, (sm,gset,lock), registry) when
@@ -86,7 +86,7 @@ def _build_seed_deferred(static_dir) -> None:
     env = dict(os.environ)
     env.setdefault("DGS_TSDF_VOXEL_M", "0.003")          # 3 mm — matches SweepSeedBuilder.SEED_VOXEL_M
     env["DGS_FUSION_DEVICE"] = "cpu"                      # CPU ALWAYS (can't OOM the GPU; better fit)
-    r = _sp.run([_sys.executable, "-m", "dynamic_gs.utils.online_fusion", str(static_dir)],
+    r = _sp.run([_sys.executable, "-m", "dynamic_gs2.online_fusion", str(static_dir)],
                 env=env, capture_output=True, text=True, timeout=900)
     if r.returncode != 0 or not (static_dir / "depth_camera_init_points.ply").exists():
         raise RuntimeError(f"CPU TSDF build failed rc={r.returncode}: {(r.stderr or '')[-400:]}")
@@ -322,7 +322,7 @@ def run_static(data_dir, cfg, device, *, prompt_text: str = "", source_kind: str
     """The ONE static-phase orchestrator — source-agnostic. The deep stages (segment / SAM3D / seed /
     train / Phase-0b fuse) are identical no matter where the frames come from; ONLY the front end differs:
 
-      live_bridge / ros1 : SWEEP the SHM stream into the red-box trigger UI + record static_scene/,
+      live_bridge        : SWEEP the SHM stream into the red-box trigger UI + record static_scene/,
           anchor = the frame on the operator's Trigger (button / Enter).
       replay (recorded)  : NO UI, NO sweep — static_scene/ is already on disk; anchor = the LAST
           keyframe (or trigger_frame), reusing the existing seed PLY. Prints phase boundaries.
@@ -337,7 +337,7 @@ def run_static(data_dir, cfg, device, *, prompt_text: str = "", source_kind: str
     model_loader.set_timing_ledger(tm)   # so bg prewarm threads record load.{sam3d,fastsam,anysplat,xfeat}
     data_dir = Path(data_dir)
     prompt = prompt_text or cfg.segmentation.prompt_text
-    is_live = source_kind in ("live_bridge", "ros1")
+    is_live = source_kind in ("live_bridge",)
 
     # AnySplat is prewarmed for the dynamic loop's feedforward ONLY — gate on ff_enabled so a --no-ff run
     # never spawns its ~17 s / ~3.5 GB worker (which the FF-off dynamic loop would never adopt or free).
@@ -411,7 +411,7 @@ def run_static(data_dir, cfg, device, *, prompt_text: str = "", source_kind: str
         # sentinel lives in LIVE_ROOT, which the SEPARATE dynamic publisher rmtree's at its own spawn,
         # so dynamic always comes back full mask+depth+rate.
         try:
-            from dynamic_gs.utils.live_shm_reader import LIVE_ROOT as _LIVE_ROOT
+            from .publisher_spawn import LIVE_ROOT as _LIVE_ROOT
             (Path(_LIVE_ROOT) / ".rgb_only").touch()
         except Exception as _e:
             print(f"[static] WARNING: could not set rgb-only sentinel ({_e})", flush=True)
@@ -552,7 +552,7 @@ def _main():
     ap.add_argument("--data", required=True, help="dataset dir")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--prompt", default="", help="object text prompt (else cfg/DGS_SAM3_PROMPT)")
-    ap.add_argument("--source", default="live_bridge", help="live source kind (live_bridge|ros1)")
+    ap.add_argument("--source", default="live_bridge", help="live source kind (live_bridge)")
     ap.add_argument("--box-px", type=int, default=500, help="live: red-box side in px")
     ap.add_argument("--no-prewarm", dest="prewarm", action="store_false", default=True,
                     help="DEFAULT prewarms AnySplat+XFeat DURING the static train (hidden under it) so "

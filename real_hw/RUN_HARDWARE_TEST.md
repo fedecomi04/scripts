@@ -23,8 +23,6 @@ export DGS_POSE_TOPIC=/dynaarm_arm/joint_states_full   # skip the dead gazebo_po
 
 # 4b. OR run the live pipeline
 export DGS_REAL_HW_CAMERA=1
-/home/mrc-cuhk/Documents/dynamic_gaussian_splat/scripts/dynamic_gs2/full_live.sh \
-    "/home/mrc-cuhk/Documents/dynamic_gaussian_splat/data_teleoperation/datasets/$(date +%Y-%m-%d_%H%M%S)" "screwdriver"
 # warm (reuse static_state.pt):
 # DGS_REAL_HW_CAMERA=1 /home/mrc-cuhk/Documents/dynamic_gaussian_splat/scripts/dynamic_gs2/warm_live.sh "<data_dir>"
 
@@ -32,6 +30,7 @@ export DGS_REAL_HW_CAMERA=1
 ```
 
 ## Cabling / physical rig (matters for mask + reliability)
+- IF ZEDMINI GIVES ERRORS JUST UNPLUG BOTH ENDS OF THE USB CABLE WAIT 5  TO 10 SECONDS AND REPLUG   
 - The ZED USB cable is NOT in the URDF, so cables drooping into the camera view are NOT masked out and
   leak into the scene. FIX physically: tape the cables flush along the arm links running BACK toward the
   base (camera looks along ELBOW +X — keep cables on the -X/back side, out of the frustum).

@@ -1,0 +1,70 @@
+WARNING: Package name "A1_arm_description" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_6DOF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_7DOF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_8DoF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_V0_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "A1_arm_description" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_6DOF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_7DOF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_8DoF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_V0_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "A1_arm_description" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_6DOF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_7DOF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_8DoF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_V0_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "A1_arm_description" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_6DOF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_7DOF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_8DoF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_V0_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "A1_arm_description" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_6DOF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_7DOF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_8DoF_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+WARNING: Package name "Camera_arm_V0_URDF" does not follow the naming conventions. It should start with a lower case letter and only contain lower case letters, digits, underscores, and dashes.
+Invalid MIT-MAGIC-COOKIE-1 keyInvalid MIT-MAGIC-COOKIE-1 keyInvalid MIT-MAGIC-COOKIE-1 key[0m[ INFO] [1782153898.234365181]: Finished loading Gazebo ROS API Plugin.[0m
+[0m[ INFO] [1782153898.235056079]: waitForService: Service [/gazebo/set_physics_properties] has not been advertised, waiting...[0m
+[1;33mWarning [parser.cc:833][0m XML Attribute[version] in element[sdf] not defined in SDF, ignoring.
+[1;33mWarning [parser.cc:833][0m XML Attribute[version] in element[sdf] not defined in SDF, ignoring.
+[1;33mWarning [parser.cc:833][0m XML Attribute[version] in element[sdf] not defined in SDF, ignoring.
+Aborted (core dumped)
+[INFO] [1782153897.996622, 0.000000]: Loading model XML from ros parameter dynaarm_description
+[INFO] [1782153898.000651, 0.000000]: Waiting for service /gazebo/spawn_urdf_model
+[INFO] [1782153898.603926, 0.000000]: Calling service /gazebo/spawn_urdf_model
+[INFO] [1782153899.928415, 0.001000]: Spawn status: SpawnModel: Successfully spawned entity
+[33m[ WARN] [1782153900.044906273, 0.001000000]: No imu specified[0m
+[33m[ WARN] [1782153900.045083569, 0.001000000]: No contacts specified[0m
+[0m[ INFO] [1782153898.419018262]: waitForService: Service [/gazebo/set_physics_properties] is now available.[0m
+[0m[ INFO] [1782153898.428798723]: Physics dynamic reconfigure ready.[0m
+[0m[ INFO] [1782153899.939134926, 0.001000000]: Loading gazebo_ros_control plugin[0m
+[0m[ INFO] [1782153899.939188876, 0.001000000]: Starting gazebo_ros_control plugin in namespace: dynaarm_arm[0m
+[0m[ INFO] [1782153899.939438737, 0.001000000]: gazebo_ros_control plugin is waiting for model URDF in parameter [/dynaarm_arm/dynaarm_description] on the ROS param server.[0m
+[0m[ INFO] [1782153900.046852350, 0.001000000]: Loaded gazebo_ros_control.[0m
+[0m[ INFO] [1782153900.056200722, 0.001000000]: StampedLinkPosePublisher publishing dynaarm_WRIST_2_base to /dynaarm_arm/dynaarm_arm/camera1/gazebo_pose in frame dynaarm_arm_tf/world[0m
+[0m[ INFO] [1782153900.058640694, 0.001000000]: MimicJointPlugin loaded! Joint: "finger_joint", Mimic joint: "left_inner_knuckle_joint", Multiplier: 1, Offset: 0, MaxEffort: 1000, Sensitiveness: 0[0m
+[0m[ INFO] [1782153900.058672827, 0.001000000]: MimicJointPlugin loaded! Joint: "finger_joint", Mimic joint: "left_inner_finger_joint", Multiplier: -1, Offset: 0, MaxEffort: 1000, Sensitiveness: 0[0m
+[0m[ INFO] [1782153900.058689412, 0.001000000]: MimicJointPlugin loaded! Joint: "finger_joint", Mimic joint: "right_inner_knuckle_joint", Multiplier: 1, Offset: 0, MaxEffort: 1000, Sensitiveness: 0[0m
+[0m[ INFO] [1782153900.058704379, 0.001000000]: MimicJointPlugin loaded! Joint: "finger_joint", Mimic joint: "right_inner_finger_joint", Multiplier: -1, Offset: 0, MaxEffort: 1000, Sensitiveness: 0[0m
+[0m[ INFO] [1782153900.058719575, 0.001000000]: MimicJointPlugin loaded! Joint: "finger_joint", Mimic joint: "right_finger_joint", Multiplier: 1, Offset: 0, MaxEffort: 1000, Sensitiveness: 0[0m
+[1;32m[Msg] [0m[1;32mLoading grasp-fix plugin[0m[1;32m
+[0m[1;32m[0m[1;32m[Msg] [0m[1;32mGazeboGraspFix: Using disable_collisions_on_attach [0m[1;32m0[0m[1;32m
+[0m[1;32m[0m[1;32m[Msg] [0m[1;32mGazeboGraspFix: Using update rate [0m[1;32m200[0m[1;32m
+[0m[1;32m[0m[1;32m[Msg] [0m[1;32mGazeboGraspFix: Using max_grip_count [0m[1;32m10[0m[1;32m
+[0m[1;32m[0m[1;32m[Msg] [0m[1;32mGazeboGraspFix: Using grip_count_threshold [0m[1;32m6[0m[1;32m
+[0m[1;32m[0m[1;32m[Msg] [0m[1;32mGazeboGraspFix: Using release_tolerance [0m[1;32m0.0015[0m[1;32m
+[0m[1;32m[0m[1;32m[Msg] [0m[1;32mGazeboGraspFix: Adding collision scoped name [0m[1;32mDynaarm_Arm::left_inner_finger::left_inner_finger_pad_collision[0m[1;32m
+[0m[1;32m[0m[1;32m[Msg] [0m[1;32mGazeboGraspFix: Adding collision scoped name [0m[1;32mDynaarm_Arm::right_inner_finger::right_inner_finger_pad_collision[0m[1;32m
+[0m[1;32m[0m[1;32m[Msg] [0m[1;32mSubscribing contact manager to topic [0m[1;32m~/Dynaarm_Arm/contacts[0m[1;32m
+[0m[1;32m[0m[1;32m[Msg] [0m[1;32mAdvertising grasping events on topic grasp_events[0m[1;32m
+[0m[1;32m[0mDynaarmController::starting()
+[33m[ WARN] [1782153936.494211101, 36.337000000]: Joint state with name: "joint1" was received but not found in URDF[0m
+[33m[ WARN] [1782153946.510668390, 46.337000000]: Joint state with name: "joint1" was received but not found in URDF[0m
+[33m[ WARN] [1782153956.517710510, 56.337000000]: Joint state with name: "joint1" was received but not found in URDF[0m
+[33m[ WARN] [1782153966.535561559, 66.337000000]: Joint state with name: "joint1" was received but not found in URDF[0m
+[33m[ WARN] [1782153976.547123513, 76.337000000]: Joint state with name: "joint1" was received but not found in URDF[0m
+[33m[ WARN] [1782153986.555773473, 86.337000000]: Joint state with name: "joint1" was received but not found in URDF[0m
+[33m[ WARN] [1782153996.618025710, 96.377000000]: Joint state with name: "joint1" was received but not found in URDF[0m
+[33m[ WARN] [1782154006.621488215, 106.377000000]: Joint state with name: "joint1" was received but not found in URDF[0m
+[33m[ WARN] [1782154016.626174908, 116.377000000]: Joint state with name: "joint1" was received but not found in URDF[0m
+[33m[ WARN] [1782154026.668740526, 126.416000000]: Joint state with name: "joint1" was received but not found in URDF[0m

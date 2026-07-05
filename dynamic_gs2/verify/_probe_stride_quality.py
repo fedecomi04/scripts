@@ -12,7 +12,7 @@ import numpy as np, cv2, open3d as o3d
 os.environ["DGS_FUSION_DEVICE"] = "cpu"
 os.environ.setdefault("DGS_TSDF_VOXEL_M", "0.003")
 import importlib
-import dynamic_gs.utils.online_fusion as OF
+import dynamic_gs2.online_fusion as OF
 importlib.reload(OF)   # pick up the 3mm voxel from env
 
 DS = Path(sys.argv[1] if len(sys.argv) > 1 else

@@ -47,7 +47,7 @@ class XFeatTracker:
     """Config-driven wrapper over the proven XFeatMotionEstimator. Main thread only."""
 
     def __init__(self, device, tracker_cfg, pose_filter_cfg):
-        from dynamic_gs.utils.xfeat_motion import XFeatMotionEstimator
+        from .xfeat_motion import XFeatMotionEstimator
         # scale-aware anchor selection is read from env by the old estimator — translate cfg->env once.
         os.environ["DGS_XFEAT_SCALE_SELECT"] = "1" if tracker_cfg.scale_select else "0"
         self._est = XFeatMotionEstimator(

@@ -2,21 +2,20 @@
 
 Owns the PRODUCER end of the Frame contract: fills the SHM ring. The rest of the
 pipeline only ever READS the ring (ShmRing.peek_latest). One ingest path for both
-recorded (ReplaySource) and live (Ros1Source) → live + replay are identical
+recorded (ReplaySource) and live (LiveBridgeSource) → live + replay are identical
 downstream. (rewrite_spec/adapters_source.md; imports frame.py + shm_channel.py per D1.)
 
 Sources:
-  - ReplaySource  : disk dataset -> SHM. paced (real-time proxy, default) or fast
-                    (lock-step, frame-exact). In-process, dynamic_gs env. FULLY TESTED.
-  - Ros1Source    : spawns the ROS publisher subprocess (dynamic_gs_ros, py3.8) that
-                    writes the new-layout SHM. Structural here; publisher body = ros_publisher.py.
+  - ReplaySource     : disk dataset -> SHM. paced (real-time proxy, default) or fast
+                       (lock-step, frame-exact). In-process, dynamic_gs env. FULLY TESTED.
+  - LiveBridgeSource : spawns the proven py3.8 ROS publisher (dynamic_gs_ros) with
+                       --new-layout so it writes THIS SHM segment directly.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
-import signal
 import subprocess
 import threading
 import time
@@ -203,91 +202,6 @@ class ReplaySource:
             self._prod = None
 
 
-# --------------------------------------------------------------- live (ROS)
-# Load-bearing env-strip (H10): the ROS publisher runs in the py3.8 dynamic_gs_ros
-# env via a bash wrapper that sources ROS; the parent (dynamic_gs) env's
-# LD_LIBRARY_PATH/CPATH/CUDA_HOME would otherwise shadow it.
-_STRIP_ENV_VARS = ("LD_LIBRARY_PATH", "CPATH", "CUDA_HOME", "PYTHONPATH")
-
-
-def _ros_publisher_env() -> dict:
-    env = dict(os.environ)
-    for k in _STRIP_ENV_VARS:
-        env.pop(k, None)
-    env["PYTHONNOUSERSITE"] = "1"
-    return env
-
-
-class Ros1Source:
-    """Spawn the ROS1 (Noetic) publisher subprocess that fills the new-layout SHM ring.
-
-    The publisher body lives in dynamic_gs2/ros_publisher.py (run inside dynamic_gs_ros).
-    This class owns the subprocess lifecycle (spawn with env-strip + ROS source,
-    terminate->kill). It does NOT import rospy itself (stays env-portable). The reader
-    side is a plain ShmRing on the same shm_name.
-
-    NOTE: this path requires a live Gazebo/ROS stack and is validated by the OPERATOR
-    (pipeline step 4), not in unattended tests.
-    """
-
-    def __init__(self, *, shm_name: str = DEFAULT_SHM_NAME, ros_env: str = "dynamic_gs_ros",
-                 ros_setup: str = "/opt/ros/noetic/setup.bash",
-                 conda_sh: str = os.path.expanduser("~/miniconda3/etc/profile.d/conda.sh"),
-                 publisher_args: Optional[list] = None, log_path: Optional[str] = None):
-        self.shm_name = shm_name
-        self.ros_env = ros_env
-        self.ros_setup = ros_setup
-        self.conda_sh = conda_sh
-        self.publisher_args = publisher_args or []
-        self.log_path = log_path
-        self._proc: Optional[subprocess.Popen] = None
-        self._log_fd = None
-        self._intr: Optional[Intrinsics] = None
-
-    def attach(self, shm_name: Optional[str] = None) -> None:
-        shm_name = shm_name or self.shm_name
-        mod = "dynamic_gs2.ros_publisher"
-        inner = (f"source {self.conda_sh} && conda activate {self.ros_env} && "
-                 f"source {self.ros_setup} && "
-                 f"exec python -m {mod} --shm-name {shm_name} " + " ".join(self.publisher_args))
-        self._log_fd = open(self.log_path, "ab") if self.log_path else None
-        self._proc = subprocess.Popen(
-            ["bash", "-lc", inner], env=_ros_publisher_env(),
-            cwd=str(Path(__file__).resolve().parents[1]),
-            stdout=self._log_fd or None, stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
-        )
-
-    def intrinsics(self) -> Intrinsics:
-        # Live intrinsics are published into the SHM header by the subprocess; read via ShmRing.
-        if self._intr is None:
-            raise RuntimeError("Ros1Source intrinsics come from the SHM header — read via ShmRing(shm_name).intrinsics()")
-        return self._intr
-
-    def next_frame(self) -> Optional[Frame]:
-        # The subprocess produces frames straight into SHM; the pipeline reads via ShmRing.
-        return None
-
-    def is_alive(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
-
-    def close(self) -> None:
-        if self._proc is not None:
-            try:
-                os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
-                try:
-                    self._proc.wait(timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
-                    self._proc.wait(timeout=5.0)
-            except ProcessLookupError:
-                pass
-            self._proc = None
-        if self._log_fd is not None:
-            self._log_fd.close()
-            self._log_fd = None
-
-
 # --------------------------------------------------------------- live (proven publisher, DIRECT new-layout)
 class LiveBridgeSource:
     """RECOMMENDED live producer: spawns the proven py3.8 ROS publisher with --new-layout so it writes
@@ -309,7 +223,7 @@ class LiveBridgeSource:
 
     def attach(self, shm_name: str = DEFAULT_SHM_NAME) -> None:
         import json as _json
-        from dynamic_gs.utils.live_shm_reader import _spawn_publisher, LIVE_ROOT
+        from .publisher_spawn import _spawn_publisher, LIVE_ROOT
         live_root = self.live_root if self.live_root is not None else LIVE_ROOT
         # Spawn the proven publisher writing the NEW layout straight into `shm_name` (what ShmRing reads).
         self._proc = _spawn_publisher(
@@ -378,8 +292,6 @@ def open_source(kind: str, data_dir=None, shm_name: str = DEFAULT_SHM_NAME,
         src = ReplaySource(data_dir, mode=replay_mode, **opts)
     elif kind == "live_bridge":
         src = LiveBridgeSource(**opts)
-    elif kind == "ros1":
-        src = Ros1Source(shm_name=shm_name, **opts)
     elif kind == "ros2":
         raise NotImplementedError("ros2 source not implemented (ros1/Noetic only — adapters_source.md OQ#4)")
     else:

@@ -59,7 +59,7 @@ class SweepSeedBuilder:
         """Construct the CPU OnlineFusion and spawn the worker thread."""
         import os
         os.environ["DGS_FUSION_DEVICE"] = "cpu"          # force the legacy CPU pipeline (no GPU contention)
-        import dynamic_gs.utils.online_fusion as OF
+        from . import online_fusion as OF
         # Override the module globals (read at IMPORT time, so env/setdefault here is too late): match
         # the GPU subprocess build's voxel/trunc EXACTLY so the seed is identical, and lighten ICP.
         OF.TSDF_VOXEL_M = self.SEED_VOXEL_M

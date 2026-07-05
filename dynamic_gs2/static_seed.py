@@ -1,7 +1,7 @@
 """static_seed.py — GPU TSDF seed build (ICP + integrate), wrapping the proven OnlineFusion.
 
 The seed PLY (static_scene/depth_camera_init_points.ply) is what splatfacto inits from.
-WRAPS dynamic_gs.utils.online_fusion.OnlineFusion (GPU VoxelBlockGrid + multi-scale ICP);
+WRAPS dynamic_gs2.online_fusion.OnlineFusion (GPU VoxelBlockGrid + multi-scale ICP);
 no fusion math is reimplemented. Consumes the SAME Frame stream as the tracker (depth_m
 metres -> uint16 mm + OpenGL c2w, gripper pre-zeroed via mask_keep).
 
@@ -32,7 +32,7 @@ class StaticSeedBuilder:
         os.environ["DGS_TSDF_VOXEL_M"] = str(float(voxel_m))
         if device != "auto":
             os.environ["DGS_FUSION_DEVICE"] = device
-        from dynamic_gs.utils.online_fusion import OnlineFusion
+        from .online_fusion import OnlineFusion
         self._fusion = OnlineFusion(intr.fx, intr.fy, intr.cx, intr.cy,
                                     int(intr.width), int(intr.height))
         self._n = 0
@@ -62,7 +62,7 @@ class StaticSeedBuilder:
     def finalize(self, data_dir) -> Path:
         """Extract the fused cloud, adaptive-downsample (near-full + far-voxel), write the
         seed PLY, and return its path. Frees the GPU grid."""
-        from dynamic_gs.utils.online_fusion import adaptive_downsample
+        from .online_fusion import adaptive_downsample
         import open3d as o3d
         pc = self._fusion.finalize()
         if self._last_cam_xyz is not None and len(pc.points) > 0:

@@ -4,7 +4,7 @@ import sys, threading, os, json, re
 import numpy as np, cv2, torch, open3d as o3d
 from pathlib import Path
 os.environ["DGS_FUSION_DEVICE"]="cpu"; os.environ.setdefault("DGS_TSDF_VOXEL_M","0.003")
-import dynamic_gs.utils.online_fusion as OF
+import dynamic_gs2.online_fusion as OF
 from dynamic_gs2 import config as C, static_train, static_fuse
 from dynamic_gs2.gaussian_set import GaussianSet
 from dynamic_gs2.scene_model import SceneModel

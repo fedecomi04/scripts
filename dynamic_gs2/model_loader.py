@@ -77,7 +77,7 @@ class _SharedSamWorker:
                 # the proven per-call SAM3D subprocess, which pins CONDA_PREFIX itself.)
                 _sam_prefix = os.path.expanduser(f"~/miniconda3/envs/{self._conda_env}")
                 os.environ.setdefault("CONDA_PREFIX", _sam_prefix)
-                from dynamic_gs.utils.sam_worker import SamWorkerClient
+                from .sam_worker import SamWorkerClient
                 self._client = SamWorkerClient(conda_env=self._conda_env)
             except Exception as e:
                 print(f"[model_loader] SAM worker spawn failed ({e}); using subprocess fallback", flush=True)
@@ -140,7 +140,7 @@ class FastSamHandle:
                                        **filter_kwargs)
             except Exception as e:
                 print(f"[model_loader] FastSAM worker infer failed ({e}); subprocess fallback", flush=True)
-        from dynamic_gs.utils.fastsam_segmentation import run_fastsam_subprocess
+        from .fastsam_segmentation import run_fastsam_subprocess
         return run_fastsam_subprocess(
             image_path=Path(image_path), text_prompt=text_prompt,
             output_dir=Path(output_dir), output_stem=output_stem,
@@ -210,7 +210,7 @@ class Sam3dHandle:
                     intrinsics_path=Path(intrinsics_path) if intrinsics_path else None)
             except Exception as e:
                 print(f"[model_loader] SAM3D worker infer failed ({e}); subprocess fallback", flush=True)
-        from dynamic_gs.utils.sam3d import run_sam3d_multi_object_subprocess
+        from .sam3d import run_sam3d_multi_object_subprocess
         return run_sam3d_multi_object_subprocess(
             render_image_path=Path(render_image_path),
             object_mask_paths=[Path(p) for p in object_mask_paths],

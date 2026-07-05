@@ -181,7 +181,7 @@ class AnysplatHandle:
         # Lock so a concurrent prewarm() thread + the first inference() can't both spawn a worker.
         with self._spawn_lock:
             if self._worker is None:
-                from dynamic_gs.utils.anysplat_decode import PersistentAnysplatWorker
+                from .anysplat_decode import PersistentAnysplatWorker
                 self._worker = PersistentAnysplatWorker(conda_env=self.conda_env,
                                                         startup_timeout_s=self.timeout_s)
             return self._worker
@@ -256,7 +256,7 @@ def _project_downsample(means: torch.Tensor, c2w, intr: dict, stride: int = 4) -
 def make_decode_fn(anysplat: AnysplatHandle, cfg, intr) -> Callable:
     """Return decode_fn(dispatch, regions, snapshot) -> GaussTensors. OPERATOR-VALIDATED:
     runs the AnySplat subprocess + reproject (the proven anysplat_decode path)."""
-    from dynamic_gs.utils.anysplat_decode import reproject_anysplat_to_scene, icp_refine_scene_c2w
+    from .anysplat_decode import reproject_anysplat_to_scene, icp_refine_scene_c2w
     from .timing import get_ledger
     ff = cfg.feedforward
     scene_intr = {"fl_x": intr.fx, "fl_y": intr.fy, "cx": intr.cx, "cy": intr.cy, "w": intr.width, "h": intr.height}

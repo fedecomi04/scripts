@@ -1,7 +1,7 @@
 """_viz_tracking_figure.py — presentation figure/video of how the XFeat+LighterGlue
 rigid-object tracker works, read STRAIGHT FROM THE PIPELINE (no re-implementation).
 
-It constructs the *actual* dynamic_gs.utils.xfeat_motion.XFeatMotionEstimator that the
+It constructs the *actual* dynamic_gs2.xfeat_motion.XFeatMotionEstimator that the
 live pipeline uses, seeds the D0 anchor on dynamic frame 0, then runs
 estimate_and_advance() on later frames. Every keypoint, every LighterGlue match and every
 RANSAC/Kabsch inlier drawn here is what the tracker computed — this module only renders it.
@@ -43,11 +43,11 @@ _SCRIPTS = _HERE.parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from dynamic_gs.utils.xfeat_motion import XFeatMotionEstimator  # noqa: E402
+from dynamic_gs2.xfeat_motion import XFeatMotionEstimator  # noqa: E402
 
 DATA = Path(
     "/home/mrc-cuhk/Documents/dynamic_gaussian_splat/data_teleoperation/datasets/"
-    "recording_15fps_2026-06-11_115107"
+    "recording_15fps_2026-06-11_115107_screwdriver_good_recording"
 )
 DYN = DATA / "dynamic_scene"
 FF_DEBUG = DYN / "_ff_debug"

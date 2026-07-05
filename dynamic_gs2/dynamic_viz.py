@@ -4,8 +4,8 @@ The ONE sanctioned live-viz surface (Invariant #9 — never the NS viewer). An e
 daemon render thread reads each connected client's camera, renders TWO views (the camera-pose
 view + a bird's-eye view), composites them with the real camera feed into one 2x2 canvas, and
 pushes the JPEG as the client background. The bridge holds NO model and NO lock — render_fn
-carries both. Reuses the proven viser<->OpenGL camera-convention helpers from
-dynamic_gs.utils.viser_direct. (rewrite_spec/dynamic_viz.md.)
+carries both. The viser<->OpenGL camera-convention helpers are inlined below (verbatim from
+the proven dynamic_gs.utils.viser_direct). (rewrite_spec/dynamic_viz.md.)
 
 Composite layout (canvas is 2*render_w wide, 2*render_h tall):
   bottom-left  = render 1   (source picked live: Cam / Top / Left / Right / Manual)
@@ -23,10 +23,115 @@ import numpy as np
 
 try:
     import viser
-    from dynamic_gs.utils.viser_direct import _build_camera_from_viser, _FLIP_YZ, _rotmat_to_quat_wxyz_np
     _HAVE_VISER = True
 except Exception:                                  # pragma: no cover
     _HAVE_VISER = False
+
+
+# viser<->OpenGL camera-convention helpers, inlined verbatim from the proven
+# dynamic_gs.utils.viser_direct (pure numpy/torch — no viser dependency).
+
+def _quat_wxyz_to_rotmat_np(q: np.ndarray) -> np.ndarray:
+    """(4,) wxyz numpy quaternion -> (3, 3) numpy rotation matrix."""
+    q = np.asarray(q, dtype=np.float64)
+    n = np.linalg.norm(q)
+    if n < 1e-12:
+        return np.eye(3, dtype=np.float32)
+    w, x, y, z = q / n
+    R = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y)],
+        [2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)],
+    ], dtype=np.float32)
+    return R
+
+
+def _rotmat_to_quat_wxyz_np(R: np.ndarray) -> np.ndarray:
+    """(3, 3) numpy rotation matrix -> (4,) wxyz numpy quaternion (Shepperd's method)."""
+    R = np.asarray(R, dtype=np.float64)
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    return np.array([w, x, y, z], dtype=np.float32)
+
+
+# Viser cameras are OpenCV-convention at the local camera frame (Y-down,
+# Z-forward), even though viser's world frame is +Y up. To convert from
+# viser's R_world_camera to nerfstudio's c2w[:3,:3] (OpenGL: Y-up,
+# Z-back at the camera), multiply by a 180-degree rotation about X.
+# This is exactly what nerfstudio's own viewer does in
+# ``nerfstudio.viewer.viewer.Viewer.get_camera_state``.
+_FLIP_YZ = np.array([
+    [1.0,  0.0,  0.0],
+    [0.0, -1.0,  0.0],
+    [0.0,  0.0, -1.0],
+], dtype=np.float32)
+
+
+def _build_camera_from_viser(client_camera, W: int, H: int, device) -> "Cameras":
+    """Convert (position, wxyz, fov) from viser into a nerfstudio Cameras.
+
+    Viser cameras are OpenGL convention: +X right, +Y up, -Z forward, with
+    ``fov`` being the vertical field of view in radians. Nerfstudio
+    ``Cameras`` uses the same OpenGL convention for ``camera_to_worlds``
+    (c2w) when built directly, so the rotation matrix from the quaternion
+    drops in without an extra coordinate flip.
+    """
+    import torch
+    from nerfstudio.cameras.cameras import Cameras, CameraType
+
+    pos = np.asarray(client_camera.position, dtype=np.float32).reshape(3)
+    wxyz = np.asarray(client_camera.wxyz, dtype=np.float32).reshape(4)
+    fov_v = float(getattr(client_camera, "fov", np.deg2rad(60.0)))
+    R_viser = _quat_wxyz_to_rotmat_np(wxyz)
+    # viser camera (Y-down, Z-forward) -> nerfstudio (Y-up, Z-back)
+    R_nerf = (R_viser @ _FLIP_YZ).astype(np.float32)
+    c2w = np.eye(4, dtype=np.float32)
+    c2w[:3, :3] = R_nerf
+    c2w[:3, 3] = pos
+    c2w_3x4 = torch.from_numpy(c2w[:3, :4]).to(device).unsqueeze(0)  # (1, 3, 4)
+
+    # fy = 0.5 * H / tan(fov_v / 2); fx = fy * (W/H) / aspect — but viser's
+    # aspect is exactly W/H so the (W/H)/aspect factor cancels: fx == fy in
+    # pixel units.
+    fy = 0.5 * H / float(np.tan(fov_v / 2.0))
+    fx = fy
+    cx = 0.5 * W
+    cy = 0.5 * H
+
+    cameras = Cameras(
+        camera_to_worlds=c2w_3x4,
+        fx=torch.tensor([[fx]], device=device, dtype=torch.float32),
+        fy=torch.tensor([[fy]], device=device, dtype=torch.float32),
+        cx=torch.tensor([[cx]], device=device, dtype=torch.float32),
+        cy=torch.tensor([[cy]], device=device, dtype=torch.float32),
+        width=torch.tensor([[W]], device=device, dtype=torch.int32),
+        height=torch.tensor([[H]], device=device, dtype=torch.int32),
+        camera_type=CameraType.PERSPECTIVE,
+    )
+    return cameras
 
 
 def _axis_angle_to_R(axis: np.ndarray, theta: float) -> np.ndarray:
@@ -119,6 +224,8 @@ class ViserBridge:
         self._initial_c2w: Optional[np.ndarray] = None
         self._follow_c2w: Optional[np.ndarray] = None
         self._feed_rgb: Optional[np.ndarray] = None
+        # Latest gripper finger-pad world points (each (3,) or None) for the overlay markers.
+        self._finger_world: tuple = (None, None)
         self._lock = threading.Lock()
         self._applied = set()
         self._trk_dt_ema: Optional[float] = None    # EMA of the tracker tick interval -> HUD Hz
@@ -152,6 +259,13 @@ class ViserBridge:
             self._gui_r2_src.value = "Top"
             self._gui_r2_deg = self._server.gui.add_slider("R2 angle", min=0, max=180, step=5,
                                                            initial_value=self.ORBIT_DEFAULT_DEG["Top"])
+
+            # Toggle the two gripper-fingertip overlay dots on the scene renders.
+            self._gui_show_fingers = self._server.gui.add_checkbox("Gripper markers", initial_value=True)
+
+            @self._gui_show_fingers.on_update
+            def _(_):
+                self._wake.set()
 
             @self._gui_view_mode.on_click
             def _(_):
@@ -207,6 +321,17 @@ class ViserBridge:
 
     def set_initial_camera(self, c2w_4x4: np.ndarray) -> None:
         self._initial_c2w = np.asarray(c2w_4x4, float)
+
+    def update_finger_points(self, finger_l, finger_r) -> None:
+        """Latest gripper finger-pad world points (each (3,) or None) for the overlay markers.
+        A point at the world origin (all-zero) is treated as 'unavailable' and not drawn."""
+        def _clean(p):
+            if p is None:
+                return None
+            a = np.asarray(p, np.float64).reshape(-1)
+            return None if (a.shape[0] != 3 or not np.any(a)) else a
+        with self._lock:
+            self._finger_world = (_clean(finger_l), _clean(finger_r))
 
     def update_tracked_camera(self, c2w_4x4: np.ndarray) -> None:
         # Called once per tracker tick -> its call rate IS the live tracker Hz (HUD readout).
@@ -312,17 +437,64 @@ class ViserBridge:
     def _src_label(self, src: str, deg: float) -> str:
         return f"{src} {deg:.0f}deg" if src in self.ORBIT_DIRS else src
 
-    def _render_for(self, src: str, deg: float, template_cam, tracked) -> np.ndarray:
+    @staticmethod
+    def _cam_scalar(x) -> float:
+        import torch as _t
+        return float(x.detach().cpu().reshape(-1)[0].item()) if _t.is_tensor(x) else float(x)
+
+    def _draw_finger_markers(self, img: np.ndarray, c2w_3x4: np.ndarray, template_cam,
+                             finger_world: tuple) -> None:
+        """Project the two gripper finger-pad world points into THIS panel (OpenGL c2w + the render
+        intrinsics) and draw a filled dot for each in front of the camera and inside the frame. Same
+        projection as the FF cull (means_cam = Rᵀ(X−t); forward = −Z). Drawn last = always on top."""
+        import cv2
+        pts = [p for p in finger_world if p is not None]
+        if not pts:
+            return
+        H, W = img.shape[:2]
+        fx = self._cam_scalar(template_cam.fx); fy = self._cam_scalar(template_cam.fy)
+        cx = self._cam_scalar(template_cam.cx); cy = self._cam_scalar(template_cam.cy)
+        # the render template's cx/cy/fx/fy are at its own (width,height); scale to this panel's HxW.
+        tw = self._cam_scalar(template_cam.width); th = self._cam_scalar(template_cam.height)
+        if tw > 0 and th > 0 and (int(tw), int(th)) != (W, H):
+            sx, sy = W / tw, H / th
+            fx *= sx; cx *= sx; fy *= sy; cy *= sy
+        c2w = np.asarray(c2w_3x4, np.float64)
+        R, t = c2w[:3, :3], c2w[:3, 3]
+        colors = [(60, 220, 60), (60, 60, 235)]    # BGR: left pad green, right pad red
+        r = max(4, int(round(0.012 * min(W, H))))
+        for p, (col_i) in zip(finger_world, range(2)):
+            if p is None:
+                continue
+            xc = R.T @ (np.asarray(p, np.float64) - t)     # camera coords
+            fwd = -xc[2]                                    # depth in front of camera
+            if fwd <= 1e-4:
+                continue                                    # behind the camera
+            u = fx * (xc[0] / fwd) + cx
+            v = fy * (-xc[1] / fwd) + cy
+            ui, vi = int(round(u)), int(round(v))
+            if 0 <= ui < W and 0 <= vi < H:
+                cv2.circle(img, (ui, vi), r + 2, (255, 255, 255), -1, cv2.LINE_AA)   # white halo
+                cv2.circle(img, (ui, vi), r, colors[col_i], -1, cv2.LINE_AA)
+
+    def _render_for(self, src: str, deg: float, template_cam, tracked,
+                    finger_world: tuple = (None, None)) -> np.ndarray:
         """Render one panel from its chosen source -> uint8 RGB. 'Manual' uses the viser orbit camera;
-        'Cam'/'Top'/'Left'/'Right' are built off the tracked capture pose (orbit camera untouched)."""
+        'Cam'/'Top'/'Left'/'Right' are built off the tracked capture pose (orbit camera untouched).
+        The gripper finger-pad markers are projected into every scene-render panel."""
         if src == "Manual":
-            return self._render_to_np(template_cam)
+            img = self._render_to_np(template_cam)
+            c2w = template_cam.camera_to_worlds[0].detach().cpu().numpy()
+            self._draw_finger_markers(img, c2w[:3, :4], template_cam, finger_world)
+            return img
         base = tracked if tracked is not None else template_cam.camera_to_worlds[0].detach().cpu().numpy()
         if src == "Cam":
             c2w = np.asarray(base, np.float32)[:3, :4]
         else:                                          # Top / Left / Right orbit of the tracked pose
             c2w = _secondary_view_c2w(base, self.TOP_VIEW_PIVOT_M, src, deg, self.WORLD_UP)
-        return self._render_to_np(_cam_with_c2w(template_cam, c2w, self.device))
+        img = self._render_to_np(_cam_with_c2w(template_cam, c2w, self.device))
+        self._draw_finger_markers(img, np.asarray(c2w, np.float64)[:3, :4], template_cam, finger_world)
+        return img
 
     def _render_loop(self):
         while not self._stop.is_set():
@@ -337,7 +509,10 @@ class ViserBridge:
             with self._lock:
                 feed = self._feed_rgb
                 tracked = self._follow_c2w                      # latest tracked capture pose (or None)
+                finger_world = self._finger_world              # latest gripper finger-pad world points
                 hud = self._hud_lines()
+            if not self._gui_show_fingers.value:               # GUI toggle: hide the fingertip markers
+                finger_world = (None, None)
             mode = self._gui_view_mode.value                   # "Camera" | "1 render" | "2 render"
             r1_src, r1_deg = self._gui_r1_src.value, float(self._gui_r1_deg.value)
             r2_src, r2_deg = self._gui_r2_src.value, float(self._gui_r2_deg.value)
@@ -356,8 +531,8 @@ class ViserBridge:
                             format="jpeg", jpeg_quality=self.jpeg_quality)
                         continue
                     template = _build_camera_from_viser(client.camera, self.render_w, self.render_h, self.device)
-                    rgb1 = self._render_for(r1_src, r1_deg, template, tracked)
-                    rgb2 = self._render_for(r2_src, r2_deg, template, tracked) if mode == "2 render" else None
+                    rgb1 = self._render_for(r1_src, r1_deg, template, tracked, finger_world)
+                    rgb2 = self._render_for(r2_src, r2_deg, template, tracked, finger_world) if mode == "2 render" else None
                     canvas = self._compose(mode, rgb1, rgb2, feed, hud)
                     client.scene.set_background_image(canvas, format="jpeg", jpeg_quality=self.jpeg_quality)
                 except Exception as exc:

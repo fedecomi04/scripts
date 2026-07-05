@@ -44,7 +44,7 @@ def main(data_dir):
     # (B) back-project anchor mask through anchor depth+camera
     import cv2
     from nerfstudio.cameras.cameras import Cameras, CameraType
-    from dynamic_gs.fusion.phase0 import backproject_mask_to_world
+    from dynamic_gs2.backproject import backproject_mask_to_world
     seg = st / "segmentation"
     man = json.loads((seg / "manifest.json").read_text())
     pose = json.loads((seg / "anchor" / "pose.json").read_text())

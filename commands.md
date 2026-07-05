@@ -11,6 +11,42 @@ Env pythons (for the diagnostic scripts below):
 
 Viser live view: **http://localhost:8081** (NOT :7007).
 
+## 0. Startup — pick SIM or HARDWARE
+
+### SIM
+```bash
+# Terminal 1 — Gazebo (starts its own master). Wait until the arm appears.
+export ROS_MASTER_URI=http://127.0.0.1:11311 ROS_IP=127.0.0.1
+source /home/mrc-cuhk/dev/teleop/catkin_ws/devel/setup.bash && roslaunch active_camera_arm_description dynamic_gaussian_splat_dynaarm.launch camera_setup:=wrist env:=4
+
+# Terminal 2 — controllers (AFTER the arm is up in Gazebo).
+export ROS_MASTER_URI=http://127.0.0.1:11311 ROS_IP=127.0.0.1
+source /home/mrc-cuhk/dev/teleop/catkin_ws/devel/setup.bash && roslaunch active_camera_arm_controllers load_dynaarm_plus_camera_arm_controller.launch
+
+# Terminal 3 — pipeline.
+dynamic_gs2/full_live.sh "<data_dir>" "screwdriver"
+```
+(`env:=1` empty scene · `env:=2` wire-winding · `env:=3` inspection-board · `env:=4` peg-in-hole.)
+If `roscore`/Gazebo hangs at startup: `getent hosts localhost` must print `127.0.0.1 localhost`; if not, `echo '127.0.0.1   localhost' | sudo tee -a /etc/hosts`.
+
+### HARDWARE (ZED Mini on the Jetson)
+Detailed runbook: [`real_hw/RUN_HARDWARE_TEST.md`](real_hw/RUN_HARDWARE_TEST.md). Every terminal below starts with the same two exports.
+```bash
+# Terminal 1 — robot bringup (your side / NimbRo). Must publish /dynaarm_arm/joint_states_full.
+export ROS_MASTER_URI=http://192.168.55.100:11311 ROS_IP=192.168.55.100
+
+# Terminal 2 — ZED camera (deploys + runs the node on the Jetson over SSH).
+export ROS_MASTER_URI=http://192.168.55.100:11311 ROS_IP=192.168.55.100
+real_hw/run_zed_publisher.sh
+#   check: rostopic hz /dynaarm_arm/dynaarm_arm/camera1/image_raw
+
+# Terminal 3 — pipeline.
+export ROS_MASTER_URI=http://192.168.55.100:11311 ROS_IP=192.168.55.100
+export DGS_REAL_HW_CAMERA=1
+export DGS_POSE_TOPIC=/dynaarm_arm/joint_states_full
+dynamic_gs2/full_live.sh "<data_dir>" "screwdriver"
+```
+
 > **Current pipeline = `dynamic_gs2/`** (the clean rewrite, built + validated). The old
 > `dynamic_gs/` package is the frozen ground-truth baseline — its `ns-train` methods still
 > run but new work goes through `dynamic_gs2/`. Single source of truth for live status:

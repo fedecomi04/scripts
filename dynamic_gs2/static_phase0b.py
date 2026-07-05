@@ -26,15 +26,48 @@ from PIL import Image
 from nerfstudio.utils.math import k_nearest_sklearn
 
 # --- wrapped-unchanged pure utilities from the proven old pipeline ---
-from dynamic_gs.utils.active_mask import extract_projected_centers_and_radii
-from dynamic_gs.utils.sam3d_fusion import (
+from .sam3d_fusion import (
     load_sam3d_gaussian_ply, load_sam3d_rotation_wxyz, register_and_fuse_sam3d_object,
 )
-from dynamic_gs.fusion.phase0 import backproject_mask_to_world, cull_points_in_front
+from .backproject import backproject_mask_to_world, cull_points_in_front
 
 from .gaussian_set import GaussTensors
 
 _SH_C0 = 0.28209479177387814            # SH band-0 <-> RGB constant (must match insert/read)
+
+
+def extract_projected_centers_and_radii(info, num_points):
+    """Read projected centers and radii from gsplat rasterization metadata.
+
+    Inlined verbatim from the proven dynamic_gs.utils.active_mask.
+    """
+
+    if "means2d" not in info:
+        raise KeyError("'means2d' not found in rasterization info.")
+    if "radii" not in info:
+        raise KeyError("'radii' not found in rasterization info.")
+
+    centers = info["means2d"]
+    radii = info["radii"]
+
+    if centers.ndim == 3:
+        centers = centers[0]
+    if centers.ndim != 2:
+        centers = centers.reshape(-1, 2)
+    if radii.ndim > 1:
+        radii = radii.reshape(-1)
+
+    centers = centers.float()
+    radii = radii.float()
+
+    if centers.shape[0] != num_points:
+        raise ValueError("Projected center count does not match the Gaussian count.")
+    if radii.shape[0] != num_points:
+        raise ValueError("Projected radius count does not match the Gaussian count.")
+    if centers.shape[-1] != 2:
+        raise ValueError("Projected centers must have shape [N, 2].")
+
+    return centers, radii
 
 
 # ----------------------------------------------------------------- spacing (port of #3)

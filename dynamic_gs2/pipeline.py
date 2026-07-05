@@ -2,7 +2,7 @@
 
 Wires source -> warm-loaded scene -> tracker -> (optional) FF worker, owns the ONE
 _model_lock and the per-tick DynamicLoop. Recorded + live collapse into one loop fed
-by a FrameSource adapter (ReplaySource or Ros1Source) through the SHM ring.
+by a FrameSource adapter (ReplaySource or LiveBridgeSource) through the SHM ring.
 
 This module also provides run_recorded_trace(): a headless A/B driver that replays a
 recorded dataset (fast, frame-exact) through the new pipeline and writes a per-tick
@@ -206,7 +206,7 @@ class DynamicLoop:
         # with the scene background so the tracker can't lock onto gripper texture.
         if self._filter_depth:
             try:
-                from dynamic_gs.utils.depth_filter import filter_depth_torch
+                from .depth_filter import filter_depth_torch
                 depth = filter_depth_torch(depth)
             except Exception:
                 pass
@@ -413,6 +413,7 @@ def run_view_recorded(data_dir, cfg, device, *, transforms_name: str = "transfor
                     last_n = n_now
                 bridge.update_camera_feed(ring_fr.rgb_bgr)
                 bridge.update_tracked_camera(ring_fr.c2w_4x4)
+                bridge.update_finger_points(ring_fr.finger_l, ring_fr.finger_r)   # gripper-fingertip markers
                 if row.get("ff_fired"):
                     bridge.note_ff_tick()
                 bridge.request_render()
@@ -528,6 +529,7 @@ def run_live(data_dir, cfg, device, *, source_kind: str = "live_bridge", ff_enab
             row = loop.step(fr)
             bridge.update_camera_feed(fr.rgb_bgr)
             bridge.update_tracked_camera(fr.c2w_4x4)
+            bridge.update_finger_points(fr.finger_l, fr.finger_r)   # gripper-fingertip overlay markers
             if row.get("ff_fired"):
                 bridge.note_ff_tick()
             bridge.request_render()
@@ -600,7 +602,7 @@ def _main():
                     help="full --source replay: use the N-th static keyframe (1-based) as the SAM anchor")
     ap.add_argument("--ff", action=argparse.BooleanOptionalAction, default=True,
                     help="feedforward (needs AnySplat worker); ON by default, --no-ff disables")
-    ap.add_argument("--source", default="live_bridge", help="live source kind (live_bridge|ros1)")
+    ap.add_argument("--source", default="live_bridge", help="live source kind (live_bridge)")
     ap.add_argument("--transforms", default="transforms.json", help="recorded/view: transforms json name")
     ap.add_argument("--out-trace", default=None, help="recorded: new_trace.jsonl path")
     ap.add_argument("--max-frames", type=int, default=None)

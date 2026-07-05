@@ -4,8 +4,8 @@ control commands.
 
 Runs in the ROS env (python 3.8, NO torch, NO nerfstudio) via:
 
-    conda run -n radiance_ros_4060 python \
-        /home/.../scripts/dynamic_gs/utils/live_ros_publisher.py
+    conda run -n dynamic_gs_ros python \
+        /home/.../scripts/dynamic_gs2/live_ros_publisher.py
 
 IPC contract (both directions):
   * High-frequency frame data → POSIX shared memory
@@ -19,9 +19,10 @@ IPC contract (both directions):
     and waits for the matching reply.
 
 This file is invoked as a script (not as a package module) because
-the ROS env doesn't have ``dynamic_gs`` on its python path. Anything
-``dynamic_gs/utils/`` would normally provide (keyframe filter math)
-is inlined below.
+the ROS env doesn't have the project on its python path. Anything a
+sibling module would normally provide (keyframe filter math) is
+inlined below; ros_mask.py / frame.py / depth_filter.py /
+zed_depth_noise.py are path-loaded from this same dynamic_gs2/ dir.
 
 PROBLEM: this whole script runs in python 3.8. Use only 3.8-compatible
 syntax; in particular no PEP 604 ``X | Y`` types in annotations, no
@@ -133,7 +134,7 @@ from tf.transformations import quaternion_from_matrix, quaternion_slerp
 # as a standalone script in the minimal dynamic_gs_ros env, not as a package.
 # ---------------------------------------------------------------------------
 
-_RECORDER_SCRIPT = Path(__file__).resolve().parents[2] / "dynamic_gs2" / "ros_mask.py"
+_RECORDER_SCRIPT = Path(__file__).resolve().parent / "ros_mask.py"
 
 
 def _load_recorder_module():
@@ -679,8 +680,8 @@ class LivePublisher:
             # bridge/forwarder, no LiveFrame copy, no SHM-A->SHM-B copy (eliminates the old double-write).
             import importlib.util as _ilu
             import sys as _sys
-            # live_ros_publisher.py is scripts/dynamic_gs/utils/ -> parents[2] == scripts/ -> dynamic_gs2/
-            _fp = Path(__file__).resolve().parents[2] / "dynamic_gs2" / "frame.py"
+            # live_ros_publisher.py now lives in scripts/dynamic_gs2/ -> frame.py is a plain sibling
+            _fp = Path(__file__).resolve().parent / "frame.py"
             _spec = _ilu.spec_from_file_location("_dgs2_frame", str(_fp))
             self._fc = _ilu.module_from_spec(_spec)
             _sys.modules["_dgs2_frame"] = self._fc       # py3.8 dataclass field-type resolution needs the

@@ -62,6 +62,14 @@ REAL_HW_CAMERA_ROT = np.array(
 # on the real-HW path, to the joint value before FK, so it flows into BOTH the mask and the saved pose.
 REAL_HW_WRIST2_OFFSET_RAD = float(np.radians(45.0))
 
+# The two gripper inner-finger-pad links — the viewer draws an overlay marker at each pad's distal TIP
+# (the end nearest the grasped object). The pad link frame sits at the CENTER of the pad box (URDF
+# geometry size 0.022 x 0.00635 x 0.0375, origin 0,0,0), and the pad's local +Z is the long axis
+# pointing AWAY from the finger body (the pad joint offsets +Z 0.03242 off the inner finger). So the tip
+# is the link origin + half the 0.0375 m length along local +Z. Same per-tick link_fk as the mask render.
+FINGER_PAD_LINKS = ("left_inner_finger_pad", "right_inner_finger_pad")
+FINGER_PAD_TIP_LOCAL = np.array([0.0, 0.0, 0.0375 / 2.0], dtype=np.float64)  # center -> distal tip (local +Z)
+
 URDF_PATH = Path(
     "/home/mrc-cuhk/dev/teleop/catkin_ws/src/active_camera_arm_control/"
     "active_camera_arm_examples/dynaarm_description/urdf/dynamic_gaussian_splat/"
@@ -301,6 +309,10 @@ class RobotMaskGenerator:
         self.actuated_joint_names = set(self.robot.actuated_joint_names)
         self.frame_prefix = f"{normalize_frame_id(WORLD_FRAME).rsplit('/', 1)[0]}/"
         self.background_rgb_colors = self._load_background_rgb_colors()
+        # World origins of the two finger-pad links from the LAST mask render (each a (3,) float, or None
+        # if that link was absent). The publisher reads this right after _render_robot_exclusion_mask and
+        # carries it into the SHM frame for the viewer's fingertip overlay.
+        self.last_finger_world: tuple[np.ndarray | None, np.ndarray | None] = (None, None)
 
     def cleanup(self) -> None:
         if self.renderer is not None:
@@ -710,6 +722,15 @@ class RobotMaskGenerator:
         _t0 = time.time() if sweep else 0.0   # timing only when the diagnostic sweep is on
         sampled_joint_positions = self._sample_joint_positions(stamp)
         link_fk = self.robot.link_fk(cfg=sampled_joint_positions, use_names=True)
+        # Stash each pad's distal-TIP world point for the viewer overlay: link origin (pad-box center) +
+        # the local tip offset rotated into world by the pad's world orientation. Same link_fk that poses
+        # the render below — zero extra FK cost, perfectly synced.
+        def _pad_tip_world(name):
+            if name not in link_fk:
+                return None
+            T = link_fk[name]
+            return (T[:3, 3] + T[:3, :3] @ FINGER_PAD_TIP_LOCAL).astype(np.float64)
+        self.last_finger_world = tuple(_pad_tip_world(name) for name in FINGER_PAD_LINKS)
         if REAL_HW_CAMERA:
             # Real-HW: render from the elbow optical camera (+Z forward). The optical build-pose needs
             # no body-frame remaps, and the render comes out upright (no vertical flip).

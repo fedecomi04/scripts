@@ -220,7 +220,10 @@ def main():
         t = _tensors(1, opacity_logit=2.0, sh_rest_dim=15); t.means[:] = xyz
         g9.insert(t, object_flag=(1.0 if oid == 7 else 0.0), instance_id=oid)
     _one(front, 0); _one(at, 0); _one(inslab, 0); _one(behind, 0); _one(deep, 0); _one(trk, 7)
-    w9 = FeedforwardWorker(g9, g9._lock, ffc_def, budget, cdn_fn=lambda d, **k: [True],
+    # This case validates the slab GEOMETRY, so it pins the 0.5mm slab explicitly rather than
+    # inheriting the runtime default (cull_replaced_depth_tol_m, a tuning knob currently 0.0 = off).
+    ffc_slab = dataclasses.replace(ffc_def, cull_replaced_depth_tol_m=0.0005)
+    w9 = FeedforwardWorker(g9, g9._lock, ffc_slab, budget, cdn_fn=lambda d, **k: [True],
                            decode_fn=lambda d, r, s: _tensors(0))
     d9 = FeedforwardDispatch(seq=1, camera=cam9, rgb_bgr=np.zeros((H9, W9, 3), np.uint8),
                              depth_m=depth9, object_mask=torch.zeros((H9, W9)),
@@ -234,7 +237,7 @@ def main():
     assert 4 not in culled, "DEEP background (row4, 50cm behind) must survive"
     assert 5 not in culled, "tracked object (id=7, row5) must be protected"
     # disabled (tol < 0) -> empty
-    w9.cfg = dataclasses.replace(ffc_def, cull_replaced_depth_tol_m=-1.0)
+    w9.cfg = dataclasses.replace(ffc_slab, cull_replaced_depth_tol_m=-1.0)
     assert w9._compute_cull_replaced(d9, cdn9).numel() == 0, "cull_replaced_depth_tol_m<0 disables it"
 
     # ---- P0 invariant: FF worker never reads a live _latest_ attribute ----

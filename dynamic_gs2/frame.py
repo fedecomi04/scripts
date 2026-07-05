@@ -13,13 +13,13 @@ neither.
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import numpy as np
 
 # --- versioned contract -------------------------------------------------------
-LAYOUT_VERSION = 1            # bump on ANY change to Frame fields / slot layout
+LAYOUT_VERSION = 2            # bump on ANY change to Frame fields / slot layout
 SHM_MAGIC = b"DGS1"          # 4 bytes; mismatch => wrong/foreign segment
 DEFAULT_SHM_NAME = "dgs_frame_v1"
 DEFAULT_NUM_SLOTS = 4         # ring depth; drop-oldest, latest-wins (ARCH #3)
@@ -49,6 +49,11 @@ class Frame:
     depth_m: np.ndarray      # (H,W)   float32, metres
     mask_keep: np.ndarray    # (H,W)   uint8 {0,1}, 1 == keep (robot excluded)
     c2w_4x4: np.ndarray      # (4,4)   float64, OpenGL camera->world
+    # World-frame positions of the two gripper inner-finger-pad link origins, for the viewer's
+    # fingertip overlay markers. (0,0,0) == not available (recorded data / non-real-HW), and the
+    # viewer skips drawing a marker at the world origin. Carried in the slot meta, not the payload.
+    finger_l: np.ndarray = field(default_factory=lambda: np.zeros(3, np.float64))  # (3,) left pad
+    finger_r: np.ndarray = field(default_factory=lambda: np.zeros(3, np.float64))  # (3,) right pad
 
 
 # --- SHM layout ---------------------------------------------------------------
@@ -59,9 +64,10 @@ _HDR_SIZE = struct.calcsize(_HDR_FMT)        # 68
 _OFF_LATEST_SEQ = struct.calcsize("<4sIIIIdddd")   # 52
 _OFF_READY = _OFF_LATEST_SEQ + 8                    # 60
 _OFF_SHUTDOWN = _OFF_READY + 4                      # 64
-# Per-slot meta (precedes the rgb/depth/mask payload): seq(q), stamp(d), c2w(16d).
-_SLOT_META_FMT = "<qd16d"
-_SLOT_META_SIZE = struct.calcsize(_SLOT_META_FMT)   # 144
+# Per-slot meta (precedes the rgb/depth/mask payload): seq(q), stamp(d), c2w(16d),
+# finger_l(3d), finger_r(3d) — the two gripper-pad world points for the viewer overlay.
+_SLOT_META_FMT = "<qd16d3d3d"
+_SLOT_META_SIZE = struct.calcsize(_SLOT_META_FMT)   # 192
 
 
 @dataclass(frozen=True)
@@ -136,7 +142,10 @@ def write_frame(buf, layout: Layout, frame: Frame) -> None:
     slot_idx = frame.seq % layout.num_slots
     base = _HDR_SIZE + slot_idx * layout.slot_size
     c2w = np.ascontiguousarray(frame.c2w_4x4, dtype=np.float64).reshape(16)
-    struct.pack_into(_SLOT_META_FMT, buf, base, frame.seq, float(frame.stamp_sec), *c2w.tolist())
+    fl = np.ascontiguousarray(frame.finger_l, dtype=np.float64).reshape(3)
+    fr = np.ascontiguousarray(frame.finger_r, dtype=np.float64).reshape(3)
+    struct.pack_into(_SLOT_META_FMT, buf, base, frame.seq, float(frame.stamp_sec),
+                     *c2w.tolist(), *fl.tolist(), *fr.tolist())
     rgb_v, depth_v, mask_v = _slot_payload_views(buf, layout, slot_idx)
     rgb_v[:] = frame.rgb_bgr
     depth_v[:] = frame.depth_m
@@ -161,7 +170,8 @@ def read_latest(buf, layout: Layout) -> Optional[Frame]:
         s1 = struct.unpack_from("<q", buf, base)[0]
         if s1 != latest:
             continue                         # slot already being overwritten
-        seq, stamp, *c2w_flat = struct.unpack_from(_SLOT_META_FMT, buf, base)
+        seq, stamp, *rest = struct.unpack_from(_SLOT_META_FMT, buf, base)
+        c2w_flat, fl_flat, fr_flat = rest[:16], rest[16:19], rest[19:22]
         rgb_v, depth_v, mask_v = _slot_payload_views(buf, layout, slot_idx)
         rgb = rgb_v.copy(); depth = depth_v.copy(); mask = mask_v.copy()
         s2 = struct.unpack_from("<q", buf, base)[0]
@@ -169,5 +179,7 @@ def read_latest(buf, layout: Layout) -> Optional[Frame]:
             continue                         # writer lapped the ring mid-copy -> retry
         return Frame(seq=seq, stamp_sec=stamp,
                      rgb_bgr=rgb, depth_m=depth, mask_keep=mask,
-                     c2w_4x4=np.asarray(c2w_flat, dtype=np.float64).reshape(4, 4))
+                     c2w_4x4=np.asarray(c2w_flat, dtype=np.float64).reshape(4, 4),
+                     finger_l=np.asarray(fl_flat, dtype=np.float64),
+                     finger_r=np.asarray(fr_flat, dtype=np.float64))
     return None

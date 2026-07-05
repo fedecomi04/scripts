@@ -15,7 +15,7 @@ import sys, time, json, re
 from pathlib import Path
 import numpy as np, cv2
 
-import dynamic_gs.utils.online_fusion as OF
+import dynamic_gs2.online_fusion as OF
 
 DS = Path(sys.argv[1] if len(sys.argv) > 1 else
           "../data_teleoperation/datasets/2026-06-21_162315_live").resolve()
