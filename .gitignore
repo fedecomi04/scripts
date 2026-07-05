@@ -45,3 +45,7 @@ RenderOption_*.json
 _probe_*.log
 rewrite_spec/_resume_*.log
 real_hw/frame_dump/
+
+# Test datasets are hosted externally (Google Drive) — too heavy for git.
+# Ignore the per-dataset data dirs; keep datasets/README.md (download links + prompts).
+dynamic_gs2/datasets/*/
