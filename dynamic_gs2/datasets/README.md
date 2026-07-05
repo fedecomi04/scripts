@@ -10,7 +10,7 @@ everything from scratch and validates the full pipeline.
 The datasets are hosted on Google Drive (too large for git). Download the ones
 you want and unzip them into this directory (`dynamic_gs2/datasets/`):
 
-> **Google Drive:** <PASTE_YOUR_SHARED_DRIVE_LINK_HERE>
+> **Google Drive:** https://drive.google.com/drive/folders/1mWxxwsLYe6H2GAav6DfOQVpSnOV9wuLf?usp=sharing
 
 Each dataset unzips to `dynamic_gs2/datasets/<name>/` with the layout below.
 Nothing here is required to clone or install the pipeline — only to run the
