@@ -1129,6 +1129,57 @@ class LivePublisher:
         return (np.asarray(fl, np.float64) if fl is not None else zeros,
                 np.asarray(fr, np.float64) if fr is not None else zeros)
 
+    # How long the prewarm waits for the first joint sample before warming up without one.
+    _MASK_PREWARM_JOINT_WAIT_SEC = 10.0
+
+    def _prewarm_mask_renderer(self) -> None:
+        """Pay the mask renderer's one-time build cost BEFORE the first per-frame request.
+
+        Building the renderer is expensive and otherwise happens lazily inside request #1: the URDF
+        parse pulls 1,625,079 triangles of arm STL through trimesh (measured 1.44 s in the publisher's
+        env), then pyrender creates the GL context, builds a buffer per mesh and uploads them all on
+        the first render. One live run logged 5.4 s between "Loading URDF" and "Mask renderer
+        initialized".
+
+        Paying that inside request #1 is what leaves the mask thread permanently behind the worker.
+        The worker's 1 s wait expires, it bumps the request id and drops the frame, and since dropping
+        a frame does not slow the incoming stream, the id it waits on keeps running away from the one
+        the mask thread is rendering -- so every frame drops. Worse, a frame that does get through
+        carries a keep-mask posed from an older joint sample, which no longer covers the gripper where
+        the gripper actually is; the change detector then sees the unmasked gripper as new scene
+        content and the feedforward decoder inserts it, smearing gripper gaussians along the
+        trajectory. Warming up here spends the build while the arm is still parked and the worker has
+        nothing to hand us, so request #1 meets a warm renderer.
+
+        Runs on the mask thread so the GL context is created on the thread that will use it. Fully
+        guarded and bounded: an empty joint buffer or a failed render just leaves the original lazy
+        path to run later, exactly as before. DGS_PUB_MASK_PREWARM=0 skips it.
+        """
+        if os.environ.get("DGS_PUB_MASK_PREWARM") == "0":
+            return
+        # Anything raising here would kill the mask thread and with it every frame, so the whole
+        # warm-up degrades to a no-op that leaves the original lazy build to run on request #1.
+        try:
+            # The render needs one joint sample to pose the URDF. Using the NEWEST buffered stamp
+            # keeps the query inside the buffer, so the warm-up cannot trip the "outside buffer ->
+            # boundary sample" frozen-pose warning that a now()-based stamp could.
+            deadline = time.time() + self._MASK_PREWARM_JOINT_WAIT_SEC
+            while not self._joint_state_times_sec and time.time() < deadline:
+                if self._worker_shutdown.is_set():
+                    return
+                time.sleep(0.05)
+            joint_samples = len(self._joint_state_times_sec)
+            stamp = rospy.Time.from_sec(self._joint_state_times_sec[-1] if joint_samples else 0.0)
+            started = time.time()
+            warmed = self._render_mask(stamp) is not None
+            rospy.loginfo(
+                "[mask] prewarm %s in %.1fs (joint samples=%d)",
+                "complete" if warmed else "partial - renderer built, no pose yet",
+                time.time() - started, joint_samples,
+            )
+        except Exception as exc:
+            rospy.logwarn("[mask] prewarm skipped: %s", exc)
+
     def _mask_thread_loop(self) -> None:
         """Own the RobotMaskGenerator (and its thread-bound GL context) for the
         whole publisher lifetime; render one mask per request submitted by the
@@ -1138,7 +1189,11 @@ class LivePublisher:
         reject a mask rendered for an OLDER request — e.g. when a slow render
         overran the worker's wait, the worker abandoned that frame and submitted a
         new one; without the seq check the worker would consume the stale mask and
-        the rgb/depth stream would silently desync one frame behind forever."""
+        the rgb/depth stream would silently desync one frame behind forever.
+
+        The renderer is warmed up before the loop starts serving, so request #1 never pays the
+        multi-second cold build that would otherwise put this thread behind for the whole run."""
+        self._prewarm_mask_renderer()
         while not self._worker_shutdown.is_set():
             if not self._mask_req_event.wait(timeout=0.1):
                 continue
