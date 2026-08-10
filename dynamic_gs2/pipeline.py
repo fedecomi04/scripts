@@ -112,7 +112,7 @@ class DynamicLoop:
         if self._pose_log is None:
             return
         rec = {"type": "pose", "tick": self._tick, "t_sec": float(frame.stamp_sec),
-               "ok": bool(est.success),
+               "ok": bool(est.success), "inliers": int(est.inlier_count),
                "R": np.asarray(est.rotation, float).reshape(9).tolist(),
                "t": np.asarray(est.translation, float).reshape(3).tolist()}
         self._pose_log.write(json.dumps(rec) + "\n")
