@@ -152,6 +152,9 @@ def main():
     ap.add_argument("--radius", type=float, default=0.0,
                     help="object radius (m): also report worst-case surface misalignment")
     ap.add_argument("--dump", help="optional per-sample CSV: t,pos_mm,rot_deg,ok,inliers")
+    ap.add_argument("--tmax", type=float, default=None,
+                    help="drop ticks after this t_sec -- e.g. once the object leaves the gripper/frame "
+                         "and is genuinely untrackable, so those dropouts don't count as tracking failure")
     args = ap.parse_args()
 
     e_t, e_R, e_p, e_ok, e_in, cent = load_est(args.est, args.segment)
@@ -161,12 +164,17 @@ def main():
 
     # ---- exact same-clock join: GT interpolated onto the tracker's own tick times ----
     m = (e_t >= g_t[0]) & (e_t <= g_t[-1])
+    n_outside = len(e_t) - int(m.sum())        # dropped for having no GT to interpolate against
+    if args.tmax is not None:
+        n_cut = int((m & (e_t > args.tmax)).sum())    # in-window ticks removed by the cutoff
+        m &= e_t <= args.tmax
+        print("  (--tmax %.3f: cutting %d trailing ticks -- object left the gripper/frame)"
+              % (args.tmax, n_cut))
     if m.sum() < 10:
         sys.exit("only %d ticks inside the GT window -- were both logs from the SAME run, with the "
                  "recorder started before the pipeline?" % int(m.sum()))
-    if m.sum() < len(e_t):
-        print("  (%d of %d ticks fall outside the GT window and are dropped)"
-              % (len(e_t) - int(m.sum()), len(e_t)))
+    if n_outside:
+        print("  (%d of %d ticks fall outside the GT window and are dropped)" % (n_outside, len(e_t)))
     e_t, e_R, e_p, e_ok = e_t[m], e_R[m], e_p[m], e_ok[m]
     e_in = e_in[m] if e_in is not None else None
     gi_p = np.stack([np.interp(e_t, g_t, g_p[:, i]) for i in range(3)], 1)
